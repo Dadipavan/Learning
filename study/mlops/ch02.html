@@ -1,0 +1,221 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 2: Reproducibility: Environments, Docker, Config and Seeds</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#6a2fd0"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 2</div><h1>Reproducibility: Environments, Docker, Config and Seeds</h1><p>If you cannot rebuild yesterday&#x27;s model exactly, you cannot trust it, fix it or explain it.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-2-1-seeds-and-randomness">2.1 Seeds and Randomness</a></li><li><a href="#s2-2-2-environments-dependencies-and-lock-files">2.2 Environments, Dependencies and Lock Files</a></li><li><a href="#s3-2-3-configuration-management">2.3 Configuration Management</a></li><li><a href="#s4-2-4-docker-for-ml">2.4 Docker for ML</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>A colleague says "my model gave 0.93 accuracy last week" and you cannot get the same number today. Was it the data? A new library version? A random seed? A different laptop? Without reproducibility, every bug hunt turns into guesswork and every audit becomes painful. Think of a restaurant kitchen: a recipe is only useful if another cook, on another day, can follow it with the same ingredients and the same oven setting and get the same dish. This chapter gives you the four tools that make ML runs repeatable: seeds, locked environments, configuration files, and Docker containers. By the end you will be able to prove two runs are identical, write a good Dockerfile, and explain why each line is there.</p>
+<p>Words you need:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Reproducible</td><td>Same code, data, settings and environment give the same result.</td></tr><tr><td>Seed</td><td>A starting number for a random number generator. Same seed, same "random" sequence.</td></tr><tr><td>Dependency</td><td>A library your code needs, for example <code>numpy</code>.</td></tr><tr><td>Lock file</td><td>A file listing the exact version of every dependency, including indirect ones.</td></tr><tr><td>Container</td><td>A packaged box holding your app and everything it needs to run, isolated from the host.</td></tr><tr><td>Image</td><td>The frozen recipe-result of a container; you start containers from images.</td></tr></tbody></table></div>
+<h2 id="s1-2-1-seeds-and-randomness">2.1 Seeds and Randomness</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A random number generator is a very long, shuffled deck of numbers. The seed says where in the deck you start. Same starting position means you read the same cards in the same order. "Random" in computers is really "repeatable shuffle".</div></div>
+<h3>Where randomness hides in ML</h3>
+<p>Randomness appears in train/test splits, weight initialisation, dropout, sampling mini-batches, tree building (random forests), and data shuffling. If you do not fix it, two identical runs give different numbers. A good report says which seed was used.</p>
+<h3>Predict, run, explain</h3>
+<p>We train a small random forest. Before you run it: will two runs with <code>seed=1</code> give the same accuracy? Will three runs with no seed?</p>
+<pre class="code lang-python"><code>import hashlib, json, sys, sklearn, numpy
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+def run(seed=None):
+    X, y = make_classification(n_samples=600, n_features=10, n_informative=4, random_state=7)
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=7)
+    m = RandomForestClassifier(n_estimators=20, max_depth=4, random_state=seed).fit(Xtr, ytr)
+    return round(m.score(Xte, yte), 4)
+print("seed=1 :", run(1), run(1))
+print("seed=2 :", run(2))
+print("no seed:", run(None), run(None), run(None))</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>seed=1 : 0.9278 0.9278
+seed=2 : 0.9278
+no seed: 0.9333 0.9222 0.9167</code></pre>
+<p><strong>Explain.</strong> With <code>seed=1</code> twice we got 0.9278 both times: identical. Without a seed we got 0.9333, 0.9222, 0.9167, three different answers from the same code and data. That spread, about 1.7 percentage points, is as large as many "improvements" that people celebrate. Notice also that <code>seed=2</code> happened to give 0.9278 too. Different seeds <em>can</em> give the same rounded accuracy by chance; the guarantee is only "same seed, same result", never "different seed, different result".</p>
+<p>Note how the split uses its own <code>random_state=7</code>. The data split and the model each have their own seed. If you forget one, the run is not reproducible.</p>
+<p class="problem"><span class="pl">Problem 2.1.1</span> Three unseeded runs scored 0.9333, 0.9222 and 0.9167. Compute the mean and the range. Is a "new model" scoring 0.9300 better than the old one?</p>
+<table class="steps"><tr><th>Formula</th><td>mean = sum ÷ count; range = max − min</td></tr><tr><th>Plug in</th><td>(0.9333 + 0.9222 + 0.9167) ÷ 3, and 0.9333 − 0.9167</td></tr><tr><th>Compute</th><td>Sum = 2.7722; mean = 2.7722 ÷ 3 = 0.92407. Range = 0.0166.</td></tr><tr><th>Answer</th><td>The mean is about 0.924 and the run-to-run range is 0.0166. A new model at 0.9300 is only 0.006 above the mean, well inside the noise range, so we cannot call it better.</td></tr><tr><th>Check</th><td>0.9300 − 0.9241 = 0.0059, which is smaller than the range 0.0166. Yes, inside the noise.</td></tr><tr><th>Why it matters</th><td>Before celebrating a gain, measure the noise by repeating runs with different seeds. Report mean and spread.</td></tr></table>
+<p class="problem"><span class="pl">Problem 2.1.2</span> You have 5 seeds and want to report a model's accuracy fairly. What do you report?</p>
+<table class="steps"><tr><th>Step 1</th><td>Run training once per seed: 5 numbers.</td></tr><tr><th>Step 2</th><td>Report the mean and the standard deviation (or min and max).</td></tr><tr><th>Step 3</th><td>Keep the seeds in the experiment log (Chapter 3) so anyone can repeat each run.</td></tr><tr><th>Answer</th><td>"Accuracy 0.924 ± 0.008 over 5 seeds" is honest; one lucky number is not.</td></tr><tr><th>Check</th><td>If you re-run with the same 5 seeds you must get the same mean. Try it.</td></tr></table>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> no seed:    run 1 -&gt; 0.9333   run 2 -&gt; 0.9222   run 3 -&gt; 0.9167   (wanders)
+ seed = 1:   run 1 -&gt; 0.9278   run 2 -&gt; 0.9278   run 3 -&gt; 0.9278   (locked)</code></pre>
+<h3>Connection to the real job</h3>
+<p>In code review you will be asked "is this reproducible?" Deep learning adds one more complication: GPU operations can be non-deterministic even with a seed, so frameworks offer a "deterministic mode" that costs speed. Write down hardware and library versions along with the seed.</p>
+<h3>Applications</h3>
+<ul><li><strong>Machine Learning</strong>: fair model comparison needs controlled randomness.</li><li><strong>MLOps</strong>: audits, bug repro, and rollback ("rebuild exactly the model that was live in March").</li><li><strong>Research / Finance</strong>: regulators may ask you to reproduce a past decision.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Setting only one seed (for example <code>np.random.seed(0)</code>) and forgetting the framework's own seed (PyTorch, TensorFlow) or the data split's seed. List every source of randomness and seed each one.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Same code, same seed, same data: what do you expect?</li></ol>
+<p>Answer: The same result.</p>
+<ol><li>Why report mean and spread over several seeds?</li></ol>
+<p>Answer: A single run can be lucky; spread shows the noise level.</p>
+<ol><li>Do two different seeds always give different accuracy?</li></ol>
+<p>Answer: No. They can tie by chance, as seed 1 and seed 2 did above.</p>
+<h2 id="s2-2-2-environments-dependencies-and-lock-files">2.2 Environments, Dependencies and Lock Files</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A recipe that says "add some flour" gives different cakes. A recipe that says "add 250 g of flour from brand X, batch 42" gives the same cake. A lock file is the second kind of recipe, for software.</div></div>
+<h3>The problem</h3>
+<p>Your code needs <code>numpy</code>, <code>scikit-learn</code>, and dozens of indirect libraries (the dependencies of your dependencies). If you write only <code>scikit-learn</code> in <code>requirements.txt</code>, tomorrow's install may pull a newer version with different defaults. That is part of "dependency hell" from Chapter 1.</p>
+<h3>Three levels of precision</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Level</th><th>Example line</th><th>Reproducible?</th></tr></thead><tbody><tr><td>Unpinned</td><td><code>scikit-learn</code></td><td>No: takes the latest</td></tr><tr><td>Pinned</td><td><code>scikit-learn==1.9.1</code></td><td>Mostly: your direct libraries are fixed</td></tr><tr><td>Locked</td><td>every package incl. indirect, with hashes</td><td>Yes: the strongest</td></tr></tbody></table></div>
+<p>Tools: <code>venv</code> (an isolated Python environment per project), <code>pip freeze</code> (lists installed versions), <code>pip-tools</code> (<code>pip-compile</code> creates a locked file), <code>poetry</code> and <code>uv</code> (modern tools with lock files), <code>conda</code> (manages Python and non-Python libraries). The exact commands change by tool version, so check each tool's docs.</p>
+<h3>Real environment record</h3>
+<p>This is what our run recorded at the end of the script (you should record the same in every experiment):</p>
+<pre class="code lang-python"><code>import sys, sklearn, numpy
+print("env:", sys.version.split()[0], "numpy", numpy.__version__, "sklearn", sklearn.__version__)</code></pre>
+<pre class="code lang-text"><code>env: 3.14.3 numpy 2.5.3 sklearn 1.9.1</code></pre>
+<p>A requirements file built from that record:</p>
+<pre class="code lang-text"><code>numpy==2.5.3
+scikit-learn==1.9.1</code></pre>
+<p class="problem"><span class="pl">Problem 2.2.1</span> <code>requirements.txt</code> says <code>pandas&gt;=2.0</code>. Today it installs 3.0.6; in two years it installs 5.x with breaking changes. How do you stop this?</p>
+<table class="steps"><tr><th>Step 1</th><td>Replace <code>&gt;=</code> with <code>==</code> for the exact tested version: <code>pandas==3.0.6</code>.</td></tr><tr><th>Step 2</th><td>Generate a full lock file that includes indirect dependencies (with <code>pip-compile</code>, <code>poetry lock</code> or <code>uv lock</code>).</td></tr><tr><th>Step 3</th><td>Rebuild images from the lock file in CI, and update versions on purpose (a pull request that bumps versions and runs tests).</td></tr><tr><th>Answer</th><td>Pin exactly and lock the whole tree; upgrade deliberately, not by accident.</td></tr><tr><th>Check</th><td>On a clean machine, install from the lock file and run <code>pip freeze</code>; it must match the lock.</td></tr></table>
+<p class="problem"><span class="pl">Problem 2.2.2</span> Two data scientists get different metrics on the same code and data. List four things you compare.</p>
+<table class="steps"><tr><th>Step 1</th><td>Python and library versions (<code>pip freeze</code>).</td></tr><tr><th>Step 2</th><td>Seeds and the config file used.</td></tr><tr><th>Step 3</th><td>The data version (a hash of the file, Chapter 4).</td></tr><tr><th>Step 4</th><td>Hardware (CPU vs GPU, number of cores) because numerical libraries can differ.</td></tr><tr><th>Answer</th><td>Versions, seeds and config, data hash, hardware.</td></tr><tr><th>Check</th><td>If all four match and metrics still differ, the code has a hidden source of randomness.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Security also depends on this. The <strong>software supply chain</strong> means all the libraries you import. Pinning and scanning them (<code>pip-audit</code>, Dependabot, Trivy for images) shows you when a dependency has a known vulnerability. Pinning alone does not make things safe; it makes them knowable.</p>
+<h3>Applications</h3>
+<ul><li><strong>MLOps</strong>: every deployed model must record the lock file used to train and serve it.</li><li><strong>Data Science</strong>: sharing notebooks with a <code>requirements.txt</code> that really works.</li><li><strong>Security</strong>: vulnerability scanning on pinned versions.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Running <code>pip install</code> on your system Python for every project. Packages collide. Create one virtual environment per project. In this study guide we could not install some packages because the network blocked them, so we wrote small stand-ins; a locked environment would have made the failure clear and the fix easy.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does a lock file add over a pinned requirements file?</li></ol>
+<p>Answer: Exact versions of indirect dependencies too (and often hashes).</p>
+<ol><li>Why one virtual environment per project?</li></ol>
+<p>Answer: To avoid version conflicts between projects.</p>
+<ol><li>Name two non-code things to record with a result.</li></ol>
+<p>Answer: The data version and the hardware (also the seed and config).</p>
+<h2 id="s3-2-3-configuration-management">2.3 Configuration Management</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">The oven temperature is not part of the recipe text; it is a setting on the dial. If you change settings by editing the recipe, you cannot tell which version made which cake. Keep settings in a separate file you can version and compare.</div></div>
+<h3>Definition</h3>
+<p>A <strong>config</strong> is the set of values that control a run: learning rate, number of trees, file paths, seed. We put them in YAML (a human-readable settings format) instead of hard-coding them. <strong>Hydra</strong> is a Python tool that loads YAML configs, merges them, and lets you override values from the command line. We could not install Hydra here, so we show the idea with PyYAML and Python dataclasses (a dataclass is a class that mainly holds data).</p>
+<h3>Predict, run, explain</h3>
+<p>Before you run: what happens if the YAML has a typo in a key name?</p>
+<pre class="code lang-python"><code>from dataclasses import dataclass
+import yaml
+text = """
+model:
+  name: logreg
+  C: 0.5
+train:
+  seed: 42
+  test_size: 0.2
+"""
+@dataclass(frozen=True)
+class TrainCfg:
+    seed: int
+    test_size: float
+@dataclass(frozen=True)
+class ModelCfg:
+    name: str
+    C: float
+raw = yaml.safe_load(text)
+m = ModelCfg(**raw["model"]); t = TrainCfg(**raw["train"])
+print(m); print(t)
+try:
+    TrainCfg(**{"seed": 1, "test_sizee": 0.2})
+except TypeError as e:
+    print("typo caught:", e)</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>ModelCfg(name='logreg', C=0.5)
+TrainCfg(seed=42, test_size=0.2)
+typo caught: TrainCfg.__init__() got an unexpected keyword argument 'test_sizee'. Did you mean 'test_size'?</code></pre>
+<p><strong>Explain.</strong> <code>yaml.safe_load</code> turns the text into a Python dictionary (always use <code>safe_load</code>, never <code>load</code>, because plain <code>load</code> can run code). <code>ModelCfg(**raw["model"])</code> unpacks the dictionary into named arguments. <code>frozen=True</code> means nobody can change a value mid-run. A typo fails loudly at start instead of silently using a default. That is a <strong>typed interface</strong> in action. The exact wording of the error message depends on your Python version.</p>
+<h3>Fingerprinting a config</h3>
+<p>Because the config is data, we can hash it. Same settings give the same hash; any change gives a new one. This is how tracking tools tell "run A" from "run B".</p>
+<pre class="code lang-python"><code>import hashlib, json
+cfg = {"model": "rf", "n_estimators": 20, "max_depth": 4, "seed": 1, "data": "v3"}
+print("config hash:", hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:12])
+cfg["max_depth"] = 5
+print("changed hash:", hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:12])</code></pre>
+<pre class="code lang-text"><code>config hash: 0c0f76eeb44f
+changed hash: 6bded236377e</code></pre>
+<p><code>sort_keys=True</code> matters: it makes key order irrelevant so the same settings always hash the same.</p>
+<p class="problem"><span class="pl">Problem 2.3.1</span> A config has <code>max_depth: 4</code>. Someone changes it to <code>5</code>, and the hash changes from <code>0c0f76eeb44f</code> to <code>6bded236377e</code>. If they change it back to 4, what is the hash?</p>
+<table class="steps"><tr><th>Formula</th><td>hash = SHA-256 of the sorted JSON text</td></tr><tr><th>Plug in</th><td>The text after changing back is identical to the original text</td></tr><tr><th>Compute</th><td>Identical input gives an identical hash, so <code>0c0f76eeb44f</code></td></tr><tr><th>Answer</th><td>The hash returns to <code>0c0f76eeb44f</code>.</td></tr><tr><th>Check</th><td>Re-run the hashing code with <code>max_depth</code> 4 and compare.</td></tr><tr><th>Why it matters</th><td>A hash is a cheap, reliable "has anything changed?" signal for data, config and code.</td></tr></table>
+<p class="problem"><span class="pl">Problem 2.3.2</span> Why is hard-coding <code>lr = 0.01</code> in cell 14 of a notebook a problem for a team?</p>
+<table class="steps"><tr><th>Step 1</th><td>The value is hidden in code; a reader may miss it.</td></tr><tr><th>Step 2</th><td>Experiment tracking (Chapter 3) cannot log it automatically.</td></tr><tr><th>Step 3</th><td>Changing it means editing code, which changes the file hash, which hides whether logic or settings changed.</td></tr><tr><th>Answer</th><td>Settings belong in a versioned config file that is logged with every run.</td></tr><tr><th>Check</th><td>You can open any past run and see its full config without reading code.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Config also separates environments: <code>configs/dev.yaml</code> points to small test data, <code>configs/prod.yaml</code> to the real bucket. Secrets (passwords, API keys) never go in config files in git. They come from environment variables or a secrets manager (Chapter 12).</p>
+<h3>Applications</h3>
+<ul><li><strong>MLOps</strong>: promote the same code from dev to prod by switching config only.</li><li><strong>Machine Learning</strong>: hyperparameter sweeps by overriding values (<code>train.seed=1,2,3</code>).</li><li><strong>Data Engineering</strong>: pipeline parameters such as dates and paths.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Putting a real password in a YAML config and committing it. Once it is in git history it must be considered leaked and rotated. Use <code>.gitignore</code>, <code>.env</code> files kept out of git, and secret scanners such as <code>gitleaks</code>.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why <code>yaml.safe_load</code> and not <code>yaml.load</code>?</li></ol>
+<p>Answer: <code>load</code> can construct arbitrary Python objects and run code from untrusted text.</p>
+<ol><li>What does <code>frozen=True</code> give you?</li></ol>
+<p>Answer: Values cannot be changed after creation, so a run cannot drift mid-way.</p>
+<ol><li>What does <code>sort_keys=True</code> do before hashing?</li></ol>
+<p>Answer: It makes the JSON text independent of key order so equal configs hash equally.</p>
+<h2 id="s4-2-4-docker-for-ml">2.4 Docker for ML</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A shipping container holds goods in a standard box; ships and trucks do not care what is inside. A Docker container holds your code, libraries and settings in a standard box; any computer with Docker can run it the same way. "It works on my machine" becomes "it works in the box".</div></div>
+<h3>Definitions</h3>
+<ul><li><strong>Image</strong>: a read-only package built from a recipe called a <strong>Dockerfile</strong>. Built in <strong>layers</strong>, one per instruction; unchanged layers are cached.</li><li><strong>Container</strong>: a running instance of an image.</li><li><strong>Registry</strong>: a server that stores images (Docker Hub, AWS ECR, Azure ACR, Google Artifact Registry).</li><li><strong>Docker Compose</strong>: a file that starts several containers together (for example API plus database).</li></ul>
+<p>Docker is <strong>not run here</strong> (it is not installed on this machine). The Dockerfiles below are standard patterns; check each flag against current Docker docs.</p>
+<h3>Dockerfile best practices for ML</h3>
+<pre class="code lang-dockerfile"><code># syntax=docker/dockerfile:1
+# ---- stage 1: build (heavy tools live here only) ----
+FROM python:3.12-slim AS builder
+WORKDIR /build
+COPY requirements.lock .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.lock
+
+# ---- stage 2: runtime (small, no compilers) ----
+FROM python:3.12-slim
+RUN useradd --create-home --uid 10001 appuser
+WORKDIR /app
+COPY --from=builder /install /usr/local
+COPY src/ ./src/
+COPY model/ ./model/
+USER appuser
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000
+HEALTHCHECK --interval=30s CMD python -c "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/health')"
+CMD ["python", "-m", "src.serve", "8000"]</code></pre>
+<p>Why each choice (this is the lesson, learn the reasons):</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Practice</th><th>Reason</th></tr></thead><tbody><tr><td><code>python:3.12-slim</code> base</td><td>Smaller image, fewer packages to attack, faster pulls</td></tr><tr><td>Pin the base tag (even better, a digest)</td><td>Same image tomorrow as today</td></tr><tr><td>Copy the lock file first, then <code>pip install</code></td><td>The slow install layer is cached until dependencies change</td></tr><tr><td>Multi-stage build</td><td>Compilers and caches stay in stage 1; final image is smaller</td></tr><tr><td><code>--no-cache-dir</code></td><td>pip's download cache is wasted space inside an image</td></tr><tr><td>Non-root <code>USER</code></td><td>If the app is hacked, the attacker is not root</td></tr><tr><td>Code and model copied last</td><td>Code changes often; keep fast-changing layers at the bottom</td></tr><tr><td><code>HEALTHCHECK</code></td><td>The platform can restart a stuck container</td></tr><tr><td><code>.dockerignore</code> for <code>data/</code>, <code>.git</code>, <code>*.ipynb</code></td><td>Keeps secrets and big files out of the build</td></tr><tr><td>No secrets in the image</td><td>Anyone who can pull the image can read its layers</td></tr></tbody></table></div>
+<p><strong>GPU images.</strong> For GPU work you start from an image that includes the CUDA libraries, and the host needs the <strong>NVIDIA Container Toolkit</strong> so containers can use GPUs (run with the <code>--gpus all</code> flag). GPU images are large (several gigabytes), so multi-stage builds and slim runtimes matter even more. Not run here.</p>
+<p><strong>Scanning.</strong> Trivy (or a registry scanner) reads the image and lists packages with known vulnerabilities. Run it in CI and fail the build on severe findings.</p>
+<p><strong>Compose</strong> sketch (not run here):</p>
+<pre class="code lang-yaml"><code>services:
+  api:
+    build: .
+    ports: ["8000:8000"]
+    environment:
+      MODEL_PATH: /app/model/model_v1.joblib
+  prometheus:
+    image: prom/prometheus
+    ports: ["9090:9090"]</code></pre>
+<p class="problem"><span class="pl">Problem 2.4.1</span> Your image is 1.8 GB and each rebuild takes 6 minutes because <code>pip install</code> re-runs on every code change. What is wrong with the Dockerfile order, and how do you fix it?</p>
+<table class="steps"><tr><th>Step 1</th><td>If <code>COPY . .</code> comes before <code>pip install</code>, any code edit invalidates the install layer (Docker rebuilds a layer and all layers after it).</td></tr><tr><th>Step 2</th><td>Copy only the lock file, install, and then copy the code.</td></tr><tr><th>Step 3</th><td>Use a slim base and a multi-stage build to shrink the image.</td></tr><tr><th>Answer</th><td>Reorder to lock file, install, code. Rebuilds after a code-only change now reuse the cached install layer and take seconds.</td></tr><tr><th>Check</th><td>Change one line of code, rebuild, and watch the log say "CACHED" for the install step.</td></tr></table>
+<p class="problem"><span class="pl">Problem 2.4.2</span> A scan reports 3 high-severity vulnerabilities in the base image. Which actions are possible, in order?</p>
+<table class="steps"><tr><th>Step 1</th><td>Check whether a patched base tag exists, rebuild on it.</td></tr><tr><th>Step 2</th><td>If your app does not use the vulnerable package, remove it by using a slimmer base.</td></tr><tr><th>Step 3</th><td>If unavoidable, document the risk and the date to re-check.</td></tr><tr><th>Answer</th><td>Update or slim the base image first; accept risk only with a written decision.</td></tr><tr><th>Check</th><td>Re-scan after the rebuild; the high findings should drop or disappear.</td></tr></table>
+<h3>The picture</h3>
+<pre class="code lang-text"><code>  Dockerfile  --build--&gt;  IMAGE (layers)  --push--&gt;  REGISTRY  --pull--&gt;  CONTAINER (running)
+   layer 1: base OS+python   (cached)
+   layer 2: dependencies     (cached until lock file changes)
+   layer 3: your code        (changes often)
+   layer 4: model file       (changes per release)</code></pre>
+<p>Read it left to right: you write the recipe, build the image, store it in a registry, and any server can pull and run it. Layers are stacked; changing a lower layer rebuilds everything above it.</p>
+<h3>Connection to the real job</h3>
+<p>Every deployment in this document (a model API, a batch job, Kubernetes pods in Chapter 11) is a container. If you can write and debug a Dockerfile, you can ship nearly anything. The checklist above is what reviewers look for.</p>
+<h3>Applications</h3>
+<ul><li><strong>MLOps</strong>: one image per model version, tagged with the model version and git commit.</li><li><strong>Data Science</strong>: share a working environment with a teammate.</li><li><strong>Data Engineering</strong>: package Spark or Airflow tasks.</li><li><strong>Security</strong>: image scanning and non-root users.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using <code>latest</code> tags and installing without versions. The image you tested is not the image that ships next month. Tag with a version and pin the base.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why put <code>COPY requirements.lock</code> before <code>COPY src/</code>?</li></ol>
+<p>Answer: So the slow install layer stays cached when only code changes.</p>
+<ol><li>What does a multi-stage build do?</li></ol>
+<p>Answer: Builds in one stage and copies only the needed result into a small final stage.</p>
+<ol><li>Why a non-root user?</li></ol>
+<p>Answer: To limit the damage if the app is compromised.</p>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>Reproducible means same code, data, settings, environment and seed give the same result.</li><li>Without a seed our accuracy wandered across 0.9333, 0.9222, 0.9167; with a seed it was locked at 0.9278.</li><li>Seed every source of randomness; report mean and spread across seeds.</li><li>Pin versions exactly and use a lock file; record Python and library versions with each result.</li><li>Keep settings in versioned config files with typed, frozen objects; use <code>yaml.safe_load</code>.</li><li>Hash configs and data to detect change cheaply.</li><li>Docker packages the app: slim base, multi-stage build, lock file first, non-root user, health check, no secrets.</li><li>Scan images and dependencies in CI.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Command / Pattern</th><th>Purpose</th></tr></thead><tbody><tr><td><code>random_state=seed</code></td><td>Fix randomness in scikit-learn</td></tr><tr><td><code>pip freeze</code></td><td>List exact installed versions</td></tr><tr><td><code>yaml.safe_load(text)</code></td><td>Safely read YAML</td></tr><tr><td><code>hashlib.sha256(json.dumps(x, sort_keys=True).encode())</code></td><td>Fingerprint a config</td></tr><tr><td><code>docker build -t name:tag .</code></td><td>Build an image (not run here)</td></tr><tr><td><code>docker run --rm -p 8000:8000 name:tag</code></td><td>Start a container (not run here)</td></tr><tr><td><code>USER appuser</code></td><td>Run as non-root</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 2.1</span> Runs give 0.90, 0.92, 0.91. Mean? <strong>Answer:</strong> (0.90 + 0.92 + 0.91) ÷ 3 = 2.73 ÷ 3 = 0.91.</p>
+<p class="problem"><span class="pl">Problem 2.2</span> What is the output of <code>hashlib.sha256(b"a").hexdigest() == hashlib.sha256(b"a").hexdigest()</code>? <strong>Answer:</strong> <code>True</code>. Same input, same hash.</p>
+<p class="problem"><span class="pl">Problem 2.3</span> Find the bug: <code>np.random.seed(0)</code> is set, but the code uses <code>RandomForestClassifier()</code> and <code>train_test_split(X, y)</code> without <code>random_state</code>. Is the run reproducible? <strong>Answer:</strong> With <code>random_state=None</code>, scikit-learn draws from NumPy's global generator, so <code>np.random.seed(0)</code> does usually make the run repeatable. It is fragile though: any extra random call elsewhere shifts the sequence. Pass explicit <code>random_state</code> arguments.</p>
+<p class="problem"><span class="pl">Problem 2.4</span> Which is better for reproducibility: <code>numpy&gt;=2.0</code> or <code>numpy==2.5.3</code>? <strong>Answer:</strong> <code>numpy==2.5.3</code>, because it is exact.</p>
+<p class="problem"><span class="pl">Problem 2.5</span> In a Dockerfile, put these in best order: <code>COPY src/</code>, <code>RUN pip install</code>, <code>COPY requirements.lock</code>, <code>FROM</code>. <strong>Answer:</strong> <code>FROM</code>, <code>COPY requirements.lock</code>, <code>RUN pip install</code>, <code>COPY src/</code>.</p>
+<p class="problem"><span class="pl">Problem 2.6</span> Why is <code>yaml.load(user_file)</code> dangerous? <strong>Answer:</strong> It can construct Python objects from tags in the file and run attacker-chosen code. Use <code>safe_load</code>.</p>
+<p class="problem"><span class="pl">Problem 2.7</span> A teammate commits <code>AWS_SECRET=...</code> in a config. What do you do? <strong>Answer:</strong> Treat it as leaked: rotate the key immediately, remove it from history, add a secret scanner in CI, and move secrets to environment variables or a secrets manager.</p>
+<p class="problem"><span class="pl">Problem 2.8</span> Two runs, same seed, same code, differ by 0.002 on a GPU. Give two possible reasons. <strong>Answer:</strong> Non-deterministic GPU kernels, and different library or driver versions. Enable deterministic mode and record versions.</p>
+<p class="problem"><span class="pl">Problem 2.9 (interview)</span> "How would you make an ML experiment reproducible?" <strong>Answer:</strong> Version the code (git), the data (hash or DVC), the config (YAML logged per run), the environment (lock file and Docker image), and fix and log the seeds and hardware. Log it all in an experiment tracker.</p>
+<p class="problem"><span class="pl">Problem 2.10 (interview)</span> "Why use a multi-stage Docker build for an ML service?" <strong>Answer:</strong> Build tools and caches are heavy and increase attack surface. A second stage copies only the installed packages and code, so the final image is smaller, faster to pull and safer.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps, and English is my second language. Explain reproducibility in ML: seeds, locked environments, configs, and data versions. Use a cooking analogy first, then precise definitions. Give me one small experiment I can run to see seed effects on accuracy. After each part, ask me one check question and wait for my answer.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Teach me Python dependency management for ML projects: venv, pip freeze, requirements pinning, lock files, pip-tools, poetry and uv. Compare them in a table, say when I should NOT worry yet, and give 8 graded exercises without solutions. Offer to check my answers.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Teach me configuration management for ML: YAML configs, dataclasses, Hydra, overrides from the command line, and keeping secrets out of git. Show a small example, then quiz me one question at a time and correct my mistakes kindly.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Review my Dockerfile for an ML model service. Check layer order, caching, base image, multi-stage use, non-root user, health check, secrets, image size and security scanning. Give a prioritised list of fixes with reasons in simple English. My Dockerfile: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Run a mock interview on reproducibility, Docker and environments for ML. Ask one question at a time, from easy to hard, grade each answer out of 10, show a model answer, and finally list my three weakest topics with a study plan for them.</pre></div><div class="readbtn"><button class="btn" data-read="study:mlops:ch02">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch01.html">← Chapter 1: From Notebook to Production</a><a class="btn" href="ch03.html">Chapter 3: Experiment Tracking and the Model Regist →</a></div></div><script src="../../assets/study.js"></script></body></html>

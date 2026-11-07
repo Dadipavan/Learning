@@ -1,0 +1,217 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 4: Statistical Thinking: Ways Data Fools You</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Science in Practice</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 4</div><h1>Statistical Thinking: Ways Data Fools You</h1><p>Nine classic traps, each reproduced with code so you can see it happen, plus how to put an honest &quot;give or take&quot; on every number you report.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-4-1-correlation-confounding-simpson-s-paradox-and-selection-effects">4.1 Correlation, Confounding, Simpson&#x27;s Paradox and Selection Effects</a></li><li><a href="#s2-4-2-regression-to-the-mean-base-rates-and-goodhart-s-law">4.2 Regression to the Mean, Base Rates and Goodhart&#x27;s Law</a></li><li><a href="#s3-4-3-many-tests-peeking-at-the-validation-set-and-look-ahead">4.3 Many Tests, Peeking at the Validation Set, and Look-Ahead</a></li><li><a href="#s4-4-4-uncertainty-intervals-effect-size-bayesian-thinking">4.4 Uncertainty: Intervals, Effect Size, Bayesian Thinking</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>A stakeholder shows you a chart: "Campaign B converts 33.5%, campaign A only 20%. B wins." Another says: "We coached our worst-performing stores last month and they improved 13 points. The coaching works." A third: "Our new fraud model is 99% accurate." All three statements sound reasonable, and all three can be badly wrong. This chapter is the "know them cold" list of ways data fools people, and the habit of reporting uncertainty. You learn each trap by running a small simulation, so you do not just remember its name, you feel it. By the end you will be able to spot these traps in a dashboard, defend against them in an analysis, and report a result with an honest range. Statistics basics (mean, variance, normal distribution, p-value) are in the learner's Math PDF; here we use them as tools.</p>
+<h2 id="s1-4-1-correlation-confounding-simpson-s-paradox-and-selection-effects">4.1 Correlation, Confounding, Simpson's Paradox and Selection Effects</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">In the summer, ice-cream sales and drownings both rise. Nobody thinks ice cream causes drowning; hot weather makes people eat ice cream and swim. The hidden third thing is called a <em>confounder</em>. Here is a similar trap: queue length at a bank and the number of people using umbrellas both rise on rainy lunch hours. Umbrellas did not cause the queue; the weather and the lunch rush did. Data science is full of hidden third things.</div></div>
+<p><strong>Words you need</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th><th>Example</th></tr></thead><tbody><tr><td>Correlation</td><td>Two things move together</td><td>Ice cream and drowning</td></tr><tr><td>Confounder</td><td>A third factor that drives both</td><td>Temperature</td></tr><tr><td>Simpson's paradox</td><td>A trend in the combined data reverses inside every subgroup</td><td>Campaign B wins overall, A wins in each device group</td></tr><tr><td>Selection bias</td><td>The sample is not the population</td><td>Survey of app users only</td></tr><tr><td>Survivorship bias</td><td>We see only the winners that remained</td><td>Funds that survived 5 years</td></tr><tr><td>Berkson's paradox</td><td>Selecting on a combined score creates a fake negative link</td><td>Admitted students: marks vs sports</td></tr></tbody></table></div>
+<p><strong>Confounding, simulated.</strong> We create 365 days. Temperature drives both ice-cream sales and drownings. Ice cream has no effect on drownings in the simulation.</p>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(5)
+n = 365
+temp = rng.normal(30, 5, n)
+ice = 50 + 4 * temp + rng.normal(0, 15, n)
+drown = 2 + 0.3 * temp + rng.normal(0, 1.5, n)
+print("corr ice,drown", np.corrcoef(ice, drown)[0, 1].round(2))
+def res(y, x):
+    b = np.polyfit(x, y, 1); return y - np.polyval(b, x)     # what is left after removing temperature
+print("partial corr given temp", np.corrcoef(res(ice, temp), res(drown, temp))[0, 1].round(2))</code></pre>
+<pre class="code lang-text"><code>corr ice,drown 0.53
+partial corr given temp -0.0</code></pre>
+<p>Line by line: <code>np.corrcoef</code> is the plain correlation: 0.53, fairly strong. <code>res(y, x)</code> fits a straight line of y on temperature and returns the leftover (residual). Correlating the leftovers is the <em>partial correlation</em>: the link between ice and drowning after removing what temperature explains. It is zero (printed as -0.0, a tiny negative rounding of 0). The apparent link was all temperature. Remember this pattern: <em>adjust for the confounder and see if the link survives.</em></p>
+<p><strong>Simpson's paradox, with real numbers.</strong> A marketing team tests two campaigns. Each visitor is on mobile or desktop.</p>
+<pre class="code lang-python"><code>import pandas as pd
+t = pd.DataFrame({"campaign": ["A","A","B","B"], "device": ["mobile","desktop","mobile","desktop"],
+                  "visitors": [200,100,50,900], "buyers": [20,40,3,315]})
+t["rate"] = (t.buyers / t.visitors).round(3)
+print(t.to_string(index=False))
+tot = t.groupby("campaign")[["visitors","buyers"]].sum(); tot["rate"] = (tot.buyers / tot.visitors).round(3)
+print(tot)</code></pre>
+<pre class="code lang-text"><code>campaign  device  visitors  buyers  rate
+       A  mobile       200      20  0.10
+       A desktop       100      40  0.40
+       B  mobile        50       3  0.06
+       B desktop       900     315  0.35
+          visitors  buyers   rate
+campaign                         
+A              300      60  0.200
+B              950     318  0.335</code></pre>
+<p class="problem"><span class="pl">Problem 4.1.1</span> Which campaign is better? Compute by device and overall, and explain the reversal.</p>
+<table class="steps"><tr><th>Formula</th><td>conversion rate = buyers / visitors</td></tr><tr><th>Plug in</th><td>A mobile 20/200, A desktop 40/100, B mobile 3/50, B desktop 315/900</td></tr><tr><th>Compute</th><td>A: 10% mobile, 40% desktop. B: 6% mobile, 35% desktop. Overall: A = 60/300 = 20.0%; B = 318/950 = 33.5%.</td></tr><tr><th>Answer</th><td>A beats B on both devices (10 &gt; 6 and 40 &gt; 35), yet B beats A overall (33.5 &gt; 20). The reason: B's traffic is 900/950 = 95% desktop (where everybody converts well), while A's traffic is only 33% desktop.</td></tr><tr><th>Check</th><td>Weighted average for A: (0.10 × 200 + 0.40 × 100) / 300 = 60/300 = 0.20 ✓. For B: (0.06 × 50 + 0.35 × 900) / 950 = 318/950 = 0.335 ✓. The overall rates are the <em>weights times the group rates</em>, and the weights differ.</td></tr><tr><th>Why it matters</th><td>If traffic was assigned by the team and not by a coin flip, the overall comparison mixes "how good is the campaign" with "which visitors it got". If the device is the true driver and the campaigns were randomly assigned, the within-device comparison is right. If the campaign changed which device people use, the overall might be right. This is why a DAG (Chapter 8) is needed: statistics cannot decide which view is correct, causal reasoning can.</td></tr></table>
+<p class="problem"><span class="pl">Problem 4.1.2</span> Survivorship bias. A fund list shows only funds that survived 5 years. In a simulation, 1,000 funds have yearly returns with <em>zero skill</em> (mean 0%, sd 20%). A fund dies if any yearly return is below -25%. What does the survivor list show?</p>
+<table class="steps"><tr><th>Step 1</th><td>Simulate 1,000 funds x 5 years, mean 0, sd 0.2 (seed 2):</td></tr></table>
+<pre class="code lang-python"><code>r = np.random.default_rng(2)
+ret = r.normal(0.0, 0.2, (1000, 5))
+alive = ret.min(axis=1) &gt; -0.25
+print("all funds mean yearly return", ret.mean().round(3), " survivors only", ret[alive].mean().round(3), " survivors share", alive.mean().round(3))</code></pre>
+<pre class="code lang-text"><code>all funds mean yearly return 0.0  survivors only 0.041  survivors share 0.558</code></pre>
+<ul><li><strong>Step 2</strong> Keep funds whose worst year was above -25%: 55.8% survive.</li><li><strong>Step 3</strong> Compare average yearly returns.</li><li><strong>Answer</strong> All funds average 0.0%; survivors average +4.1% per year, although nobody had skill.</li><li><strong>Check</strong> Removing the losers can only raise the mean. The survivor share (0.558) matches theory: each year's chance to stay above -25% is about 0.894, and 0.894⁵ = 0.57.</li><li><strong>Why it matters</strong> If you study only the companies that survived, the customers who stayed, or the loans that were approved, you learn the wrong lessons. It is the same mistake as Chapter 2's "approved-only" labels.</li></ul>
+<p><strong>Berkson's paradox.</strong> Suppose marks (a) and sports skill (b) are independent in the population. A college admits students whose sum is high.</p>
+<pre class="code lang-python"><code>rng = np.random.default_rng(3)
+a = rng.normal(0, 1, 100000); b = rng.normal(0, 1, 100000)     # independent marks and sports
+adm = (a + b) &gt; 1.5                                             # admit if the sum is high
+print("corr all", np.corrcoef(a, b)[0, 1].round(3), " corr admitted", np.corrcoef(a[adm], b[adm])[0, 1].round(3), " admitted share", adm.mean().round(3))</code></pre>
+<pre class="code lang-text"><code>corr all 0.0  corr admitted -0.67  admitted share 0.145</code></pre>
+<p>Among the admitted 14.5%, marks and sports show a strong negative correlation (-0.67), created only by the admission rule: if a student has low marks, they must have high sports skill to get in. Whenever your data is filtered by a combined score (approved loans, hired employees, shown products), expect fake negative links.</p>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>Confounder:        Temperature --&gt; Ice cream
+                        |
+                        +-------&gt; Drownings      (ice cream -&gt; drownings? NO)
+
+Selection (collider): Marks --&gt; Admitted &lt;-- Sports
+                      Looking only at "Admitted" links marks and sports.</code></pre>
+<p><strong>Connection to the real job.</strong> In product analytics, "users who use feature X retain better" is nearly always confounding: engaged users use more features. Interviewers love this question.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Product analytics: feature usage vs retention.</li><li>Healthcare: sicker patients get more treatment, so treatment looks harmful.</li><li>Finance: fund performance tables, credit approvals.</li><li>HR analytics: performance of those hired only.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Saying "correlation is not causation" and stopping. Be specific: name the likely confounder, state how you would adjust or experiment, and say which view (overall or subgroup) matches the decision you need.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>In Simpson's example, why does B win overall?</li></ol>
+<p>Answer: B's traffic is mostly on desktop, which converts better for everyone.</p>
+<ol><li>What is the first step to deal with a confounder?</li></ol>
+<p>Answer: name it and adjust for it, or randomise.</p>
+<ol><li>Why do admitted students show a negative link between marks and sports?</li></ol>
+<p>Answer: selection on the sum creates it (Berkson's paradox).</p>
+<h2 id="s2-4-2-regression-to-the-mean-base-rates-and-goodhart-s-law">4.2 Regression to the Mean, Base Rates and Goodhart's Law</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A cricketer scores a century in one match. In the next match he usually scores less. He did not get worse; the first score was partly skill and partly luck, and luck does not repeat. If you pick the extremes, you pick the lucky ones, and they drift back toward average.</div></div>
+<p><strong>Regression to the mean (RTM).</strong> When a measure has both skill and random noise, the top and bottom groups of the first measurement are partly lucky or unlucky. On the next measurement they move toward the average, <em>without any intervention</em>.</p>
+<p class="problem"><span class="pl">Problem 4.2.1</span> A chain has 1,000 stores. Monthly sales index = true skill + random noise (both with sd 10, mean 100). We pick the worst 10% in month 1 and do nothing. What happens in month 2?</p>
+<pre class="code lang-python"><code>rng = np.random.default_rng(0)
+n = 1000
+skill = rng.normal(100, 10, n)
+m1 = skill + rng.normal(0, 10, n)
+m2 = skill + rng.normal(0, 10, n)
+worst = m1 &lt;= np.quantile(m1, 0.10)
+print("worst 10% month1 mean", m1[worst].mean().round(1), "-&gt; month2 mean (no intervention)", m2[worst].mean().round(1))
+print("corr month1 month2", np.corrcoef(m1, m2)[0, 1].round(2), " expected 0.5")
+best = m1 &gt;= np.quantile(m1, 0.90)
+print("best 10% month1", m1[best].mean().round(1), "-&gt; month2", m2[best].mean().round(1))</code></pre>
+<pre class="code lang-text"><code>worst 10% month1 mean 73.7 -&gt; month2 mean (no intervention) 86.7
+corr month1 month2 0.49  expected 0.5
+best 10% month1 124.7 -&gt; month2 109.6</code></pre>
+<ul><li><strong>Formula</strong> expected month-2 = mean + r × (month-1 - mean), where r is the correlation between months (here skill variance / total variance = 100/200 = 0.5).</li><li><strong>Plug in</strong> 100 + 0.5 × (73.7 - 100)</li><li><strong>Compute</strong> 73.7 - 100 = -26.3; × 0.5 = -13.15; 100 - 13.15 = 86.85</li><li><strong>Answer</strong> The worst stores "improved" from 73.7 to 86.7 (+13.0) without any coaching; the formula predicted 86.85. The best stores "fell" from 124.7 to 109.6.</li><li><strong>Check</strong> The measured correlation is 0.49, close to the theoretical 0.5, and the observed improvement matches the formula within 0.2.</li><li><strong>Why it matters</strong> If you had coached the worst stores, you would have claimed a 13-point success. The right comparison is with a <em>control group of similarly weak stores that were not coached</em> (an experiment, Chapter 7). RTM also explains the "Sports Illustrated cover jinx" and why medicine uses placebo controls.</li></ul>
+<p><strong>Base-rate neglect.</strong> A test is 99% sensitive (finds 99% of true cases) and 99% specific (clears 99% of non-cases). A condition affects 0.1% of cases. You test positive. How likely are you truly positive?</p>
+<p class="problem"><span class="pl">Problem 4.2.2</span> Use Bayes' rule with numbers per 100,000.</p>
+<table class="steps"><tr><th>Formula</th><td>PPV = true positives / (true positives + false positives)</td></tr><tr><th>Step 1</th><td>True cases = 100,000 × 0.001 = 100. Found: 100 × 0.99 = 99.</td></tr><tr><th>Step 2</th><td>Non-cases = 99,900. False alarms = 99,900 × 0.01 = 999.</td></tr><tr><th>Compute</th><td>PPV = 99 / (99 + 999) = 99 / 1,098 = 0.0902</td></tr><tr><th>Answer</th><td>Only 9.0% of positives are real; about 9 in 10 alarms are false, although the test is "99% accurate".</td></tr><tr><th>Check</th><td>The code gave PPV 0.0902, with per 100,000 true positives 99 and false positives 999 ✓.</td></tr><tr><th>Why it matters</th><td>Fraud (0.1% to 1% of transactions), rare disease, intrusion detection and any "needle in haystack" task behave like this. Always ask for the base rate and report <em>precision at the operating threshold</em>, not accuracy. This is why a fraud team with capacity to review 500 alerts a day cares about precision@500.</td></tr></table>
+<p><strong>Goodhart's law:</strong> "When a measure becomes a target, it ceases to be a good measure." People (and models) optimise the number, not the goal. A toy model: a support team is rewarded for tickets per hour. Spending fewer minutes per ticket makes a ticket less likely to be truly resolved: P(resolved) = 1 - exp(-minutes / 8). A resolved ticket is worth Rs 100; an unresolved one costs Rs 400 (angry customer, repeat contact).</p>
+<pre class="code lang-python"><code>mins = np.array([30, 25, 20, 12, 6, 3])
+p = 1 - np.exp(-mins / 8); tph = 60 / mins
+print(pd.DataFrame({"minutes_per_ticket": mins, "tickets_per_hour": tph, "P_resolved": p.round(3),
+                    "value_Rs_per_hour": (tph * (100 * p - 400 * (1 - p))).round(0)}).to_string(index=False))</code></pre>
+<pre class="code lang-text"><code> minutes_per_ticket  tickets_per_hour  P_resolved  value_Rs_per_hour
+                 30               2.0       0.976              176.0
+                 25               2.4       0.956              187.0
+                 20               3.0       0.918              177.0
+                 12               5.0       0.777              -58.0
+                  6              10.0       0.528            -1362.0
+                  3              20.0       0.313            -4873.0</code></pre>
+<p class="problem"><span class="pl">Problem 4.2.3</span> Read the table: which handling time maximises the <em>target metric</em> and which maximises the <em>real value</em>?</p>
+<table class="steps"><tr><th>Step 1</th><td>The target metric, tickets per hour, is largest at 3 minutes (20 per hour).</td></tr><tr><th>Step 2</th><td>The real value per hour peaks at 25 minutes (Rs 187) and is hugely negative at 3 minutes (Rs -4,873).</td></tr><tr><th>Answer</th><td>Optimising the metric (3 minutes) loses Rs 4,873 per hour; the best real choice is about 25 minutes.</td></tr><tr><th>Check</th><td>At 25 min: 2.4 × (100 × 0.956 - 400 × 0.044) = 2.4 × (95.6 - 17.6) = 2.4 × 78 = 187 ✓.</td></tr><tr><th>Why it matters</th><td>Any KPI used for bonuses will be gamed. Pair every target metric with a <em>counter-metric</em> (guardrail: resolution rate, reopen rate). The same happens to models: a recommender that optimises clicks learns clickbait.</td></tr></table>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>real value per hour
+  ^        *  (25 min)
+  |     *     *
+  | * __________*___ 0
+  |                  *       *          * (3 min)
+  +---- fast ----------------------- slow --&gt; minutes per ticket
+  the metric "tickets/hour" keeps rising to the left; the value does not.</code></pre>
+<p><strong>Connection to the real job.</strong> In any "we improved X after we targeted the worst" story, ask for the control group. In any "99% accurate" claim, ask for the base rate. In any KPI for staff or a model, ask what could be gamed.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Operations: store or agent coaching programs (RTM).</li><li>Fraud/medical screening: base rates and precision@capacity.</li><li>Product: engagement metrics (time spent) that harm users.</li><li>Operations: optimising the average delivery time while the slowest 1% of deliveries get worse.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Evaluating an intervention only on the "worst performers". A big improvement in an extreme group is the normal signature of RTM. Always keep an untreated comparison group.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Stores in the bottom decile improved without help. Why?</li></ol>
+<p>Answer: regression to the mean; part of their low score was bad luck.</p>
+<ol><li>A 99% accurate test on a 0.1% condition; PPV?</li></ol>
+<p>Answer: about 9%.</p>
+<ol><li>How do you protect a KPI from Goodhart's law?</li></ol>
+<p>Answer: add counter-metrics and watch the real outcome.</p>
+<h2 id="s3-4-3-many-tests-peeking-at-the-validation-set-and-look-ahead">4.3 Many Tests, Peeking at the Validation Set, and Look-Ahead</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Buy 20 lottery tickets and a win seems less surprising than with 1. If you test 20 metrics, one of them will "win" by luck. If you try 200 models and keep the one with the best validation score, it will look good simply because you picked the maximum of 200 random numbers.</div></div>
+<p><strong>Multiple comparisons.</strong> Each test at the 5% level has a 5% chance of a false positive when nothing is going on. With 20 independent tests, the chance of at least one false positive is <code>1 - 0.95²⁰ = 0.642</code>, about 64%. Corrections:</p>
+<ul><li><strong>Bonferroni</strong>: use threshold <code>0.05 / m</code> for m tests (strict, safe).</li><li><strong>Benjamini-Hochberg (BH)</strong>: control the <em>false discovery rate</em> (FDR), the expected share of false findings among your discoveries. Sort p-values <code>p(1) &lt;= ... &lt;= p(m)</code>; find the largest k with <code>p(k) &lt;= (k/m) × 0.05</code>; reject the first k.</li></ul>
+<p class="problem"><span class="pl">Problem 4.3.1</span> Run an A/A test (both groups from the same distribution) on 20 metrics with 2,000 users per group. How many look significant?</p>
+<pre class="code lang-python"><code>from scipy import stats
+rng = np.random.default_rng(0)
+ps = np.array([stats.ttest_ind(rng.normal(0, 1, 2000), rng.normal(0, 1, 2000)).pvalue for _ in range(20)])
+print("metrics with p&lt;0.05 in an A/A test:", int((ps &lt; 0.05).sum()), " min p", ps.min().round(4))
+print("Bonferroni threshold", 0.05 / 20, " significant:", int((ps &lt; 0.05 / 20).sum()))
+srt = np.sort(ps); m = len(ps)
+ok = srt &lt;= (np.arange(1, m + 1) / m) * 0.05     # BH rule: p(k) &lt;= (k/m) x 0.05
+print("BH rejections:", int(ok.sum()))
+print("P(at least one false positive of 20 at 0.05):", round(1 - 0.95**20, 3))</code></pre>
+<pre class="code lang-text"><code>metrics with p&lt;0.05 in an A/A test: 1  min p 0.0297
+Bonferroni threshold 0.0025   significant: 0
+BH rejections: 0
+P(at least one false positive of 20 at 0.05): 0.642</code></pre>
+<ul><li><strong>Step 1</strong> One metric (the smallest p = 0.0297) falls under 0.05.</li><li><strong>Step 2</strong> Bonferroni threshold is 0.05 / 20 = 0.0025. 0.0297 &gt; 0.0025, so no metric is declared significant.</li><li><strong>Step 3</strong> BH: the smallest p must be below (1/20) × 0.05 = 0.0025; it is not, so no rejections.</li><li><strong>Answer</strong> Without correction you would report one "winning" metric that does not exist; with Bonferroni or BH you correctly report nothing.</li><li><strong>Check</strong> All 20 differences are pure noise by construction, so the right number of discoveries is 0.</li><li><strong>Why it matters</strong> In experiment reports with 15 metrics and 6 segments, 90 comparisons produce about 4 to 5 fake wins. Pre-register one primary metric (Chapter 7) and treat the rest as exploration. The <em>garden of forking paths</em> (choosing the analysis after seeing the data) is the same problem in disguise: p-hacking.</li></ul>
+<p><strong>Overfitting to the validation set.</strong> Each time you look at the validation score and change something, the set leaks into your choices. We score 200 <em>random</em> models (no skill) on a validation set of 300 rows.</p>
+<p class="problem"><span class="pl">Problem 4.3.2</span> What does the best validation AUC look like, and what happens on fresh data?</p>
+<table class="steps"><tr><th>Step 1</th><td>200 random scorers, validation AUC for each.</td></tr><tr><th>Step 2</th><td>Pick the maximum; test it on 3,000 fresh rows.</td></tr><tr><th>Answer</th><td>Best validation AUC is 0.566 (the mean of all 200 is 0.498), but fresh data gives 0.499, i.e. pure chance.</td></tr><tr><th>Check</th><td>True skill is zero for every model, so the expected fresh AUC is 0.5 ✓.</td></tr><tr><th>Why it matters</th><td>A winner among many tries looks better than it is. Keep a final test set you touch once; use cross-validation or time-based folds for tuning; log how many things you tried.</td></tr></table>
+<p><strong>Look-ahead bias and leakage in time data</strong> (the Chapters 2 and 9 theme): any feature, label or split that uses information from after the prediction time. Time-based data must be split by time, never randomly.</p>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>P(at least one false positive)
+ 1.0 |                          ______________
+     |                  _______/
+ 0.64|______________---/            (m = 20)
+     |       _-/
+ 0.05|__----/
+     +---------------------------------------&gt; number of tests m</code></pre>
+<p><strong>Connection to the real job.</strong> Experiment platforms apply these corrections for you; in your own analysis you must do it. In interviews: "You ran 20 metrics and one is significant. Ship?"</p>
+<p><strong>Applications</strong></p>
+<ul><li>Experimentation: many metrics and segments per test.</li><li>Genomics and finance: thousands of hypotheses, FDR control is standard.</li><li>ML: model selection and hyperparameter search.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Slicing a failed experiment into 30 segments until one is significant and then reporting that segment as "the story". Treat such a finding as a new hypothesis for a new test.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is the chance of at least one false positive in 10 independent tests at 0.05?</li></ol>
+<p>Answer: 1 - 0.95¹⁰ = 0.401.</p>
+<ol><li>Bonferroni threshold for 50 tests?</li></ol>
+<p>Answer: 0.05 / 50 = 0.001.</p>
+<ol><li>Why keep an untouched test set?</li></ol>
+<p>Answer: repeated validation peeking makes validation scores optimistic.</p>
+<h2 id="s4-4-4-uncertainty-intervals-effect-size-bayesian-thinking">4.4 Uncertainty: Intervals, Effect Size, Bayesian Thinking</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A delivery firm reports average delivery time 480 minutes. Would you sign a contract at "480 minutes" if a re-check could give 520? You check three weeks and report "480 give or take 25". That "give or take" is uncertainty. A number without it is a guess dressed as a fact.</div></div>
+<p><strong>Words you need</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th><th>Example</th></tr></thead><tbody><tr><td>Standard error (SE)</td><td>Typical size of the error of an estimate</td><td>SE of a rate: <code>sqrt(p(1-p)/n)</code></td></tr><tr><td>Confidence interval (CI)</td><td>A range that, over many repeats, contains the true value 95% of the time</td><td>11 to 17.5 points</td></tr><tr><td>Bootstrap</td><td>Re-draw rows with replacement many times to see how the estimate wobbles</td><td>2,000 re-samples</td></tr><tr><td>Prediction interval (PI)</td><td>Range for a <em>new single</em> outcome</td><td>Next customer's value</td></tr><tr><td>Effect size</td><td>How big the difference is</td><td>14 points, Cohen's d</td></tr><tr><td>Credible interval</td><td>Bayesian range: given data and prior, 95% probability inside</td><td>0.18 to 0.34</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 4.4.1</span> Pro customers churn at 17.0% (179 of 1,053); free at 31.3% (472 of 1,509). Give the difference with a 95% CI, analytically and with the bootstrap.</p>
+<table class="steps"><tr><th>Formula</th><td><code>SE = sqrt(p₀(1-p₀)/n₀ + p₁(1-p₁)/n₁)</code>, CI = diff ± 1.96 × SE</td></tr><tr><th>Plug in</th><td>p₀ = 0.313, n₀ = 1,509, p₁ = 0.170, n₁ = 1,053</td></tr><tr><th>Compute</th><td>diff = 0.313 - 0.170 = 0.143. SE = sqrt(0.313 × 0.687 / 1509 + 0.170 × 0.830 / 1053) = sqrt(0.0001425 + 0.0001340) = sqrt(0.0002765) = 0.0166. CI = 0.143 ± 1.96 × 0.0166 = 0.143 ± 0.0326 = (0.110, 0.175).</td></tr><tr><th>Answer</th><td>Free customers churn 14.3 points more than pro, 95% CI 11.0 to 17.5 points. The bootstrap (2,000 re-draws) gives (0.110, 0.176), nearly identical.</td></tr><tr><th>Check</th><td>Code printed <code>diff 0.143 SE 0.0166 95% CI 0.11 0.175</code> and <code>bootstrap 95% CI [0.11 0.176]</code> ✓.</td></tr><tr><th>Why it matters</th><td>In words for a manager: "Pro users churn about 14 points less, and we are fairly sure the true gap is between 11 and 18 points." Note: this is a <em>difference between groups</em>, not proof that giving someone Pro lowers churn (confounding, Chapter 8).</td></tr></table>
+<p>The bootstrap is useful when no neat formula exists (a median, a ratio, AUC): resample rows with replacement, recompute the statistic 1,000+ times, take the 2.5th and 97.5th percentiles.</p>
+<p><strong>Small data and Bayesian thinking.</strong> A new segment has 3 churners among 10 customers.</p>
+<p class="problem"><span class="pl">Problem 4.4.2</span> Compare the classical CI with a Bayesian credible interval.</p>
+<table class="steps"><tr><th>Step 1</th><td>Classical (normal approximation): 0.30 ± 1.96 × sqrt(0.3 × 0.7 / 10) = 0.30 ± 0.284 → (0.016, 0.584). Very wide and unreliable at n = 10.</td></tr><tr><th>Step 2</th><td>Bayesian with a flat prior Beta(1, 1): posterior is Beta(1 + 3, 1 + 7); mean 0.333; 95% credible interval (0.109, 0.610).</td></tr><tr><th>Step 3</th><td>Bayesian with an informative prior from history (average churn 25%, worth 100 customers: Beta(25, 75)): posterior Beta(28, 82); mean 0.255; interval (0.178, 0.340).</td></tr><tr><th>Answer</th><td>With almost no data, the flat prior says "somewhere 11% to 61%"; the history-informed prior says "about 25.5%, between 18% and 34%".</td></tr><tr><th>Check</th><td>Beta posterior mean = (a + k) / (a + b + n): flat: 4/12 = 0.333 ✓; informative: 28/110 = 0.255 ✓.</td></tr><tr><th>Why it matters</th><td>A <em>prior</em> is what you believed before seeing the data; Bayes' rule updates it with the data into a <em>posterior</em>. With small data, a sensible prior stabilises estimates and avoids silly conclusions ("segment X churns 30%!"). Bayesian methods also suit sequential decisions (Chapter 7). The prior must be defensible; document it.</td></tr></table>
+<p><strong>Effect size vs significance.</strong> With 2 million users per group, a difference of 0.18 points on a scale with sd 15 gives p = 8e-33, "highly significant", while the standardised effect (Cohen's d = 0.012) is tiny. Statistical significance says "not noise"; practical significance asks "does it matter in rupees?". Always report the effect size with its interval and translate it into business units.</p>
+<p><strong>Confidence interval vs prediction interval.</strong> From a straight-line fit on 200 points (true line y = 2 + 3x, noise sd 4), the prediction at x = 5 is 16.65. The CI for the <em>average</em> outcome at x = 5 has half-width 0.56; the PI for a <em>single new</em> outcome has half-width 7.99. The average is well known, an individual is not: forecasts for single days, orders or customers need the wider PI.</p>
+<p><strong>Reporting uncertainty to non-technical audiences.</strong> Use frequencies and ranges, not jargon:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Instead of</th><th>Say</th></tr></thead><tbody><tr><td>"p = 0.03"</td><td>"If there were really no difference, we would see a gap this big only 3 times in 100."</td></tr><tr><td>"95% CI 11 to 17.5"</td><td>"Our best estimate is 14 points; plausible range 11 to 18."</td></tr><tr><td>"AUC 0.88"</td><td>"If we pick one churner and one non-churner at random, the model ranks the churner higher 88 times in 100."</td></tr><tr><td>"Not significant"</td><td>"We could not tell; the data allow anything from a small loss to a small gain. We need more data."</td></tr></tbody></table></div>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>          |&lt;------ 95% CI for the average ------&gt;|
+          |   |&lt;------------ 95% prediction interval for one customer ---------&gt;|
+ value:   ----[====(===*===)====]----------------------------------------------
+                    estimate</code></pre>
+<p><strong>Connection to the real job.</strong> Every dashboard number, forecast and A/B test result should come with a range. Senior data scientists are trusted because they say "we are about 90% sure, and here is what would change my mind".</p>
+<p><strong>Applications</strong></p>
+<ul><li>Experimentation: CI on the lift decides ship or not.</li><li>Forecasting: prediction intervals decide safety stock and staffing.</li><li>Finance and credit: risk ranges, not point estimates.</li><li>Operations: an interval on the 95th-percentile delivery time across weeks before saying "it got worse".</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reading a 95% CI as "there is a 95% chance the true value is inside <em>this</em> interval". The frequentist meaning concerns the procedure over many repeats. The Bayesian credible interval does have the "95% probability" meaning, given the prior. And never confuse a CI for the mean with a PI for individuals.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which is wider, a CI for the mean or a PI for one new value?</li></ol>
+<p>Answer: the prediction interval.</p>
+<ol><li>What does a 99.99% significant but tiny effect tell you?</li></ol>
+<p>Answer: it is real but may not matter; check the effect size in business terms.</p>
+<ol><li>With 3 events in 10 trials why use a prior?</li></ol>
+<p>Answer: the data alone is too weak; a prior stabilises the estimate.</p>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>Correlation is not causation: name the confounder, adjust, or randomise (partial correlation of ice cream and drownings fell from 0.53 to about 0).</li><li>Simpson's paradox: B beat A overall (33.5% vs 20%) while A beat B on each device (10% vs 6%, 40% vs 35%). Which view is right depends on the causal story.</li><li>Selection and survivorship bias: survivors average +4.1% a year with zero skill; Berkson: selection makes a fake link of -0.67.</li><li>Regression to the mean: the worst 10% rose from 73.7 to 86.7 with no action; always keep a control group.</li><li>Base rates: a "99% accurate" test on a 0.1% condition has PPV 9%.</li><li>Goodhart: a KPI that becomes a target gets gamed; add guardrail metrics.</li><li>Multiple tests: 20 tests give a 64% chance of a false win; use Bonferroni or BH and one primary metric.</li><li>Validation peeking: best of 200 random models scored 0.566 on validation and 0.499 on fresh data.</li><li>Report uncertainty: CI, bootstrap, prediction interval, effect size, credible interval.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Idea</th><th>Formula</th><th>Example</th></tr></thead><tbody><tr><td>Rate SE</td><td><code>sqrt(p(1-p)/n)</code></td><td>0.009 for p = 0.25, n = 2,300</td></tr><tr><td>Two-rate CI</td><td><code>diff ± 1.96 × sqrt(p₀q₀/n₀ + p₁q₁/n₁)</code></td><td>0.143 ± 0.033</td></tr><tr><td>RTM</td><td><code>mean + r × (x₁ - mean)</code></td><td>100 + 0.5 × (73.7 - 100) = 86.85</td></tr><tr><td>PPV</td><td><code>TP / (TP + FP)</code></td><td>99 / 1,098 = 0.090</td></tr><tr><td>Family error</td><td><code>1 - (1 - α)^m</code></td><td>1 - 0.95²⁰ = 0.642</td></tr><tr><td>Bonferroni</td><td><code>α / m</code></td><td>0.05 / 20 = 0.0025</td></tr><tr><td>Beta update</td><td><code>Beta(a + k, b + n - k)</code></td><td>Beta(1,1) + 3/10 → Beta(4, 8)</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 4.P.1</span> (easy) 30 of 200 visitors buy. Find the rate and its SE. <strong>Answer:</strong> 30/200 = 0.15; SE = sqrt(0.15 × 0.85 / 200) = sqrt(0.0006375) = 0.0252.</p>
+<p class="problem"><span class="pl">Problem 4.P.2</span> (easy) 12 tests at the 5% level, independent, no real effects. Probability of at least one false positive? <strong>Answer:</strong> 1 - 0.95¹² = 1 - 0.5404 = 0.4596, about 46%.</p>
+<p class="problem"><span class="pl">Problem 4.P.3</span> (easy) A group of 1,000 stores: mean 100, r = 0.4. A store scored 70 in month 1. Expected month-2 score without action? <strong>Answer:</strong> 100 + 0.4 × (70 - 100) = 88.</p>
+<p class="problem"><span class="pl">Problem 4.P.4</span> (medium) Prevalence 2%, sensitivity 90%, specificity 95%. PPV? <strong>Answer:</strong> Per 10,000: cases 200, found 180; non-cases 9,800, false alarms 490. PPV = 180 / 670 = 0.269, about 27%.</p>
+<p class="problem"><span class="pl">Problem 4.P.5</span> (medium) Campaign X: 30/100 mobile, 10/300 desktop; Campaign Y: 4/20 mobile, 120/380 desktop. Rates by device and overall? <strong>Answer:</strong> X: mobile 30%, desktop 3.3%, overall 40/400 = 10%. Y: mobile 20%, desktop 31.6%, overall 124/400 = 31%. Y wins overall and on desktop; X wins on mobile. Always look at the mix.</p>
+<p class="problem"><span class="pl">Problem 4.P.6</span> (medium) What is the output? <code>np.corrcoef(a[adm], b[adm])[0,1]</code> when a, b are independent and <code>adm = (a + b) &gt; 1.5</code>. <strong>Answer:</strong> A clearly negative number (we measured -0.67), caused by selection.</p>
+<p class="problem"><span class="pl">Problem 4.P.7</span> (medium) Find the bug: "We improved the 100 worst-performing agents with training. Their score rose 8 points, so training works." What is missing? <strong>Answer:</strong> A control group of equally poor agents without training; regression to the mean may explain the rise.</p>
+<p class="problem"><span class="pl">Problem 4.P.8</span> (hard) Using BH at 5% for p-values 0.001, 0.008, 0.02, 0.04, 0.30 (m = 5): which are rejected? <strong>Answer:</strong> Thresholds (k/5) × 0.05 = 0.01, 0.02, 0.03, 0.04, 0.05. Compare sorted p: 0.001 &lt;= 0.01 yes; 0.008 &lt;= 0.02 yes; 0.02 &lt;= 0.03 yes; 0.04 &lt;= 0.04 yes; 0.30 &lt;= 0.05 no. Largest k = 4, so reject the first four.</p>
+<p class="problem"><span class="pl">Problem 4.P.9</span> (interview) "Explain a p-value to a manager." <strong>Answer:</strong> "Imagine nothing changed. The p-value is how often random luck alone would give us a difference at least this large. A small value, like 3 in 100, means luck is an unlikely explanation. It does not tell how big or how important the difference is."</p>
+<p class="problem"><span class="pl">Problem 4.P.10</span> (interview) "Users who use our new feature retain 20 points better. Should we push everyone to use it?" <strong>Answer:</strong> Not yet. This is correlation; engaged users naturally use more features (confounding, selection). Run a randomised test (promote the feature to a random half), or use causal methods with careful adjustment. Compare retention in the promoted vs not promoted groups, with guardrails.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional at an Indian MNC moving into data science, and English is my second language. Teach me Simpson's paradox, confounding, selection bias and survivorship bias with small numeric examples I can verify by hand. After each example, ask me to explain it in my own words and correct me. End with 3 real business cases where I must decide which view (overall or by group) is correct.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Topic: "regression to the mean, base-rate neglect and Goodhart's law". Give me 8 graded exercises with real numbers (for example store performance, a rare-disease test, a support KPI). Do not give solutions yet. After I answer, grade me, show the calculation steps, and explain what business decision each result changes.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional new to data science. Topic: "multiple comparisons, p-hacking, Bonferroni and Benjamini-Hochberg, and validation-set overfitting". Quiz me one question at a time using small p-value lists and experiment scenarios. Wait for my answer, grade it, and explain. Ask 10 questions, increasing in difficulty.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Review my analysis below for statistical traps: confounding, selection bias, regression to the mean, base rates, multiple testing, effect size versus significance, and missing uncertainty (confidence or prediction intervals). List each problem, why it matters, and a concrete fix in simple English. My analysis: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for data science interviews in India. Run a mock interview on statistical thinking: "explain a p-value to a manager", "users of feature X retain better, so what do you do", "99% accurate model on rare events", "how do you report uncertainty". Ask one question at a time, score me out of 10, give a model answer and a follow-up. Do 8 rounds.</pre></div><div class="readbtn"><button class="btn" data-read="study:ds:ch04">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch03.html">← Chapter 3: Exploratory Data Analysis for Modelling</a><a class="btn" href="ch05.html">Chapter 5: Feature Engineering I: Transformations,  →</a></div></div><script src="../../assets/study.js"></script></body></html>

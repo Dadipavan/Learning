@@ -1,0 +1,210 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 4: Ingestion Patterns</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Engineering &amp; Big Data</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 4</div><h1>Ingestion Patterns</h1><p>How to copy data from the outside world into your platform: completely, incrementally, safely, and again after a failure.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-4-1-full-load-vs-incremental-load-and-the-watermark">4.1 Full Load vs Incremental Load and the Watermark</a></li><li><a href="#s2-4-2-apis-pagination-rate-limits-retries-files-and-webhooks">4.2 APIs, Pagination, Rate Limits, Retries, Files and Webhooks</a></li><li><a href="#s3-4-3-change-data-capture-backfills-and-late-arriving-data">4.3 Change Data Capture, Backfills and Late-Arriving Data</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>Every pipeline starts with a hard question: "How do I get the data in without missing anything, without duplicating anything, and without hurting the source?" A new order arrives, an old order is changed, a customer is deleted, an API returns page 3 twice, a job crashes halfway. This chapter gives you the patterns that answer those cases: full load, incremental load with a watermark, change data capture (CDC), API pagination and retries, file drops and webhooks. You will write and run a working incremental loader in Python and SQLite, break it on purpose, and fix it. By the end you will be able to design an ingestion job that you can re-run at any time and trust.</p>
+<p>Our running example is the ShopKart <code>orders</code> table: it has <code>id</code>, <code>amount</code> and <code>updated_at</code>.</p>
+<h2 id="s1-4-1-full-load-vs-incremental-load-and-the-watermark">4.1 Full Load vs Incremental Load and the Watermark</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You keep a diary of your friend's bank statement. The <em>full load</em> way is to photocopy the whole statement every night. The <em>incremental</em> way is to write down only the lines after the last line you already have. The "last line you already have" is the <strong>watermark</strong>.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Full load</td><td>Copy everything, replace the target</td></tr><tr><td>Incremental load</td><td>Copy only new or changed rows since last time</td></tr><tr><td>Watermark (high-water mark)</td><td>The largest <code>updated_at</code> (or id) already loaded; the next run starts after it</td></tr><tr><td>Upsert</td><td>Insert if the key is new, update if it exists</td></tr><tr><td>State table</td><td>A small table that remembers the watermark between runs</td></tr><tr><td>Page</td><td>One chunk of results from an API</td></tr></tbody></table></div>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>When it fits</th><th>Cost</th><th>Risk</th></tr></thead><tbody><tr><td>Full load</td><td>small tables (under a few million rows), no reliable change column</td><td>grows with table size</td><td>slow, hammers the source</td></tr><tr><td>Incremental by timestamp</td><td>table has a trustworthy <code>updated_at</code></td><td>proportional to change</td><td>misses deletes, tie and clock problems</td></tr><tr><td>Incremental by id</td><td>append-only tables (logs)</td><td>small</td><td>misses updates to old rows</td></tr><tr><td>CDC (next section)</td><td>need deletes, low latency, no extra load</td><td>needs log access</td><td>setup complexity</td></tr></tbody></table></div>
+<h3>The incremental loader</h3>
+<p>Rules we will follow: read the watermark first, fetch rows after it, upsert them, and advance the watermark in the same transaction as the last write. That way a crash leaves the old watermark and the next run repeats safely (because upserts are idempotent).</p>
+<pre class="code lang-python"><code>import sqlite3
+
+SOURCE = [{"id": i, "amount": 100 + i, "updated_at": f"2024-05-{(i % 5) + 1:02d}T10:00:00"} for i in range(1, 26)]
+
+def api_get(since, page, page_size=10):
+    """Fake: GET /orders?updated_after=..&amp;page=..  (sorted by updated_at, id)"""
+    data = sorted([r for r in SOURCE if r["updated_at"] &gt; since], key=lambda r: (r["updated_at"], r["id"]))
+    chunk = data[page * page_size:(page + 1) * page_size]
+    return {"items": chunk, "has_more": (page + 1) * page_size &lt; len(data)}
+
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE orders(id INTEGER PRIMARY KEY, amount REAL, updated_at TEXT);
+CREATE TABLE etl_state(pipeline TEXT PRIMARY KEY, watermark TEXT);
+INSERT INTO etl_state VALUES('orders','1970-01-01T00:00:00');
+""")
+
+def run_once():
+    wm = db.execute("SELECT watermark FROM etl_state WHERE pipeline='orders'").fetchone()[0]
+    page, fetched, new_wm = 0, 0, wm
+    while True:
+        resp = api_get(wm, page)
+        for r in resp["items"]:
+            db.execute("""INSERT INTO orders VALUES(:id,:amount,:updated_at)
+                          ON CONFLICT(id) DO UPDATE SET amount=excluded.amount, updated_at=excluded.updated_at""", r)
+            new_wm = max(new_wm, r["updated_at"]); fetched += 1
+        if not resp["has_more"]: break
+        page += 1
+    db.execute("UPDATE etl_state SET watermark=? WHERE pipeline='orders'", (new_wm,))
+    db.commit()
+    total = db.execute("SELECT COUNT(*) FROM orders").fetchone()[0]
+    print(f"run: wm_in={wm} fetched={fetched} pages={page+1} wm_out={new_wm} rows_in_table={total}")
+
+run_once()                       # first load
+run_once()                       # nothing new
+SOURCE[2]["amount"] = 999; SOURCE[2]["updated_at"] = "2024-06-01T09:00:00"        # an update
+SOURCE.append({"id": 26, "amount": 126, "updated_at": "2024-06-01T09:30:00"})     # an insert
+run_once()                       # picks up the 2 changes
+db.execute("UPDATE etl_state SET watermark='1970-01-01T00:00:00'"); db.commit()    # a backfill: reset the watermark
+run_once()
+print(db.execute("SELECT id, amount, updated_at FROM orders WHERE id IN (3,26)").fetchall())
+print("duplicates:", db.execute("SELECT COUNT(*)-COUNT(DISTINCT id) FROM orders").fetchone()[0])</code></pre>
+<p>Before you run it: how many rows does the first run fetch, and how many pages? What does run 3 fetch? After the reset (run 4), will the table have duplicates?</p>
+<p>Real output:</p>
+<pre class="code lang-text"><code>run: wm_in=1970-01-01T00:00:00 fetched=25 pages=3 wm_out=2024-05-05T10:00:00 rows_in_table=25
+run: wm_in=2024-05-05T10:00:00 fetched=0 pages=1 wm_out=2024-05-05T10:00:00 rows_in_table=25
+run: wm_in=2024-05-05T10:00:00 fetched=2 pages=1 wm_out=2024-06-01T09:30:00 rows_in_table=26
+run: wm_in=1970-01-01T00:00:00 fetched=26 pages=3 wm_out=2024-06-01T09:30:00 rows_in_table=26
+[(3, 999.0, '2024-06-01T09:00:00'), (26, 126.0, '2024-06-01T09:30:00')]
+duplicates: 0</code></pre>
+<p><strong>Explain, line by line.</strong></p>
+<ul><li>Run 1: 25 rows at 10 per page need ⌈25 / 10⌉ = 3 pages (10 + 10 + 5). The watermark moves to the largest <code>updated_at</code>, May 5.</li><li>Run 2: nothing is newer than the watermark, so 0 rows, 1 page (the first call returns an empty list). Cheap runs when nothing changed are the point of incremental loading.</li><li>Run 3: id 3 was updated and id 26 is new: 2 rows. The upsert <code>ON CONFLICT(id) DO UPDATE</code> changed id 3 to 999.0 and inserted 26. The table grows from 25 to 26 rows (one insert, one update).</li><li>Run 4 (backfill): we reset the watermark to 1970 to reload everything. It fetched all 26 rows and still ended with 26 rows and 0 duplicates, because writing is an upsert by key. <strong>Check:</strong> <code>COUNT(*) − COUNT(DISTINCT id)</code> is 0. <em>Interpretation:</em> the loader is idempotent. You can re-run it, or backfill, without cleaning up first.</li></ul>
+<h3>The classic bug: ties at the watermark</h3>
+<p>Rows can share the exact same timestamp. We used <code>updated_at &gt; watermark</code> (strictly greater). Suppose order 26 was loaded at <code>09:30:00</code>, and a moment later the source writes order 27 with the same timestamp <code>09:30:00</code>. The next run asks for "greater than 09:30:00" and never sees 27.</p>
+<pre class="code lang-python"><code>SOURCE.append({"id": 27, "amount": 1, "updated_at": "2024-06-01T09:30:00"})   # same timestamp as id 26
+run_once()
+print("id 27 present?", db.execute("SELECT COUNT(*) FROM orders WHERE id=27").fetchone()[0])</code></pre>
+<pre class="code lang-text"><code>run: wm_in=2024-06-01T09:30:00 fetched=0 pages=1 wm_out=2024-06-01T09:30:00 rows_in_table=26
+id 27 present after run with '&gt;' watermark? 0</code></pre>
+<p>Id 27 is lost: <code>fetched=0</code>. The fix is to read from the watermark inclusive (<code>&gt;=</code>) and rely on the idempotent upsert to absorb the repeated row. We changed only that one comparison and re-ran the same sequence:</p>
+<pre class="code lang-text"><code>run: wm_in=2024-06-01T09:30:00 fetched=2 pages=1 wm_out=2024-06-01T09:30:00 rows_in_table=27
+id 27 present after run with '&gt;' watermark? 1</code></pre>
+<p>(The label in the print statement still says <code>'&gt;'</code>, but the filter was changed to <code>&gt;=</code>. The row count went to 27.) It fetched 2 rows (26 again, plus 27), and the upsert made 26 harmless. <strong>Why it matters:</strong> this kind of bug loses data silently, so nothing alerts you. Tests like "count in source = count in target" (Chapter 5) catch it.</p>
+<p>Other watermark traps:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Trap</th><th>What happens</th><th>Fix</th></tr></thead><tbody><tr><td>Deletes</td><td>A deleted row never shows up in "changed since"</td><td>soft-delete flag in the source, or CDC</td></tr><tr><td>Source clock skew</td><td>two servers disagree on time, a row gets an older timestamp than the watermark</td><td>re-read a safety window, for example <code>watermark − 10 minutes</code>, and upsert</td></tr><tr><td>Long transactions</td><td>a row commits late with an earlier <code>updated_at</code></td><td>same safety window</td></tr><tr><td><code>updated_at</code> not updated</td><td>an update path forgets to set it</td><td>enforce in the source, or use CDC</td></tr><tr><td>Using local time</td><td>daylight shifts, mixed zones</td><td>store and compare UTC</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 4.1.1</span> Source table: 4,000,000 rows. Each day about 20,000 rows change. A full load moves 4,000,000 rows, an incremental one moves changed rows plus a 10-minute safety window of about 140 rows (20,000 per day ÷ 144 ten-minute windows). How many times less data does incremental move per run?</p>
+<table class="steps"><tr><th>Formula</th><td>ratio = full rows / incremental rows</td></tr><tr><th>Plug in</th><td>4,000,000 / (20,000 + 140)</td></tr><tr><th>Compute</th><td>20,000 + 140 = 20,140, and 4,000,000 / 20,140 = 198.6</td></tr><tr><th>Answer</th><td>About 199 times less data (about 0.5% of the table). The safety window adds under 1% overhead.</td></tr><tr><th>Check</th><td>20,140 × 199 = 4,007,860, close to 4,000,000.</td></tr><tr><th>Why it matters</th><td>Less data read from the source means less load on the production database and shorter runs.</td></tr></table>
+<p class="problem"><span class="pl">Problem 4.1.2</span> Design check: the loader crashes after upserting 18 of 26 rows but before updating the state table. What is the table state, and what happens on the next run?</p>
+<table class="steps"><tr><th>Step 1</th><td>Because the state update is the last statement and happens in the same transaction as the commit, in our code the whole transaction is rolled back (nothing visible), or, if rows were committed in smaller steps, 18 rows are in the table and the watermark is still the old one.</td></tr><tr><th>Step 2</th><td>The next run re-fetches from the old watermark, upserts all 26 rows (the 18 already there are overwritten with identical values), then advances the watermark.</td></tr><tr><th>Answer</th><td>After the retry the table is complete and without duplicates; the partial first attempt did no lasting harm.</td></tr><tr><th>Check</th><td><code>COUNT(*) = COUNT(DISTINCT id)</code> and the row count equals the source count.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Almost every "ingest table X nightly" ticket is an incremental load with a state table. Tools do the same: Airbyte and Fivetran call the watermark a "cursor field", and dbt incremental models (Chapter 7) use <code>where updated_at &gt; (select max(updated_at) from {{ this }})</code>.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> nightly or hourly table syncs from OLTP.</li><li><strong>Data Analytics:</strong> fresh dashboards without full reloads.</li><li><strong>Machine Learning:</strong> incremental feature refresh; only changed customers recomputed.</li><li><strong>MLOps:</strong> training-data snapshots built from incremental loads.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Moving the watermark to "now" instead of "max updated_at actually loaded". Rows written between your read and your "now" are skipped forever. Always advance to the largest value you really saw.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why do we upsert instead of insert? Answer: re-runs and overlaps must not create duplicates.</li><li>What does the state table store? Answer: the watermark between runs.</li><li>What can incremental loads by timestamp not see? Answer: hard deletes.</li></ol>
+<h2 id="s2-4-2-apis-pagination-rate-limits-retries-files-and-webhooks">4.2 APIs, Pagination, Rate Limits, Retries, Files and Webhooks</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">An API is a shop counter with a queue manager. You may ask for 100 items per visit (pagination), only 10 visits per minute (rate limit), and if the manager says "busy, come back later" (HTTP 429 or 503) you wait politely and come back (retry with backoff).</div></div>
+<h3>Pagination: offset versus cursor</h3>
+<p>An API usually returns a limited page and a way to ask for the next one.</p>
+<ul><li><strong>Offset pagination:</strong> <code>?offset=40&amp;limit=20</code>. Simple, but if rows are inserted while you are paging, positions shift.</li><li><strong>Cursor (keyset) pagination:</strong> <code>?after_id=7&amp;limit=4</code> or an opaque token <code>next_cursor</code>. You ask for "rows after the last one I saw". Stable under inserts.</li></ul>
+<p>Predict, then run. Ten rows (ids 10 to 1, newest first), page size 4. A new row (id 11) arrives between page 1 and page 2. Before you run it: which id appears twice with offset paging? Does cursor paging have any duplicate?</p>
+<pre class="code lang-python"><code>data = [{"id": i} for i in range(10, 0, -1)]      # newest first: ids 10..1
+def offset_page(offset, limit): return data[offset:offset+limit]
+def cursor_page(after_id, limit):                 # rows with id &lt; after_id
+    return [r for r in data if after_id is None or r["id"] &lt; after_id][:limit]
+seen = []; page1 = offset_page(0, 4); seen += [r["id"] for r in page1]
+data.insert(0, {"id": 11})                        # a new row arrives
+page2 = offset_page(4, 4); seen += [r["id"] for r in page2]
+print("offset paging saw:", seen, "-&gt; duplicate:", [x for x in set(seen) if seen.count(x) &gt; 1])
+data.pop(0)
+seen = []; last = None
+for step in range(3):
+    pg = cursor_page(last, 4)
+    if step == 1: data.insert(0, {"id": 11})
+    if not pg: break
+    seen += [r["id"] for r in pg]; last = pg[-1]["id"]
+print("cursor paging saw:", seen, "-&gt; duplicates:", len(seen) - len(set(seen)))</code></pre>
+<pre class="code lang-text"><code>offset paging saw: [10, 9, 8, 7, 7, 6, 5, 4] -&gt; duplicate: [7]
+cursor paging saw: [10, 9, 8, 7, 6, 5, 4, 3, 2, 1] -&gt; duplicates: 0</code></pre>
+<p><strong>Explain.</strong> After the insert, every old row moved down by one position. Page 2 (positions 4 to 7) therefore started with id 7, which page 1 had already returned: a duplicate. The newer id 11 is not visible to the offset loop at all, which is acceptable only because the next incremental run will fetch it. With a cursor, "id &lt; 7" does not depend on positions, so there is no duplicate. <strong>Check:</strong> the cursor result has 10 distinct ids, the original table size. The offset result has 8 values for 7 distinct ids. <em>Interpretation:</em> offset paging over changing data can duplicate or skip. Prefer cursors, and always upsert by key anyway.</p>
+<h3>Rate limits and retries with backoff</h3>
+<p>When an API says "too many requests" (HTTP 429) or "service unavailable" (503), retry later, with growing delays: 1 s, 2 s, 4 s, 8 s. This is <strong>exponential backoff</strong>. Add <strong>jitter</strong> (randomness) so that 100 clients do not all retry at the same instant. Do not retry errors that will never succeed (400 bad request, 401 unauthorised, 404).</p>
+<pre class="code lang-python"><code>import random
+random.seed(11)
+def flaky():
+    if random.random() &lt; 0.6: raise ConnectionError("503 service unavailable")
+    return "ok"
+def with_retry(fn, max_tries=6, base=1.0, cap=30.0):
+    waited = 0.0
+    for attempt in range(1, max_tries + 1):
+        try: return fn(), attempt, waited
+        except ConnectionError as e:
+            if attempt == max_tries: raise
+            delay = min(cap, base * 2 ** (attempt - 1)); jitter = random.uniform(0, delay)
+            print(f"  attempt {attempt} failed ({e}); sleep up to {delay:.0f}s -&gt; chose {jitter:.2f}s"); waited += jitter
+res, att, w = with_retry(flaky); print("result", res, "after", att, "attempts, total wait", round(w, 2), "s")
+print("max waits without jitter for 5 failures:", [min(30, 2**k) for k in range(5)], "sum", sum(min(30, 2**k) for k in range(5)))</code></pre>
+<pre class="code lang-text"><code>  attempt 1 failed (503 service unavailable); sleep up to 1s -&gt; chose 0.56s
+result ok after 2 attempts, total wait 0.56 s
+max waits without jitter for 5 failures: [1, 2, 4, 8, 16] sum 31</code></pre>
+<p>The code above only prints the sleep time instead of sleeping, so that it runs instantly. In production you call <code>time.sleep(jitter)</code>, or use the <code>tenacity</code> library which provides this pattern. <strong>Check:</strong> five failures in a row would wait 1 + 2 + 4 + 8 + 16 = 31 seconds in the worst case, which is the second output line. <em>Interpretation:</em> retries must be bounded (here at most 6 tries), otherwise a dead API blocks your pipeline forever. After the limit, fail the task loudly and let the orchestrator alert (Chapter 6).</p>
+<p class="problem"><span class="pl">Problem 4.2.1</span> An API allows 60 requests per minute and has 12,000 pages to fetch. How long does a fetch take at the limit?</p>
+<table class="steps"><tr><th>Formula</th><td>time = pages / rate</td></tr><tr><th>Plug in</th><td>12,000 pages / 60 per minute</td></tr><tr><th>Compute</th><td>200 minutes</td></tr><tr><th>Answer</th><td>200 minutes, about 3 hours 20 minutes. Fetching in parallel does not help if the limit is per key; ask the provider for a bulk export or use an incremental filter instead.</td></tr><tr><th>Check</th><td>60 × 200 = 12,000 requests.</td></tr><tr><th>Why it matters</th><td>Rate limits turn into design decisions: incremental over full, bulk export over paging.</td></tr></table>
+<p class="problem"><span class="pl">Problem 4.2.2</span> A client waits 1, 2, 4, 8 seconds with a cap of 5 seconds. List the waits for six failures.</p>
+<table class="steps"><tr><th>Step 1</th><td>Doubling gives 1, 2, 4, 8, 16, 32 before the cap.</td></tr><tr><th>Step 2</th><td>Apply <code>min(5, ...)</code>: 1, 2, 4, 5, 5, 5.</td></tr><tr><th>Answer</th><td>1, 2, 4, 5, 5, 5 seconds (total 22).</td></tr><tr><th>Check</th><td>1 + 2 + 4 + 5 + 5 + 5 = 22.</td></tr></table>
+<h3>Other ingestion channels</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Channel</th><th>How it works</th><th>Care points</th></tr></thead><tbody><tr><td>File drops</td><td>partner puts CSV/JSON into SFTP or a bucket</td><td>detect completion (a <code>_SUCCESS</code> marker or size stable), never read half-written files, track processed file names</td></tr><tr><td>Webhooks</td><td>the source calls your URL when something happens</td><td>verify signatures, answer fast (200) and queue the work, handle duplicates and out-of-order delivery</td></tr><tr><td>Change feeds</td><td>the system offers a "changes since token" endpoint (Cosmos DB change feed, S3 events, Salesforce)</td><td>store the continuation token like a watermark</td></tr><tr><td>Message queue / stream</td><td>Kafka, Event Hubs, Pub/Sub (Chapter 11)</td><td>offsets, consumer groups</td></tr><tr><td>Managed connectors</td><td>Airbyte, Fivetran (managed), Meltano and Singer taps (open-source), Azure Data Factory, AWS Glue</td><td>save time on standard sources; check cost per row, schema drift handling, and how deletes are treated</td></tr></tbody></table></div>
+<p>Build versus buy: use a connector when the source is common (Salesforce, Postgres, Google Ads) and the cost is acceptable. Write custom Python when the source is unusual or when you need special logic. Keep custom code small, tested and idempotent.</p>
+<h3>Connection to the real job</h3>
+<p>Typical Python stack: <code>requests</code> or <code>httpx</code> for HTTP, <code>tenacity</code> for retries, <code>pydantic</code> to validate response shapes, <code>pyarrow</code> to write Parquet, and <code>structlog</code> for logs.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> SaaS ingestion (CRM, ads, payments).</li><li><strong>Data Analytics:</strong> marketing dashboards fed by API pulls.</li><li><strong>GenAI:</strong> web or document crawlers (obey robots.txt and terms of service; respect rate limits and privacy).</li><li><strong>Operations:</strong> the same retry and backoff ideas appear when a busy shop website answers 429 (too many requests).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Retrying forever, or retrying non-idempotent calls (like POST "charge card") without an idempotency key. Retries are safe only when repeating the action has no extra effect.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Offset or cursor, which survives inserts during paging? Answer: cursor.</li><li>What does jitter prevent? Answer: many clients retrying at the same moment.</li><li>Which HTTP codes are worth retrying? Answer: 429 and 5xx; not 4xx like 400, 401, 404.</li></ol>
+<h2 id="s3-4-3-change-data-capture-backfills-and-late-arriving-data">4.3 Change Data Capture, Backfills and Late-Arriving Data</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Instead of re-reading the whole bank statement, you listen to the bank's cash register tape: every deposit, change and cancellation, in order. The database already writes such a tape for its own recovery (the <strong>transaction log</strong>: WAL in PostgreSQL, binlog in MySQL). <strong>CDC</strong> reads that tape and turns it into events.</div></div>
+<h3>How CDC works</h3>
+<figure><img src="images/de_cdc_pipeline.svg" alt="CDC pipeline: OLTP database to Debezium to Kafka to lake or warehouse to BI" loading="lazy"/><figcaption>CDC pipeline: OLTP database to Debezium to Kafka to lake or warehouse to BI</figcaption></figure>
+<p>How to read it: the left box is the production database. Debezium (an open-source CDC tool) reads its log and publishes each change to Kafka as an event. A consumer applies the events to the warehouse or lake, using <code>MERGE</code>. Dashboards read the result.</p>
+<p>A change event usually contains: operation (<code>c</code> create, <code>u</code> update, <code>d</code> delete, plus <code>r</code> for snapshot read), the key, the "before" and "after" row images, a log position (LSN or binlog offset) and a timestamp.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Method</th><th>How</th><th>Deletes?</th><th>Source load</th><th>Latency</th></tr></thead><tbody><tr><td>Query-based (watermark)</td><td><code>WHERE updated_at &gt; ...</code></td><td>no</td><td>queries on the table</td><td>minutes to hours</td></tr><tr><td>Trigger-based</td><td>triggers write changes to an audit table</td><td>yes</td><td>extra writes on every change</td><td>seconds</td></tr><tr><td>Log-based (Debezium)</td><td>read the transaction log</td><td>yes</td><td>tiny</td><td>sub-second to seconds</td></tr></tbody></table></div>
+<h3>Predict, Run, Explain: applying a change log</h3>
+<p>Six events arrive in order. Before you run it: after all six events, which customers exist and where do they live? Then we replay events 3 and 4 a second time (as at-least-once delivery would do). What changes?</p>
+<pre class="code lang-python"><code>import sqlite3
+db = sqlite3.connect(":memory:")
+db.execute("CREATE TABLE cust(id INTEGER PRIMARY KEY, name TEXT, city TEXT)")
+log = [(1,"c",1,{"name":"Asha","city":"Pune"}), (2,"c",2,{"name":"Ravi","city":"Delhi"}),
+       (3,"u",1,{"city":"Mumbai"}), (4,"d",2,None),
+       (5,"c",3,{"name":"Meena","city":"Chennai"}), (6,"u",3,{"city":"Kochi"})]
+def apply(ev):
+    lsn, op, k, d = ev
+    if op == "c": db.execute("INSERT OR REPLACE INTO cust VALUES(?,?,?)", (k, d["name"], d["city"]))
+    elif op == "u":
+        for c, v in d.items(): db.execute(f"UPDATE cust SET {c}=? WHERE id=?", (v, k))
+    else: db.execute("DELETE FROM cust WHERE id=?", (k,))
+for e in log: apply(e)
+print(db.execute("SELECT * FROM cust ORDER BY id").fetchall())
+for e in log[2:4]: apply(e)
+print("after replaying events 3,4 again:", db.execute("SELECT * FROM cust ORDER BY id").fetchall())</code></pre>
+<pre class="code lang-text"><code>[(1, 'Asha', 'Mumbai'), (3, 'Meena', 'Kochi')]
+after replaying events 3,4 again: [(1, 'Asha', 'Mumbai'), (3, 'Meena', 'Kochi')]</code></pre>
+<p><strong>Explain.</strong> Asha moved to Mumbai (event 3), Ravi was deleted (event 4), Meena was created and moved to Kochi. Result: customers 1 and 3. Replaying events 3 and 4 changes nothing: "set city = Mumbai" and "delete id 2" give the same result when repeated, so these operations are idempotent. <strong>Check:</strong> 3 customers were created and 1 was deleted, so 3 − 1 = 2 customers remain. <em>Limit:</em> replaying an old event after newer ones can <strong>undo</strong> progress (for example replaying event 3 after a later update to Asha's city would set it back to Mumbai). Real CDC consumers therefore apply events in log order, and compare the log position (LSN) with the last applied one, ignoring anything older.</p>
+<p><strong>The warehouse side:</strong> insert all events into an append-only "changes" table, then each hour keep the latest event per key and <code>MERGE</code> it into the target (ordering by LSN and keeping <code>rn = 1</code>, the same <code>ROW_NUMBER()</code> pattern as in Chapter 1.3 and in the SQL document's window-functions chapter). Deletes can be hard (remove the row) or soft (set <code>is_deleted = true</code>).</p>
+<p class="problem"><span class="pl">Problem 4.3.1</span> Events for key 7 arrive out of order: (LSN 105, update city=Goa), (LSN 101, insert city=Pune), (LSN 103, update city=Delhi). What is the final city, and how do you get it?</p>
+<table class="steps"><tr><th>Step 1</th><td>Sort by LSN: 101 (Pune), 103 (Delhi), 105 (Goa).</td></tr><tr><th>Step 2</th><td>Apply in order: Pune, then Delhi, then Goa.</td></tr><tr><th>Answer</th><td>The final city is Goa: the event with the highest LSN wins, regardless of arrival order.</td></tr><tr><th>Check</th><td><code>ROW_NUMBER() OVER (PARTITION BY key ORDER BY lsn DESC) = 1</code> selects LSN 105, Goa.</td></tr><tr><th>Why it matters</th><td>Ordering by arrival time instead of log position gives wrong results whenever the network reorders events.</td></tr></table>
+<h3>Backfills and late-arriving data</h3>
+<p>A <strong>backfill</strong> re-runs a pipeline for past periods: after a bug fix, a new column, or a source correction. Design for it from day one:</p>
+<ol><li>Parameterise every job by a <strong>logical date</strong> (the data interval being processed), never by "now".</li><li>Make each run <strong>overwrite its own partition</strong> (for example <code>DELETE WHERE day = X</code> then insert, or <code>INSERT OVERWRITE</code>, or <code>MERGE</code>) so a re-run replaces, never appends duplicates.</li><li>Control load on the source: run a few days at a time.</li><li>Reconcile counts per day after the backfill.</li></ol>
+<p><strong>Late-arriving data</strong> (an event for yesterday arriving today): choose a strategy. (a) Reprocess the last N days every run ("lookback window"). (b) Keep an <code>event_time</code> and a separate <code>ingest_time</code>, and let downstream tables use event_time. (c) For streaming, use watermarks (Chapter 11).</p>
+<p class="problem"><span class="pl">Problem 4.3.2</span> A daily job loads yesterday's partition with <code>INSERT</code> (append). It fails at 80% and is re-run. 1,000,000 rows should be in the day. How many rows are there after the re-run, if the first attempt had written 800,000 and committed?</p>
+<table class="steps"><tr><th>Step 1</th><td>After the failure: 800,000 rows are present.</td></tr><tr><th>Step 2</th><td>The re-run appends the full 1,000,000.</td></tr><tr><th>Compute</th><td>800,000 + 1,000,000 = 1,800,000.</td></tr><tr><th>Answer</th><td>1,800,000: 800,000 duplicates. With "delete the day then insert" or <code>INSERT OVERWRITE</code> the result is 1,000,000.</td></tr><tr><th>Check</th><td>The expected 1,000,000 rows, so the append design is wrong by exactly the partial first attempt.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Production incidents are mostly "the job ran twice", "the job missed a day" or "late data changed yesterday's number". Idempotent, partition-overwriting, date-parameterised jobs turn all three into routine reruns.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> Debezium to Kafka to lakehouse; Airflow backfills.</li><li><strong>Data Analytics:</strong> correcting history after a business-rule change.</li><li><strong>Machine Learning:</strong> rebuilding feature history with correct event time.</li><li><strong>Compliance:</strong> CDC deletes carry "right to be forgotten" requests into the lake.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using <code>datetime.now()</code> inside a pipeline task to decide what to load. A backfill then loads the wrong period. Use the logical date given by the scheduler.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which CDC type sees hard deletes with the smallest source load? Answer: log-based.</li><li>What decides final state for out-of-order events? Answer: the log position (LSN), not arrival time.</li><li>How do you make a daily load safe to re-run? Answer: overwrite or merge its own partition by logical date.</li></ol>
+<h2 id="s4-chapter-recap">Chapter recap</h2>
+<ul><li>Full load is simple but grows with table size; incremental uses a watermark and a state table.</li><li>Always upsert by key so re-runs, overlaps and backfills never duplicate.</li><li>Advance the watermark only to the largest value actually loaded, in the same transaction as the data.</li><li>Timestamp ties and clock skew lose rows with strict <code>&gt;</code>; read inclusive or with a safety window.</li><li>Prefer cursor pagination to offset; respect rate limits; retry only transient errors with exponential backoff and jitter, with a maximum.</li><li>File drops need completion markers; webhooks need fast acknowledgement and duplicate handling.</li><li>CDC reads the database log, sees deletes and costs the source little; apply events in log order.</li><li>Backfills work when jobs take a logical date and overwrite their own partition.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Rule</th></tr></thead><tbody><tr><td>Watermark</td><td>max(updated_at) actually loaded; read <code>&gt;=</code> (or with a safety window); upsert</td></tr><tr><td>Pages</td><td>⌈rows / page size⌉</td></tr><tr><td>Backoff</td><td>wait = min(cap, base × 2^(attempt−1)) with jitter</td></tr><tr><td>Idempotent load</td><td>delete-then-insert partition, MERGE, or upsert by key</td></tr><tr><td>CDC final state</td><td>order by LSN; keep the highest per key</td></tr></tbody></table></div>
+<h2 id="s5-practice-set">Practice set</h2>
+<p><strong>1.</strong> (easy) 95 rows, page size 20. How many pages? <strong>Answer:</strong> ⌈95 / 20⌉ = 5.</p>
+<p><strong>2.</strong> (easy) Which is idempotent: <code>INSERT</code> or <code>INSERT ... ON CONFLICT DO UPDATE</code>? <strong>Answer:</strong> the upsert.</p>
+<p><strong>3.</strong> Backoff with base 2 s, no cap, three failures. Waits? <strong>Answer:</strong> 2, 4, 8 seconds (2 × 2^(attempt−1)), total 14.</p>
+<p><strong>4.</strong> A job's watermark is 10:00:00 and rows exist at 10:00:00 (already loaded) and 10:00:00 (new, written later). With <code>&gt;</code>, how many of the new row are seen? <strong>Answer:</strong> none. The tie is lost; use <code>&gt;=</code> plus upsert.</p>
+<p><strong>5.</strong> Find the bug: <code>wm = datetime.now()</code> is saved at the end of each run. <strong>Answer:</strong> rows committed between the query and the end of the run are skipped forever. Save the largest <code>updated_at</code> loaded.</p>
+<p><strong>6.</strong> A table has 50 million rows and 0.2% change daily. Rows moved incrementally? <strong>Answer:</strong> 50,000,000 × 0.002 = 100,000 rows (plus any safety window).</p>
+<p><strong>7.</strong> What is output? Replay of event "d 2" twice. <strong>Answer:</strong> the second delete finds no row and changes nothing; the table is the same.</p>
+<p><strong>8.</strong> An API has 5,000 pages at 100 requests per minute. Time? <strong>Answer:</strong> 5,000 / 100 = 50 minutes.</p>
+<p><strong>9.</strong> (interview) "How would you ingest a 2 TB Postgres database into a warehouse and keep it fresh?" <strong>Answer:</strong> One snapshot (parallel by key range) into bronze, then log-based CDC (Debezium to Kafka) for changes, applied with MERGE ordered by LSN; soft-delete flags for deletes; reconcile counts and checksums per table; monitor lag; document backfill by re-snapshot of a table.</p>
+<p><strong>10.</strong> (interview) "What does idempotent mean and how do you build idempotent ingestion?" <strong>Answer:</strong> Running it twice gives the same result as once. Use upserts by business key, partition overwrite by logical date, state updated atomically with data, and no use of "now" in the logic.</p>
+<p><strong>11.</strong> (scenario) A partner API changes <code>amount</code> from a number to a string "1,250.50" on a Tuesday and your load fails. Describe a robust approach. <strong>Answer:</strong> Validate against a schema on ingest, quarantine failing records in a dead-letter table with the reason, alert, keep landing raw JSON in bronze, fix the parsing in silver, and reprocess the quarantined rows. Add a data contract with the partner.</p>
+<h2 id="s6-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me incremental loading with a watermark and a state table. Use a small Python and SQLite example, explain each line, then show me the tie-at-watermark bug and how to fix it. Ask me 3 questions one at a time about when a watermark loses data.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: ingesting from REST APIs: offset versus cursor pagination, rate limits, retries with exponential backoff and jitter, idempotency keys. Give me 8 graded exercises with real numbers (pages, rates, waits) with no solutions, then check my answers when I paste them: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am learning data engineering. Explain Change Data Capture (query-based, trigger-based, log-based with Debezium) with an analogy, a diagram in text, and a worked example of applying out-of-order events by log position. Then quiz me, one scenario at a time, on choosing the CDC method and handling deletes.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: backfills, idempotent partition overwrites, and late-arriving data. Describe a realistic pipeline failure and ask me to design the rerun safely. Critique my design, then show a better one using logical dates and MERGE or partition overwrite. Keep simple English.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, applying for data engineer roles. Run a mock interview on ingestion patterns: full versus incremental, watermarks, CDC, API ingestion, idempotency and backfills. Ask 8 questions one at a time, score my answers 1 to 5, give a model answer in simple English, and name one follow-up an interviewer might ask. My answers: [PASTE HERE]</pre></div><div class="readbtn"><button class="btn" data-read="study:de:ch04">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch03.html">← Chapter 3: File Formats, Storage and Lakehouse Tabl</a><a class="btn" href="ch05.html">Chapter 5: Data Quality and Testing →</a></div></div><script src="../../assets/study.js"></script></body></html>

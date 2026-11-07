@@ -1,0 +1,656 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 7: Iterators, Generators, Decorators and Context Managers</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#2b4fd6"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Python &amp; Software Engineering</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 7</div><h1>Iterators, Generators, Decorators and Context Managers</h1><p>Four features that turn beginner Python into professional Python: process data lazily, wrap behaviour around functions, and guarantee cleanup.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-7-1-iterators">7.1 Iterators</a></li><li><a href="#s2-7-2-generators">7.2 Generators</a></li><li><a href="#s3-7-3-decorators">7.3 Decorators</a></li><li><a href="#s4-7-4-context-managers">7.4 Context Managers</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>Suppose you must read a 20 GB log file, keep only the delivered orders, and compute their average delivery time. If you load the file into a list, your laptop runs out of memory. With iterators and generators you read one line at a time and the job runs in a few megabytes. Now suppose five of your functions need the same extras: timing, retry on network failure, and a log line. Copy-pasting those into every function is a maintenance disaster. A decorator adds them in one line each. Finally, every file, database connection and lock must be released even when errors happen, and context managers guarantee it. By the end of this chapter you can build lazy data pipelines, write your own timing and retry decorators, and write your own <code>with</code> blocks.</p>
+<p><strong>Running example:</strong> a tiny order log with lines like <code>OK north A1 120</code> (status, region, order id, delivery time in minutes). We read it lazily, time the functions, retry the flaky ones, and manage resources safely. Every program here was run with <code>python3</code> (Python 3.14) and the output is real.</p>
+<h2 id="s1-7-1-iterators">7.1 Iterators</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of a vending machine that gives one item each time you press the button, and says "empty" when it is done. You never see the whole stock at once. An iterator is that machine: you ask for the next item, it gives one, and at the end it says "no more". A <code>for</code> loop is just a person pressing the button until the machine says empty.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>iterable</td><td>Anything you can loop over: list, string, dict, file, <code>range</code></td></tr><tr><td>iterator</td><td>An object that hands out items one at a time with <code>next()</code></td></tr><tr><td><code>iter(x)</code></td><td>Asks an iterable for a fresh iterator</td></tr><tr><td><code>next(it)</code></td><td>Asks the iterator for the next item</td></tr><tr><td><code>StopIteration</code></td><td>The exception that means "no more items"</td></tr><tr><td>exhausted</td><td>An iterator that has given all its items; it cannot restart</td></tr></tbody></table></div>
+<h3>How it works</h3>
+<p>A list is an iterable, but it is not an iterator. The rules (called the <em>iterator protocol</em>) are simple:</p>
+<ul><li>An <strong>iterable</strong> has an <code>__iter__</code> method that returns an iterator.</li><li>An <strong>iterator</strong> has <code>__next__</code>, which returns the next item or raises <code>StopIteration</code>, and <code>__iter__</code> that returns itself.</li><li>A <code>for x in thing:</code> loop calls <code>iter(thing)</code>, then calls <code>next</code> again and again, and stops quietly when <code>StopIteration</code> is raised.</li></ul>
+<p>Why does this exist? So that one <code>for</code> loop works on lists, files, database cursors, and network streams alike, and so that huge or endless sources do not need to be stored in memory.</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 7.1.1</span> Use <code>iter</code> and <code>next</code> by hand on <code>[10, 20, 30]</code>, and see what happens at the end.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>it = iter(nums)</code> creates the iterator.</td></tr><tr><th>Step 2</th><td>Call <code>next(it)</code> three times.</td></tr><tr><th>Step 3</th><td>Call it a fourth time and catch <code>StopIteration</code>.</td></tr><tr><th>Step 4</th><td>Rebuild the <code>for</code> loop from <code>while True</code>.</td></tr></table>
+<p><strong>Predict:</strong> What does the fourth <code>next(it)</code> do? What does <code>list(it)</code> give after the iterator is already used up?</p>
+<pre class="code lang-python"><code>nums = [10, 20, 30]
+it = iter(nums)
+print(type(it).__name__, next(it), next(it), next(it))
+try:
+    next(it)
+except StopIteration:
+    print("StopIteration: exhausted")
+print(iter(it) is it, iter(nums) is nums)
+
+it = iter(nums)
+while True:
+    try:
+        x = next(it)
+    except StopIteration:
+        break
+    print("got", x)
+
+it = iter([1, 2, 3])
+print(list(it), list(it))
+print(next(iter([]), "default"))</code></pre>
+<pre class="code lang-text"><code>list_iterator 10 20 30
+StopIteration: exhausted
+True False
+got 10
+got 20
+got 30
+[1, 2, 3] []
+default</code></pre>
+<ul><li><strong>Explain</strong> <code>iter(nums)</code> gave a <code>list_iterator</code>. <code>iter(it) is it</code> is <code>True</code>: an iterator is its own iterator. <code>iter(nums) is nums</code> is <code>False</code>: the list makes a new iterator each time, so you can loop over a list many times. The <code>while True</code> loop is exactly what <code>for</code> does inside. The second <code>list(it)</code> is empty because the first call used up all items. <code>next(iter([]), "default")</code> gives a fallback instead of raising.</li><li><strong>Answer</strong> The fourth <code>next</code> raises <code>StopIteration</code>. A used iterator cannot be reused.</li><li><strong>Check</strong> <code>[1, 2, 3]</code> then <code>[]</code> proves the iterator was spent after one pass.</li><li><strong>Why it matters</strong> In plain words: if you pass an iterator to two functions, the second one sees nothing. This is a very common silent bug.</li></ul>
+<p><strong>The typical wrong version.</strong> Loop twice over a generator or iterator:</p>
+<pre class="code lang-python"><code>it = iter([1, 2, 3])
+print(sum(it))   # 6
+print(sum(it))   # 0, silently</code></pre>
+<p>No error appears, only a wrong result (0). The fix: keep the data in a list, or recreate the iterator.</p>
+<p class="problem"><span class="pl">Problem 7.1.2</span> Build your own iterator class <code>Countdown</code> and use it with <code>list</code>, <code>sum</code> and <code>max</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>Store the start value in <code>__init__</code>.</td></tr><tr><th>Step 2</th><td><code>__iter__</code> returns <code>self</code>.</td></tr><tr><th>Step 3</th><td><code>__next__</code> raises <code>StopIteration</code> at 0, otherwise returns the next number down.</td></tr></table>
+<pre class="code lang-python"><code>class Countdown:
+    def __init__(self, start):
+        self.n = start
+    def __iter__(self):
+        return self
+    def __next__(self):
+        if self.n &lt;= 0:
+            raise StopIteration
+        self.n -= 1
+        return self.n + 1
+
+print(list(Countdown(4)))
+print(sum(Countdown(4)), max(Countdown(3)))
+d = {"a": 1, "b": 2}
+print(list(iter(d)), list(d.items()))
+print(list(enumerate("ab", start=1)), list(zip("ab", [1, 2, 3])))</code></pre>
+<pre class="code lang-text"><code>[4, 3, 2, 1]
+10 3
+['a', 'b'] [('a', 1), ('b', 2)]
+[(1, 'a'), (2, 'b')] [('a', 1), ('b', 2)]</code></pre>
+<ul><li><strong>Answer</strong> <code>list(Countdown(4))</code> is <code>[4, 3, 2, 1]</code>, and <code>sum</code> is 4+3+2+1 = 10.</li><li><strong>Check</strong> <code>max(Countdown(3))</code> is 3 (values 3, 2, 1). <code>zip</code> stops at the shorter input, so <code>3</code> has no partner and is dropped.</li><li><strong>Why it matters</strong> Anything that follows the protocol works with all built-ins (<code>list</code>, <code>sum</code>, <code>max</code>, <code>sorted</code>, <code>for</code>, <code>in</code>). You rarely write classes like this (7.2 is easier), but you now know what happens under every <code>for</code> loop.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code>iterable ──iter()──▶ iterator ──next()──▶ 10
+                        │       next()──▶ 20
+                        │       next()──▶ 30
+                        └─ next() ──▶ raises StopIteration  (for-loop ends quietly)</code></pre>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Iterable</td><td>a <code>list</code>, a <code>str</code>, a DataFrame's columns</td><td>passed to <code>for</code>, <code>sum</code>, <code>sorted</code></td></tr><tr><td>Iterator</td><td>an open file, <code>zip(...)</code>, <code>map(...)</code></td><td>reading big files, streaming rows</td></tr><tr><td><code>enumerate</code> / <code>zip</code></td><td><code>enumerate(rows, 1)</code></td><td>line numbers, pairing columns</td></tr></tbody></table></div>
+<h3>Connection to the real job</h3>
+<p>An open file is an iterator over lines; a database cursor is an iterator over rows; <code>pandas.read_csv(..., chunksize=100_000)</code> returns an iterator of DataFrames. Understanding the protocol explains why these tools can handle data bigger than memory.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> stream rows from a database cursor into a file in batches.</li><li><strong>Data Analytics:</strong> <code>for chunk in pd.read_csv(path, chunksize=...)</code> aggregates a file too big for memory.</li><li><strong>Machine Learning:</strong> a data loader is an iterator that yields batches.</li><li><strong>GenAI:</strong> streaming an LLM reply is an iterator of text pieces.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using an iterator twice. After the first pass it is empty. Convert to a list if you need two passes.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Confusing iterable and iterator. A list is iterable, not an iterator: <code>next([1,2])</code> raises <code>TypeError</code>.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Raising <code>StopIteration</code> inside a generator by accident. Since Python 3.7 this becomes a <code>RuntimeError</code>.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does <code>for</code> call first on the object? Answer: <code>iter()</code>.</li><li>What exception ends iteration? Answer: <code>StopIteration</code>.</li><li>Can you loop over a list twice? Answer: yes, because each loop gets a new iterator; but an iterator itself can be used once.</li></ol>
+<h2 id="s2-7-2-generators">7.2 Generators</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A normal function is a cook who prepares the whole meal and brings every dish at once. A generator is a cook who brings one dish, waits until you ask, and then cooks the next. Nothing is cooked before you ask, and nothing is stored. This is called <strong>lazy evaluation</strong>: work is done only when the result is needed.</div></div>
+<h3>How it works</h3>
+<p>A <strong>generator function</strong> looks like a normal function but uses <code>yield</code> instead of (or in addition to) <code>return</code>. Calling it does <em>not</em> run the body. It returns a <strong>generator object</strong> (an iterator). Each <code>next()</code> runs the body until the next <code>yield</code>, hands out that value, and freezes the function with all its local variables. The next <code>next()</code> unfreezes it.</p>
+<ul><li>A <strong>generator expression</strong> is a comprehension in round brackets: <code>(i*i for i in range(10))</code>. It makes a generator, not a list.</li><li><code>yield from other</code> hands out everything from another iterable (a shortcut for a loop with <code>yield</code>).</li><li><code>gen.send(value)</code> sends a value <em>into</em> a paused generator (advanced; used for coroutines).</li><li>Why it exists: you can describe an endless or huge sequence in a few lines and use only constant memory.</li></ul>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 7.2.1</span> Write <code>squares(n)</code> as a generator, and see that the body runs only on demand.</p>
+<table class="steps"><tr><th>Step 1</th><td>Use <code>yield i * i</code> in a loop.</td></tr><tr><th>Step 2</th><td>Call it and look at the type.</td></tr><tr><th>Step 3</th><td>Make a <code>trace</code> generator with <code>print</code> calls to see <em>when</em> the code runs.</td></tr></table>
+<p><strong>Predict:</strong> After <code>t = trace()</code>, does anything print?</p>
+<pre class="code lang-python"><code>def squares(n):
+    for i in range(n):
+        yield i * i
+
+g = squares(4)
+print(type(g).__name__, next(g), next(g), list(g))
+
+def trace():
+    print("start"); yield 1
+    print("middle"); yield 2
+    print("end")
+
+t = trace()
+print("created, nothing printed yet")
+print(next(t)); print(next(t))
+try:
+    next(t)
+except StopIteration:
+    print("done")</code></pre>
+<pre class="code lang-text"><code>generator 0 1 [4, 9]
+created, nothing printed yet
+start
+1
+middle
+2
+end
+done</code></pre>
+<ul><li><strong>Explain</strong> <code>g</code> is a <code>generator</code>. <code>next(g)</code> gave 0 and 1 (0² and 1²). <code>list(g)</code> collected the rest: 2² = 4 and 3² = 9. For <code>trace</code>, creating it prints nothing. The first <code>next</code> runs until the first <code>yield</code> (printing <code>start</code>, giving 1). The third <code>next</code> runs to the end of the function (printing <code>end</code>) and Python raises <code>StopIteration</code>.</li><li><strong>Answer</strong> Nothing prints at creation. Code runs only when you ask for the next value.</li><li><strong>Check</strong> <code>0, 1, 4, 9</code> are the first four squares; the output shows <code>0 1 [4, 9]</code>: 0 and 1 from <code>next</code>, then 4 and 9 from <code>list</code>.</li><li><strong>Why it matters</strong> In plain words: you can set up a long chain of steps and no work happens until the final consumer asks for results.</li></ul>
+<p><strong>The typical wrong version.</strong> Build a list when a generator is enough:</p>
+<pre class="code lang-python"><code>big_list = [i*i for i in range(1_000_000)]   # all 1 million numbers in memory
+big_gen  = (i*i for i in range(1_000_000))   # nothing computed yet</code></pre>
+<p class="problem"><span class="pl">Problem 7.2.2</span> Measure the memory difference between a list and a generator of one million squares.</p>
+<table class="steps"><tr><th>Step 1</th><td>Use <code>sys.getsizeof</code> on both. (It measures the container only, not the integers inside the list, so the real gap is even larger.)</td></tr><tr><th>Step 2</th><td>Confirm both give the same sum.</td></tr></table>
+<p><strong>Predict:</strong> Roughly how many bytes will each take? (Think: 8 bytes per list slot.)</p>
+<pre class="code lang-python"><code>import sys
+big_list = [i*i for i in range(1_000_000)]
+big_gen = (i*i for i in range(1_000_000))
+print(sys.getsizeof(big_list), sys.getsizeof(big_gen))
+print(sum(big_gen) == sum(big_list))</code></pre>
+<pre class="code lang-text"><code>8448728 208
+True</code></pre>
+<ul><li><strong>Explain</strong> One million slots at 8 bytes each is about 8,000,000 bytes, plus some growth room, giving 8,448,728 here. The generator is 208 bytes, no matter how many items it will produce. The exact numbers depend on your Python version and computer; the size of the gap does not.</li><li><strong>Answer</strong> The list costs about 8.4 MB for the container, the generator 208 bytes, and the sums are equal.</li><li><strong>Check</strong> 1,000,000 × 8 = 8,000,000 bytes, close to the measured 8,448,728 (the extra is spare capacity and the list header).</li><li><strong>Why it matters</strong> Scale this to 1 billion order lines: 8 GB versus 208 bytes. This is why data code uses generators for big inputs.</li></ul>
+<p class="problem"><span class="pl">Problem 7.2.3</span> Build a generator pipeline over a log: parse, keep status OK, take the delivery times, average them.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>parse</code> yields <code>(status, region, order, minutes)</code> and skips bad lines.</td></tr><tr><th>Step 2</th><td><code>only_ok</code> keeps status OK.</td></tr><tr><th>Step 3</th><td><code>times</code> extracts the <code>minutes</code> values.</td></tr><tr><th>Step 4</th><td>Chain them. Compute the average by hand: (120 + 340 + 95) / 3.</td></tr></table>
+<pre class="code lang-python"><code>lines = ["OK north A1 120", "LATE south B2 900", "OK east C3 340",
+         "bad line", "OK west D4 95"]
+
+def parse(ls):
+    for l in ls:
+        parts = l.split()
+        if len(parts) == 4:
+            yield parts[0], parts[1], parts[2], int(parts[3])
+
+def only_ok(rs):
+    return (r for r in rs if r[0] == "OK")
+
+def times(rs):
+    return (r[3] for r in rs)
+
+ts = list(times(only_ok(parse(lines))))
+print(ts, sum(ts) / len(ts))</code></pre>
+<pre class="code lang-text"><code>[120, 340, 95] 185.0</code></pre>
+<ul><li><strong>Answer</strong> Three delivered orders took 120, 340 and 95 minutes; the average is 185.0 minutes.</li><li><strong>Check</strong> 120 + 340 + 95 = 555 and 555 / 3 = 185. The late order (900 minutes) and the bad line were correctly left out.</li><li><strong>Why it matters</strong> In plain words: delivered orders average 185 minutes. Each line flows through all stages one at a time, so with a real 20 GB file memory stays tiny. Each stage is small and testable on its own.</li></ul>
+<p class="problem"><span class="pl">Problem 7.2.4</span> More generator tools: <code>yield from</code>, an infinite generator with <code>islice</code>, <code>send</code>, and batching.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>yield from</code> flattens a list of lists.</td></tr><tr><th>Step 2</th><td>The Fibonacci generator never ends; <code>itertools.islice</code> takes the first ten.</td></tr><tr><th>Step 3</th><td><code>running_avg</code> receives numbers with <code>send</code> and yields the running average.</td></tr><tr><th>Step 4</th><td><code>gen_read</code> groups items into batches of 3.</td></tr></table>
+<pre class="code lang-python"><code>from itertools import islice
+
+def inner():
+    yield from [1, 2]
+    yield from "ab"
+print(list(inner()))
+
+def chain_flat(nested):
+    for sub in nested:
+        yield from sub
+print(list(chain_flat([[1, 2], [3], [4, 5]])))
+
+def fib():
+    a, b = 0, 1
+    while True:
+        yield a
+        a, b = b, a + b
+print(list(islice(fib(), 10)))
+
+def running_avg():
+    total = n = 0
+    avg = None
+    while True:
+        x = yield avg
+        total += x
+        n += 1
+        avg = total / n
+r = running_avg(); next(r)
+print(r.send(10), r.send(20), r.send(60))
+
+def gen_read(lines, size):
+    batch = []
+    for l in lines:
+        batch.append(l)
+        if len(batch) == size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+print(list(gen_read(range(7), 3)))</code></pre>
+<pre class="code lang-text"><code>[1, 2, 'a', 'b']
+[1, 2, 3, 4, 5]
+[0, 1, 1, 2, 3, 5, 8, 13, 21, 34]
+10.0 15.0 30.0
+[[0, 1, 2], [3, 4, 5], [6]]</code></pre>
+<ul><li><strong>Answer</strong> All five outputs match our expectations. The running averages are 10/1 = 10.0, (10+20)/2 = 15.0, (10+20+60)/3 = 30.0.</li><li><strong>Check</strong> Fibonacci: each number is the sum of the two before it: 0, 1, 1, 2, 3, 5, 8, 13, 21, 34. And 7 items in batches of 3 give 3 + 3 + 1.</li><li><strong>Why it matters</strong> Batching is how you insert millions of rows into a database in chunks of 1,000 instead of one at a time. An infinite generator plus <code>islice</code> is a safe way to take "the first N" of a stream.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> file lines ─▶ parse ─▶ only_ok ─▶ times ─▶ sum / list
+   (lazy)       (lazy)    (lazy)     (lazy)    (consumer pulls: nothing runs until here)
+
+ one line travels through ALL stages before the next line is read</code></pre>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Generator function</td><td><code>def read_rows(path): ... yield row</code></td><td>Row-by-row file readers</td></tr><tr><td>Generator expression</td><td><code>(r[3] for r in rows)</code></td><td>One-off lazy filters</td></tr><tr><td><code>yield from</code></td><td><code>yield from sub</code></td><td>Flattening nested results</td></tr><tr><td>Batching</td><td><code>gen_read(rows, 1000)</code></td><td>Bulk database inserts</td></tr></tbody></table></div>
+<h3>Connection to the real job</h3>
+<p>Pipelines are the shape of data engineering: read, parse, validate, transform, write. Writing each step as a generator keeps memory flat and makes steps easy to test. Frameworks such as Airflow, Spark and PyTorch data loaders follow the same stream-of-items idea.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> read 50 GB of JSON Lines logs, filter errors, write a summary, using constant memory.</li><li><strong>Data Science:</strong> generate sliding windows of a time series without storing all of them.</li><li><strong>Machine Learning:</strong> <code>yield</code> training batches forever, one epoch after another.</li><li><strong>Backend / APIs:</strong> stream a big response row by row instead of building it in memory.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Calling <code>len()</code> on a generator (<code>TypeError: object of type 'generator' has no len()</code>) or indexing it. A generator has no size and no positions.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting that a generator is used up after one pass. Printing it with <code>list(g)</code> for debugging empties it for the real consumer.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using a generator for tiny data or when you need to loop many times; a list is simpler and faster there.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does calling a generator function return before any code runs? Answer: a generator object (no body code has run yet).</li><li>What does <code>yield</code> do to the function? Answer: it hands out a value and pauses the function, keeping its local variables.</li><li>What is the difference between <code>[x for x in a]</code> and <code>(x for x in a)</code>? Answer: the first builds a whole list now; the second makes a lazy generator.</li></ol>
+<h2 id="s3-7-3-decorators">7.3 Decorators</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Imagine gift-wrapping. The gift (your function) stays the same, but you wrap it in paper that adds something: a bow for timing, a ribbon for retry, a card for logging. Anyone who receives the wrapped gift uses it exactly as before. A decorator is a function that takes your function and returns a wrapped version of it. In everyday terms, it is like a price tag or gift note attached to a product without changing the product.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>first-class function</td><td>A function is a value; you can pass it around and return it, like a number</td></tr><tr><td>closure</td><td>An inner function that remembers variables from the function that made it</td></tr><tr><td>wrapper</td><td>The inner function that runs extra code around the original</td></tr><tr><td><code>*args, **kwargs</code></td><td>"Accept any positional and keyword arguments and pass them on"</td></tr><tr><td><code>@name</code></td><td>Short syntax: <code>@shout</code> above <code>def add</code> means <code>add = shout(add)</code></td></tr></tbody></table></div>
+<h3>How it works</h3>
+<p>The <code>@</code> line is only a shortcut. These two are identical:</p>
+<pre class="code lang-python"><code>@shout
+def add(a, b): ...
+# same as:
+def add(a, b): ...
+add = shout(add)</code></pre>
+<p>Every decorator has the same skeleton:</p>
+<pre class="code lang-text"><code>def decorator(func):
+    @functools.wraps(func)            # copy name and docstring of func onto wrapper
+    def wrapper(*args, **kwargs):
+        ... do something before ...
+        result = func(*args, **kwargs)
+        ... do something after ...
+        return result
+    return wrapper</code></pre>
+<p>A decorator that takes its <em>own</em> arguments (like <code>@retry(3)</code>) needs one more level: a function that returns the decorator.</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 7.3.1</span> Write <code>shout</code>, which prints the function name before each call. Then see why <code>functools.wraps</code> is needed.</p>
+<table class="steps"><tr><th>Step 1</th><td>Define <code>shout(func)</code> with an inner <code>wrapper</code>.</td></tr><tr><th>Step 2</th><td>Decorate <code>add</code> and print <code>add.__name__</code> and <code>add.__doc__</code>.</td></tr><tr><th>Step 3</th><td>Repeat with <code>@functools.wraps(func)</code> added.</td></tr></table>
+<p><strong>Predict:</strong> What will <code>add.__name__</code> print for the first version?</p>
+<pre class="code lang-python"><code>import functools
+
+def shout(func):
+    def wrapper(*args, **kwargs):
+        print("calling", func.__name__)
+        return func(*args, **kwargs)
+    return wrapper
+
+@shout
+def add(a, b):
+    "Add two numbers."
+    return a + b
+print(add(2, 3), add.__name__, add.__doc__)
+
+def shout2(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        return func(*args, **kwargs)
+    return wrapper
+
+@shout2
+def add2(a, b):
+    "Add two numbers."
+    return a + b
+print(add2.__name__, add2.__doc__)</code></pre>
+<pre class="code lang-text"><code>calling add
+5 wrapper None
+add2 Add two numbers.</code></pre>
+<ul><li><strong>Explain</strong> After <code>@shout</code>, the name <code>add</code> points to <code>wrapper</code>, so it reports itself as <code>wrapper</code> with no docstring. That breaks help text, logging, and debugging tools. <code>functools.wraps(func)</code> copies the original name and docstring to the wrapper.</li><li><strong>Answer</strong> Without <code>wraps</code> you get <code>wrapper None</code>; with it you get the real name and docstring.</li><li><strong>Check</strong> The call returned 5, which is 2 + 3, so the wrapped function still works.</li><li><strong>Why it matters</strong> Without <code>wraps</code>, every logged function name is "wrapper" and you cannot tell which function was slow. Always use it.</li></ul>
+<p class="problem"><span class="pl">Problem 7.3.2</span> Write a <code>timed</code> decorator and a <code>repeat(times)</code> decorator with an argument.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>timed</code> measures with <code>time.perf_counter()</code> and uses <code>try/finally</code>, so the time is reported even if the function fails.</td></tr><tr><th>Step 2</th><td><code>repeat(times)</code> is a decorator factory: it returns <code>deco</code>, which returns <code>wrapper</code>.</td></tr><tr><th>Step 3</th><td>Test with a function that sleeps 10 ms, and a function that greets.</td></tr></table>
+<pre class="code lang-python"><code>import functools, time
+
+def timed(func):
+    @functools.wraps(func)
+    def wrapper(*a, **k):
+        t0 = time.perf_counter()
+        try:
+            return func(*a, **k)
+        finally:
+            ms = (time.perf_counter() - t0) * 1000
+            print(f"{func.__name__} took &gt;=5ms: {ms &gt;= 5}")
+    return wrapper
+
+@timed
+def slow():
+    time.sleep(0.01)
+    return "done"
+print(slow())
+
+def repeat(times):
+    def deco(func):
+        @functools.wraps(func)
+        def wrapper(*a, **k):
+            return [func(*a, **k) for _ in range(times)]
+        return wrapper
+    return deco
+
+@repeat(3)
+def hi(name):
+    return f"hi {name}"
+print(hi("Ravi"))</code></pre>
+<pre class="code lang-text"><code>slow took &gt;=5ms: True
+done
+['hi Ravi', 'hi Ravi', 'hi Ravi']</code></pre>
+<p>(We print <code>&gt;=5ms: True</code> instead of the exact milliseconds because the exact number changes on every run. In real code you would log the number itself.)</p>
+<ul><li><strong>Explain</strong> <code>@repeat(3)</code> first <em>calls</em> <code>repeat(3)</code>, which returns <code>deco</code>, and then applies <code>deco</code> to <code>hi</code>. So three layers of functions: factory, decorator, wrapper.</li><li><strong>Answer</strong> <code>slow</code> took at least 5 ms (it sleeps 10 ms), and <code>hi("Ravi")</code> ran three times.</li><li><strong>Check</strong> <code>time.sleep(0.01)</code> is 10 ms, which is greater than 5 ms, so <code>True</code> is correct.</li><li><strong>Why it matters</strong> In plain words: you got timing in one line (<code>@timed</code>) on any function, without editing its body.</li></ul>
+<p><strong>The typical wrong version.</strong> Forgetting the parentheses on a decorator that takes arguments:</p>
+<pre class="code lang-python"><code>@repeat          # should be @repeat(3)
+def bad(): pass
+bad()</code></pre>
+<pre class="code lang-text"><code>TypeError: repeat.&lt;locals&gt;.deco() missing 1 required positional argument: 'func'</code></pre>
+<p><code>@repeat</code> passes the function as the <code>times</code> argument, so <code>bad</code> becomes <code>deco</code>, and calling it fails. Read the message: it names <code>deco</code> and the missing <code>func</code>. The fix is <code>@repeat(3)</code>.</p>
+<p class="problem"><span class="pl">Problem 7.3.3</span> Write a <code>retry</code> decorator for a flaky network call that fails twice, then works. Show the case where all attempts fail.</p>
+<table class="steps"><tr><th>Step 1</th><td>Loop <code>attempt</code> from 1 to <code>max_tries</code>, call the function in <code>try</code>.</td></tr><tr><th>Step 2</th><td>On the listed exception types, print the failure; on the last attempt re-raise.</td></tr><tr><th>Step 3</th><td><code>flaky</code> raises <code>ConnectionError</code> on calls 1 and 2, then returns.</td></tr></table>
+<pre class="code lang-python"><code>import functools
+
+def retry(max_tries=3, exceptions=(Exception,)):
+    def deco(func):
+        @functools.wraps(func)
+        def wrapper(*a, **k):
+            for attempt in range(1, max_tries + 1):
+                try:
+                    return func(*a, **k)
+                except exceptions as e:
+                    print(f"  attempt {attempt} failed: {e}")
+                    if attempt == max_tries:
+                        raise
+        return wrapper
+    return deco
+
+calls = {"n": 0}
+
+@retry(max_tries=3, exceptions=(ConnectionError,))
+def flaky():
+    calls["n"] += 1
+    if calls["n"] &lt; 3:
+        raise ConnectionError("network down")
+    return "ok on call %d" % calls["n"]
+print(flaky())
+
+@retry(max_tries=2)
+def always_bad():
+    raise ValueError("nope")
+try:
+    always_bad()
+except ValueError as e:
+    print("gave up:", e)</code></pre>
+<pre class="code lang-text"><code>  attempt 1 failed: network down
+  attempt 2 failed: network down
+ok on call 3
+  attempt 1 failed: nope
+  attempt 2 failed: nope
+gave up: nope</code></pre>
+<ul><li><strong>Answer</strong> The third attempt succeeded. When every attempt fails, the last exception is re-raised to the caller.</li><li><strong>Check</strong> <code>calls["n"]</code> was 1, 2 (errors), then 3 (success), so <code>ok on call 3</code> is right. With <code>max_tries=2</code> the loop stops after two failures.</li><li><strong>Why it matters</strong> In plain words: temporary network problems no longer kill your program, but real bugs still stop it. Only retry errors that can be temporary (connection, timeout), never <code>ValueError</code>; our demo does this only to show the re-raise. Real retries add a waiting time that grows between attempts (called backoff); this demo leaves it out.</li></ul>
+<p class="problem"><span class="pl">Problem 7.3.4</span> Cache results with <code>functools.lru_cache</code>, stack two decorators, use a class decorator and a registry.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>fib(80)</code> is computed with and without a cache. Without a cache the work doubles at each step; with <code>lru_cache</code> each <code>n</code> is computed once.</td></tr><tr><th>Step 2</th><td>Stacking: <code>@tag("b")</code> above <code>@tag("i")</code> means <code>text = tag("b")(tag("i")(text))</code>, so <code>i</code> is applied first (inner).</td></tr><tr><th>Step 3</th><td>A class decorator receives a class and returns a class; here it adds <code>__repr__</code>.</td></tr><tr><th>Step 4</th><td>A decorator can <em>register</em> functions in a dictionary and return them unchanged.</td></tr></table>
+<pre class="code lang-python"><code>import functools, time
+
+@functools.lru_cache(maxsize=None)
+def fib(n):
+    return n if n &lt; 2 else fib(n-1) + fib(n-2)
+print(fib(80), fib.cache_info())
+
+def fib_slow(n):
+    return n if n &lt; 2 else fib_slow(n-1) + fib_slow(n-2)
+t0 = time.perf_counter(); fib_slow(27); slow_t = time.perf_counter() - t0
+print("uncached fib(27) slower than 5ms:", slow_t &gt; 0.005)
+
+@functools.cache
+def sq(x):
+    print("computing", x)
+    return x * x
+print(sq(4), sq(4))
+
+def tag(name):
+    def deco(f):
+        @functools.wraps(f)
+        def w(*a, **k):
+            return f"&lt;{name}&gt;{f(*a, **k)}&lt;/{name}&gt;"
+        return w
+    return deco
+
+@tag("b")
+@tag("i")
+def text():
+    return "hi"
+print(text())
+
+def add_repr(cls):
+    def __repr__(self):
+        items = ", ".join(f"{k}={v!r}" for k, v in vars(self).items())
+        return f"{cls.__name__}({items})"
+    cls.__repr__ = __repr__
+    return cls
+
+@add_repr
+class Point:
+    def __init__(self, x, y):
+        self.x, self.y = x, y
+print(Point(1, 2))
+
+registry = {}
+def register(f):
+    registry[f.__name__] = f
+    return f
+
+@register
+def clean(): return "cleaning"
+@register
+def load(): return "loading"
+print(sorted(registry), registry["load"]())</code></pre>
+<pre class="code lang-text"><code>23416728348467685 CacheInfo(hits=78, misses=81, maxsize=None, currsize=81)
+uncached fib(27) slower than 5ms: True
+computing 4
+16 16
+&lt;b&gt;&lt;i&gt;hi&lt;/i&gt;&lt;/b&gt;
+Point(x=1, y=2)
+['clean', 'load'] loading</code></pre>
+<ul><li><strong>Explain</strong> <code>fib(80)</code> is a 17-digit number, computed instantly because each of 81 values (0 to 80) was calculated once (<code>misses=81</code>) and reused 78 times (<code>hits=78</code>). <code>sq(4)</code> printed <code>computing 4</code> only once; the second call came from the cache. The stacked decorators wrapped from the bottom up: <code>i</code> inside, <code>b</code> outside. The registry pattern is how web frameworks collect routes (<code>@app.get("/users")</code>).</li><li><strong>Answer</strong> Caching turns an exponential job into a linear one; stacked decorators apply bottom-up; class decorators and registries change or collect things at definition time.</li><li><strong>Check</strong> 81 misses is exactly the number of distinct inputs (0 to 80). The uncached version of <code>fib(27)</code> is not demonstrated with a number here because timing varies; try <code>fib_slow(35)</code> yourself to feel the difference.</li><li><strong>Why it matters</strong> Caching a function is only safe if it is <em>pure</em>: the same inputs always give the same output and no side effects. Never cache a function that reads the current time or a database that changes. Also, <code>lru_cache</code> needs hashable arguments (a list argument raises <code>TypeError</code>).</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> caller ──▶ [ wrapper ]  ──▶  [ original function ]
+              │  before: start timer / check cache / log
+              │  after:  stop timer / store result / retry on error
+              ◀── result returned to caller unchanged
+
+ @a        a(b(f)):   caller ▶ a's wrapper ▶ b's wrapper ▶ f
+ @b
+ def f</code></pre>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>@timed</code></td><td>prints durations</td><td>Finding slow pipeline steps</td></tr><tr><td><code>@retry(3)</code></td><td>repeats on <code>ConnectionError</code></td><td>API calls, database connects</td></tr><tr><td><code>@lru_cache</code></td><td>remembers results</td><td>Repeated lookups, recursive math</td></tr><tr><td><code>@app.get("/x")</code></td><td>registers a route</td><td>FastAPI / Flask (Chapter 12)</td></tr><tr><td><code>@pytest.fixture</code></td><td>marks a test helper</td><td>Testing (Chapter 10)</td></tr><tr><td><code>@property</code>, <code>@dataclass</code></td><td>built-in decorators</td><td>Classes (Chapter 8)</td></tr></tbody></table></div>
+<h3>Connection to the real job</h3>
+<p>You will <em>use</em> decorators daily (<code>@pytest.fixture</code>, <code>@app.get</code>, <code>@dataclass</code>, <code>@task</code> in Airflow) and <em>write</em> them for cross-cutting needs: timing, retry, logging, access checks. A <code>@timed</code> decorator that logs the duration of each pipeline step is a natural first tool.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> retry decorators around API and database calls; <code>@task</code> in Airflow.</li><li><strong>Backend / APIs:</strong> <code>@app.get("/orders")</code> routes; an <code>@require_login</code> check.</li><li><strong>Machine Learning:</strong> <code>@torch.no_grad()</code>, <code>@tf.function</code> modify how a function runs.</li><li><strong>Performance Testing:</strong> <code>@timed</code> on functions inside a Python benchmark script (for example Locust tasks, named only as an example tool).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting <code>functools.wraps</code>. Names and docstrings are lost.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting to <code>return</code> the result inside <code>wrapper</code>. The decorated function then always returns <code>None</code>.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Retrying everything, including non-temporary errors and non-idempotent actions (such as "charge the customer"). A retry can double the effect. Idempotent means repeating gives the same result as doing it once; retry only those.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is <code>@shout</code> above <code>def add</code> equal to? Answer: <code>add = shout(add)</code>.</li><li>Why do we write <code>*args, **kwargs</code> in the wrapper? Answer: so the wrapper accepts and passes on whatever arguments the original function takes.</li><li>What does <code>functools.wraps</code> do? Answer: it copies the name, docstring and other details of the original function to the wrapper.</li></ol>
+<h2 id="s4-7-4-context-managers">7.4 Context Managers</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">When you rent a hall for an event, there is a checkout rule: you must switch off the lights and return the key, even if the party went badly. A context manager is that rule in code. The <code>with</code> block says: "set things up, let me do my work, and <em>always</em> tidy up at the end, even if something exploded in the middle."</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>resource</td><td>Something you must give back: a file, a connection, a lock</td></tr><tr><td>context manager</td><td>An object that sets up and cleans up around a block of code</td></tr><tr><td><code>__enter__</code></td><td>Runs at the start of <code>with</code>; its return value goes to <code>as name</code></td></tr><tr><td><code>__exit__</code></td><td>Runs at the end, always; it receives the exception details, if any</td></tr><tr><td>suppress</td><td>Swallow an exception so it does not reach the caller</td></tr></tbody></table></div>
+<h3>How it works</h3>
+<p><code>with thing as x:</code> means: call <code>thing.__enter__()</code>, run the block, then call <code>thing.__exit__(exc_type, exc, traceback)</code> whatever happened. If <code>__exit__</code> returns <code>True</code>, the exception is swallowed; if it returns <code>False</code> (or nothing), the exception continues.</p>
+<p>Two ways to make one:</p>
+<ol><li><strong>A class</strong> with <code>__enter__</code> and <code>__exit__</code>.</li><li><strong>A generator</strong> with <code>@contextlib.contextmanager</code>: code before <code>yield</code> is the setup, the <code>yield</code> gives the value, and code after <code>yield</code> (in <code>finally</code>) is the cleanup. This is shorter and used most often.</li></ol>
+<p>Ready-made helpers in <code>contextlib</code>: <code>suppress(...)</code>, <code>redirect_stdout</code>, <code>ExitStack</code> (a stack of many managers when you do not know how many beforehand).</p>
+<p>Why does it exist? Before it, people wrote <code>try/finally</code> by hand and forgot one. <code>with</code> makes the right way the easy way.</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 7.4.1</span> Write a class-based <code>Timer</code> context manager. See what happens with and without an error.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>__enter__</code> records the start time and returns <code>self</code>.</td></tr><tr><th>Step 2</th><td><code>__exit__</code> records the elapsed time and prints whether an exception happened. It returns <code>False</code>, so errors still propagate.</td></tr><tr><th>Step 3</th><td>Run a normal block, and then a block that divides by zero.</td></tr></table>
+<p><strong>Predict:</strong> In the failing block, does <code>__exit__</code> run? Does the <code>ZeroDivisionError</code> still reach us?</p>
+<pre class="code lang-python"><code>import time
+
+class Timer:
+    def __enter__(self):
+        self.t0 = time.perf_counter()
+        print("enter")
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        self.elapsed = time.perf_counter() - self.t0
+        print("exit, exception:", exc_type.__name__ if exc_type else None)
+        return False
+
+with Timer() as t:
+    time.sleep(0.01)
+print(t.elapsed &gt; 0.005)
+
+try:
+    with Timer():
+        1/0
+except ZeroDivisionError:
+    print("error still propagates")</code></pre>
+<pre class="code lang-text"><code>enter
+exit, exception: None
+True
+enter
+exit, exception: ZeroDivisionError
+error still propagates</code></pre>
+<ul><li><strong>Explain</strong> In both runs <code>__exit__</code> ran, so cleanup is guaranteed. In the failing run it received <code>ZeroDivisionError</code> as <code>exc_type</code>. Because we returned <code>False</code>, the error continued outwards and our <code>except</code> caught it.</li><li><strong>Answer</strong> <code>__exit__</code> always runs, and errors are not hidden unless you return <code>True</code>.</li><li><strong>Check</strong> The <code>sleep(0.01)</code> is 10 ms, so <code>elapsed &gt; 0.005</code> (5 ms) is <code>True</code>.</li><li><strong>Why it matters</strong> In plain words: the timer reports even when the code fails, which is exactly when you want a measurement.</li></ul>
+<p class="problem"><span class="pl">Problem 7.4.2</span> Swallow only one kind of error with a class, and with <code>contextlib.suppress</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>Suppress.__exit__</code> returns <code>True</code> only when the exception is a <code>KeyError</code>.</td></tr><tr><th>Step 2</th><td><code>with contextlib.suppress(FileNotFoundError):</code> removes a file that may not exist.</td></tr></table>
+<pre class="code lang-python"><code>import contextlib, os
+
+class Suppress:
+    def __enter__(self):
+        return self
+    def __exit__(self, et, e, tb):
+        return et is KeyError
+
+with Suppress():
+    {}["x"]
+print("KeyError swallowed")
+
+with contextlib.suppress(FileNotFoundError):
+    os.remove("/tmp/definitely_not_here_123")
+print("suppress ok")</code></pre>
+<pre class="code lang-text"><code>KeyError swallowed
+suppress ok</code></pre>
+<ul><li><strong>Answer</strong> Both blocks swallowed their expected error and the program carried on.</li><li><strong>Check</strong> Removing a missing file would normally raise <code>FileNotFoundError</code>; since we saw <code>suppress ok</code>, it was swallowed.</li><li><strong>Why it matters</strong> <code>suppress</code> is perfect for "delete if exists" and similar harmless cases. Never use it for errors you do not understand.</li></ul>
+<p class="problem"><span class="pl">Problem 7.4.3</span> Write context managers with <code>@contextlib.contextmanager</code>: one that changes into a temporary folder and always returns, one that prints open/close, and combine several in one <code>with</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>Save the old folder, create a temp folder, <code>os.chdir</code> into it, <code>yield</code>, and in <code>finally</code> go back and remove it.</td></tr><tr><th>Step 2</th><td><code>opened(name)</code> prints <code>open</code> before the <code>yield</code> and <code>close</code> after, inside <code>finally</code>.</td></tr><tr><th>Step 3</th><td><code>with opened("a") as a, opened("b") as b:</code> enters left to right and exits right to left.</td></tr><tr><th>Step 4</th><td><code>redirect_stdout</code> captures prints; <code>ExitStack</code> handles a list of managers.</td></tr></table>
+<pre class="code lang-python"><code>import contextlib, os, tempfile, io
+
+@contextlib.contextmanager
+def chdir_temp():
+    old = os.getcwd()
+    d = tempfile.mkdtemp()
+    os.chdir(d)
+    try:
+        yield d
+    finally:
+        os.chdir(old)
+        os.rmdir(d)
+        print("restored")
+
+with chdir_temp() as d:
+    print(os.path.samefile(os.getcwd(), d))
+
+@contextlib.contextmanager
+def opened(name):
+    print("open", name)
+    try:
+        yield name
+    finally:
+        print("close", name)
+
+with opened("a") as a, opened("b") as b:
+    print("inside", a, b)
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    print("captured")
+print(repr(buf.getvalue()))
+
+with contextlib.ExitStack() as st:
+    fs = [st.enter_context(opened(n)) for n in "xy"]
+    print("both open", fs)</code></pre>
+<pre class="code lang-text"><code>True
+restored
+open a
+open b
+inside a b
+close b
+close a
+'captured\n'
+open x
+open y
+both open ['x', 'y']
+close y
+close x</code></pre>
+<ul><li><strong>Explain</strong> Inside <code>chdir_temp</code> the working folder really is the temp folder (<code>samefile</code> is <code>True</code>), and afterwards we are back (<code>restored</code>). <code>a</code> is opened first and closed last, like putting on and taking off a coat and a jacket in the right order. <code>redirect_stdout</code> sent the <code>print</code> into the buffer, which is useful in tests. <code>ExitStack</code> opened <code>x</code> and <code>y</code> and closed them in reverse order.</li><li><strong>Answer</strong> Cleanup always ran, in reverse order of setup.</li><li><strong>Check</strong> The open/close order is a stack: <code>open a, open b ... close b, close a</code>. The same pattern appears for <code>x</code> and <code>y</code>.</li><li><strong>Why it matters</strong> The <code>try/finally</code> around <code>yield</code> is what guarantees the cleanup if the block raises an error. Leave it out and a failure leaves your program in the wrong folder.</li></ul>
+<p><strong>The typical wrong version.</strong> Opening a file without <code>with</code>, when an error happens before <code>close()</code>:</p>
+<pre class="code lang-python"><code>f = open("data.txt", encoding="utf-8")
+total = 1 / 0        # error: the next line never runs
+f.close()</code></pre>
+<p>The file stays open until the program ends. We checked this behaviour: after an error that was caught elsewhere the file object still reported <code>closed == False</code> (our run printed <code>without with, still open: True</code>). With <code>with open(...) as f:</code> the file is closed on the way out. Leaked handles become "Too many open files" errors in long-running jobs.</p>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> with A() as x:           __enter__()  ──▶ x
+     body                 run body ──▶ (ok or error)
+                          __exit__(error info)  ◀── ALWAYS runs
+                              return True  → error swallowed
+                              return False → error continues up
+
+ @contextmanager:  [setup] ── yield value ── [cleanup in finally]</code></pre>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>File</td><td><code>with open(p) as f:</code></td><td>Reading and writing files</td></tr><tr><td>DB connection</td><td><code>with engine.begin() as conn:</code></td><td>Commit on success, rollback on error</td></tr><tr><td>Lock</td><td><code>with lock:</code></td><td>Threads (Chapter 11)</td></tr><tr><td>Temp folder</td><td><code>with tempfile.TemporaryDirectory()</code></td><td>Tests</td></tr><tr><td><code>mock.patch</code></td><td><code>with patch("x.y"):</code></td><td>Testing (Chapter 10)</td></tr><tr><td>GPU / no-grad</td><td><code>with torch.no_grad():</code></td><td>Machine learning</td></tr></tbody></table></div>
+<h3>Connection to the real job</h3>
+<p>Database sessions, HTTP sessions, file handles, locks, temporary folders, test mocks and ML inference modes are all context managers. A data engineer who forgets to close connections eventually brings down a database. A senior reviewer looks for <code>with</code> around every resource.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> <code>with</code> around database transactions: commit if fine, roll back on error.</li><li><strong>Machine Learning:</strong> <code>with torch.no_grad():</code> switches off gradient tracking for inference.</li><li><strong>Testing / MLOps:</strong> temporary directories and patched settings that are restored after each test.</li><li><strong>Performance Testing:</strong> a <code>Timer</code> block that records the duration of a code section.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Returning <code>True</code> from <code>__exit__</code> by accident. Every error then disappears silently. Return <code>False</code> or <code>None</code> unless you mean to swallow.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">In <code>@contextmanager</code>, putting the cleanup after <code>yield</code> without <code>try/finally</code>. If the block raises, the cleanup is skipped.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using the resource after the <code>with</code> block. The file is closed; reading it gives <code>ValueError: I/O operation on closed file</code>.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>When does <code>__exit__</code> run? Answer: always at the end of the <code>with</code> block, even after an error.</li><li>How do you swallow an exception in <code>__exit__</code>? Answer: return <code>True</code>.</li><li>In <code>@contextmanager</code>, what does the <code>yield</code> mark? Answer: the point where the <code>with</code> body runs; code before is setup, code after is cleanup.</li></ol>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>An iterable can be looped over; an iterator hands out items with <code>next()</code> and raises <code>StopIteration</code> at the end.</li><li>An iterator can be used only once. A list gives a fresh iterator for each loop.</li><li>A generator function uses <code>yield</code>; calling it runs no code until you ask for items (lazy evaluation).</li><li>Generators use tiny, constant memory: 208 bytes versus about 8.4 MB for one million squares (container only).</li><li>Chain generators into a pipeline (parse, filter, extract) so each item flows through all stages one by one.</li><li>A decorator is a function that wraps a function; <code>@d</code> is <code>f = d(f)</code>.</li><li>Always use <code>functools.wraps</code>, <code>*args, **kwargs</code>, and remember to return the result.</li><li>A decorator with arguments needs a third layer; do not forget the parentheses: <code>@retry(3)</code>.</li><li>Useful ones: timing, retry (only for temporary errors), <code>lru_cache</code> (only for pure functions), registries.</li><li>A context manager guarantees cleanup via <code>with</code>; build one with <code>__enter__/__exit__</code> or <code>@contextlib.contextmanager</code> with <code>try/finally</code>.</li></ul>
+<p><strong>Cheat-sheet</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Task</th><th>Pattern</th></tr></thead><tbody><tr><td>Manual iteration</td><td><code>it = iter(x); next(it); next(it, default)</code></td></tr><tr><td>Generator function</td><td><code>def g(): yield value</code></td></tr><tr><td>Generator expression</td><td><code>(f(x) for x in data if cond)</code></td></tr><tr><td>Delegate</td><td><code>yield from other</code></td></tr><tr><td>First N of a stream</td><td><code>list(itertools.islice(gen, N))</code></td></tr><tr><td>Decorator skeleton</td><td><code>def d(f): @wraps(f) def w(*a, **k): return f(*a, **k); return w</code></td></tr><tr><td>Decorator with args</td><td><code>def d(n): def deco(f): ...; return deco</code></td></tr><tr><td>Cache pure function</td><td><code>@functools.lru_cache(maxsize=None)</code> or <code>@functools.cache</code></td></tr><tr><td>Context manager (class)</td><td><code>__enter__(self)</code> and <code>__exit__(self, et, e, tb)</code></td></tr><tr><td>Context manager (function)</td><td><code>@contextmanager def cm(): setup; try: yield; finally: cleanup</code></td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 7.P.1</span> What is <code>next(iter([5, 6]))</code>?</p>
+<p><strong>Answer:</strong> <code>5</code>.</p>
+<p class="problem"><span class="pl">Problem 7.P.2</span> What does this print?</p>
+<pre class="code lang-python"><code>g = (x * 2 for x in [1, 2, 3])
+print(list(g))
+print(list(g))</code></pre>
+<p><strong>Answer:</strong> <code>[2, 4, 6]</code> then <code>[]</code>. The generator is used up after the first pass.</p>
+<p class="problem"><span class="pl">Problem 7.P.3</span> What is the output?</p>
+<pre class="code lang-python"><code>def f():
+    yield 1
+    yield 2
+print(f())</code></pre>
+<p><strong>Answer:</strong> Something like <code>&lt;generator object f at 0x...&gt;</code>. The function body did not run, and the address changes every run.</p>
+<p class="problem"><span class="pl">Problem 7.P.4</span> Write a generator <code>evens(limit)</code> that yields even numbers below <code>limit</code>. What is <code>list(evens(10))</code>?</p>
+<p><strong>Answer:</strong></p>
+<pre class="code lang-python"><code>def evens(limit):
+    for n in range(limit):
+        if n % 2 == 0:
+            yield n</code></pre>
+<p><code>list(evens(10))</code> is <code>[0, 2, 4, 6, 8]</code>.</p>
+<p class="problem"><span class="pl">Problem 7.P.5</span> Find the bug:</p>
+<pre class="code lang-python"><code>def shout(func):
+    def wrapper(*args, **kwargs):
+        print("calling", func.__name__)
+        func(*args, **kwargs)
+    return wrapper
+
+@shout
+def add(a, b):
+    return a + b
+print(add(2, 3))</code></pre>
+<p><strong>Answer:</strong> The wrapper does not <code>return</code> the result, so <code>add(2, 3)</code> prints <code>calling add</code> and then <code>None</code>. Write <code>return func(*args, **kwargs)</code>. Also add <code>@functools.wraps(func)</code>.</p>
+<p class="problem"><span class="pl">Problem 7.P.6</span> In what order do these print?</p>
+<pre class="code lang-python"><code>@tag("b")
+@tag("i")
+def text(): return "hi"</code></pre>
+<p>where <code>tag(name)</code> wraps the output as <code>&lt;name&gt;...&lt;/name&gt;</code>.</p>
+<p><strong>Answer:</strong> The result is <code>&lt;b&gt;&lt;i&gt;hi&lt;/i&gt;&lt;/b&gt;</code>. The decorator nearest the function (<code>i</code>) is applied first and ends up inside.</p>
+<p class="problem"><span class="pl">Problem 7.P.7</span> What does <code>with opened("a"), opened("b"):</code> print when the body prints <code>inside</code>, if <code>opened</code> prints <code>open</code>/<code>close</code>?</p>
+<p><strong>Answer:</strong> <code>open a</code>, <code>open b</code>, <code>inside</code>, <code>close b</code>, <code>close a</code>. Exit is in reverse order.</p>
+<p class="problem"><span class="pl">Problem 7.P.8</span> Find the bug: a <code>@contextmanager</code> function does <code>yield conn</code> and then <code>conn.close()</code> on the next line, with no <code>try/finally</code>. What goes wrong?</p>
+<p><strong>Answer:</strong> If the <code>with</code> body raises an error, the exception is thrown at the <code>yield</code>, and the <code>conn.close()</code> line never runs, so the connection leaks. Use <code>try: yield conn finally: conn.close()</code>.</p>
+<p class="problem"><span class="pl">Problem 7.P.9</span> Scenario: a daily job processes a 30 GB file of JSON Lines to count errors per hour. How do you structure it?</p>
+<p><strong>Answer:</strong> Open the file with <code>with open(...)</code>, read lines lazily, and build generator stages: <code>parse_json(lines)</code> (skip bad lines and count them), <code>only_errors(rows)</code>, and a final loop that updates a <code>Counter</code> keyed by hour. Memory stays small because only one line is alive at a time. Log the number of skipped bad lines at the end.</p>
+<p class="problem"><span class="pl">Problem 7.P.10</span> Interview: what is the difference between an iterator and an iterable? Give an example of each.</p>
+<p><strong>Answer:</strong> An iterable can be looped over and returns a new iterator from <code>iter()</code> (list, str, dict, file path object contents). An iterator keeps its position, gives items with <code>next()</code>, and is used up once (<code>iter([1,2])</code>, a generator, an open file). Every iterator is iterable, but not every iterable is an iterator.</p>
+<p class="problem"><span class="pl">Problem 7.P.11</span> Interview: write a <code>timed</code> decorator that logs the function name and duration, and explain why you use <code>functools.wraps</code>.</p>
+<p><strong>Answer:</strong></p>
+<pre class="code lang-python"><code>import functools, logging, time
+log = logging.getLogger(__name__)
+
+def timed(func):
+    @functools.wraps(func)
+    def wrapper(*args, **kwargs):
+        t0 = time.perf_counter()
+        try:
+            return func(*args, **kwargs)
+        finally:
+            log.info("%s took %.1f ms", func.__name__, (time.perf_counter() - t0) * 1000)
+    return wrapper</code></pre>
+<p><code>wraps</code> keeps the original <code>__name__</code> and docstring; without it every function would be logged as <code>wrapper</code>. <code>try/finally</code> logs even on failure and <code>perf_counter</code> is a steady clock.</p>
+<p class="problem"><span class="pl">Problem 7.P.12</span> Interview: when is <code>lru_cache</code> a bad idea?</p>
+<p><strong>Answer:</strong> When the function is not pure (it reads the clock, a database, a file, or random numbers) because stale results would be returned; when arguments are not hashable (lists, dicts); and when the number of distinct inputs is huge with no <code>maxsize</code>, since the cache grows forever and eats memory.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language, so use simple words. Teach me Python iterators and the iterator protocol: iterable versus iterator, iter(), next(), StopIteration, and how a for loop works inside. Use a vending machine analogy first, then small runnable examples. After each part, ask me one "predict the output" question and wait for my answer before continuing.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: Python generators, yield, yield from, generator expressions, lazy evaluation and memory benefits, and generator pipelines for processing large log files. Give me 8 graded exercises from easy to hard without solutions. After I paste my answer to each, review it for bugs, memory use and clarity, and explain mistakes in simple English.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Topic: Python decorators: closures, functools.wraps, *args and **kwargs, decorators with arguments, stacking order, class decorators, and practical decorators for timing, caching, retry and logging. Explain step by step with the gift-wrapping analogy, then review my decorator code: [PASTE HERE]. Point out bugs and suggest improvements.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: Python context managers: the with statement, __enter__ and __exit__, contextlib.contextmanager, suppress, redirect_stdout and ExitStack, and why cleanup must be guaranteed. Quiz me one question at a time, from easy to hard, including find-the-bug questions. Explain each wrong answer step by step, and finish with a short summary of what I should practise next.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Topic: iterators, generators, decorators and context managers in Python. Run a mock technical interview with 8 questions of rising difficulty, one at a time. Grade each answer out of 10, show a model answer, and ask one follow-up question. At the end, list my three weakest points and give me a one-week practice plan of one hour per day.</pre></div><div class="readbtn"><button class="btn" data-read="study:python:ch07">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch06.html">← Chapter 6: Errors, Exceptions, Logging and Debuggin</a><a class="btn" href="ch08.html">Chapter 8: Object-Oriented Programming →</a></div></div><script src="../../assets/study.js"></script></body></html>

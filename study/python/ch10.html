@@ -1,0 +1,557 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 10: Testing and Code Quality</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Python &amp; Software Engineering</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 10</div><h1>Testing and Code Quality</h1><p>How to prove your code works today, and keep proving it every day after.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-10-1-why-we-test-and-the-testing-pyramid">10.1 Why We Test, and the Testing Pyramid</a></li><li><a href="#s2-10-2-pytest-plain-asserts-fixtures-and-parametrize">10.2 pytest: Plain Asserts, Fixtures and Parametrize</a></li><li><a href="#s3-10-3-mocks-fakes-monkeypatch-and-database-tests">10.3 Mocks, Fakes, monkeypatch and Database Tests</a></li><li><a href="#s4-10-4-tdd-and-coverage">10.4 TDD and Coverage</a></li><li><a href="#s5-10-5-code-quality-formatters-linters-type-checkers-and-pre-commit">10.5 Code Quality: Formatters, Linters, Type Checkers and pre-commit</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p>You have written a data-cleaning function. It works on your five test rows. Next month a teammate changes it, and a wrong number reaches a manager's dashboard. Professional engineers prevent this with automatic tests and automatic style checks. In this chapter you will write tests with <code>unittest</code> and <code>pytest</code>, replace slow or risky parts with mocks and fakes, build code step by step with TDD, measure coverage, and set up the tools that keep a team's code clean. You will use one running example, a small <code>slugify</code> function and a tiny price-lookup service, so each idea builds on the last.</p>
+<blockquote><p><strong>A note on what was run.</strong> This machine has only the Python 3.14 standard library and no network. So <code>pytest</code>, <code>pytest-cov</code>, <code>pytest-mock</code>, <code>black</code>, <code>ruff</code>, <code>mypy</code> and <code>pre-commit</code> were <strong>not run here</strong>. Their snippets are standard usage, marked "not run here". The same ideas were run with the standard library (<code>unittest</code>, <code>unittest.mock</code>, <code>sqlite3</code>, <code>trace</code>), and all output below is real.</p></blockquote>
+<h2 id="s1-10-1-why-we-test-and-the-testing-pyramid">10.1 Why We Test, and the Testing Pyramid</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A restaurant kitchen tastes every dish before it leaves the pass. A test is a small robot that checks one promise your code makes, and it never gets tired. You change code, run the robots, and in seconds you know if you broke something. Without tests, every change is a gamble.</div></div>
+<h3>What a test is</h3>
+<p>A <strong>test</strong> is a piece of code that calls your code with known input and checks the output against the answer you expect. If they differ, the test <strong>fails</strong>. A set of tests is a <strong>test suite</strong>. When you run the suite after every change, a failure points to the change that broke things. This is called catching a <strong>regression</strong> (an old feature that stops working).</p>
+<h3>The testing pyramid</h3>
+<p>Tests come in three sizes.</p>
+<ul><li><strong>Unit test</strong>: checks one small piece (one function or class) alone. Runs in milliseconds. No network, no disk, no real database.</li><li><strong>Integration test</strong>: checks that two or more pieces work together, for example your code plus a real (small) database.</li><li><strong>End-to-end (E2E) test</strong>: runs the whole system like a user would, for example call the real API and check the stored result.</li></ul>
+<figure><img src="images/10_test_pyramid.svg" alt="The testing pyramid" loading="lazy"/><figcaption>The testing pyramid</figcaption></figure>
+<pre class="code lang-text"><code>          /\          few: slow, costly, flaky
+         /E2E\
+        /------\
+       /integr. \     some: medium speed
+      /----------\
+     /   unit     \   many: fast, cheap, precise
+    /--------------\</code></pre>
+<p>Why a pyramid and not an upside-down one? Unit tests are fast and tell you exactly where the bug is. E2E tests are slow and a failure only says "something is wrong somewhere". You want many cheap tests at the bottom and few expensive tests on top.</p>
+<h3>Test data</h3>
+<p>Tests need input. Good test data is small, explicit, and lives next to the test. Use three kinds of cases:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Kind</th><th>Example for <code>slugify</code></th><th>Why</th></tr></thead><tbody><tr><td>Normal</td><td><code>"Hello World"</code></td><td>The main promise</td></tr><tr><td>Edge</td><td><code>""</code>, one character, very long text</td><td>Boundaries break most code</td></tr><tr><td>Bad</td><td><code>None</code>, wrong type</td><td>Check clear errors</td></tr></tbody></table></div>
+<p>Never use real customer data in tests. Make small fake data by hand, or generate it with a fixed random seed so the test is repeatable.</p>
+<h3>Mapping the idea to a real project</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Unit test</td><td><code>slugify("Hello World") == "hello-world"</code></td><td>Checking one cleaning function</td></tr><tr><td>Integration test</td><td>Function plus in-memory SQLite</td><td>Checking a data-access layer</td></tr><tr><td>E2E test</td><td>Call the real API, read the stored row</td><td>Smoke test after a deploy (like a quick taste check before opening the restaurant)</td></tr><tr><td>Regression</td><td>Yesterday's bug returns</td><td>Why CI runs on every change</td></tr></tbody></table></div>
+<h3>Predict, run, explain</h3>
+<p class="problem"><span class="pl">Problem 10.1.1</span> Write a function <code>add(a, b)</code> and four tests: two integers, floats, a deliberately wrong expectation, and a wrong type. Run them and read the report.</p>
+<table class="steps"><tr><th>Step 1</th><td>Write the function and the <code>unittest.TestCase</code> class. <code>unittest</code> is the testing module that ships with Python. Each method starting with <code>test_</code> is one test.</td></tr><tr><th>Step 2</th><td>Run the file with <code>verbosity=2</code> to list each test.</td></tr><tr><th>Step 3</th><td>Read the failure. It shows the line, and <code>4 != 5</code>.</td></tr></table>
+<pre class="code lang-python"><code>import unittest
+def add(a, b):
+    return a + b
+class TestAdd(unittest.TestCase):
+    def test_ints(self):
+        self.assertEqual(add(2, 3), 5)
+    def test_floats(self):
+        self.assertAlmostEqual(add(0.1, 0.2), 0.3)
+    def test_bad(self):
+        self.assertEqual(add(2, 2), 5)
+    def test_type(self):
+        with self.assertRaises(TypeError):
+            add("a", 1)
+if __name__ == "__main__":
+    unittest.main(verbosity=2)</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>test_bad (__main__.TestAdd.test_bad) ... FAIL
+test_floats (__main__.TestAdd.test_floats) ... ok
+test_ints (__main__.TestAdd.test_ints) ... ok
+test_type (__main__.TestAdd.test_type) ... ok
+
+======================================================================
+FAIL: test_bad (__main__.TestAdd.test_bad)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/private/tmp/w10/t1.py", line 10, in test_bad
+    self.assertEqual(add(2, 2), 5)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+AssertionError: 4 != 5
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.003s
+
+FAILED (failures=1)</code></pre>
+<ul><li><strong>Answer</strong> Three tests passed and one failed, as designed. We used <code>assertAlmostEqual</code> for floats because <code>0.1 + 0.2</code> is <code>0.30000000000000004</code>, not exactly <code>0.3</code>.</li><li><strong>Check</strong> <code>2 + 2</code> is 4, and the report says <code>4 != 5</code>, so the failure message is telling the truth: our expected value (5) was the wrong one.</li><li><strong>Why it matters</strong> A failing test is not bad news. It is a clear message that says which promise broke and on which line.</li></ul>
+<p>Before you run it, predict: how many tests will say <code>ok</code>? (Answer: three.) If you remove <code>assertAlmostEqual</code> and write <code>assertEqual(add(0.1, 0.2), 0.3)</code>, the report would show <code>0.30000000000000004 != 0.3</code>, so use the almost-equal form.</p>
+<p class="problem"><span class="pl">Problem 10.1.2</span> Test <code>slugify(text)</code>, which turns a title into a URL piece, using normal, edge and several cases at once with <code>subTest</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>Write the function with <code>re.sub</code> (regex from Chapter 3). Replace every run of characters that are not letters or digits with <code>-</code>, then trim <code>-</code> at the ends.</td></tr><tr><th>Step 2</th><td>Write tests. <code>subTest</code> runs each case separately, so one failure does not hide the others.</td></tr></table>
+<pre class="code lang-python"><code># slug.py
+import re
+def slugify(text):
+    text = text.strip().lower()
+    text = re.sub(r"[^a-z0-9]+", "-", text)
+    return text.strip("-")</code></pre>
+<pre class="code lang-python"><code># test_slug.py
+import unittest
+from slug import slugify
+class T(unittest.TestCase):
+    def test_basic(self):
+        self.assertEqual(slugify("Hello World"), "hello-world")
+    def test_punct(self):
+        self.assertEqual(slugify("  Python, 101!  "), "python-101")
+    def test_empty(self):
+        self.assertEqual(slugify(""), "")
+    def test_subtests(self):
+        cases = [("A  B", "a-b"), ("--x--", "x"), ("C++ Tips", "c-tips")]
+        for raw, want in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(slugify(raw), want)</code></pre>
+<pre class="code lang-bash"><code>python3 -m unittest -v test_slug</code></pre>
+<pre class="code lang-text"><code>test_basic (test_slug.T.test_basic) ... ok
+test_empty (test_slug.T.test_empty) ... ok
+test_punct (test_slug.T.test_punct) ... ok
+test_subtests (test_slug.T.test_subtests) ... ok
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.000s
+
+OK</code></pre>
+<ul><li><strong>Answer</strong> All four tests pass. <code>python3 -m unittest</code> finds files named <code>test*.py</code> when you run <code>python3 -m unittest discover</code>.</li><li><strong>Check</strong> By hand: <code>"C++ Tips"</code> lower-cased is <code>c++ tips</code>. The run <code>"++ "</code> is not a letter or digit, so it becomes one <code>-</code>, giving <code>c-tips</code>. This matches the test.</li><li><strong>Why it matters</strong> Using one test per rule means that if you later change the regex, you see exactly which rule broke.</li></ul>
+<h3>Connection to the real job</h3>
+<ul><li>Data pipelines silently produce wrong numbers when a function changes. Tests on transformation functions catch this before the dashboard does.</li><li>ML code is tested too: shape checks, no-NaN checks, and "same seed gives same result".</li><li>Teams will not merge your pull request if the CI (Continuous Integration, an automatic runner) shows red tests.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> tests on a cleaning function that turns <code>"₹1,200"</code> into <code>1200</code>.</li><li><strong>Data Engineering:</strong> unit tests for each transform, integration tests with a small database.</li><li><strong>Machine Learning:</strong> checks that feature code gives the same output for the same seed.</li><li><strong>MLOps:</strong> regression suites that run in CI before a model-serving service is released.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Writing tests that only check the "happy path". Bugs live at the edges: empty list, zero, negative, <code>None</code>, duplicate keys, a time zone change. Add at least one edge and one bad case for each function.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Testing with <code>==</code> on floats. Use <code>assertAlmostEqual</code> (unittest) or <code>pytest.approx</code> (pytest).</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Name the three levels of the pyramid, from cheapest to most expensive. Answer: unit, integration, end-to-end.</li><li>Why is <code>assertEqual(0.1 + 0.2, 0.3)</code> a bad test? Answer: floats are stored in binary, and the sum is <code>0.30000000000000004</code>, so equality fails.</li><li>What does a regression mean? Answer: something that worked before stops working after a change.</li></ol>
+<h2 id="s2-10-2-pytest-plain-asserts-fixtures-and-parametrize">10.2 pytest: Plain Asserts, Fixtures and Parametrize</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt"><code>unittest</code> makes you write a class and remember names like <code>assertEqual</code>. <code>pytest</code> lets you write a plain function and a plain <code>assert</code>. It then prints a rich explanation when the assert fails. It is the standard in industry.</div></div>
+<h3>How pytest works</h3>
+<p><code>pytest</code> is a third-party tool (<code>pip install pytest</code>). It finds files named <code>test_*.py</code> and functions named <code>test_*</code>. You write <code>assert condition</code>. If the condition is false, the test fails, and pytest shows the values on both sides.</p>
+<pre class="code lang-python"><code># test_slug_pytest.py   (not run here)
+import pytest
+from slug import slugify
+
+def test_basic():
+    assert slugify("Hello World") == "hello-world"
+
+def test_empty():
+    assert slugify("") == ""
+
+def test_none_raises():
+    with pytest.raises(AttributeError):
+        slugify(None)
+
+def test_float_close():
+    assert 0.1 + 0.2 == pytest.approx(0.3)</code></pre>
+<p>Run with <code>pytest -q</code> (quiet) or <code>pytest -v</code> (verbose). Useful flags: <code>-x</code> stops at the first failure, <code>-k name</code> runs tests whose name contains <code>name</code>, <code>--lf</code> re-runs only the tests that failed last time.</p>
+<h3>Parametrize: one test, many cases</h3>
+<p><code>@pytest.mark.parametrize</code> runs the same test body with different inputs. Each case shows as its own test, so a failure names the exact case. It is the pytest version of the <code>subTest</code> loop above.</p>
+<pre class="code lang-python"><code># not run here
+import pytest
+from slug import slugify
+
+@pytest.mark.parametrize(
+    "raw, want",
+    [
+        ("A  B", "a-b"),
+        ("--x--", "x"),
+        ("C++ Tips", "c-tips"),
+        ("", ""),
+    ],
+)
+def test_slugify_cases(raw, want):
+    assert slugify(raw) == want</code></pre>
+<h3>Fixtures: shared setup, with clean-up</h3>
+<p>A <strong>fixture</strong> is a function that prepares something a test needs (a database, a temp file, sample data). Tests ask for it by writing its name as an argument. pytest runs the fixture and passes the result. Code after <code>yield</code> is the clean-up.</p>
+<pre class="code lang-python"><code># not run here
+import sqlite3
+import pytest
+
+@pytest.fixture
+def conn():
+    c = sqlite3.connect(":memory:")
+    c.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+    yield c            # the test runs here
+    c.close()          # clean-up, even if the test failed
+
+def test_insert(conn):
+    conn.execute("INSERT INTO users(name) VALUES (?)", ("ravi",))
+    rows = conn.execute("SELECT name FROM users").fetchall()
+    assert rows == [("ravi",)]</code></pre>
+<p>Fixture <strong>scope</strong> controls how often it is rebuilt: <code>function</code> (default, every test), <code>module</code>, <code>session</code> (once for the whole run). Use the widest scope only for expensive, read-only things. Built-in fixtures worth knowing: <code>tmp_path</code> (a fresh temporary folder), <code>capsys</code> (capture printed text), <code>monkeypatch</code> (change things for one test, see 10.3). A file called <code>conftest.py</code> holds fixtures shared by many test files.</p>
+<h3>The same ideas, run with unittest</h3>
+<p>Since pytest is not installed here, this is the <code>unittest</code> form of fixture and clean-up, which we can run. <code>setUp</code> runs before each test, <code>tearDown</code> after, and <code>tempfile.TemporaryDirectory</code> gives a fresh folder.</p>
+<p><strong>Words you need.</strong> <em>Setup</em> is code that prepares the world before a test. <em>Teardown</em> is code that cleans up after. A <em>fixture</em> is a named setup/teardown that pytest gives to tests.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Fixture</td><td>In-memory DB with a table</td><td>Every DB or API test</td></tr><tr><td>Parametrize</td><td>15 messy phone numbers, 15 clean answers</td><td>Data-cleaning rules</td></tr><tr><td><code>tmp_path</code></td><td>Fresh temp folder</td><td>Testing file readers and writers</td></tr><tr><td><code>conftest.py</code></td><td>Shared fixtures for the whole project</td><td>Large test suites</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 10.2.1</span> Test a save/load pair of JSON functions using a temporary folder, so no test leaves files behind.</p>
+<table class="steps"><tr><th>Step 1</th><td>Write <code>save(path, obj)</code> and <code>load(path)</code> using <code>pathlib</code> and <code>json</code> (Chapter 5).</td></tr><tr><th>Step 2</th><td>In the test, create a temp folder with a context manager, so it is deleted at the end.</td></tr><tr><th>Step 3</th><td>Save, load, compare.</td></tr></table>
+<pre class="code lang-python"><code>import tempfile, pathlib, unittest, json
+def save(path, obj): path.write_text(json.dumps(obj))
+def load(path): return json.loads(path.read_text())
+class T(unittest.TestCase):
+    def test_roundtrip(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = pathlib.Path(d) / "x.json"
+            save(p, {"a": [1, 2]})
+            self.assertEqual(load(p), {"a": [1, 2]})
+unittest.main(argv=["x"], verbosity=1)</code></pre>
+<pre class="code lang-text"><code>----------------------------------------------------------------------
+Ran 1 test in 0.010s
+
+OK</code></pre>
+<ul><li><strong>Answer</strong> The round trip works, and the temp folder is gone after the test. In pytest the same job is done by the <code>tmp_path</code> fixture.</li><li><strong>Check</strong> We saved <code>{"a": [1, 2]}</code> and loaded the same dictionary back, so nothing was lost in JSON. The test touched no real project file.</li><li><strong>Why it matters</strong> Tests that clean up after themselves can run in any order and on any machine.</li></ul>
+<p class="problem"><span class="pl">Problem 10.2.2</span> Read what a failing assertion on two dictionaries looks like in <code>unittest</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>Compare <code>{'a':1,'b':2}</code> with <code>{'a':1,'b':3}</code>.</td></tr><tr><th>Step 2</th><td>Read the diff marks. The <code>^</code> shows the exact character that differs.</td></tr></table>
+<pre class="code lang-text"><code>AssertionError: {'a': 1, 'b': 2} != {'a': 1, 'b': 3}
+- {'a': 1, 'b': 2}
+?               ^
+
++ {'a': 1, 'b': 3}
+?               ^</code></pre>
+<ul><li><strong>Answer</strong> The value of key <code>b</code> differs: 2 against 3. pytest prints a similar diff for a plain <code>assert</code>.</li><li><strong>Check</strong> Compare by eye: key <code>a</code> is 1 in both, key <code>b</code> is 2 and 3. The <code>^</code> marks sit under the <code>2</code> and the <code>3</code>.</li><li><strong>Why it matters</strong> Learning to read the diff saves minutes on every failing test.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> test_x(conn)                 fixture conn()
+     |   asks for "conn"          |
+     |---------------------------&gt;|  build DB
+     |&lt;-------- DB object --------|  (yield)
+     | run test body              |
+     |---------------------------&gt;|  clean-up after yield</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>A fixture that builds a tiny DataFrame or a tiny SQLite table is how data teams test transformations without touching production.</li><li><code>parametrize</code> is perfect for data-cleaning rules: list 15 messy inputs and the clean output you want.</li><li>CI runs <code>pytest</code> on every pull request.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> parametrized tests for date and currency parsing rules.</li><li><strong>Data Engineering:</strong> fixtures that build a tiny table to test an ETL transform.</li><li><strong>Machine Learning:</strong> tests for model-input validation (missing columns, wrong types).</li><li><strong>MLOps / backend:</strong> FastAPI endpoint tests with a test client (Chapter 12); CLI tests through <code>capsys</code>.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting the pytest-only names. If you write <code>def test_x(conn)</code> and no fixture called <code>conn</code> exists, pytest stops with an error that says <code>fixture 'conn' not found</code> (not run here). Check the spelling or add the fixture to <code>conftest.py</code>.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Tests that depend on each other or on order. Test B passes only because test A ran first and left a row in the database. Each test must build what it needs, using a fixture, and leave nothing behind.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Giving a fixture the wide <code>session</code> scope when tests change it. One test then pollutes the next. Start with the default scope.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>In pytest, how does a test receive a fixture? Answer: by naming it as a function argument.</li><li>What does code after <code>yield</code> in a fixture do? Answer: it runs as clean-up after the test finishes.</li><li>What is <code>parametrize</code> for? Answer: to run one test body with many input cases, each reported separately.</li></ol>
+<h2 id="s3-10-3-mocks-fakes-monkeypatch-and-database-tests">10.3 Mocks, Fakes, monkeypatch and Database Tests</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">In a rehearsal of an online shop you do not call a real payment gateway with real money. You stub it. A unit test is the same: replace the slow, costly or random parts (network, clock, email) with stand-ins you control, so the test is fast and repeatable.</div></div>
+<h3>Terms (words you need)</h3>
+<ul><li><strong>Test double</strong>: any stand-in used instead of the real thing.</li><li><strong>Fake</strong>: a small, working, simple replacement (for example a dictionary instead of a database). It has real behaviour.</li><li><strong>Stub</strong>: returns fixed answers. No logic.</li><li><strong>Mock</strong>: records how it was called, so you can check "was it called once, with these arguments?". In Python, <code>unittest.mock.Mock</code> is both a stub and a mock.</li><li><strong>Spy</strong>: wraps the real thing and records calls.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Stub</td><td>Always returns <code>{"status": 200}</code></td><td>Skipping a slow partner API</td></tr><tr><td>Fake</td><td>Dict-backed <code>FakeClient</code></td><td>Testing logic without a DB</td></tr><tr><td>Mock</td><td><code>client.get.assert_called_once()</code></td><td>Checking "email sent once"</td></tr><tr><td>Spy</td><td>Real function wrapped to count calls</td><td>Checking a retry loop</td></tr></tbody></table></div>
+<p>Rule of thumb: prefer a <strong>fake</strong> when the behaviour is simple, because it tests the result. Use a <strong>mock</strong> when the important thing is that a call happened (email sent, once).</p>
+<h3>Mock in action</h3>
+<p class="problem"><span class="pl">Problem 10.3.1</span> <code>fetch_price(client, sku)</code> calls <code>client.get(...)</code> and returns the price. <code>total</code> sums prices for many SKUs. Test <code>total</code> with no network, using a <code>Mock</code> and also a <code>Fake</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>Pass the client in as an argument. This is <strong>dependency injection</strong> (Chapter 8): the function does not build its own client, so tests can pass a different one.</td></tr><tr><th>Step 2</th><td>Use <code>side_effect</code> with a list so each call returns the next item. Then assert the call count.</td></tr><tr><th>Step 3</th><td>Write a <code>FakeClient</code> class with a dictionary and test again.</td></tr></table>
+<pre class="code lang-python"><code>import unittest
+from unittest import mock
+
+def fetch_price(client, sku):
+    resp = client.get(f"/price/{sku}")
+    if resp["status"] != 200:
+        raise ValueError("bad status")
+    return resp["body"]["price"]
+
+def total(client, skus):
+    return sum(fetch_price(client, s) for s in skus)
+
+class TestMock(unittest.TestCase):
+    def test_total_with_mock(self):
+        client = mock.Mock()
+        client.get.side_effect = [
+            {"status": 200, "body": {"price": 100}},
+            {"status": 200, "body": {"price": 250}},
+        ]
+        self.assertEqual(total(client, ["a", "b"]), 350)
+        self.assertEqual(client.get.call_count, 2)
+        client.get.assert_any_call("/price/a")
+    def test_error(self):
+        client = mock.Mock()
+        client.get.return_value = {"status": 500, "body": {}}
+        with self.assertRaises(ValueError):
+            fetch_price(client, "x")
+
+class FakeClient:
+    def __init__(self, prices): self.prices = prices
+    def get(self, path):
+        sku = path.rsplit("/", 1)[1]
+        if sku in self.prices:
+            return {"status": 200, "body": {"price": self.prices[sku]}}
+        return {"status": 404, "body": {}}
+
+class TestFake(unittest.TestCase):
+    def test_total(self):
+        self.assertEqual(total(FakeClient({"a": 1, "b": 2}), ["a", "b"]), 3)
+    def test_missing(self):
+        with self.assertRaises(ValueError):
+            total(FakeClient({}), ["zzz"])</code></pre>
+<p>Real output (this file also contained the patch and sqlite tests shown later, 9 tests in all):</p>
+<pre class="code lang-text"><code>test_missing (__main__.TestFake.test_missing) ... ok
+test_total (__main__.TestFake.test_total) ... ok
+test_error (__main__.TestMock.test_error) ... ok
+test_total_with_mock (__main__.TestMock.test_total_with_mock) ... ok
+test_default (__main__.TestPatch.test_default) ... ok
+test_env (__main__.TestPatch.test_env) ... ok
+test_time (__main__.TestPatch.test_time) ... ok
+test_add (__main__.TestRepo.test_add) ... ok
+test_unique (__main__.TestRepo.test_unique) ... ok
+
+----------------------------------------------------------------------
+Ran 9 tests in 0.004s
+
+OK</code></pre>
+<ul><li><strong>Answer</strong> <code>total</code> returned 350 with the mock and 3 with the fake, and both error paths raised <code>ValueError</code>. No network was used.</li><li><strong>Check</strong> By hand: 100 + 250 = 350 and 1 + 2 = 3. The mock was called twice (two SKUs), which <code>call_count</code> confirmed.</li><li><strong>Why it matters</strong> The tests ran in milliseconds and would give the same answer on a plane with no internet.</li></ul>
+<h3>Patching: replacing a name for one test</h3>
+<p><code>mock.patch("module.name")</code> swaps a name for a mock during a test and restores it afterwards. pytest's <code>monkeypatch</code> fixture does the same job for attributes and environment variables, and <code>pytest-mock</code> gives a <code>mocker.patch(...)</code> fixture.</p>
+<pre class="code lang-python"><code># not run here: pytest style
+def test_user_from_env(monkeypatch):
+    monkeypatch.setenv("APP_USER", "asha")
+    assert home_name() == "asha"
+
+def test_with_mocker(mocker):            # needs pytest-mock
+    mocker.patch("time.time", return_value=1000.0)</code></pre>
+<p>The <code>unittest</code> forms, which ran in the output above, are <code>@mock.patch.dict(os.environ, {"APP_USER": "asha"})</code> and <code>@mock.patch("time.time", return_value=1000.0)</code>.</p>
+<p class="problem"><span class="pl">Problem 10.3.2</span> The famous trap: <em>patch where the name is used, not where it is defined.</em> <code>bill.py</code> does <code>from util import rate</code>. Which patch changes the result of <code>to_inr(2)</code> when the real <code>rate()</code> is 83.0?</p>
+<table class="steps"><tr><th>Step 1</th><td><code>from util import rate</code> copies the name <code>rate</code> into module <code>bill</code>. Now <code>bill.rate</code> and <code>util.rate</code> are two names for the same function.</td></tr><tr><th>Step 2</th><td>Patching <code>util.rate</code> changes only the <code>util</code> name. <code>bill</code> still points to the old function.</td></tr><tr><th>Step 3</th><td>Patch <code>bill.rate</code> instead, and run all three cases.</td></tr></table>
+<pre class="code lang-python"><code>from unittest import mock
+import bill, util
+with mock.patch("util.rate", return_value=100.0):
+    print("patch util.rate  -&gt;", bill.to_inr(2))
+with mock.patch("bill.rate", return_value=100.0):
+    print("patch bill.rate  -&gt;", bill.to_inr(2))
+print("no patch         -&gt;", bill.to_inr(2))</code></pre>
+<pre class="code lang-text"><code>patch util.rate  -&gt; 166.0
+patch bill.rate  -&gt; 200.0
+no patch         -&gt; 166.0</code></pre>
+<ul><li><strong>Answer</strong> Only <code>bill.rate</code> works (result 200.0 = 2 × 100). Patching <code>util.rate</code> left the answer at 166.0 = 2 × 83.</li><li><strong>Check</strong> 2 × 83.0 = 166.0 matches the "no patch" line, so the first patch changed nothing.</li><li><strong>Why it matters</strong> This is the most common reason a patch "does not work". A plain-language rule: patch the name in the module that <em>looks it up</em>.</li></ul>
+<p>Before you run it, predict the first line. Most beginners guess 200.0 and get 166.0, which is the typical wrong version.</p>
+<h3>Safer mocks with a spec</h3>
+<p>A bare <code>Mock()</code> accepts any attribute, so a typo can pass silently. Give it a <code>spec</code> so only real attributes exist. Modern Python also refuses misspelled assert helpers.</p>
+<pre class="code lang-python"><code>from unittest import mock
+m2 = mock.Mock(spec=["get"])
+try:
+    m2.post()
+except AttributeError as e:
+    print("AttributeError:", e)
+m3 = mock.Mock()
+m3.assert_called_once_wiht()</code></pre>
+<pre class="code lang-text"><code>AttributeError: Mock object has no attribute 'post'
+...
+AttributeError: 'assert_called_once_wiht' is not a valid assertion. Use a spec for the mock if 'assert_called_once_wiht' is meant to be an attribute.. Did you mean: 'assert_called_once_with'?</code></pre>
+<p><code>mock.create_autospec(real_object)</code> copies the real signature, so wrong argument counts also fail.</p>
+<h3>Database tests with in-memory SQLite</h3>
+<p><code>sqlite3.connect(":memory:")</code> makes a database in RAM that vanishes when closed. It is perfect for fast integration tests of your data-access code. (It is not Postgres, so dialect-specific features need a real Postgres in CI, for example via Docker.)</p>
+<p class="problem"><span class="pl">Problem 10.3.3</span> Test a <code>Repo</code> class that adds users and rejects duplicates.</p>
+<table class="steps"><tr><th>Step 1</th><td>In <code>setUp</code>, open a fresh in-memory DB and create the table. In <code>tearDown</code>, close it.</td></tr><tr><th>Step 2</th><td>Test insertion order and the <code>UNIQUE</code> rule.</td></tr><tr><th>Step 3</th><td>Notice the code uses <code>?</code> placeholders. This is also the defence against SQL injection (Chapter 13).</td></tr></table>
+<pre class="code lang-python"><code>import sqlite3, unittest
+class Repo:
+    def __init__(self, conn):
+        self.conn = conn
+        conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+    def add(self, name):
+        cur = self.conn.execute("INSERT INTO users(name) VALUES (?)", (name,))
+        return cur.lastrowid
+    def names(self):
+        return [r[0] for r in self.conn.execute("SELECT name FROM users ORDER BY id")]
+class TestRepo(unittest.TestCase):
+    def setUp(self):
+        self.conn = sqlite3.connect(":memory:")
+        self.repo = Repo(self.conn)
+    def tearDown(self):
+        self.conn.close()
+    def test_add(self):
+        self.repo.add("ravi"); self.repo.add("meena")
+        self.assertEqual(self.repo.names(), ["ravi", "meena"])
+    def test_unique(self):
+        self.repo.add("ravi")
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.repo.add("ravi")</code></pre>
+<ul><li><strong>Answer</strong> Both tests passed (see the 9-test run above). Each test got a brand-new database, so they cannot disturb each other.</li><li><strong>Check</strong> <code>test_unique</code> inserts <code>"ravi"</code> twice and <code>sqlite3.IntegrityError</code> is raised, which proves the <code>UNIQUE</code> rule is active.</li><li><strong>Why it matters</strong> Your SQL code is tested against a real engine, not a guess.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> Real run:    your code --&gt; HTTP client --&gt; internet --&gt; price service
+ Unit test:   your code --&gt; Mock/Fake  (answers you chose, instantly)
+ Integration: your code --&gt; real SQLite (in memory)</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>Pipelines call APIs, clouds and databases. You mock the call, test your logic, and keep test runs fast and free.</li><li>Clock-dependent code (daily jobs) is tested by passing the date in as an argument or by patching the clock.</li><li>ML code: replace the slow model with a fake that returns fixed scores to test the surrounding service.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> test a report function with a tiny in-memory table.</li><li><strong>Data Engineering:</strong> mock a cloud storage client to test "upload then log" logic.</li><li><strong>Machine Learning:</strong> fake model returning fixed scores to test the code around it.</li><li><strong>GenAI / MLOps:</strong> stub the LLM API so tests are free, fast and repeatable.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Over-mocking. If the test mocks everything, it only checks that your code calls your mocks. It will pass even when the real thing is broken. Mock only the boundary (network, clock, disk), and keep a few integration tests.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Patching the wrong name (Problem 10.3.2). If a patch seems to do nothing, check where the name is imported.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Fake or mock: which one has real simple behaviour? Answer: the fake.</li><li>Where do you patch after <code>from util import rate</code> in <code>bill.py</code>? Answer: <code>bill.rate</code>.</li><li>Why is <code>:memory:</code> SQLite good for tests? Answer: it is fast, needs no setup, and disappears on close, so tests stay isolated.</li></ol>
+<h2 id="s4-10-4-tdd-and-coverage">10.4 TDD and Coverage</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A good builder first writes the inspection checklist, then builds until the checklist passes. <strong>Test-Driven Development (TDD)</strong> works like this. You write a failing test, then the smallest code that passes it, then clean up.</div></div>
+<h3>The red-green-refactor loop</h3>
+<ol><li><strong>Red</strong>: write one small test for behaviour that does not exist yet. Run it. It must fail. (A test that was never red may test nothing.)</li><li><strong>Green</strong>: write the simplest code that makes it pass. Do not be clever.</li><li><strong>Refactor</strong>: clean the code (names, duplication) while the tests stay green.</li><li>Repeat with the next small behaviour.</li></ol>
+<p>TDD is not required everywhere. It shines for logic with clear rules (parsers, calculations, validators). It is awkward for exploratory data work in notebooks. Also, when you find a bug, write a failing test that reproduces it first, then fix it. That bug can never come back silently.</p>
+<h3>Worked walkthrough: FizzBuzz</h3>
+<p class="problem"><span class="pl">Problem 10.4.1</span> Build <code>fizzbuzz(n)</code> by TDD: <code>3</code> gives <code>"Fizz"</code>, <code>5</code> gives <code>"Buzz"</code>, <code>15</code> gives <code>"FizzBuzz"</code>, others give the number as text.</p>
+<table class="steps"><tr><th>Step 1 (Red)</th><td>Write four tests and a stub that raises <code>NotImplementedError</code>. Run.</td></tr><tr><th>Step 2 (Green, part 1)</th><td>Handle only the multiples of 3. Run again and see the remaining failures.</td></tr><tr><th>Step 3 (Green and refactor)</th><td>Build the text from parts, and fall back to the number. Run until green.</td></tr></table>
+<pre class="code lang-python"><code># test_fizz.py
+import unittest
+from fizz import fizzbuzz
+class T(unittest.TestCase):
+    def test_plain(self): self.assertEqual(fizzbuzz(1), "1")
+    def test_fizz(self): self.assertEqual(fizzbuzz(3), "Fizz")
+    def test_buzz(self): self.assertEqual(fizzbuzz(5), "Buzz")
+    def test_both(self): self.assertEqual(fizzbuzz(15), "FizzBuzz")</code></pre>
+<p>Red: <code>fizz.py</code> is <code>def fizzbuzz(n): raise NotImplementedError</code>.</p>
+<pre class="code lang-text"><code>  File "/private/tmp/w10/tdd/fizz.py", line 2, in fizzbuzz
+    raise NotImplementedError
+NotImplementedError
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.002s
+
+FAILED (errors=4)</code></pre>
+<p>Step 2: only <code>if n % 3 == 0: return "Fizz"</code> then <code>return str(n)</code>.</p>
+<pre class="code lang-text"><code>AssertionError: '5' != 'Buzz'
+- 5
++ Buzz
+
+----------------------------------------------------------------------
+Ran 4 tests in 0.002s
+
+FAILED (failures=2)</code></pre>
+<p>Two failures remain: <code>5</code> and <code>15</code>. Final code:</p>
+<pre class="code lang-python"><code>def fizzbuzz(n):
+    out = ""
+    if n % 3 == 0:
+        out += "Fizz"
+    if n % 5 == 0:
+        out += "Buzz"
+    return out or str(n)</code></pre>
+<pre class="code lang-text"><code>....
+----------------------------------------------------------------------
+Ran 4 tests in 0.000s
+
+OK</code></pre>
+<ul><li><strong>Answer</strong> Four errors, then two failures, then green. The 4 errors in step 1 were "not implemented" errors, and in step 2 two tests turned green and two became real assertion failures. The test list guided every step.</li><li><strong>Check</strong> By hand: 3 → Fizz, 5 → Buzz, 15 is divisible by both so <code>"Fizz" + "Buzz"</code>, 1 → <code>"1"</code>. All four match the final code.</li><li><strong>Why it matters</strong> At no point did you write code without a failing test asking for it, so no code is untested.</li></ul>
+<h3>Coverage: which lines did the tests run?</h3>
+<p><strong>Code coverage</strong> is the percent of your code lines that ran during the tests. With pytest you use the <code>pytest-cov</code> plugin:</p>
+<pre class="code lang-bash"><code># not run here
+pip install pytest-cov
+pytest --cov=mypackage --cov-report=term-missing</code></pre>
+<p><code>term-missing</code> lists the line numbers no test touched. The standard library has a rough equivalent, <code>trace</code>, which we can run.</p>
+<p class="problem"><span class="pl">Problem 10.4.2</span> <code>grade(score)</code> returns A for 90+, B for 75+, else C. Two tests only: 95 and 10. Which line is never executed?</p>
+<table class="steps"><tr><th>Step 1</th><td>Write <code>cov.py</code> and <code>test_cov.py</code> with the two tests.</td></tr><tr><th>Step 2</th><td>Run the tests under <code>python3 -m trace --count --missing -C covout --module unittest test_cov</code>.</td></tr><tr><th>Step 3</th><td>Read <code>covout/cov.cover</code>. A line starting with <code>&gt;&gt;&gt;&gt;&gt;&gt;</code> never ran.</td></tr></table>
+<pre class="code lang-text"><code>    1: def grade(score):
+    2:     if score &gt;= 90:
+    1:         return "A"
+    1:     if score &gt;= 75:
+&gt;&gt;&gt;&gt;&gt;&gt;         return "B"
+    1:     return "C"</code></pre>
+<ul><li><strong>Answer</strong> The line <code>return "B"</code> never ran, because no test used a score between 75 and 89. Add <code>test_b</code> with 80 and a boundary test with 75 and 74.</li><li><strong>Check</strong> 95 takes the first branch and 10 skips both <code>if</code>s. Neither can reach <code>return "B"</code>, so the report is right.</li><li><strong>Why it matters</strong> In plain words: 4 of 5 executable lines were tested, and the missing one is a real business rule.</li></ul>
+<p>Before you run it, predict which line is marked. Then compare with the report above.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Line coverage</td><td>4 of 5 lines ran = 80%</td><td>CI quality gate</td></tr><tr><td>Branch coverage</td><td>Both sides of each <code>if</code> ran</td><td>Finding untested error paths</td></tr><tr><td>Regression test</td><td>Test written from a bug report</td><td>Support-ticket fixes</td></tr></tbody></table></div>
+<h3>What coverage does not tell you</h3>
+<p>100% coverage means every line ran. It does not mean every line was <em>checked</em>. A test with no assert gives coverage and no safety. Use coverage to find untested areas, not as a score to chase. Many teams set a floor (for example 80%) and fail CI below it. Branch coverage (<code>--cov-branch</code>) also checks that both sides of every <code>if</code> ran.</p>
+<h3>The picture</h3>
+<pre class="code lang-text"><code>   RED ----------&gt; GREEN ----------&gt; REFACTOR
+ (failing test)   (smallest code)    (clean, tests stay green)
+     ^                                     |
+     +------------- next behaviour --------+</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>When a production bug is reported, the professional move is: write the failing test, fix, keep the test. Over a year this builds a safety net.</li><li>Data validators (is this row valid?) are ideal for TDD: rules are explicit.</li><li>Performance work (Chapter 11) is safe only if tests prove the faster code gives the same answers.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> validators for report rules (tax, discount, billing).</li><li><strong>Data Engineering:</strong> parsers for messy log or CSV formats, built one rule at a time.</li><li><strong>Machine Learning:</strong> a failing test that reproduces a data-leak bug before you fix it.</li><li><strong>MLOps:</strong> a safety net that lets you refactor a legacy pipeline without fear.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Writing the test after the code and copying the code's current output as the "expected" value. If the code is wrong, the test now locks in the wrong answer. Work out the expected value by hand first.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Chasing 100% coverage with assert-free tests. Coverage measures execution, not correctness.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What do you do in the Red step? Answer: write a small test for missing behaviour and see it fail.</li><li>A line shows <code>&gt;&gt;&gt;&gt;&gt;&gt;</code> in a trace report. What does it mean? Answer: no test executed that line.</li><li>Can 100% coverage still hide bugs? Answer: yes, if tests do not assert the results.</li></ol>
+<h2 id="s5-10-5-code-quality-formatters-linters-type-checkers-and-pre-commit">10.5 Code Quality: Formatters, Linters, Type Checkers and pre-commit</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">In a team, nobody wants to argue about spaces versus quotes in a code review. Let machines settle style, so humans discuss design. A formatter rewrites style, a linter flags suspicious code, a type checker flags wrong types, and pre-commit runs all three before each commit.</div></div>
+<h3>The four tools</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Tool</th><th>Job</th><th>Changes your code?</th><th>Typical command</th></tr></thead><tbody><tr><td><code>black</code></td><td>Formats code in one fixed style</td><td>Yes</td><td><code>black .</code></td></tr><tr><td><code>ruff</code></td><td>Very fast linter (and formatter, <code>ruff format</code>)</td><td>Lint: with <code>--fix</code></td><td><code>ruff check .</code></td></tr><tr><td><code>mypy</code></td><td>Checks type hints (Chapter 9)</td><td>No</td><td><code>mypy src</code></td></tr><tr><td><code>pre-commit</code></td><td>Runs checks automatically at <code>git commit</code></td><td>Depends on hooks</td><td><code>pre-commit install</code></td></tr></tbody></table></div>
+<p>All four are third-party (<code>pip install</code>), <strong>not run here</strong>. Many teams now use <code>ruff</code> for both lint and format and drop <code>black</code>. Either is fine; the point is one agreed tool.</p>
+<h3>Configuration: one place, <code>pyproject.toml</code></h3>
+<pre class="code lang-toml"><code># pyproject.toml   (not run here; standard keys)
+[tool.black]
+line-length = 88
+
+[tool.ruff]
+line-length = 88
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B"]   # pycodestyle errors, pyflakes, import order, bugbear
+
+[tool.mypy]
+python_version = "3.12"
+strict = true</code></pre>
+<p><code>F</code> rules find unused imports and undefined names. <code>I</code> sorts imports. <code>B</code> (bugbear) catches classic traps such as the mutable default argument. The set of rule letters can change between versions, so check the tool's documentation.</p>
+<h3>pre-commit</h3>
+<p><code>pre-commit</code> reads <code>.pre-commit-config.yaml</code>. Each hook runs on the files you are about to commit. If a hook fails or edits a file, the commit stops, you re-add the files and commit again.</p>
+<pre class="code lang-yaml"><code># .pre-commit-config.yaml   (not run here)
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: vX.Y.Z          # put the current release tag here
+    hooks:
+      - id: ruff
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/pre-commit/mirrors-mypy
+    rev: vX.Y.Z          # put the current release tag here
+    hooks:
+      - id: mypy</code></pre>
+<pre class="code lang-bash"><code># not run here
+pip install pre-commit
+pre-commit install          # sets up the git hook once
+pre-commit run --all-files  # check the whole repo now</code></pre>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Formatter</td><td><code>black .</code> rewrites quotes and spacing</td><td>Zero style arguments in review</td></tr><tr><td>Linter</td><td><code>ruff check .</code> flags an unused import</td><td>Catching bugs before running</td></tr><tr><td>Type checker</td><td><code>mypy src</code> flags <code>double("5")</code></td><td>Data code with wrong column types</td></tr><tr><td>pre-commit</td><td>Runs hooks at <code>git commit</code></td><td>Every team repo</td></tr></tbody></table></div>
+<h3>What these tools catch</h3>
+<p>Here is the kind of bug a linter finds, and how running the code shows it.</p>
+<p class="problem"><span class="pl">Problem 10.5.1</span> The code below has the "mutable default" bug. Show the bug, then fix it. A bugbear rule (<code>B006</code>) would flag the first version.</p>
+<table class="steps"><tr><th>Step 1</th><td>Run the buggy function twice.</td></tr><tr><th>Step 2</th><td>Fix with <code>None</code> as default.</td></tr></table>
+<pre class="code lang-python"><code>def add_tag(tag, tags=[]):
+    tags.append(tag)
+    return tags
+print(add_tag("a"), add_tag("b"))
+
+def add_tag_ok(tag, tags=None):
+    if tags is None:
+        tags = []
+    tags.append(tag)
+    return tags
+print(add_tag_ok("a"), add_tag_ok("b"))</code></pre>
+<pre class="code lang-text"><code>['a', 'b'] ['a', 'b']
+['a'] ['b']</code></pre>
+<ul><li><strong>Answer</strong> The default list is created once and shared, so the first call's data leaks into the second. Both prints in the buggy version show the same list object. The fix gives <code>['a'] ['b']</code>.</li><li><strong>Check</strong> The buggy line prints <code>['a', 'b']</code> twice because Python evaluates both calls first, and both returned the same list, which by then held both tags.</li><li><strong>Why it matters</strong> A linter finds this in a second. Without it, the bug appears as data from one user showing up in another's result.</li></ul>
+<p class="problem"><span class="pl">Problem 10.5.2</span> What does <code>mypy</code> say about this code? (Not run here; this is the standard message shape.)</p>
+<table class="steps"><tr><th>Step 1</th><td>Read the hint: <code>def double(x: int) -&gt; int</code>.</td></tr><tr><th>Step 2</th><td>The call <code>double("5")</code> passes a <code>str</code>.</td></tr><tr><th>Step 3</th><td>mypy reports it before the program runs.</td></tr></table>
+<pre class="code lang-python"><code>def double(x: int) -&gt; int:
+    return x * 2
+
+double("5")</code></pre>
+<p>Expected report (wording varies by mypy version): <code>error: Argument 1 to "double" has incompatible type "str"; expected "int"</code>.</p>
+<ul><li><strong>Answer</strong> mypy flags the call without running it. At runtime <code>"5" * 2</code> would silently give <code>"55"</code>, a wrong answer with no error. That is why type checking helps.</li><li><strong>Check</strong> In plain Python, <code>"5" * 2</code> is <code>"55"</code> (string repeat). So the program would not crash, it would be quietly wrong.</li><li><strong>Why it matters</strong> The worst bugs are the ones that do not raise errors.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> you edit --&gt; git commit --&gt; pre-commit hooks --&gt; pass? --&gt; commit saved
+                                 |  ruff-format
+                                 |  ruff check
+                                 |  mypy              fail --&gt; fix, re-add</code></pre>
+<p>Then CI (Chapter 13) runs the same tools again on the server, so nothing slips past a skipped local hook.</p>
+<h3>Connection to the real job</h3>
+<ul><li>Every professional repo has a formatter, a linter, and usually a type checker in CI. A pull request that fails them is not reviewed.</li><li>Notebooks can be linted too (<code>ruff</code> supports <code>.ipynb</code>); convert long notebooks to scripts as they mature.</li><li>Type hints plus <code>mypy</code> catch many "column is a string, not int" bugs in data code early.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> <code>ruff</code> on notebooks exported to scripts, so shared analysis code stays tidy.</li><li><strong>Data Engineering:</strong> pre-commit plus CI on every pipeline repository.</li><li><strong>Machine Learning:</strong> <code>mypy</code> catching wrong tensor/DataFrame argument types in training code.</li><li><strong>MLOps:</strong> hooks that block secrets and debug prints from reaching the main branch.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Turning on <code>strict</code> mypy and every lint rule in an old codebase on day one. You get 2,000 errors and give up. Start with a small rule set on new code, then widen it.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Skipping hooks with <code>git commit --no-verify</code> "just this once". CI will fail anyway, and now it fails in public.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is the difference between a formatter and a linter? Answer: a formatter rewrites style only; a linter flags suspicious or wrong code.</li><li>When does <code>pre-commit</code> run? Answer: automatically at <code>git commit</code>, once you ran <code>pre-commit install</code>.</li><li>Does <code>mypy</code> run your program? Answer: no, it only reads the code and the type hints.</li></ol>
+<h2 id="s6-chapter-recap">Chapter recap</h2>
+<ul><li>A test calls your code with known input and checks the output. Tests catch regressions fast.</li><li>The testing pyramid: many unit tests, fewer integration tests, very few end-to-end tests.</li><li>Test normal, edge and bad cases. Use small fake data, never real customer data.</li><li>pytest uses plain <code>assert</code>, fixtures (with <code>yield</code> for clean-up), <code>parametrize</code>, <code>tmp_path</code> and <code>monkeypatch</code>. <code>unittest</code> is the built-in alternative.</li><li>A fake has simple real behaviour; a mock records calls. Prefer fakes, mock only boundaries.</li><li>Patch the name where it is used (<code>bill.rate</code>), not where it is defined.</li><li>In-memory SQLite gives fast, isolated database tests.</li><li>TDD is red, green, refactor. Reproduce every bug with a failing test before fixing it.</li><li>Coverage shows which lines ran, not whether results were checked.</li><li><code>black</code>/<code>ruff</code> for style and lint, <code>mypy</code> for types, <code>pre-commit</code> to run them before each commit, config in <code>pyproject.toml</code>.</li></ul>
+<h3>Cheat-sheet</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Task</th><th>Command or pattern</th></tr></thead><tbody><tr><td>Run unittest</td><td><code>python3 -m unittest discover -v</code></td></tr><tr><td>Run pytest, stop at first failure</td><td><code>pytest -x -q</code></td></tr><tr><td>Many cases, one test</td><td><code>@pytest.mark.parametrize("a,want", [...])</code></td></tr><tr><td>Fixture with clean-up</td><td><code>@pytest.fixture</code> + <code>yield</code></td></tr><tr><td>Replace a name</td><td><code>mock.patch("module_where_used.name")</code></td></tr><tr><td>Safer mock</td><td><code>mock.Mock(spec=[...])</code> or <code>create_autospec</code></td></tr><tr><td>Coverage with missing lines</td><td><code>pytest --cov=pkg --cov-report=term-missing</code></td></tr><tr><td>Format / lint / types</td><td><code>ruff format .</code> / <code>ruff check .</code> / <code>mypy src</code></td></tr><tr><td>Install hooks</td><td><code>pre-commit install</code></td></tr></tbody></table></div>
+<h2 id="s7-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 10.P.1</span> (easy) What is the output of <code>slugify("  Python, 101!  ")</code> with the function from 10.1?</p>
+<p><strong>Answer:</strong> <code>python-101</code>. Strip and lower give <code>python, 101!</code>, the regex turns <code>", "</code> into <code>-</code> and <code>!</code> into <code>-</code>, and the trailing <code>-</code> is trimmed.</p>
+<p class="problem"><span class="pl">Problem 10.P.2</span> (easy) Which pyramid level should have the most tests, and why?</p>
+<p><strong>Answer:</strong> unit tests, because they are fast, cheap, and point to the exact failing function.</p>
+<p class="problem"><span class="pl">Problem 10.P.3</span> (easy) In <code>grade(score)</code> from 10.4 (A at 90 and above, B at 75 and above), what does <code>grade(75)</code> return, and which boundary tests should you add?</p>
+<p><strong>Answer:</strong> <code>"B"</code>. Add tests for 90 (A), 89 (B), 75 (B), 74 (C).</p>
+<p class="problem"><span class="pl">Problem 10.P.4</span> (medium) Write a pytest <code>parametrize</code> test for <code>fizzbuzz</code> with the cases 1, 3, 5, 15.</p>
+<p><strong>Answer:</strong> (not run here)</p>
+<pre class="code lang-python"><code>import pytest
+from fizz import fizzbuzz
+
+@pytest.mark.parametrize("n, want", [(1, "1"), (3, "Fizz"), (5, "Buzz"), (15, "FizzBuzz")])
+def test_fizzbuzz(n, want):
+    assert fizzbuzz(n) == want</code></pre>
+<p class="problem"><span class="pl">Problem 10.P.5</span> (medium, what is the output?) With <code>bill.py</code> doing <code>from util import rate</code> and <code>util.rate()</code> returning 83.0, what does <code>to_inr(2)</code> return inside <code>mock.patch("util.rate", return_value=100.0)</code>?</p>
+<p><strong>Answer:</strong> <code>166.0</code>. The patch changed <code>util.rate</code>, but <code>bill</code> kept its own reference to the old function.</p>
+<p class="problem"><span class="pl">Problem 10.P.6</span> (medium, find the bug) A test says <code>self.assertEqual(0.1 * 3, 0.3)</code>. It fails. Why, and how do you fix it?</p>
+<p><strong>Answer:</strong> <code>0.1 * 3</code> is <code>0.30000000000000004</code> in binary floating point. Use <code>assertAlmostEqual(0.1 * 3, 0.3)</code> or, in pytest, <code>pytest.approx(0.3)</code>.</p>
+<p class="problem"><span class="pl">Problem 10.P.7</span> (medium, find the bug) This fixture is meant to give each test a clean list, but tests leak data. What is wrong?</p>
+<pre class="code lang-python"><code># not run here
+import pytest
+shared = []
+
+@pytest.fixture
+def items():
+    return shared</code></pre>
+<p><strong>Answer:</strong> it returns the same module-level list every time, so tests mutate shared state. Create a new list inside the fixture: <code>return []</code>.</p>
+<p class="problem"><span class="pl">Problem 10.P.8</span> (medium) A trace report shows <code>&gt;&gt;&gt;&gt;&gt;&gt;</code> on the line <code>raise ValueError</code>. What test do you write?</p>
+<p><strong>Answer:</strong> a test that triggers the error path, wrapped in <code>with self.assertRaises(ValueError):</code> (or <code>pytest.raises(ValueError)</code>), using an input that makes the condition true.</p>
+<p class="problem"><span class="pl">Problem 10.P.9</span> (hard, interview) Explain the difference between a mock, a stub and a fake, and when you would choose each.</p>
+<p><strong>Answer:</strong> a stub returns fixed answers. A fake is a lightweight working version (an in-memory dictionary instead of a database). A mock records how it was called so you can assert on interactions. Choose a fake when behaviour is simple and you want to test results, a stub when you only need a canned answer, and a mock when the call itself is the outcome (for example "the email was sent once"). Avoid mocking everything, because then the test checks your mocks, not your code.</p>
+<p class="problem"><span class="pl">Problem 10.P.10</span> (hard, interview) A teammate says "we have 95% coverage so the code is safe". Reply in three sentences.</p>
+<p><strong>Answer:</strong> Coverage only says those lines executed, not that the results were asserted. Tests without assertions, or tests that only cover the happy path, still give high coverage. I would check assertion quality, edge cases and branch coverage, and look at which 5% is untested, because it may be the risky error handling.</p>
+<p class="problem"><span class="pl">Problem 10.P.11</span> (hard, scenario) Your nightly pipeline function <code>build_report(today)</code> reads the system date inside and your test fails every Sunday. Redesign it so it is testable.</p>
+<p><strong>Answer:</strong> pass the date in as an argument (<code>build_report(today)</code>), and let the caller supply <code>date.today()</code>. The test then passes a fixed date such as <code>date(2026, 11, 8)</code>. If the code cannot change yet, patch the clock for the test. Passing values in beats patching.</p>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles, and English is my second language, so use simple words. Teach me Python unit testing with pytest: assert, fixtures with yield, parametrize, tmp_path and monkeypatch. Explain step by step with small examples using real numbers, then ask me one question at a time to check my understanding. Wait for my answer before continuing, and correct me kindly. Relate ideas to everyday examples such as shop orders where it helps.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles, and English is my second language. The topic is mocks, fakes and stubs in Python (unittest.mock, patch, side_effect, autospec) and the rule "patch where the name is used". Give me 8 graded exercises from easy to hard, each with a small code snippet and a clear goal. Do not give solutions yet. After I reply with my answers, review them one by one and explain every mistake in simple English.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles. Chapter topic: Test-Driven Development (red, green, refactor). Pick a small data-cleaning problem for me, such as normalising phone numbers. Walk me through TDD for it, one tiny step at a time. At each step show only the next failing test and wait for me to write the code. Review my code, point out edge cases I missed, and finish with a summary of what I learned.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles, and English is my second language. Please review my Python tests and my code quality setup. Here is my code and tests: [PASTE HERE]. Check for missing edge cases, tests that depend on each other, over-mocking, float comparison mistakes, and weak assertions. Then suggest a pyproject.toml configuration for ruff and mypy and a .pre-commit-config.yaml, and explain each setting in simple English.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles. Run a mock interview on Python testing and code quality for a data engineer job. Ask me one question at a time: the testing pyramid, fixtures, mocking versus faking, coverage limits, TDD, linters, type checkers and pre-commit. Grade each answer from 1 to 5, show a model answer, and give one tip to improve. After 10 questions, tell me my weakest areas and what to practise next.</pre></div><div class="readbtn"><button class="btn" data-read="study:python:ch10">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch09.html">← Chapter 9: Modules, Packages, Environments, Type Hi</a><a class="btn" href="ch11.html">Chapter 11: Concurrency and Performance →</a></div></div><script src="../../assets/study.js"></script></body></html>

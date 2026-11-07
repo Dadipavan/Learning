@@ -1,0 +1,479 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 8: Classical Image Processing</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#6a2fd0"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Deep Learning &amp; Computer Vision</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 8</div><h1>Classical Image Processing</h1><p>Pixels, filters, edges, thresholds, morphology, corner features and Fourier ideas, built from scratch in NumPy before you ever call OpenCV.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-8-1-pixels-color-spaces-resizing-and-histogram-equalization">8.1 Pixels, Color Spaces, Resizing and Histogram Equalization</a></li><li><a href="#s2-8-2-filtering-blur-median-and-sharpen">8.2 Filtering: Blur, Median and Sharpen</a></li><li><a href="#s3-8-3-edge-detection-sobel-canny-and-hough">8.3 Edge Detection: Sobel, Canny and Hough</a></li><li><a href="#s4-8-4-thresholding-morphology-and-connected-components">8.4 Thresholding, Morphology and Connected Components</a></li><li><a href="#s5-8-5-features-homography-stitching-and-the-fourier-view">8.5 Features, Homography, Stitching and the Fourier View</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p>Before deep learning, computers "saw" with hand-made rules: blur the noise, find the edges, cut out the object with a threshold, clean the mask, count the blobs. These tools are still everywhere. They prepare images for neural networks, they run on cheap cameras where no GPU exists, and they often solve a factory or document problem in 20 lines with no training data at all. This chapter builds each tool from a tiny array you can compute by hand, then runs it in NumPy on small synthetic images and shows the real output. By the end you will be able to read an OpenCV pipeline, explain what each call does, and pick between a classical method and a CNN. Chapter 6 gave you convolution; here we use it as a toolbox. Chapter 7's augmentations (flip, crop, brightness) are the same pixel operations you will see below.</p>
+<div class="callout blue"><div class="lab">PROFESSOR'S NOTE</div><div class="txt">OpenCV (<code>cv2</code>), scikit-image and PIL are not installed where this chapter was written, so every output below comes from NumPy code that I ran. The OpenCV lines are short, standard calls marked "not run here". Our versions are slow loops written for clarity; the library versions do the same job in C and are hundreds of times faster. The helper block below (<code>show</code>, <code>conv2d</code>) is reused by every later snippet in this chapter.</div></div>
+<pre class="code lang-python"><code>import numpy as np
+def show(a, chars=" .:-=+*#%@"):
+    """print a 2D array as ASCII art (each pixel is 2 characters wide)"""
+    a = np.asarray(a, float); lo, hi = a.min(), a.max()
+    q = ((a - lo) / (hi - lo + 1e-9) * (len(chars) - 1)).round().astype(int)
+    print("\n".join("".join(chars[v] * 2 for v in row) for row in q))
+
+def conv2d(x, k):
+    """same-size 2D filtering (cross-correlation), edge pixels repeated"""
+    kh, kw = k.shape; ph, pw = kh // 2, kw // 2
+    xp = np.pad(x, ((ph, ph), (pw, pw)), mode='edge')
+    out = np.zeros(x.shape, float)
+    for i in range(x.shape[0]):
+        for j in range(x.shape[1]):
+            out[i, j] = (xp[i:i+kh, j:j+kw] * k).sum()
+    return out</code></pre>
+<h2 id="s1-8-1-pixels-color-spaces-resizing-and-histogram-equalization">8.1 Pixels, Color Spaces, Resizing and Histogram Equalization</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A digital photo is a spreadsheet of numbers. A grey image is one sheet (rows by columns) with values 0 (black) to 255 (white). A colour image is three sheets stacked: red, green, blue. Everything in this chapter is arithmetic on those sheets, like computing the average of a column of exam marks.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Pixel</td><td>One number (grey) or three numbers (colour) at one position</td></tr><tr><td>Channel</td><td>One sheet of the stack; RGB has 3 channels</td></tr><tr><td>Shape</td><td><code>(height, width)</code> for grey, <code>(height, width, 3)</code> for colour in NumPy and OpenCV (PyTorch uses <code>(3, height, width)</code>)</td></tr><tr><td>Colour space</td><td>A way to write a colour as numbers: RGB, HSV (hue, saturation, value), Lab (lightness plus two colour axes)</td></tr><tr><td>Interpolation</td><td>How to invent pixel values when resizing</td></tr><tr><td>Histogram</td><td>Count of how many pixels have each grey level</td></tr></tbody></table></div>
+<p>Why several colour spaces? RGB mixes brightness and colour together, so "find the red apple under a shadow" is awkward. <strong>HSV</strong> separates them: Hue is the colour angle (0° red, 120° green, 240° blue), Saturation is how vivid (0 grey to 1 pure), Value is brightness. A colour rule on hue survives lighting changes better. <strong>Lab</strong> is designed so that distance between two Lab numbers matches how different the colours look to a human, so it is used for colour matching. OpenCV note: it loads images in <strong>BGR</strong> order, not RGB. Mixing the two up gives blue faces and is one of the most common bugs.</p>
+<p class="problem"><span class="pl">Problem 8.1.1</span> Convert the RGB pixel <code>(200, 100, 50)</code> to grey using the standard luma weights <code>0.299, 0.587, 0.114</code>, and to HSV.</p>
+<table class="steps"><tr><th>Formula</th><td>grey <code>= 0.299·R + 0.587·G + 0.114·B</code>. HSV: <code>V = max</code>, <code>S = (max − min)/max</code>, <code>H = 60° × ((G − B)/(max − min))</code> when red is the max.</td></tr><tr><th>Compute grey</th><td><code>0.299 × 200 = 59.8</code>, <code>0.587 × 100 = 58.7</code>, <code>0.114 × 50 = 5.7</code>; sum <code>124.2</code>.</td></tr><tr><th>Compute HSV</th><td><code>max = 200</code>, <code>min = 50</code>, so <code>V = 200/255 = 0.7843</code>, <code>S = 150/200 = 0.75</code>, <code>H = 60 × (50/150) = 20°</code>.</td></tr><tr><th>Answer</th><td>Grey is 124.2. In HSV: hue 20° (orange), saturation 0.75, value 0.784.</td></tr><tr><th>Check</th><td>The code below prints <code>gray 124.2</code> and <code>hsv [0.0556, 0.75, 0.7843]</code> (<code>0.0556 × 360 = 20°</code>, Python's <code>colorsys</code> uses 0 to 1 for hue).</td></tr><tr><th>Interpretation</th><td>Green gets the biggest weight (0.587) because human eyes are most sensitive to green. A plain average <code>(200+100+50)/3 = 116.7</code> would look slightly wrong.</td></tr></table>
+<p class="problem"><span class="pl">Problem 8.1.2</span> Resize the 2×2 image <code>[[10, 20], [30, 40]]</code> to 3×3 by nearest neighbour and by bilinear interpolation.</p>
+<table class="steps"><tr><th>Nearest</th><td>each new pixel copies the closest old pixel. Rows and columns map to old indices <code>0, 0, 1</code> (pixel positions <code>0, 0.5, 1</code> round to <code>0, 0, 1</code> with ties going down), giving <code>[[10,10,20],[10,10,20],[30,30,40]]</code>.</td></tr><tr><th>Bilinear</th><td>a new pixel at fractional position is a weighted average of the 4 nearest old pixels. The centre <code>(0.5, 0.5)</code> has weights <code>0.25</code> each: <code>0.25 × (10 + 20 + 30 + 40) = 25</code>. The top-middle <code>(0, 0.5)</code> is half of <code>10</code> and half of <code>20</code>: <code>15</code>.</td></tr><tr><th>Answer</th><td>Bilinear gives <code>[[10,15,20],[20,25,30],[30,35,40]]</code>: a smooth ramp. Nearest gives blocks.</td></tr><tr><th>Check</th><td>The output below matches. Also, rotating with <code>np.rot90</code> and flipping with <code>m[::-1]</code> are one-line index changes.</td></tr><tr><th>Interpretation</th><td>Nearest is fastest and keeps hard edges (good for label masks, where you must not invent class 1.5). Bilinear or bicubic is smoother (good for photos). Shrinking a photo a lot needs area averaging (OpenCV <code>INTER_AREA</code>) or you get jagged aliasing.</td></tr></table>
+<p>Before you run it, predict: what does <code>np.rot90</code> do to a 2×3 array: what shape comes out?</p>
+<pre class="code lang-python"><code>import colorsys
+px = np.array([200, 100, 50.])
+print("gray", round(float(px @ np.array([0.299, 0.587, 0.114])), 2))
+print("hsv", [round(float(v), 4) for v in colorsys.rgb_to_hsv(*(px / 255))])
+
+a = np.array([[10., 20.], [30., 40.]])
+def bilinear(a, H, W):
+    h, w = a.shape; out = np.zeros((H, W))
+    for i in range(H):
+        for j in range(W):
+            y = i * (h - 1) / (H - 1); x = j * (w - 1) / (W - 1)
+            y0, x0 = int(np.floor(y)), int(np.floor(x))
+            y1, x1 = min(y0 + 1, h - 1), min(x0 + 1, w - 1)
+            fy, fx = y - y0, x - x0
+            out[i, j] = (a[y0,x0]*(1-fy)*(1-fx) + a[y0,x1]*(1-fy)*fx
+                         + a[y1,x0]*fy*(1-fx) + a[y1,x1]*fy*fx)
+    return out
+print(bilinear(a, 3, 3))
+print(a[np.ix_([0, 0, 1], [0, 0, 1])])      # nearest-neighbour 2x2 -&gt; 3x3 (rows/cols 0,0,1)
+
+m = np.arange(6).reshape(2, 3)
+print(np.rot90(m)); print(m[::-1])</code></pre>
+<pre class="code lang-text"><code>gray 124.2
+hsv [0.0556, 0.75, 0.7843]
+[[10. 15. 20.]
+ [20. 25. 30.]
+ [30. 35. 40.]]
+[[10. 10. 20.]
+ [10. 10. 20.]
+ [30. 30. 40.]]
+[[2 5]
+ [1 4]
+ [0 3]]
+[[3 4 5]
+ [0 1 2]]</code></pre>
+<p><strong>Line by line.</strong> <code>colorsys.rgb_to_hsv</code> takes values in 0 to 1, so we divide by 255. <code>bilinear</code> maps new index <code>i</code> of <code>H</code> to the old coordinate <code>y = i·(h−1)/(H−1)</code> (so the corners line up), takes the four neighbours <code>(y0,x0), (y0,x1), (y1,x0), (y1,x1)</code> and weights each by how close it is: <code>(1−fy)(1−fx)</code> and so on. <code>np.rot90</code> of a <code>(2,3)</code> array gives shape <code>(3,2)</code>, rotating counter-clockwise.</p>
+<h3>Histogram equalization: using the whole range</h3>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A foggy photo uses only grey levels 100 to 140. All the detail is squeezed into a narrow band. Equalization spreads the levels out so the busy band uses the whole 0 to 255 range, like re-scaling a chart axis that was too tight.</div></div>
+<p><strong>Rule:</strong> compute the histogram, then the cumulative histogram (the CDF: running total of counts). Map each level <code>v</code> to <code>round((cdf(v) − cdf_min) / (N − cdf_min) × (L − 1))</code>, where <code>N</code> is the number of pixels, <code>cdf_min</code> the smallest non-zero CDF value and <code>L</code> the number of levels.</p>
+<p class="problem"><span class="pl">Problem 8.1.3</span> A 4×4 image has only grey levels 1, 2, 3, 4 (on a scale of 8 levels, 0 to 7): rows <code>[1,1,2,2]</code>, <code>[1,2,2,3]</code>, <code>[2,2,3,3]</code>, <code>[2,3,3,4]</code>. Equalize it.</p>
+<table class="steps"><tr><th>Step 1</th><td>Counts: level 1 appears 3 times, level 2 appears 7, level 3 appears 5, level 4 appears 1. Total <code>3+7+5+1 = 16</code>.</td></tr><tr><th>Step 2</th><td>CDF: level 1: 3, level 2: 10, level 3: 15, level 4: 16. <code>cdf_min = 3</code>, <code>N = 16</code>.</td></tr><tr><th>Step 3</th><td>Map level 1: <code>(3−3)/(16−3) × 7 = 0</code>. Level 2: <code>7/13 × 7 = 3.77 → 4</code>. Level 3: <code>12/13 × 7 = 6.46 → 6</code>. Level 4: <code>13/13 × 7 = 7</code>.</td></tr><tr><th>Answer</th><td>Levels <code>1,2,3,4</code> become <code>0,4,6,7</code>: the image now spans the full 0 to 7 range.</td></tr><tr><th>Check</th><td>The mapping is monotone (order of brightness preserved), and the code prints <code>lut [0 0 4 6 7 7 7 7]</code>.</td></tr><tr><th>Interpretation</th><td>Contrast increased without losing the order of brightness. Use it for faint medical or surveillance images. Do not use it blindly before a CNN: it changes the statistics the network was trained on. For uneven contrast, CLAHE (<code>cv2.createCLAHE</code>, equalization on small tiles with a clip limit) is the usual choice.</td></tr></table>
+<pre class="code lang-python"><code>im = np.array([[1,1,2,2],[1,2,2,3],[2,2,3,3],[2,3,3,4]])   # 4x4 image, gray levels 0..7
+cnt = np.bincount(im.ravel(), minlength=8); cdf = cnt.cumsum()
+print("counts", cnt); print("cdf   ", cdf)
+cmin = cdf[cdf &gt; 0].min(); n = im.size
+lut = np.round((cdf - cmin) / (n - cmin) * 7).astype(int); lut[cdf == 0] = 0
+print("lut   ", lut)
+print(lut[im])</code></pre>
+<pre class="code lang-text"><code>counts [0 3 7 5 1 0 0 0]
+cdf    [ 0  3 10 15 16 16 16 16]
+lut    [0 0 4 6 7 7 7 7]
+[[0 0 4 4]
+ [0 4 4 6]
+ [4 4 6 6]
+ [4 6 6 7]]</code></pre>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>BGR versus RGB</td><td><code>cv2.cvtColor(img, cv2.COLOR_BGR2RGB)</code> (not run here)</td><td>First bug in every OpenCV to PyTorch pipeline</td></tr><tr><td>HSV threshold</td><td>hue 0 to 10 and 170 to 180 (OpenCV scale) = red</td><td>Colour-based sorting, traffic light colour checks</td></tr><tr><td>Resize with <code>INTER_AREA</code></td><td>shrink a 4000 px photo to 224 px</td><td>Preprocessing before any CNN</td></tr><tr><td>Histogram</td><td>grey-level counts</td><td>Quick quality checks: is the image too dark or saturated?</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Computer vision:</strong> every pipeline starts with load, resize, colour conversion, normalise.</li><li><strong>Data engineering / MLOps:</strong> image quality gates (is the histogram all black? is the image blurry?) before images enter a training set.</li><li><strong>Document AI:</strong> convert scans to grey and equalise before OCR (see Chapter 9).</li><li><strong>Medical imaging:</strong> contrast enhancement of X-rays.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Treating <code>uint8</code> arithmetic as normal. In NumPy <code>np.uint8(250) + np.uint8(10)</code> wraps to <code>4</code>, not <code>260</code>. Convert to float first (<code>img.astype(np.float32)</code>), or use <code>np.clip</code>. Also keep track of array shape order: OpenCV is <code>(H, W, C)</code>, PyTorch <code>(C, H, W)</code>.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is the grey value of pure white <code>(255,255,255)</code> with luma weights? Answer: <code>255 × (0.299+0.587+0.114) = 255</code>.</li><li>Why prefer nearest-neighbour resizing for segmentation masks? Answer: it never creates new, invalid class numbers.</li><li>Which colour space separates brightness from colour? Answer: HSV (Value) or Lab (L).</li></ol>
+<h2 id="s2-8-2-filtering-blur-median-and-sharpen">8.2 Filtering: Blur, Median and Sharpen</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Noise is like a bad phone line: random crackle on top of the voice. Averaging a pixel with its neighbours cancels the crackle (blur). But averaging also smears real edges, and a single very loud pop (a dead pixel) ruins the average. Taking the middle value instead (median) ignores the pop. Sharpening is the opposite move: exaggerate what differs from the neighbours.</div></div>
+<h3>How it works</h3>
+<p>You already know convolution from Chapter 6: slide a kernel over the image and add up products. The kernel decides the effect:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Filter</th><th>Kernel (3×3)</th><th>Effect</th></tr></thead><tbody><tr><td>Mean (box) blur</td><td>all <code>1/9</code></td><td>equal average of neighbours</td></tr><tr><td>Gaussian blur</td><td><code>[[1,2,1],[2,4,2],[1,2,1]] / 16</code></td><td>centre pixel counts more; smoother, fewer artefacts</td></tr><tr><td>Sharpen</td><td><code>[[0,−1,0],[−1,5,−1],[0,−1,0]]</code></td><td>centre boosted, neighbours subtracted</td></tr><tr><td>Median</td><td>not a convolution</td><td>sort the 9 values, take the 5th</td></tr></tbody></table></div>
+<p>The <strong>Gaussian</strong> kernel follows the bell curve <code>exp(−d²/2σ²)</code>; a larger <code>σ</code> (sigma) blurs more. Its weights always add up to 1 so brightness is preserved. The <strong>median</strong> filter is non-linear (it cannot be written as a kernel) but is the best tool for salt-and-pepper noise (random pure white and black dots).</p>
+<p class="problem"><span class="pl">Problem 8.2.1</span> A 3×3 patch has a noise spike in the centre: <code>[[10,20,30],[40,250,60],[70,80,90]]</code>. Compute the centre output of the mean filter, the 3×3 Gaussian and the median.</p>
+<table class="steps"><tr><th>Mean</th><td>sum <code>= 10+20+30+40+250+60+70+80+90 = 650</code>; <code>650/9 = 72.22</code>.</td></tr><tr><th>Gaussian</th><td>weighted sum: row 1 <code>1·10 + 2·20 + 1·30 = 80</code>; row 2 <code>2·40 + 4·250 + 2·60 = 80 + 1000 + 120 = 1200</code>; row 3 <code>1·70 + 2·80 + 1·90 = 320</code>. Total <code>1600</code>, divided by 16 gives <code>100</code>.</td></tr><tr><th>Median</th><td>sorted values <code>10, 20, 30, 40, 60, 70, 80, 90, 250</code>; the 5th is <code>60</code>.</td></tr><tr><th>Answer</th><td>Mean 72.22, Gaussian 100, median 60.</td></tr><tr><th>Check</th><td>The neighbours are between 10 and 90, so the "true" centre should be near 50. The median (60) is closest. The Gaussian is worst because it gives the spike weight 4/16.</td></tr><tr><th>Interpretation</th><td>Linear filters spread an outlier into its neighbours; the median rejects it. This is the same reason a typical house price is reported as a median: a few extreme values distort the mean but not the middle value.</td></tr></table>
+<p class="problem"><span class="pl">Problem 8.2.2</span> Sharpen: a flat patch of value 10 with one centre pixel of 50. Apply the sharpen kernel.</p>
+<table class="steps"><tr><th>Formula</th><td><code>5 × centre − (up + down + left + right)</code>.</td></tr><tr><th>Compute</th><td><code>5 × 50 − (10 + 10 + 10 + 10) = 250 − 40 = 210</code>.</td></tr><tr><th>Answer</th><td>The centre becomes 210: a faint bump of 40 above its surroundings turns into a strong peak.</td></tr><tr><th>Check</th><td>On a perfectly flat region of 10s: <code>5 × 10 − 40 = 10</code>, unchanged. Sharpening only changes places where neighbours differ.</td></tr><tr><th>Interpretation</th><td>Sharpening amplifies noise as well as detail. Values above 255 must be clipped. Unsharp masking (<code>original + amount × (original − blurred)</code>) is the common practical form.</td></tr></table>
+<p>Before you run it, predict: which filter will give the smallest error on salt-and-pepper noise: Gaussian or median?</p>
+<pre class="code lang-python"><code>patch = np.array([[10,20,30],[40,250,60],[70,80,90]], float)   # 250 is a bright noise spike
+mean_k = np.ones((3,3)) / 9
+gauss_k = np.array([[1,2,1],[2,4,2],[1,2,1]]) / 16
+sharp_k = np.array([[0,-1,0],[-1,5,-1],[0,-1,0]], float)
+print("mean  ", round(float((patch * mean_k).sum()), 2))
+print("gauss ", float((patch * gauss_k).sum()))
+print("median", float(np.median(patch)))
+print("sharp on flat 10 with centre 50:", float((np.array([[10,10,10],[10,50,10],[10,10,10]]) * sharp_k).sum()))</code></pre>
+<pre class="code lang-text"><code>mean   72.22
+gauss  100.0
+median 60.0
+sharp on flat 10 with centre 50: 210.0</code></pre>
+<p>Now a whole image: a dark floor (40) with a bright square (200), corrupted two ways. We measure the mean absolute error against the clean image (lower is better).</p>
+<pre class="code lang-python"><code>rng = np.random.default_rng(1)
+img = np.full((16, 16), 40.0); img[4:12, 4:12] = 200          # clean: dark floor, bright square
+gaussian_noisy = np.clip(img + rng.normal(0, 25, img.shape), 0, 255)
+g = np.exp(-(np.arange(5) - 2) ** 2 / (2 * 1.0 ** 2)); G = np.outer(g, g); G /= G.sum()   # 5x5 Gaussian, sigma 1
+print(G.round(4)); print("sum of weights", round(float(G.sum()), 4))
+def median(x, k=3):
+    p = k // 2; xp = np.pad(x, p, mode='edge'); out = np.zeros_like(x)
+    for i in range(x.shape[0]):
+        for j in range(x.shape[1]): out[i, j] = np.median(xp[i:i+k, j:j+k])
+    return out
+sp = img.copy(); idx = rng.choice(256, 20, replace=False)
+sp.flat[idx] = 255 * rng.integers(0, 2, 20)                   # 20 salt-and-pepper pixels
+err = lambda a: round(float(np.abs(a - img).mean()), 2)       # mean absolute error vs clean
+print("gaussian noise : noisy", err(gaussian_noisy), "| gauss blur", err(conv2d(gaussian_noisy, G)), "| median", err(median(gaussian_noisy)))
+print("salt &amp; pepper  : noisy", err(sp), "| gauss blur", err(conv2d(sp, G)), "| median", err(median(sp)))</code></pre>
+<pre class="code lang-text"><code>[[0.003  0.0133 0.0219 0.0133 0.003 ]
+ [0.0133 0.0596 0.0983 0.0596 0.0133]
+ [0.0219 0.0983 0.1621 0.0983 0.0219]
+ [0.0133 0.0596 0.0983 0.0596 0.0133]
+ [0.003  0.0133 0.0219 0.0133 0.003 ]]
+sum of weights 1.0
+gaussian noise : noisy 17.26 | gauss blur 15.61 | median 10.78
+salt &amp; pepper  : noisy 12.01 | gauss blur 21.92 | median 2.5</code></pre>
+<p><strong>Reading the result.</strong> For Gaussian noise, blur helps a little (17.26 to 15.61) and median helps more (10.78); both smooth noise but both soften the square's edges, which is where the remaining error is. For salt-and-pepper noise, Gaussian blur makes things <em>worse</em> (12.01 to 21.92) because each extreme dot is smeared over 25 pixels, while the median removes the dots almost completely (2.50). Remember this rule: <strong>Gaussian for gentle sensor noise, median for impulse noise.</strong> Other options exist (bilateral filter and non-local means keep edges better; OpenCV: <code>cv2.GaussianBlur</code>, <code>cv2.medianBlur</code>, <code>cv2.bilateralFilter</code>, <code>cv2.filter2D</code> for any custom kernel; not run here).</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>cv2.GaussianBlur(img, (5,5), 1.0)</code></td><td>5×5 kernel, σ = 1</td><td>Denoising before edge detection or thresholding (not run here)</td></tr><tr><td><code>cv2.medianBlur(img, 3)</code></td><td>3×3 median</td><td>Removing dead pixels and scanner dust</td></tr><tr><td>Gaussian kernel sum = 1</td><td><code>sum of weights 1.0</code></td><td>Keeps overall brightness unchanged</td></tr><tr><td>Blur as data augmentation</td><td>random blur in training</td><td>Robustness to out-of-focus cameras (Chapter 7)</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Computer vision:</strong> pre-filtering before edges, thresholding, feature matching.</li><li><strong>Industrial inspection:</strong> blur a textured surface so only real scratches stand out.</li><li><strong>Medical imaging:</strong> denoise noisy low-dose scans.</li><li><strong>Deep learning:</strong> the first conv layers of a CNN often learn blur-like and sharpen-like kernels; Gaussian-blurred images are also used as augmentation.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using a big blur to "remove noise" and then wondering why small defects disappeared. Blur removes fine detail too. Choose the smallest kernel that works, and compare the result visually. Also check the kernel size is odd (3, 5, 7) so it has a centre pixel.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Do the Gaussian kernel weights add up to 1? Answer: yes, so the average brightness stays the same.</li><li>Which filter handles a single burnt-out pixel best? Answer: the median filter.</li><li>Sharpen kernel on a flat region: what happens? Answer: nothing, the output equals the input.</li></ol>
+<h2 id="s3-8-3-edge-detection-sobel-canny-and-hough">8.3 Edge Detection: Sobel, Canny and Hough</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">An edge is a place where brightness changes fast, like a cliff on a height map. The slope (gradient) tells you two things: how steep (magnitude) and which way (direction). A Sobel filter measures slope with two small kernels, one for left-to-right change and one for top-to-bottom change.</div></div>
+<h3>How it works</h3>
+<p>The two <strong>Sobel</strong> kernels:</p>
+<pre class="code lang-text"><code>Kx = [[-1, 0, 1],      Ky = [[-1, -2, -1],
+      [-2, 0, 2],             [ 0,  0,  0],
+      [-1, 0, 1]]             [ 1,  2,  1]]</code></pre>
+<p><code>Kx</code> responds to vertical edges (brightness changing left to right), <code>Ky</code> to horizontal edges. The middle row/column has weight 2: it is a small smoothing built into the derivative. With <code>gx</code> and <code>gy</code> the two responses, <strong>magnitude</strong> <code>= √(gx² + gy²)</code> and <strong>direction</strong> <code>= atan2(gy, gx)</code>.</p>
+<p class="problem"><span class="pl">Problem 8.3.1</span> Apply Sobel to a 5×5 patch whose every row is <code>[10, 10, 50, 50, 50]</code> (dark left, bright right). Find <code>gx</code>, <code>gy</code>, the magnitude and the direction at each of the three window positions across.</p>
+<table class="steps"><tr><th>Step 1</th><td>Window over columns 0 to 2: each row is <code>(10, 10, 50)</code>. <code>Kx</code> row <code>(−1, 0, 1)</code> gives <code>−10 + 0 + 50 = 40</code>. The three rows carry weights 1, 2, 1, so <code>gx = 40 × (1 + 2 + 1) = 160</code>.</td></tr><tr><th>Step 2</th><td>Window over columns 1 to 3: rows <code>(10, 50, 50)</code> give <code>−10 + 50 = 40</code>, so <code>gx = 160</code>.</td></tr><tr><th>Step 3</th><td>Window over columns 2 to 4: rows <code>(50, 50, 50)</code> give <code>−50 + 50 = 0</code>, so <code>gx = 0</code>.</td></tr><tr><th>Step 4</th><td><code>gy</code>: every column is constant down the rows, so <code>Ky</code> gives <code>0</code> everywhere.</td></tr><tr><th>Answer</th><td>Magnitude <code>160, 160, 0</code> with direction <code>0°</code> (the gradient points to the right, towards brighter pixels).</td></tr><tr><th>Check</th><td>The code below prints the same numbers. A step of height 40 produced a response of 160 because the Sobel weights add to 4.</td></tr><tr><th>Interpretation</th><td>The response is large exactly at the cliff and zero on the flat area, as intended. The edge is two pixels wide because the 3×3 window straddles the cliff for two positions: this is why Canny adds a thinning step.</td></tr></table>
+<pre class="code lang-python"><code>patch = np.array([[10,10,50,50,50]] * 5, float)               # dark left, bright right
+Kx = np.array([[-1,0,1],[-2,0,2],[-1,0,1]], float); Ky = Kx.T
+def valid(x, k):
+    kh, kw = k.shape
+    return np.array([[(x[i:i+kh, j:j+kw] * k).sum() for j in range(x.shape[1]-kw+1)]
+                     for i in range(x.shape[0]-kh+1)])
+gx, gy = valid(patch, Kx), valid(patch, Ky)
+print("gx\n", gx); print("gy\n", gy)
+print("magnitude row 0:", np.hypot(gx, gy)[0], " angle row 0:", np.degrees(np.arctan2(gy, gx))[0])</code></pre>
+<pre class="code lang-text"><code>gx
+ [[160. 160.   0.]
+ [160. 160.   0.]
+ [160. 160.   0.]]
+gy
+ [[0. 0. 0.]
+ [0. 0. 0.]
+ [0. 0. 0.]]
+magnitude row 0: [160. 160.   0.]  angle row 0: [0. 0. 0.]</code></pre>
+<h3>Noise breaks edge detectors: blur first</h3>
+<p>Derivatives amplify noise (a random jump looks like a cliff). So we blur first. On the 16×16 square image with strong noise (σ = 50 grey levels), we flag pixels with magnitude above 300 and compare with the true edge pixels (found on the clean image).</p>
+<p>Before you run it, predict: how many false alarms with and without blur?</p>
+<pre class="code lang-python"><code>Kx = np.array([[-1,0,1],[-2,0,2],[-1,0,1]], float); Ky = Kx.T
+rng = np.random.default_rng(1)
+img = np.full((16, 16), 40.0); img[4:12, 4:12] = 200
+noisy = np.clip(img + rng.normal(0, 50, img.shape), 0, 255)     # strong noise
+g = np.exp(-(np.arange(5) - 2) ** 2 / 2.0); G = np.outer(g, g); G /= G.sum()
+mag = lambda x: np.hypot(conv2d(x, Kx), conv2d(x, Ky))
+true_edge = mag(img) &gt; 300
+for name, x in [("no blur", noisy), ("blur first", conv2d(noisy, G))]:
+    pred = mag(x) &gt; 300
+    print(f"{name:10s} flagged {pred.sum():3d} | true edge pixels {true_edge.sum()} | hit {(pred &amp; true_edge).sum()} | false alarms {(pred &amp; ~true_edge).sum()}")
+show(mag(conv2d(noisy, G)) &gt; 300, ".#")</code></pre>
+<pre class="code lang-text"><code>no blur    flagged  79 | true edge pixels 60 | hit 58 | false alarms 21
+blur first flagged  56 | true edge pixels 60 | hit 56 | false alarms 0
+................................
+................................
+................................
+........################........
+........##################......
+......####............####......
+......####............####......
+......####..............##......
+......####..............##......
+......####............####......
+......####............####......
+......####################......
+........##############..........
+................................
+................................
+................................</code></pre>
+<p><strong>Line by line.</strong> <code>mag</code> is the Sobel magnitude. <code>true_edge</code> is the ground truth from the clean image (60 pixels). Without blur, noise makes 21 pixels look like edges that are not. With the Gaussian blur first there are 0 false alarms, and 56 of 60 true edge pixels are found. The picture shows the square outline (a few pixels thick, because of the 3×3 window and the blur). The cost of blurring is a slightly thicker, slightly less exact edge.</p>
+<h3>Canny and Hough in words</h3>
+<p><strong>Canny</strong> (the standard edge detector, <code>cv2.Canny(img, low, high)</code>, not run here) is Sobel plus four steps:</p>
+<ol><li><strong>Blur</strong> with a Gaussian to suppress noise.</li><li><strong>Gradient</strong> magnitude and direction with Sobel.</li><li><strong>Non-maximum suppression:</strong> at each pixel compare the magnitude with its two neighbours <em>along the gradient direction</em>; keep it only if it is the largest. This thins the thick edge to one pixel.</li><li><strong>Hysteresis thresholding:</strong> two thresholds, <code>high</code> and <code>low</code>. Pixels above <code>high</code> are certainly edges. Pixels between <code>low</code> and <code>high</code> are kept only if connected to a certain edge. This keeps long faint edges and drops isolated specks.</li></ol>
+<p>Typical settings: <code>low</code> about one half to one third of <code>high</code>.</p>
+<p><strong>Hough transform</strong> finds straight lines from edge points. A line can be written <code>ρ = x·cos θ + y·sin θ</code> (<code>ρ</code> is the distance from the origin, <code>θ</code> the angle of its normal). Each edge point votes for every <code>(ρ, θ)</code> pair it could lie on. A real line collects many votes at one <code>(ρ, θ)</code>.</p>
+<p class="problem"><span class="pl">Problem 8.3.2</span> Ten edge points lie on the diagonal <code>y = x</code> at <code>(0,0), (1,1), ..., (9,9)</code>. Show how Hough voting finds the line.</p>
+<table class="steps"><tr><th>Formula</th><td><code>ρ = x·cos θ + y·sin θ</code>.</td></tr><tr><th>Step 1</th><td>For <code>θ = 135°</code>: <code>cos θ = −0.7071</code>, <code>sin θ = 0.7071</code>. Point <code>(k, k)</code> gives <code>ρ = −0.7071k + 0.7071k = 0</code> for every <code>k</code>.</td></tr><tr><th>Step 2</th><td>So all 10 points vote for the same cell <code>(ρ = 0, θ = 135°)</code>.</td></tr><tr><th>Step 3</th><td>For <code>θ = 0°</code>: <code>ρ = x</code>, giving 10 different values, one vote each. Same idea for 45° and 90°.</td></tr><tr><th>Answer</th><td>The cell <code>(0, 135°)</code> gets 10 votes, all others get 1, so the line <code>y = x</code> is detected.</td></tr><tr><th>Check</th><td>The code prints <code>angle 135 most votes for one rho: 10 (rho = 0.0)</code> and 1 for the other angles.</td></tr><tr><th>Interpretation</th><td>Voting makes the method robust: missing points or a few stray points do not matter. Real use: lane lines, document edges (<code>cv2.HoughLinesP</code>), circles (<code>cv2.HoughCircles</code>).</td></tr></table>
+<pre class="code lang-python"><code>im = np.zeros((10, 10))
+for i in range(10): im[i, i] = 1                              # one diagonal line y = x
+ys, xs = np.where(im &gt; 0)
+for deg in (0, 45, 90, 135):
+    t = np.deg2rad(deg); rho = np.round(xs * np.cos(t) + ys * np.sin(t), 6)
+    vals, c = np.unique(rho, return_counts=True)
+    print("angle", deg, "most votes for one rho:", int(c.max()), "(rho =", float(vals[c.argmax()]), ")")</code></pre>
+<pre class="code lang-text"><code>angle 0 most votes for one rho: 1 (rho = 0.0 )
+angle 45 most votes for one rho: 1 (rho = 0.0 )
+angle 90 most votes for one rho: 1 (rho = 0.0 )
+angle 135 most votes for one rho: 10 (rho = 0.0 )</code></pre>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Sobel magnitude</td><td>160 for a 40-step edge</td><td>Quick edge map, blur or focus measure</td></tr><tr><td>Canny <code>(100, 200)</code></td><td>low and high thresholds</td><td>Contour extraction for shape analysis</td></tr><tr><td>Variance of the Laplacian</td><td>low value means blurry</td><td>Rejecting out-of-focus images in a data pipeline</td></tr><tr><td>Hough lines</td><td><code>(ρ, θ)</code> per line</td><td>Straightening scanned documents, lane detection</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Document AI:</strong> find page edges and skew angle before OCR.</li><li><strong>Robotics and driving:</strong> lane lines with Canny plus Hough.</li><li><strong>Manufacturing:</strong> measure part dimensions from edge positions.</li><li><strong>Deep learning:</strong> the first layers of a CNN learn Sobel-like kernels by themselves; classic edges are sometimes fed as an extra input channel.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Choosing the Canny thresholds by guessing and changing them per image. Fix one pair on a representative set, and fix lighting at capture time if you can. If thresholds keep changing between images, the problem is probably better solved by a CNN.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What do <code>gx</code> and <code>gy</code> measure? Answer: brightness change along x (left to right) and along y (top to bottom).</li><li>Why blur before Sobel? Answer: derivatives amplify noise, so noise creates false edges.</li><li>What does non-maximum suppression do? Answer: thins edges to one pixel by keeping only the local peak along the gradient direction.</li></ol>
+<h2 id="s4-8-4-thresholding-morphology-and-connected-components">8.4 Thresholding, Morphology and Connected Components</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You want a mask: white where the object is, black elsewhere. The simplest way is to pick a brightness cut-off. Then the mask is rough: it has holes and speckles. Morphology is "tidying with a small stamp": remove specks, fill holes. Finally you count and measure the white blobs, like counting coins on a table.</div></div>
+<h3>Thresholding</h3>
+<p>A <strong>threshold</strong> <code>T</code> turns grey into black and white: <code>mask = pixel &gt; T</code>. The question is how to pick <code>T</code> automatically.</p>
+<p><strong>Otsu's method</strong> looks at the histogram and picks the <code>T</code> that best separates two groups. For each candidate <code>T</code>, split pixels into class 0 (<code>≤ T</code>) and class 1 (<code>&gt; T</code>), and compute the <strong>between-class variance</strong> <code>σb² = w0 · w1 · (mean0 − mean1)²</code>, where <code>w0</code> and <code>w1</code> are the fractions of pixels in each class. Pick the <code>T</code> that makes this biggest: the two groups are far apart and balanced.</p>
+<p class="problem"><span class="pl">Problem 8.4.1</span> A tiny image has 6 grey levels 0 to 5 with counts <code>[8, 12, 5, 3, 10, 14]</code> (total 52). Find Otsu's threshold.</p>
+<table class="steps"><tr><th>Formula</th><td><code>σb² = w0 · w1 · (mean0 − mean1)²</code>.</td></tr><tr><th>Step 1</th><td><code>T = 2</code> (class 0 is levels 0 to 2): pixels <code>8 + 12 + 5 = 25</code>, <code>w0 = 25/52 = 0.481</code>, <code>w1 = 0.519</code>. <code>mean0 = (0·8 + 1·12 + 2·5)/25 = 22/25 = 0.88</code>. <code>mean1 = (3·3 + 4·10 + 5·14)/27 = 119/27 = 4.407</code>.</td></tr><tr><th>Step 2</th><td><code>σb² = 0.481 × 0.519 × (0.88 − 4.407)² = 0.2497 × 12.44 = 3.106</code>.</td></tr><tr><th>Step 3</th><td>Repeat for the other <code>T</code> (the code does it): <code>T = 0</code> gives 1.337, <code>T = 1</code> 2.787, <code>T = 3</code> 3.003, <code>T = 4</code> 1.929.</td></tr><tr><th>Answer</th><td><code>T = 2</code> has the largest value (3.106), so Otsu chooses it: levels 0 to 2 become black, 3 to 5 become white.</td></tr><tr><th>Check</th><td>The histogram has two clumps (levels 0 to 2 and levels 4 to 5), and the cut falls in the valley between them. <code>T = 3</code> is very close (3.003), as the valley is shallow.</td></tr><tr><th>Interpretation</th><td>Otsu needs no manual tuning, but it assumes a two-clump histogram and <em>even lighting</em>.</td></tr></table>
+<pre class="code lang-python"><code>cnt = np.array([8, 12, 5, 3, 10, 14.]); lv = np.arange(6); tot = cnt.sum()
+for t in range(5):                                            # class 0 = levels &lt;= t
+    w0 = cnt[:t+1].sum() / tot; w1 = 1 - w0
+    m0 = (cnt[:t+1] * lv[:t+1]).sum() / cnt[:t+1].sum()
+    m1 = (cnt[t+1:] * lv[t+1:]).sum() / cnt[t+1:].sum()
+    print(f"t={t} w0={w0:.3f} mean0={m0:.3f} mean1={m1:.3f} between-class variance={w0*w1*(m0-m1)**2:.3f}")</code></pre>
+<pre class="code lang-text"><code>t=0 w0=0.154 mean0=0.000 mean1=3.205 between-class variance=1.337
+t=1 w0=0.385 mean0=0.600 mean1=4.031 between-class variance=2.787
+t=2 w0=0.481 mean0=0.880 mean1=4.407 between-class variance=3.106
+t=3 w0=0.538 mean0=1.107 mean1=4.583 between-class variance=3.003
+t=4 w0=0.731 mean0=1.868 mean1=5.000 between-class variance=1.929</code></pre>
+<p><strong>Adaptive thresholding</strong> compares each pixel with the average of its own neighbourhood (<code>pixel &gt; local mean + c</code>), so it survives lighting that changes across the image (a page photographed under a window). In the test below, a bright object on dark paper is photographed under even light and then with a brightness ramp added across the width.</p>
+<p>Before you run it, predict: how much does a single global threshold suffer when the light is uneven?</p>
+<pre class="code lang-python"><code>def otsu(x):
+    p = np.bincount(x.ravel().astype(int), minlength=256) / x.size
+    best, bt = -1, 0
+    for t in range(255):
+        w0 = p[:t+1].sum(); w1 = 1 - w0
+        if w0 == 0 or w1 == 0: continue
+        m0 = (p[:t+1] * np.arange(t+1)).sum() / w0
+        m1 = (p[t+1:] * np.arange(t+1, 256)).sum() / w1
+        s = w0 * w1 * (m0 - m1) ** 2
+        if s &gt; best: best, bt = s, t
+    return bt
+def adaptive(x, k=9, c=5):                                    # pixel &gt; local mean + c
+    p = k // 2; xp = np.pad(x, p, mode='edge'); out = np.zeros(x.shape, bool)
+    for i in range(x.shape[0]):
+        for j in range(x.shape[1]): out[i, j] = x[i, j] &gt; xp[i:i+k, j:j+k].mean() + c
+    return out
+rng = np.random.default_rng(2)
+img = np.full((20, 20), 60.0); img[5:15, 5:15] = 180          # dark paper, bright object
+truth = img &gt; 100
+even = np.clip(img + rng.normal(0, 20, img.shape), 0, 255)
+t = otsu(even); print("even light  : otsu threshold", t, "accuracy", ((even &gt; t) == truth).mean())
+ramp = np.linspace(0, 120, 20)[None, :] * np.ones((20, 1))   # lighting gets brighter to the right
+uneven = np.clip(img + ramp + rng.normal(0, 10, img.shape), 0, 255)
+t2 = otsu(uneven); print("uneven light: otsu threshold", t2, "accuracy", round(float(((uneven &gt; t2) == truth).mean()), 3))
+print("uneven light: adaptive accuracy", round(float((adaptive(uneven) == truth).mean()), 3))</code></pre>
+<pre class="code lang-text"><code>even light  : otsu threshold 111 accuracy 1.0
+uneven light: otsu threshold 151 accuracy 0.777
+uneven light: adaptive accuracy 0.902</code></pre>
+<p><strong>Reading the result.</strong> With even light Otsu is perfect (threshold 111, between the paper at 60 and the object at 180). With a brightness ramp the global threshold (151) wrongly turns dark paper on the bright side white, and accuracy falls to 77.7%. The adaptive version reaches 90.2%. It is not perfect (the interior of a big bright region can fall below its own local mean), but it is far better. OpenCV: <code>cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)</code> and <code>cv2.adaptiveThreshold</code> (not run here).</p>
+<h3>Morphological operations</h3>
+<p>Morphology works on binary masks with a small <strong>structuring element</strong> (here a 3×3 square).</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Operation</th><th>Rule</th><th>Effect</th></tr></thead><tbody><tr><td>Erosion</td><td>pixel stays white only if all its 3×3 neighbours are white</td><td>shrinks objects, removes specks</td></tr><tr><td>Dilation</td><td>pixel becomes white if any neighbour is white</td><td>grows objects, fills small gaps</td></tr><tr><td>Opening</td><td>erosion then dilation</td><td>removes small specks, keeps big shapes</td></tr><tr><td>Closing</td><td>dilation then erosion</td><td>fills small holes and gaps</td></tr></tbody></table></div>
+<p>Remember the order: <strong>open removes white noise, close fills black holes.</strong></p>
+<p class="problem"><span class="pl">Problem 8.4.2</span> A 10×10 mask has a 6×6 square (rows and columns 2 to 7) with one hole at <code>(5,5)</code> and two speckles at <code>(0,9)</code> and <code>(9,0)</code>. Which operation sequence cleans it?</p>
+<table class="steps"><tr><th>Step 1</th><td>Try opening first. Erosion removes both speckles (each has no white neighbours) but it also turns the 3×3 area around the hole black. Dilation then regrows the square, but the area next to the hole does not fully come back.</td></tr><tr><th>Step 2</th><td>Try closing first. Dilation grows the square by one pixel, the hole (one pixel, all neighbours white) vanishes, and erosion shrinks the outline back. The speckles are dilated into 3×3 blobs and eroded back to single pixels, so they stay.</td></tr><tr><th>Step 3</th><td>Then open: the single-pixel speckles do not survive an erosion, the solid square does.</td></tr><tr><th>Answer</th><td>Close, then open. The output below shows a clean 6×6 square.</td></tr><tr><th>Check</th><td>Compare with the "opening only" picture: it damaged the right side of the square near the hole.</td></tr><tr><th>Interpretation</th><td>Order matters. Match the order to the noise: holes inside objects need closing, specks outside need opening.</td></tr></table>
+<pre class="code lang-python"><code>def erode(b, k=3):
+    p = k // 2; bp = np.pad(b, p); out = np.zeros_like(b)
+    for i in range(b.shape[0]):
+        for j in range(b.shape[1]): out[i, j] = bp[i:i+k, j:j+k].all()
+    return out
+def dilate(b, k=3):
+    p = k // 2; bp = np.pad(b, p); out = np.zeros_like(b)
+    for i in range(b.shape[0]):
+        for j in range(b.shape[1]): out[i, j] = bp[i:i+k, j:j+k].any()
+    return out
+b = np.zeros((10, 10), bool)
+b[2:8, 2:8] = True; b[5, 5] = False          # a square with a one-pixel hole
+b[0, 9] = True; b[9, 0] = True               # two speckles of noise
+print("input"); show(b, ".#")
+print("opening = erode then dilate (hole grows, speckles vanish)"); show(dilate(erode(b)), ".#")
+closed = erode(dilate(b))                    # closing = dilate then erode
+print("closing (hole filled, speckles stay)"); show(closed, ".#")
+print("closing then opening (clean)"); show(dilate(erode(closed)), ".#")</code></pre>
+<pre class="code lang-text"><code>input
+..................##
+....................
+....############....
+....############....
+....############....
+....######..####....
+....############....
+....############....
+....................
+##..................
+opening = erode then dilate (hole grows, speckles vanish)
+....................
+....................
+....############....
+....############....
+....############....
+....######..........
+....######..........
+....######..........
+....................
+....................
+closing (hole filled, speckles stay)
+....................
+....................
+....############....
+....############....
+....############....
+....############....
+....############....
+....############....
+....................
+....................
+closing then opening (clean)
+....................
+....................
+....############....
+....############....
+....############....
+....############....
+....############....
+....############....
+....................
+....................</code></pre>
+<h3>Connected components and shape analysis</h3>
+<p>A <strong>connected component</strong> is a group of white pixels touching each other (here, up/down/left/right neighbours). Labelling them gives each blob an ID, so you can measure its <strong>area</strong> (pixel count) and <strong>bounding box</strong>. A <strong>contour</strong> is the outline of a blob (<code>cv2.findContours</code>, not run here); from contours you compute perimeter, area, and shape descriptors such as circularity <code>4π·area/perimeter²</code> (1 for a perfect circle).</p>
+<p class="problem"><span class="pl">Problem 8.4.3</span> Label the original messy mask (before cleaning) and report each blob.</p>
+<table class="steps"><tr><th>Step 1</th><td>Scan the pixels; when you meet an unlabelled white pixel, start a new label and flood outward to its white neighbours.</td></tr><tr><th>Step 2</th><td>The square: <code>6 × 6 = 36</code> pixels minus the 1-pixel hole <code>= 35</code>. Its bounding box is columns 2 to 7 and rows 2 to 7. Each speckle: area 1.</td></tr><tr><th>Answer</th><td>3 components: the square (area 35, bbox <code>(2, 2, 7, 7)</code>) and two speckles of area 1.</td></tr><tr><th>Check</th><td><code>35 + 1 + 1 = 37</code> white pixels, which equals <code>36 − 1 + 2</code>. The code prints the same.</td></tr><tr><th>Interpretation</th><td>A simple rule "ignore blobs with area below 5" would also remove the speckles. This is how you count objects: threshold, clean, label, filter by area, count.</td></tr></table>
+<pre class="code lang-python"><code>def label(b):
+    lab = np.zeros(b.shape, int); n = 0
+    for i in range(b.shape[0]):
+        for j in range(b.shape[1]):
+            if b[i, j] and lab[i, j] == 0:
+                n += 1; stack = [(i, j)]; lab[i, j] = n
+                while stack:
+                    y, x = stack.pop()
+                    for dy, dx in ((1,0), (-1,0), (0,1), (0,-1)):
+                        yy, xx = y + dy, x + dx
+                        if 0 &lt;= yy &lt; b.shape[0] and 0 &lt;= xx &lt; b.shape[1] and b[yy, xx] and lab[yy, xx] == 0:
+                            lab[yy, xx] = n; stack.append((yy, xx))
+    return lab, n
+b = np.zeros((10, 10), bool); b[2:8, 2:8] = True; b[5, 5] = False; b[0, 9] = True; b[9, 0] = True
+lab, n = label(b); print("components:", n)
+for k in range(1, n + 1):
+    ys, xs = np.where(lab == k)
+    print(k, "area", len(ys), "bbox (x0,y0,x1,y1)", tuple(int(v) for v in (xs.min(), ys.min(), xs.max(), ys.max())))</code></pre>
+<pre class="code lang-text"><code>components: 3
+1 area 1 bbox (x0,y0,x1,y1) (9, 0, 9, 0)
+2 area 35 bbox (x0,y0,x1,y1) (2, 2, 7, 7)
+3 area 1 bbox (x0,y0,x1,y1) (0, 9, 0, 9)</code></pre>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Otsu threshold</td><td>one number from the histogram</td><td>Binarising scanned pages before OCR</td></tr><tr><td>Adaptive threshold</td><td>block size 11 to 51</td><td>Photographed documents, uneven lighting</td></tr><tr><td>Opening and closing</td><td>3×3 or 5×5 kernel</td><td>Cleaning masks from thresholds or from segmentation models</td></tr><tr><td>Connected components</td><td>area, bbox, centroid</td><td>Counting cells, coins, defects, vehicles</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Healthcare:</strong> count cells in a microscope image by threshold, open, label.</li><li><strong>Manufacturing:</strong> a bright blob over a minimum area on a dark conveyor is a defect.</li><li><strong>Agriculture:</strong> segment green plants in HSV, then measure leaf area.</li><li><strong>Deep learning:</strong> clean up segmentation masks from U-Net (Chapter 9) with closing and a minimum-area filter.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Applying one global threshold to photos with shadows or gradients, then blaming the camera. Look at the histogram first: if it does not show two clear clumps, use adaptive thresholding or fix the lighting. Also remember that erosion at the image border treats outside pixels as black, so objects touching the border shrink.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does Otsu maximise? Answer: the between-class variance of the two pixel groups.</li><li>Which operation removes white specks: opening or closing? Answer: opening.</li><li>A mask has holes inside objects. What do you apply? Answer: closing (dilate then erode).</li></ol>
+<h2 id="s5-8-5-features-homography-stitching-and-the-fourier-view">8.5 Features, Homography, Stitching and the Fourier View</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">To match two photos of the same building, the computer needs landmarks that are easy to find again. A flat wall is bad (all pixels look alike). A straight edge is better, but you could slide along it and not know where you are. A <strong>corner</strong> is best: move in any direction and the picture changes. Corner and blob detectors find such landmarks, descriptors write them down as numbers, and matching pairs landmarks between two photos.</div></div>
+<h3>Harris corners</h3>
+<p>Harris looks at a small window and asks "if I shift the window, how much does it change?". It builds a 2×2 matrix <code>M</code> from the image gradients <code>Ix</code>, <code>Iy</code> summed over the window:</p>
+<pre class="code lang-text"><code>M = [[Σ Ix·Ix, Σ Ix·Iy],
+     [Σ Ix·Iy, Σ Iy·Iy]]
+R = det(M) − k·(trace M)²     with k ≈ 0.04</code></pre>
+<p>The two <strong>eigenvalues</strong> of <code>M</code> (think: change strength along the two main directions) tell the story:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Both small</th><th>One large, one small</th><th>Both large</th></tr></thead><tbody><tr><td>flat area, <code>R ≈ 0</code></td><td>edge, <code>R &lt; 0</code></td><td>corner, <code>R</code> large positive</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 8.5.1</span> Run Harris on a white 6×6 square on black (rows and columns 4 to 9 of a 14×14 image). What do the eigenvalues say at a corner, on an edge and in a flat area?</p>
+<table class="steps"><tr><th>Step 1</th><td>At the corner <code>(4, 4)</code> the window sees gradients in both directions: eigenvalues <code>0.5625</code> and <code>1.0625</code>, both large, so <code>R = 0.492</code> is positive.</td></tr><tr><th>Step 2</th><td>On the middle of the top edge <code>(4, 7)</code> the gradient points only up and down: eigenvalues <code>0</code> and <code>1.5</code>, <code>R = −0.09</code> is negative.</td></tr><tr><th>Step 3</th><td>In the flat middle <code>(7, 7)</code> no gradients: eigenvalues <code>0, 0</code>, <code>R = 0</code>.</td></tr><tr><th>Answer</th><td>Large <code>R</code> appears in four clusters, one around each corner of the square (rows and columns 4 to 5 and 8 to 9).</td></tr><tr><th>Check</th><td><code>det(M) − k·trace²</code> for the corner: <code>0.5625 × 1.0625 − 0.04 × 1.625² = 0.5977 − 0.1056 = 0.4920</code>, which matches the printed <code>R</code>.</td></tr><tr><th>Interpretation</th><td>The detector correctly calls only the four corners "good landmarks". Use <code>cv2.cornerHarris</code> or <code>cv2.goodFeaturesToTrack</code> (not run here).</td></tr></table>
+<pre class="code lang-python"><code>img = np.zeros((14, 14)); img[4:10, 4:10] = 1.0               # white square on black
+Kx = np.array([[-1,0,1],[-2,0,2],[-1,0,1]], float) / 8; Ky = Kx.T
+Ix, Iy = conv2d(img, Kx), conv2d(img, Ky); box = np.ones((3, 3))
+Sxx, Syy, Sxy = conv2d(Ix*Ix, box), conv2d(Iy*Iy, box), conv2d(Ix*Iy, box)
+k = 0.04; R = (Sxx*Syy - Sxy**2) - k * (Sxx + Syy) ** 2
+print("R max", R.max().round(4), "R min", R.min().round(4))
+print("corner pixels (R &gt; 0.5*max):", np.argwhere(R &gt; 0.5 * R.max()).tolist())
+for name, (i, j) in [("corner", (4, 4)), ("edge", (4, 7)), ("flat", (7, 7))]:
+    M = np.array([[Sxx[i,j], Sxy[i,j]], [Sxy[i,j], Syy[i,j]]])
+    print(f"{name:6s} at {(i, j)} eigenvalues {np.linalg.eigvalsh(M).round(4)} R {R[i,j]:.4f}")</code></pre>
+<pre class="code lang-text"><code>R max 0.492 R min -0.09
+corner pixels (R &gt; 0.5*max): [[4, 4], [4, 5], [4, 8], [4, 9], [5, 4], [5, 5], [5, 8], [5, 9], [8, 4], [8, 5], [8, 8], [8, 9], [9, 4], [9, 5], [9, 8], [9, 9]]
+corner at (4, 4) eigenvalues [0.5625 1.0625] R 0.4920
+edge   at (4, 7) eigenvalues [0.  1.5] R -0.0900
+flat   at (7, 7) eigenvalues [0. 0.] R 0.0000</code></pre>
+<h3>SIFT, ORB, matching (concepts, not run here)</h3>
+<ul><li><strong>SIFT</strong> finds blobs at many scales and describes each by a 128-number histogram of gradient directions. It is robust to scale, rotation and some lighting change, but is slower. (Patent issues ended; it is available in current OpenCV.)</li><li><strong>ORB</strong> is a fast, free alternative: FAST corners plus a 256-bit binary descriptor (BRIEF). Binary descriptors are compared with Hamming distance (count of different bits), which is extremely fast. Good for real-time and mobile use.</li><li><strong>Matching:</strong> for each descriptor in image A, find the nearest descriptor in image B. Keep a match only if the best distance is clearly smaller than the second best (Lowe's ratio test, ratio about 0.75). Then <strong>RANSAC</strong> (random sample consensus) repeatedly fits a model to random small sets of matches and keeps the model that most matches agree with, which throws out wrong matches.</li><li>Today, learned detectors and matchers (SuperPoint, LightGlue, LoFTR) often beat these, but the classical pipeline is still a standard baseline and is used in robotics and AR.</li></ul>
+<h3>Homography and image stitching</h3>
+<p>A <strong>homography</strong> is a 3×3 matrix <code>H</code> that maps points of one flat plane to another as seen by a camera (a tilted photograph of a document, or two photos of a distant scene from the same spot). A point <code>(x, y)</code> is written as <code>(x, y, 1)</code>, multiplied by <code>H</code>, and the first two entries are divided by the third:</p>
+<pre class="code lang-text"><code>[u', v', w'] = H · [x, y, 1]        (u, v) = (u'/w', v'/w')</code></pre>
+<p><code>H</code> has 8 free numbers (its overall scale does not matter, so we fix <code>H[2,2] = 1</code>). Each point pair gives 2 equations, so <strong>4 point pairs</strong> are enough. We solve with SVD (the same decomposition you may know from the Math PDF).</p>
+<p class="problem"><span class="pl">Problem 8.5.2</span> A document's unit square corners <code>(0,0), (1,0), (1,1), (0,1)</code> appear in a photo at <code>(10,10), (50,20), (60,70), (5,60)</code>. Find <code>H</code> and map the document centre <code>(0.5, 0.5)</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>Each pair <code>(x, y) → (u, v)</code> gives two rows of the equation matrix: <code>[−x, −y, −1, 0, 0, 0, u·x, u·y, u]</code> and <code>[0, 0, 0, −x, −y, −1, v·x, v·y, v]</code>. Four pairs make an 8×9 matrix <code>A</code>.</td></tr><tr><th>Step 2</th><td>The solution of <code>A·h = 0</code> is the last right-singular vector from the SVD; reshape it to 3×3 and divide by its bottom-right entry.</td></tr><tr><th>Step 3</th><td>Apply <code>H</code> to the corners: they must land on the photo points.</td></tr><tr><th>Answer</th><td><code>H</code> is printed below. The centre <code>(0.5, 0.5)</code> maps to <code>(31.81, 36.17)</code>, which is not the simple average <code>(31.25, 40)</code> of the four photo corners: perspective squeezes the far side.</td></tr><tr><th>Check</th><td><code>H</code> maps <code>(0,0)</code> to <code>(10,10)</code> and <code>(1,1)</code> to <code>(60,70)</code> exactly, as the output shows.</td></tr><tr><th>Interpretation</th><td>With <code>H</code> you can "unwarp" a photographed page to a flat rectangle (<code>cv2.warpPerspective</code>) or stitch panoramas: match features between two photos, fit <code>H</code> with RANSAC (<code>cv2.findHomography(src, dst, cv2.RANSAC)</code>), warp one photo onto the other and blend the overlap. Not run here.</td></tr></table>
+<pre class="code lang-python"><code>src = np.array([[0,0],[1,0],[1,1],[0,1]], float)              # a unit square (the "document")
+dst = np.array([[10,10],[50,20],[60,70],[5,60]], float)       # where its corners appear in the photo
+A = []
+for (x, y), (u, v) in zip(src, dst):
+    A.append([-x, -y, -1, 0, 0, 0, u*x, u*y, u])
+    A.append([0, 0, 0, -x, -y, -1, v*x, v*y, v])
+_, _, Vt = np.linalg.svd(np.array(A)); H = Vt[-1].reshape(3, 3); H /= H[2, 2]
+print(H.round(3))
+for x, y in [(0, 0), (1, 1), (0.5, 0.5)]:
+    q = H @ np.array([x, y, 1.0]); print((x, y), "-&gt;", (q[:2] / q[2]).round(2))</code></pre>
+<pre class="code lang-text"><code>[[42.83  -6.415 10.   ]
+ [11.132 33.019 10.   ]
+ [ 0.057 -0.283  1.   ]]
+(0, 0) -&gt; [10. 10.]
+(1, 1) -&gt; [60. 70.]
+(0.5, 0.5) -&gt; [31.81 36.17]</code></pre>
+<h3>The Fourier view</h3>
+<p>Any signal is a sum of waves. The <strong>Fourier transform</strong> (FFT, fast Fourier transform) writes a signal as how much of each frequency it contains. Slow waves are smooth, large-scale structure; fast waves are fine detail and noise. In an image, edges and noise live in high frequencies. Blur is simply removing high frequencies: a low-pass filter. Convolution in space equals multiplication in frequency, which is why large-kernel filtering can be done faster with the FFT.</p>
+<p class="problem"><span class="pl">Problem 8.5.3</span> Build <code>x(t) = sin(2π·2t/32) + 0.5·sin(2π·10t/32)</code> for <code>t = 0..31</code>. What magnitude does the FFT show at bins 2 and 10?</p>
+<table class="steps"><tr><th>Formula</th><td>A sine of amplitude <code>A</code> at an exact frequency bin gives magnitude <code>N·A/2</code> in an <code>N</code>-point FFT.</td></tr><tr><th>Compute</th><td>bin 2: <code>32 × 1 / 2 = 16</code>. Bin 10: <code>32 × 0.5 / 2 = 8</code>.</td></tr><tr><th>Answer</th><td>Bin 2 shows 16, bin 10 shows 8, all other bins show 0.</td></tr><tr><th>Check</th><td>The output below prints <code>[0. 16. 8.]</code> for bins 0, 2, 10 and zeros elsewhere.</td></tr><tr><th>Interpretation</th><td>The FFT separates the slow 2-cycle wave from the fast 10-cycle wave. Zeroing bin 10 would remove the fast component. For the 2D image test we keep only frequencies within radius 4 of the centre of the shifted spectrum: the error falls from 0.213 (noisy) to 0.145. Edges also lose sharpness, which is the price of low-pass filtering.</td></tr></table>
+<pre class="code lang-python"><code>n = 32; t = np.arange(n)
+x = np.sin(2*np.pi*2*t/n) + 0.5*np.sin(2*np.pi*10*t/n)        # slow wave (2 cycles) + fast wave (10 cycles)
+mag = np.abs(np.fft.fft(x))[:n//2]
+print("magnitude at bins 0,2,10:", mag[[0, 2, 10]].round(2), " at bins 1,3,5:", mag[[1, 3, 5]].round(2))
+rng = np.random.default_rng(1); im = np.zeros((16, 16)); im[4:12, 4:12] = 1
+noisy = im + rng.normal(0, 0.3, im.shape)
+F = np.fft.fftshift(np.fft.fft2(noisy)); yy, xx = np.mgrid[:16, :16]
+mask = ((yy - 8)**2 + (xx - 8)**2) &lt;= 4**2                    # keep only low frequencies near the centre
+den = np.fft.ifft2(np.fft.ifftshift(F * mask)).real
+print("mean error: noisy", np.abs(noisy - im).mean().round(3), "| after low-pass", np.abs(den - im).mean().round(3))</code></pre>
+<pre class="code lang-text"><code>magnitude at bins 0,2,10: [ 0. 16.  8.]  at bins 1,3,5: [0. 0. 0.]
+mean error: noisy 0.213 | after low-pass 0.145</code></pre>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>ORB + RANSAC homography</td><td>500 features, ratio test 0.75</td><td>Panorama stitching, AR, visual localisation (not run here)</td></tr><tr><td><code>warpPerspective</code></td><td>4 corners to a rectangle</td><td>Document scanner apps</td></tr><tr><td>Harris/Shi-Tomasi corners</td><td><code>goodFeaturesToTrack</code></td><td>Optical-flow tracking in video</td></tr><tr><td>FFT</td><td>frequency bins</td><td>Periodic-pattern defects (fabric weave), noise analysis, fast large filters</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Robotics and AR:</strong> visual odometry and SLAM use feature matching.</li><li><strong>Document scanning:</strong> find the four page corners (contours), compute <code>H</code>, unwarp.</li><li><strong>Remote sensing:</strong> align satellite images taken on different days.</li><li><strong>Signal processing and time series:</strong> the FFT is also the tool for spectrum analysis of sensor data (Chapter 6 covered 1D CNNs on such signals).</li><li><strong>GenAI:</strong> diffusion and some image-quality metrics reason about frequencies (Chapter 13).</li></ul>
+<h3>When to use classical methods and when to use deep learning</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Situation</th><th>Better choice</th></tr></thead><tbody><tr><td>Controlled lighting and camera, simple rule, no labelled data</td><td>Classical (threshold, morphology, contours)</td></tr><tr><td>Real-time on tiny hardware</td><td>Classical, or a very small CNN</td></tr><tr><td>Variable appearance (animals, faces, damage types)</td><td>Deep learning</td></tr><tr><td>Need to measure geometry exactly (calibration, stitching)</td><td>Classical features plus geometry, even in modern systems</td></tr></tbody></table></div>
+<p>Most strong systems mix both: classical for cleaning and geometry, deep learning for recognition.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Expecting Harris or ORB to match under large changes in viewpoint, lighting or blur, and trusting all matches. Always filter matches with the ratio test and RANSAC and check how many inliers survive. Few inliers means "do not trust this homography".</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>How many point pairs are the minimum to estimate a homography? Answer: 4.</li><li>Which of flat, edge and corner has two large eigenvalues? Answer: corner.</li><li>Blur removes which frequencies? Answer: high frequencies.</li></ol>
+<h2 id="s6-chapter-recap">Chapter recap</h2>
+<ul><li>An image is an array of numbers; pixel arithmetic needs care with <code>uint8</code> wrap-around and with channel order (BGR in OpenCV).</li><li>HSV and Lab separate colour from brightness; grey uses weights <code>0.299, 0.587, 0.114</code>.</li><li>Resizing needs interpolation: nearest for masks, bilinear or area averaging for photos.</li><li>Gaussian blur suits gentle noise, median suits salt-and-pepper noise (2.50 versus 21.92 error in our test), and sharpening amplifies differences.</li><li>Sobel measures gradient magnitude and direction; blur first or noise creates false edges (21 false alarms versus 0). Canny adds thinning and two-threshold hysteresis.</li><li>Hough voting finds lines (10 votes at one cell for ten collinear points).</li><li>Otsu picks the threshold that maximises between-class variance; adaptive thresholding handles uneven light (77.7% versus 90.2%).</li><li>Opening removes white specks, closing fills holes; connected components give area and bounding boxes for counting.</li><li>Harris finds corners (both eigenvalues large); ORB/SIFT describe them; a homography from 4 pairs maps one plane to another; the FFT shows frequency content.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / command / pattern</th><th>Meaning</th></tr></thead><tbody><tr><td><code>grey = 0.299R + 0.587G + 0.114B</code></td><td>luma conversion</td></tr><tr><td><code>√(gx² + gy²)</code>, <code>atan2(gy, gx)</code></td><td>gradient magnitude and direction</td></tr><tr><td><code>σb² = w0·w1·(m0 − m1)²</code></td><td>Otsu criterion</td></tr><tr><td><code>R = det(M) − k·trace(M)²</code></td><td>Harris corner response</td></tr><tr><td><code>(u, v) = (u'/w', v'/w')</code> after <code>H·[x,y,1]</code></td><td>homography mapping</td></tr><tr><td><code>cv2.GaussianBlur</code>, <code>cv2.medianBlur</code>, <code>cv2.Canny</code>, <code>cv2.threshold</code></td><td>OpenCV equivalents (not run here)</td></tr><tr><td><code>cv2.findHomography(src, dst, cv2.RANSAC)</code></td><td>robust homography (not run here)</td></tr></tbody></table></div>
+<h2 id="s7-practice-set">Practice set</h2>
+<p><strong>1.</strong> (easy) Grey value of <code>(100, 150, 200)</code> with luma weights. <strong>Answer:</strong> <code>29.9 + 88.05 + 22.8 = 140.75</code>.</p>
+<p><strong>2.</strong> (easy) Median of the 3×3 patch values <code>5, 9, 1, 7, 200, 3, 8, 2, 6</code>. <strong>Answer:</strong> sorted <code>1, 2, 3, 5, 6, 7, 8, 9, 200</code>; the 5th value is <code>6</code>.</p>
+<p><strong>3.</strong> (easy) What is <code>np.uint8(250) + np.uint8(10)</code>? <strong>Answer:</strong> <code>4</code> (wraps modulo 256; newer NumPy may also print a warning). Cast to float first.</p>
+<p><strong>4.</strong> (medium) Sobel <code>gx</code> for the window with rows <code>(0, 0, 10)</code> repeated three times. <strong>Answer:</strong> per row <code>−0 + 10 = 10</code>; times weights <code>1+2+1 = 4</code> gives <code>40</code>.</p>
+<p><strong>5.</strong> (medium) Bilinear value at the centre of the 2×2 image <code>[[0, 100], [100, 200]]</code>. <strong>Answer:</strong> <code>0.25 × (0 + 100 + 100 + 200) = 100</code>.</p>
+<p><strong>6.</strong> (medium) Find the bug: someone does <code>img = cv2.imread('a.jpg')</code> then passes it to a model expecting RGB. <strong>Answer:</strong> OpenCV loads BGR, so red and blue are swapped; convert with <code>cv2.cvtColor(img, cv2.COLOR_BGR2RGB)</code>. Not run here.</p>
+<p><strong>7.</strong> (medium) Otsu on a histogram with counts <code>[10, 10, 0, 0, 10, 10]</code> (levels 0 to 5): compute <code>σb²</code> for <code>T = 1</code>. <strong>Answer:</strong> <code>w0 = 20/40 = 0.5</code>, <code>w1 = 0.5</code>, <code>mean0 = 0.5</code>, <code>mean1 = 4.5</code>; <code>0.25 × 16 = 4.0</code>. (<code>T = 2</code> and <code>T = 3</code> give the same, since there are no pixels in the gap.)</p>
+<p><strong>8.</strong> (medium) A mask has one big blob (area 500) and 30 specks (area 1 to 3). What is the cleaning plan? <strong>Answer:</strong> opening with a 3×3 kernel, or connected components with a minimum area filter such as 5. Check that the big blob keeps its shape.</p>
+<p><strong>9.</strong> (hard) A grey ramp adds 100 grey levels from left to right to an image whose objects are 120 brighter than the background. Why does Otsu fail, and what do you do? <strong>Answer:</strong> the ramp is as large as the object contrast, so the two histogram clumps overlap and one threshold cannot separate them. Use adaptive thresholding, or estimate and subtract the background (large blur or flat-field correction), then Otsu.</p>
+<p><strong>10.</strong> (hard) Compute <code>R</code> for a Harris window with eigenvalues <code>λ1 = 0.4</code>, <code>λ2 = 0.9</code>, <code>k = 0.04</code>. <strong>Answer:</strong> <code>det = 0.36</code>, <code>trace = 1.3</code>, <code>R = 0.36 − 0.04 × 1.69 = 0.36 − 0.0676 = 0.2924</code> (positive: corner).</p>
+<p><strong>11.</strong> (interview) "Compare Gaussian blur and median filter. When do you pick each?" <strong>Answer:</strong> Gaussian is linear and averages neighbours with bell-shaped weights, so it suits mild sensor noise but smears edges and spreads outliers. Median takes the middle value, so it removes impulse noise (dead pixels, salt and pepper) and keeps edges better, but is slower and not a kernel.</p>
+<p><strong>12.</strong> (interview/scenario) "Build a pipeline to count tablets in a photo on a plain tray." <strong>Answer:</strong> grey (or HSV) conversion; Gaussian blur; Otsu or adaptive threshold; closing to fill holes, opening to remove specks; connected components; discard blobs below a minimum area; if tablets touch, use a distance transform with watershed to split them; count the components. Validate on 20 labelled photos, and move to a detector (Chapter 9) if touching or varied tablets break the rules.</p>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me "image filtering": mean, Gaussian and median filters, and sharpening, on small 3 by 3 pixel patches with real numbers. Compare how each treats a noise spike. Ask me to compute each output myself first, then check my arithmetic and explain when to choose which filter.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning computer vision, and English is not my first language. Explain "edge detection with Sobel, Canny and the Hough transform" step by step. Use a 5 by 5 patch with a vertical edge, compute gx, gy, magnitude and direction by hand with me, then explain the four Canny stages and why blur comes first. Finish with 3 questions that test my understanding.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Give me 8 graded exercises on "thresholding (Otsu, adaptive) and morphological operations (erosion, dilation, opening, closing) and connected components". Include small histograms and binary masks I can compute by hand. Do not show solutions until I answer each one, then check my work.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, with English as my second language. Review my image-processing pipeline for correctness and robustness: colour order, data types, blur size, threshold choice, morphology order and OpenCV function arguments. Explain each problem simply and suggest a fix with a quick test I can run. My pipeline or code: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for computer vision interviews, and English is my second language. Run a mock interview on "classical image processing": filters, edges, thresholds, morphology, Harris corners, ORB and SIFT, homography and stitching, the Fourier transform, and when to use classical methods versus deep learning. Ask 8 questions one at a time, grade each out of 10, give the ideal short answer, then ask a harder follow-up.</pre></div><div class="readbtn"><button class="btn" data-read="study:dl:ch08">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch07.html">← Chapter 7: Transfer Learning and Fine-Tuning for Im</a><a class="btn" href="ch09.html">Chapter 9: Object Detection, Segmentation and OCR →</a></div></div><script src="../../assets/study.js"></script></body></html>

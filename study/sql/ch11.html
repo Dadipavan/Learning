@@ -1,0 +1,309 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 11: Schema Design, Normalization and Data Warehouse Modeling</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">SQL &amp; Databases Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 11</div><h1>Schema Design, Normalization and Data Warehouse Modeling</h1><p>How to draw a database on paper before you build it, how to remove duplicated data safely, and when to break those rules on purpose for analytics.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-11-1-er-diagrams-keys-and-naming">11.1 ER Diagrams, Keys and Naming</a></li><li><a href="#s2-11-2-normalization-1nf-2nf-3nf-and-bcnf">11.2 Normalization: 1NF, 2NF, 3NF and BCNF</a></li><li><a href="#s3-11-3-denormalization-and-oltp-vs-olap">11.3 Denormalization and OLTP vs OLAP</a></li><li><a href="#s4-11-4-star-and-snowflake-schemas">11.4 Star and Snowflake Schemas</a></li><li><a href="#s5-11-5-slowly-changing-dimensions-scd">11.5 Slowly Changing Dimensions (SCD)</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p>Bad data usually starts as a bad table design. A customer's city stored in five places gives five different answers. A comma-separated list in one column makes "which orders contain a mouse?" painful. And a dashboard that joins ten tables for every click is slow and hard to understand. In this chapter you learn to design a schema in three steps: draw it (ER diagram), clean it (normalization), then reshape it for reporting (star schema and slowly changing dimensions). By the end you can take a messy spreadsheet and turn it into sound tables, and explain in an interview when you would break the rules.</p>
+<p>We keep using the shop database from Chapter 2 (<code>customers</code>, <code>products</code>, <code>orders</code>, <code>order_items</code>). All SQL ran in SQLite 3.51, except where I write <strong>not run here</strong>.</p>
+<h2 id="s1-11-1-er-diagrams-keys-and-naming">11.1 ER Diagrams, Keys and Naming</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Before building a house, an architect draws a plan: rooms and doors. An <strong>ER diagram</strong> (Entity-Relationship diagram) is the plan of a database: the things you store, and how they connect. Drawing takes ten minutes. Changing a live table with 50 million rows takes weeks.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Entity</strong>: a kind of thing you store (customer, product, order). It becomes a table.</li><li><strong>Attribute</strong>: a property of an entity (name, price). It becomes a column.</li><li><strong>Relationship</strong>: how two entities connect (a customer <em>places</em> orders). It becomes a foreign key, or a separate table.</li><li><strong>Cardinality</strong>: how many on each side: one-to-one (1:1), one-to-many (1:N), many-to-many (M:N).</li><li><strong>Junction table</strong> (also <em>bridge</em> or <em>associative</em> table): a table that turns M:N into two 1:N.</li></ul>
+<h3>How to read the diagram</h3>
+<pre class="code lang-text"><code> CUSTOMER 1 ----&lt; places &gt;---- N ORDER N ----&lt; contains &gt;---- M PRODUCT
+ (PK customer_id)               (PK order_id,                  (PK product_id)
+                                 FK customer_id)
+ 
+ M:N ORDER-PRODUCT becomes a junction table ORDER_ITEM:
+
+ +-----------+ 1     N +---------+ 1      N +------------+ N     1 +-----------+
+ | customers |---------| orders  |----------| order_items|---------| products  |
+ +-----------+         +---------+          +------------+         +-----------+
+ customer_id PK        order_id PK          (order_id, product_id) PK   product_id PK
+                       customer_id FK       qty, unit_price</code></pre>
+<p>Read "1 --- N" as "one customer has many orders." The line sits on the "many" side where the foreign key lives. Rule: <strong>the foreign key always goes on the "many" side.</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Relationship</th><th>How to build it</th><th>Example</th></tr></thead><tbody><tr><td>1:N</td><td>foreign key on the N side</td><td><code>orders.customer_id</code></td></tr><tr><td>M:N</td><td>junction table with two FKs (+ own attributes)</td><td><code>order_items(order_id, product_id, qty, unit_price)</code></td></tr><tr><td>1:1</td><td>FK with <code>UNIQUE</code>, or merge into one table</td><td><code>user</code> and <code>user_profile</code></td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 11.1.1</span> A learning platform has students, courses and enrollments (a student takes many courses, a course has many students, and each enrollment has a grade). Design the tables.</p>
+<table class="steps"><tr><th>Step 1</th><td>Entities: <code>students</code>, <code>courses</code>.</td></tr><tr><th>Step 2</th><td>Students to courses is M:N, and the grade belongs to the <em>pair</em>. So we need a junction table <code>enrollments</code>.</td></tr><tr><th>Step 3</th><td>Primary key of the junction table is the pair <code>(student_id, course_id)</code>, so a student cannot enroll twice in one course.</td></tr></table>
+<pre class="code lang-sql"><code>CREATE TABLE students (student_id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE courses  (course_id  INTEGER PRIMARY KEY, title TEXT NOT NULL);
+CREATE TABLE enrollments (
+  student_id INTEGER NOT NULL REFERENCES students(student_id),
+  course_id  INTEGER NOT NULL REFERENCES courses(course_id),
+  grade      INTEGER CHECK (grade BETWEEN 0 AND 100),
+  PRIMARY KEY (student_id, course_id)
+);</code></pre>
+<ul><li><strong>Answer</strong> Three tables. Each fact lives once: a student's name in <code>students</code>, a grade in <code>enrollments</code>.</li><li><strong>Check</strong> If the grade were put in <code>students</code>, which course would it belong to? It has no home. That tells you it belongs on the relationship.</li></ul>
+<p class="problem"><span class="pl">Problem 11.1.2</span> Where does the foreign key go for "an employee works in one department; a department has many employees"?</p>
+<table class="steps"><tr><th>Step 1</th><td>One department, many employees: department is the "one" side.</td></tr><tr><th>Step 2</th><td>The FK goes on the "many" side: <code>employees.department_id REFERENCES departments(department_id)</code>.</td></tr><tr><th>Answer</th><td>The <code>employees</code> table holds the FK. Chapter 1 already did this with <code>departments</code> and <code>employees</code>.</td></tr></table>
+<h3>Surrogate keys, data types and naming (small rules that matter)</h3>
+<ul><li>Use a <strong>surrogate primary key</strong> (<code>customer_id</code>) and a <code>UNIQUE</code> constraint on the natural key (see 9.2).</li><li>Pick the smallest sensible type: <code>INTEGER</code> ids, <code>NUMERIC(12,2)</code> for money, <code>TIMESTAMPTZ</code> for event times (store UTC), <code>DATE</code> for dates, <code>BOOLEAN</code> for flags. Never store dates as text in PostgreSQL (SQLite has no date type; it stores text, as in our shop data).</li><li>Naming: <code>snake_case</code>, same name for the same thing everywhere (<code>customer_id</code> in both tables), no spaces, no reserved words like <code>order</code> or <code>group</code>, tables as plural nouns, and booleans as <code>is_active</code>.</li></ul>
+<h3>Connection to the real job</h3>
+<p>In design reviews and interviews you are often asked "draw the schema for X." The expected answer: entities, keys, cardinalities, the junction tables, and the reasons. Analysts read an ER diagram first when they join a new company's database.</p>
+<h3>Applications</h3>
+<ul><li><strong>Back ends:</strong> model users, orders, payments before writing code.</li><li><strong>Data Engineering:</strong> read the source system's ER diagram before building a pipeline.</li><li><strong>Data Analytics:</strong> know which join key to use and which side repeats rows (Chapter 4).</li><li><strong>ML:</strong> features come from joins: the ER diagram tells you how rows multiply.</li></ul>
+<h3>Check yourself</h3>
+<ol><li>Where does the foreign key go in a 1:N relationship?</li></ol>
+<p>Answer: On the "many" side.</p>
+<ol><li>How do you model a many-to-many relationship?</li></ol>
+<p>Answer: With a junction table holding two foreign keys.</p>
+<ol><li>Why is <code>order</code> a bad table name?</li></ol>
+<p>Answer: It is a reserved SQL word (<code>ORDER BY</code>), so it needs quoting; use <code>orders</code>.</p>
+<h2 id="s2-11-2-normalization-1nf-2nf-3nf-and-bcnf">11.2 Normalization: 1NF, 2NF, 3NF and BCNF</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Imagine writing a customer's phone number on every sales slip. When they change number, you must find and fix every slip, and if you miss one, two numbers exist for one person. <strong>Normalization</strong> is the discipline of writing each fact in <strong>one place only</strong>. The slogan: <em>every non-key column depends on the key, the whole key, and nothing but the key.</em></div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Functional dependency (FD)</strong>: "A determines B," written <code>A → B</code>: if two rows have the same A, they must have the same B. Example: <code>product_id → product_name</code>.</li><li><strong>Candidate key</strong>: a minimal set of columns that identifies a row.</li><li><strong>Anomaly</strong>: a bug caused by repeated data. Three kinds: <strong>update anomaly</strong> (change in some places only), <strong>insert anomaly</strong> (cannot store a fact without another), <strong>delete anomaly</strong> (deleting a row loses an unrelated fact).</li><li><strong>Normal form</strong>: a level of tidiness. Each form includes the one before it.</li></ul>
+<h3>The messy starting point</h3>
+<pre class="code lang-sql"><code>CREATE TABLE flat (
+  order_id INT, product_id INT, product_name TEXT, category TEXT,
+  customer_id INT, customer_city TEXT, qty INT,
+  PRIMARY KEY (order_id, product_id));
+INSERT INTO flat VALUES
+ (101,1,'Keyboard','Electronics',1,'Pune',1),
+ (101,3,'Notebook','Stationery',1,'Pune',2),
+ (103,1,'Keyboard','Electronics',1,'Pune',1),
+ (102,2,'Mouse','Electronics',2,'Mumbai',1);</code></pre>
+<p>Keyboard's name and category repeat in rows 1 and 3. Customer 1's city repeats three times. This is a spreadsheet pretending to be a table.</p>
+<h3>The forms, one at a time</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Form</th><th>Rule</th><th>Violation looks like</th></tr></thead><tbody><tr><td><strong>1NF</strong></td><td>each cell holds one value; no repeating groups; rows are identified by a key</td><td><code>products = 'Keyboard,Mouse'</code> in one cell</td></tr><tr><td><strong>2NF</strong></td><td>in 1NF, and no non-key column depends on <strong>part</strong> of a composite key</td><td><code>product_name</code> depends only on <code>product_id</code>, not on <code>(order_id, product_id)</code></td></tr><tr><td><strong>3NF</strong></td><td>in 2NF, and no non-key column depends on <strong>another non-key column</strong></td><td><code>customer_city</code> depends on <code>customer_id</code>, which is not the key</td></tr><tr><td><strong>BCNF</strong></td><td>for every dependency <code>A → B</code>, A must be a candidate key</td><td>see the course example below</td></tr></tbody></table></div>
+<p><strong>1NF in action.</strong> A table stores <code>products</code> as <code>'Keyboard,Mouse'</code> in one cell. Which orders contain a mouse?</p>
+<pre class="code lang-sql"><code>CREATE TABLE orders_bad (order_id INT, customer TEXT, city TEXT, products TEXT);
+INSERT INTO orders_bad VALUES
+ (1,'Asha','Pune','Keyboard,Mouse'),(2,'Asha','Pune','Notebook'),(3,'Ravi','Mumbai','Mouse');
+SELECT count(*) AS orders_with_mouse FROM orders_bad WHERE products LIKE '%Mouse%';</code></pre>
+<pre class="code lang-text"><code>orders_with_mouse
+-----------------
+2                </code></pre>
+<ul><li><strong>Step 1</strong> <code>LIKE '%Mouse%'</code> finds orders 1 and 3, so 2 is right today.</li><li><strong>Step 2</strong> It would also match a product named <code>Mouse Pad</code> or <code>Bluetooth Mouse</code>: wrong count with no error. It cannot use an index (Chapter 10, leading wildcard). You cannot join the list to <code>products</code>.</li><li><strong>Answer</strong> The count is right by luck. The fix for 1NF is one row per (order, product), which is exactly the <code>order_items</code> table you already know.</li></ul>
+<p class="problem"><span class="pl">Problem 11.2.1 (find the functional dependency).</span> Does <code>product_id → product_name</code> hold in <code>flat</code>? Test it with SQL: group by the left side and count distinct values on the right. Any group with more than 1 value is a violation.</p>
+<pre class="code lang-sql"><code>SELECT product_id, COUNT(DISTINCT product_name) AS names
+FROM flat GROUP BY product_id HAVING COUNT(DISTINCT product_name) &gt; 1;</code></pre>
+<pre class="code lang-text"><code>(no rows)</code></pre>
+<ul><li><strong>Step 1</strong> No product has two names, so the FD holds in today's data.</li><li><strong>Step 2</strong> Now simulate the <strong>update anomaly</strong>: someone fixes the name in one row only, with a typo.</li></ul>
+<pre class="code lang-sql"><code>UPDATE flat SET product_name = 'Keybord' WHERE order_id = 101 AND product_id = 1;
+-- run the same check again</code></pre>
+<pre class="code lang-text"><code>product_id  names
+----------  -----
+1           2    </code></pre>
+<ul><li><strong>Answer</strong> Product 1 now has two names. The same fact is stored twice, so the copies drifted apart. This is why we split the table.</li><li><strong>Meaning</strong> Careful: data can only <em>disprove</em> an FD. A test that finds no violation shows the FD holds in this data, not that it must hold forever. The business rule decides.</li></ul>
+<p class="problem"><span class="pl">Problem 11.2.2 (normalize to 3NF).</span> Apply the rules to <code>flat</code>.</p>
+<table class="steps"><tr><th>Step 1 (2NF)</th><td><code>product_name</code> and <code>category</code> depend only on <code>product_id</code>, part of the key <code>(order_id, product_id)</code>. Move them to a <code>products</code> table keyed by <code>product_id</code>.</td></tr><tr><th>Step 2 (3NF)</th><td><code>customer_city</code> depends on <code>customer_id</code>, which depends on <code>order_id</code>. Move customer and city into a table keyed by the customer, and keep <code>customer_id</code> on the order. (Our quick script keeps a combined orders table with <code>customer_city</code> for brevity; a full design has a separate <code>customers</code> table like Chapter 2.)</td></tr><tr><th>Step 3</th><td>What remains, <code>(order_id, product_id, qty)</code>, has only <code>qty</code>, which depends on the whole key.</td></tr></table>
+<pre class="code lang-sql"><code>CREATE TABLE p  AS SELECT DISTINCT product_id, product_name, category FROM flat;
+CREATE TABLE o  AS SELECT DISTINCT order_id, customer_id, customer_city FROM flat;
+CREATE TABLE oi AS SELECT order_id, product_id, qty FROM flat;
+SELECT (SELECT count(*) FROM flat) AS flat_rows, (SELECT count(*) FROM p) AS p,
+       (SELECT count(*) FROM o) AS o, (SELECT count(*) FROM oi) AS oi;</code></pre>
+<pre class="code lang-text"><code>flat_rows  p  o  oi
+---------  -  -  --
+4          3  3  4 </code></pre>
+<ul><li><strong>Check (lossless)</strong> Join the pieces back; we must get the original 4 rows with the same facts:</li></ul>
+<pre class="code lang-sql"><code>SELECT o.order_id, p.product_name, oi.qty, o.customer_city
+FROM oi JOIN p USING (product_id) JOIN o USING (order_id) ORDER BY 1,2;</code></pre>
+<pre class="code lang-text"><code>order_id  product_name  qty  customer_city
+--------  ------------  ---  -------------
+101       Keyboard      1    Pune         
+101       Notebook      2    Pune         
+102       Mouse         1    Mumbai       
+103       Keyboard      1    Pune         </code></pre>
+<ul><li><strong>Answer</strong> Four rows, identical to the original facts. <code>p</code> has 3 rows (Keyboard stored once, not twice) and <code>o</code> has 3 orders. The city is stored once per order here and once per customer in a full design, so changing Pune takes one <code>UPDATE</code>.</li><li><strong>Why it matters</strong> A good decomposition is <strong>lossless</strong>: joining the parts gives back exactly the original, with no missing and no extra rows.</li></ul>
+<p><strong>BCNF.</strong> 3NF still allows one odd case. Take a table <code>enroll(student, course, instructor)</code> where each instructor teaches only one course (<code>instructor → course</code>), but the key is <code>(student, course)</code>.</p>
+<pre class="code lang-text"><code>student  course  instructor
+Asha     SQL     Rao
+Ravi     SQL     Rao
+Asha     Python  Iyer
+Meena    Python  Iyer</code></pre>
+<p>Here <code>instructor → course</code>, but <code>instructor</code> is not a candidate key. That breaks BCNF. Rao's course is repeated in every student row. Test the FD:</p>
+<pre class="code lang-sql"><code>SELECT instructor, COUNT(DISTINCT course) AS courses FROM enroll GROUP BY instructor;</code></pre>
+<pre class="code lang-text"><code>instructor  courses
+----------  -------
+Iyer        1      
+Rao         1      </code></pre>
+<p>Each instructor has exactly one course in this data, consistent with the rule. The fix: <code>teaches(instructor, course)</code> and <code>enrollment(student, instructor)</code>. BCNF is rarely a problem in practice; most designs that reach 3NF are already in BCNF. (4NF and 5NF deal with multi-valued dependencies; just know the names.)</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Treating normal forms as magic words. Ask the simple question instead: "If this fact changes, how many rows must I edit?" The answer should be one.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Concluding an FD from a small sample. <code>city → state</code> looks true until a second <code>Springfield</code> appears. FDs come from business rules, so ask the business.</div></div>
+<h3>Connection to the real job</h3>
+<p>Operational (OLTP) databases are normalized to 3NF so writes are safe and fast. When you query them for analysis you re-join the pieces back, which is why Chapter 4 on joins matters so much.</p>
+<h3>Applications</h3>
+<ul><li><strong>Back ends:</strong> 3NF keeps checkout, user and inventory data consistent.</li><li><strong>Data Engineering:</strong> you split wide source files (CSV exports) into clean tables when loading.</li><li><strong>Data Analytics:</strong> you read the normalized source to find where each metric lives.</li><li><strong>Data quality:</strong> FD checks with <code>GROUP BY ... HAVING COUNT(DISTINCT ...) &gt; 1</code> find dirty data.</li></ul>
+<h3>Check yourself</h3>
+<ol><li>What does <code>A → B</code> mean?</li></ol>
+<p>Answer: Whenever two rows have the same A, they have the same B.</p>
+<ol><li>Which normal form removes dependency on part of a composite key?</li></ol>
+<p>Answer: 2NF.</p>
+<ol><li>Name the three anomalies.</li></ol>
+<p>Answer: Update, insert and delete anomalies.</p>
+<h2 id="s3-11-3-denormalization-and-oltp-vs-olap">11.3 Denormalization and OLTP vs OLAP</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A restaurant kitchen is organised for cooking: ingredients stored once in separate shelves (normalized). But the menu card the customer reads has everything pre-combined: "Paneer wrap with fries and a drink, Rs 250" (denormalized). Cooking and menu-reading are different jobs, so you organise differently for each. In databases the two jobs are <strong>OLTP</strong> (taking orders) and <strong>OLAP</strong> (reading reports).</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>OLTP</strong> (Online Transaction Processing): many small, fast reads and writes (place an order, update an address). Like the billing counter of a shop.</li><li><strong>OLAP</strong> (Online Analytical Processing): fewer, heavy queries that scan lots of rows and aggregate (revenue by month and city).</li><li><strong>Denormalization</strong>: deliberately storing repeated or pre-joined data to make reads faster or simpler.</li><li><strong>Data warehouse</strong>: a database built for OLAP, fed from many OLTP systems.</li><li><strong>Row store vs column store</strong>: a row store keeps a whole row together (good for OLTP). A column store keeps each column together (good for scanning one column across many rows: ClickHouse, BigQuery, Snowflake, Redshift, and Parquet files).</li></ul>
+<h3>OLTP vs OLAP</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th></th><th>OLTP</th><th>OLAP</th></tr></thead><tbody><tr><td>Typical query</td><td><code>UPDATE ... WHERE id = 7</code></td><td><code>SUM(revenue) GROUP BY month, city</code></td></tr><tr><td>Rows touched</td><td>a few</td><td>millions</td></tr><tr><td>Latency goal</td><td>milliseconds</td><td>seconds to minutes</td></tr><tr><td>Users</td><td>thousands of app users</td><td>tens of analysts, dashboards</td></tr><tr><td>Design</td><td>normalized (3NF)</td><td>denormalized (star schema)</td></tr><tr><td>Storage</td><td>row-oriented</td><td>often column-oriented</td></tr><tr><td>Example systems</td><td>PostgreSQL, MySQL</td><td>Snowflake, BigQuery, Redshift, ClickHouse</td></tr></tbody></table></div>
+<h3>When to denormalize</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Technique</th><th>Example</th><th>Gain</th><th>Risk</th></tr></thead><tbody><tr><td>Copy a column</td><td>store <code>customer_city</code> on orders</td><td>skip one join</td><td>copies can drift</td></tr><tr><td>Pre-computed total</td><td><code>orders.total</code></td><td>no <code>SUM</code> per read</td><td>must update with items</td></tr><tr><td>Summary table</td><td>daily revenue per product</td><td>dashboards read 365 rows, not 100M</td><td>needs refresh job</td></tr><tr><td>Wide table</td><td>one flat row per event for ML</td><td>simple training queries</td><td>big, repeated data</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 11.3.1</span> Our dashboard shows revenue per customer city. Normalized, that needs <code>customers JOIN orders JOIN order_items</code>. Estimate the work, then reduce it with a summary table.</p>
+<pre class="code lang-sql"><code>CREATE TABLE city_revenue AS
+SELECT c.city, SUM(i.qty * i.unit_price) AS revenue
+FROM customers c
+JOIN orders o ON o.customer_id = c.customer_id
+JOIN order_items i ON i.order_id = o.order_id
+WHERE o.status = 'paid'
+GROUP BY c.city;</code></pre>
+<ul><li><strong>Step 1</strong> Run the 3-table join once, store the result. The dashboard now reads the small summary table.</li><li><strong>Step 2</strong> With 100 million order items and 50 cities, each dashboard view reads 50 rows instead of scanning and joining 100 million.</li><li><strong>Answer</strong> Reads are far cheaper, in exchange for a refresh job and staleness: the table is only as fresh as its last refresh.</li><li><strong>Check</strong> The summary must equal the live query. Compare <code>SUM(revenue)</code> from both; they must match, otherwise the refresh has a bug.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Denormalizing <em>first</em> "for speed." Normalize first, measure, and denormalize only the proven hot path. Every copy needs a plan to keep it in sync (a trigger, a refresh job, or one code path).</div></div>
+<div class="callout blue"><div class="lab">PROFESSOR'S NOTE</div><div class="txt">You will hear "NoSQL denormalizes everything." Document stores such as MongoDB embed related data inside one document, which is denormalization again. This document teaches relational design only.</div></div>
+<h3>Connection to the real job</h3>
+<p>Data engineers move data from OLTP databases (normalized) to a warehouse (denormalized). This is the <strong>ETL</strong> or <strong>ELT</strong> job (extract, transform, load): extract from the source, reshape, load into star schemas. Analysts live on the OLAP side; back-end developers live on the OLTP side. Knowing both lets you talk to both teams.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> dashboards read pre-aggregated tables, not raw logs.</li><li><strong>Data Engineering:</strong> nightly jobs fill warehouse tables from operational ones.</li><li><strong>ML:</strong> training tables are wide and flat, with one row per example.</li><li><strong>Operations:</strong> heavy reports must not run on the primary OLTP database during the busiest sale hours; use a replica or warehouse.</li></ul>
+<h3>Check yourself</h3>
+<ol><li>Which workload uses normalized tables, OLTP or OLAP?</li></ol>
+<p>Answer: OLTP.</p>
+<ol><li>Give one risk of denormalization.</li></ol>
+<p>Answer: The repeated copies can become inconsistent unless you keep them in sync.</p>
+<ol><li>Why are column stores good for analytics?</li></ol>
+<p>Answer: A query reading one or two columns over millions of rows reads only those columns from disk.</p>
+<h2 id="s4-11-4-star-and-snowflake-schemas">11.4 Star and Snowflake Schemas</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Imagine a receipt (the event: what was sold, how many, how much) surrounded by description cards: who bought (customer), what (product), when (date). The receipt is the <strong>fact</strong>. The cards are <strong>dimensions</strong>. Draw the receipt in the middle and the cards around it: a star.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Fact table</strong>: one row per business event (a sale line, a page view). Mostly numbers (measures: <code>qty</code>, <code>revenue</code>) and keys to dimensions. Usually the biggest table.</li><li><strong>Dimension table</strong>: descriptive attributes used to filter and group (<code>city</code>, <code>category</code>, <code>month</code>). Usually small and wide.</li><li><strong>Grain</strong>: what one row of the fact table means. <strong>Decide the grain first.</strong> Ours: one row per order line.</li><li><strong>Measure</strong>: a number you add up (<code>revenue</code>).</li><li><strong>Surrogate key</strong> in a dimension: a warehouse-made id (<code>cust_sk</code>), needed for slowly changing dimensions (11.5).</li></ul>
+<h3>Build one from the shop</h3>
+<pre class="code lang-sql"><code>CREATE TABLE dim_product  AS SELECT product_id AS product_key, name AS product_name, category FROM products;
+CREATE TABLE dim_customer AS SELECT customer_id AS customer_key, name AS customer_name, city FROM customers;
+CREATE TABLE dim_date (date_key TEXT PRIMARY KEY, year INT, month INT, month_name TEXT);
+INSERT INTO dim_date
+SELECT DISTINCT order_date, CAST(strftime('%Y',order_date) AS INT), CAST(strftime('%m',order_date) AS INT),
+       CASE strftime('%m',order_date) WHEN '01' THEN 'Jan' WHEN '02' THEN 'Feb' WHEN '03' THEN 'Mar' ELSE 'Apr' END
+FROM orders;
+CREATE TABLE fact_sales AS
+SELECT o.order_id, o.order_date AS date_key, o.customer_id AS customer_key,
+       i.product_id AS product_key, i.qty, i.qty * i.unit_price AS revenue
+FROM orders o JOIN order_items i USING (order_id)
+WHERE o.status = 'paid';
+SELECT count(*) AS fact_rows, sum(revenue) AS total FROM fact_sales;</code></pre>
+<pre class="code lang-text"><code>fact_rows  total
+---------  -----
+18         12660</code></pre>
+<p class="problem"><span class="pl">Problem 11.4.1</span> Revenue for March by product category and customer city.</p>
+<pre class="code lang-sql"><code>SELECT d.month_name, p.category, c.city, SUM(f.revenue) AS revenue
+FROM fact_sales f
+JOIN dim_date     d ON d.date_key     = f.date_key
+JOIN dim_product  p ON p.product_key  = f.product_key
+JOIN dim_customer c ON c.customer_key = f.customer_key
+WHERE d.month = 3
+GROUP BY d.month_name, p.category, c.city
+ORDER BY revenue DESC;</code></pre>
+<pre class="code lang-text"><code>month_name  category     city       revenue
+----------  -----------  ---------  -------
+Mar         Electronics  Pune       1200   
+Mar         Home         Mumbai     900    
+Mar         Stationery   Mumbai     440    
+Mar         Stationery   Bengaluru  360    
+Mar         Stationery   Pune       80     </code></pre>
+<ul><li><strong>Step 1</strong> The query starts at the fact table and joins to each dimension on its key: one join per dimension, always the same shape.</li><li><strong>Step 2</strong> Filters and groupings come from dimension columns (<code>month</code>, <code>category</code>, <code>city</code>). Sums come from the fact (<code>revenue</code>).</li><li><strong>Check by hand</strong> Order 106 (March, customer 1 in Pune) is 2 mice at 600 = 1200 plus a notebook at 80. The mouse line is Electronics/Pune = 1200, the notebook line is Stationery/Pune = 80. Both match. Order 108 (customer 2, Mumbai, Home) is 900, also matching.</li><li><strong>Check (total)</strong> All paid revenue directly from the source tables was also 12,660, equal to the fact total.</li><li><strong>Answer</strong> A star schema answers any "measure by attributes" question with the same simple pattern.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code>                     dim_date
+                        |
+ dim_customer ------ fact_sales ------ dim_product
+   (who)          (order_id, date_key,      (what)
+                   customer_key,
+                   product_key,
+                   qty, revenue)</code></pre>
+<p>The fact table is in the middle. Each arm is one join. Dimensions are denormalized: <code>category</code> sits right in <code>dim_product</code>.</p>
+<h3>Star vs snowflake</h3>
+<p>A <strong>snowflake schema</strong> normalizes the dimensions further: <code>dim_product</code> points to <code>dim_category</code>, which points to <code>dim_department</code>. It saves some storage and keeps one copy of the category name, but needs more joins.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th></th><th>Star</th><th>Snowflake</th></tr></thead><tbody><tr><td>Dimension tables</td><td>denormalized, flat</td><td>normalized, split into sub-tables</td></tr><tr><td>Joins per query</td><td>fewer</td><td>more</td></tr><tr><td>Storage</td><td>slightly more</td><td>slightly less</td></tr><tr><td>Query simplicity</td><td>high</td><td>lower</td></tr><tr><td>Use</td><td>default for BI tools and warehouses</td><td>when a dimension is huge or shared, or hierarchies need their own maintenance</td></tr></tbody></table></div>
+<p>Storage is cheap and analyst time is not, so <strong>star is the usual choice</strong>.</p>
+<h3>Date dimension and calendar tables</h3>
+<p>A <code>dim_date</code> table with one row per day (year, quarter, month, week, <code>is_weekend</code>, holiday flags) is standard. It lets analysts group by "Q1" or "weekend" without date functions, and it supplies days with zero sales, which a plain <code>GROUP BY</code> on the fact table cannot show (the date spine idea from the analytics section).</p>
+<h3>Connection to the real job</h3>
+<p>Tools such as Power BI, Tableau and Looker expect star schemas. dbt projects name models <code>fact_</code> and <code>dim_</code>. In an interview "design a data model for an e-commerce / food-delivery / ride-share app" means: pick the grain, list the facts, list the dimensions, mention the date dimension.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> BI dashboards built on facts and dimensions.</li><li><strong>Data Engineering:</strong> warehouse models in dbt, Snowflake, BigQuery.</li><li><strong>ML:</strong> feature tables made by joining a fact table to dimensions.</li><li><strong>Healthcare:</strong> a star model for appointments: <code>fact_appointments</code> with <code>dim_doctor</code>, <code>dim_patient</code> and <code>dim_date</code> makes trend reports simple.</li></ul>
+<h3>Check yourself</h3>
+<ol><li>What is the grain of <code>fact_sales</code> above?</li></ol>
+<p>Answer: One row per paid order line (an order and a product).</p>
+<ol><li>Fact or dimension: <code>revenue</code>? <code>city</code>?</li></ol>
+<p>Answer: <code>revenue</code> is a fact measure; <code>city</code> is a dimension attribute.</p>
+<ol><li>Why is a star usually preferred to a snowflake?</li></ol>
+<p>Answer: Fewer joins and simpler queries; the extra storage is cheap.</p>
+<h2 id="s5-11-5-slowly-changing-dimensions-scd">11.5 Slowly Changing Dimensions (SCD)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Asha lived in Pune and ordered in January. In March she moves to Delhi and orders again. If you simply overwrite her city with Delhi, then January's order looks as if it came from Delhi, and your "revenue by city" history is rewritten and wrong. A dimension attribute that changes <em>slowly and occasionally</em> is a <strong>slowly changing dimension</strong>. The question is: do you want history or not?</div></div>
+<h3>The types</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Type</th><th>What it does</th><th>History kept?</th><th>Use when</th></tr></thead><tbody><tr><td><strong>SCD 0</strong></td><td>never changes</td><td>n/a</td><td>fixed values (birth date)</td></tr><tr><td><strong>SCD 1</strong></td><td>overwrite the old value</td><td>No</td><td>corrections, typos, values nobody analyses by time</td></tr><tr><td><strong>SCD 2</strong></td><td>add a new row, close the old one with dates</td><td>Full</td><td>"as it was then" reporting (the common choice)</td></tr><tr><td><strong>SCD 3</strong></td><td>add a column <code>previous_city</code></td><td>Only one previous value</td><td>rare, "current and previous" only</td></tr></tbody></table></div>
+<h3>SCD 1: overwrite</h3>
+<pre class="code lang-sql"><code>CREATE TABLE d1 (customer_id INT PRIMARY KEY, city TEXT);
+INSERT INTO d1 VALUES (1,'Pune');
+UPDATE d1 SET city = 'Delhi' WHERE customer_id = 1;
+SELECT * FROM d1;</code></pre>
+<pre class="code lang-text"><code>customer_id  city 
+-----------  -----
+1            Delhi</code></pre>
+<p>Pune is gone. January's orders will now report Delhi.</p>
+<h3>SCD 2: add a row</h3>
+<p>Each version of a customer gets its own row, a new surrogate key, a validity period and an <code>is_current</code> flag. The natural key <code>customer_id</code> repeats.</p>
+<p class="problem"><span class="pl">Problem 11.5.1</span> Asha (customer 1) moves from Pune to Delhi on 2024-03-10. Record it as SCD 2, then find the city on the date of each order.</p>
+<pre class="code lang-sql"><code>CREATE TABLE dim_cust (
+  cust_sk INTEGER PRIMARY KEY, customer_id INT, name TEXT, city TEXT,
+  valid_from TEXT, valid_to TEXT, is_current INT);
+INSERT INTO dim_cust (customer_id,name,city,valid_from,valid_to,is_current) VALUES
+ (1,'Asha','Pune','2024-01-05','9999-12-31',1),
+ (2,'Ravi','Mumbai','2024-01-12','9999-12-31',1);
+
+BEGIN;
+UPDATE dim_cust SET valid_to = '2024-03-10', is_current = 0
+ WHERE customer_id = 1 AND is_current = 1;
+INSERT INTO dim_cust (customer_id,name,city,valid_from,valid_to,is_current)
+ VALUES (1,'Asha','Delhi','2024-03-10','9999-12-31',1);
+COMMIT;
+SELECT * FROM dim_cust ORDER BY cust_sk;</code></pre>
+<pre class="code lang-text"><code>cust_sk  customer_id  name  city    valid_from  valid_to    is_current
+-------  -----------  ----  ------  ----------  ----------  ----------
+1        1            Asha  Pune    2024-01-05  2024-03-10  0         
+2        2            Ravi  Mumbai  2024-01-12  9999-12-31  1         
+3        1            Asha  Delhi   2024-03-10  9999-12-31  1         </code></pre>
+<ul><li><strong>Step 1</strong> Close the old row: set <code>valid_to</code> to the change date and <code>is_current = 0</code>.</li><li><strong>Step 2</strong> Insert a new row with a new <code>cust_sk</code> (3), the new city, <code>valid_from</code> = the change date, and the far-future <code>9999-12-31</code> as "open end."</li><li><strong>Step 3</strong> Both statements sit in one transaction (Chapter 9), so no reader sees a customer with zero or two current rows.</li></ul>
+<p>Now link orders to the version that was true on the order date:</p>
+<pre class="code lang-sql"><code>CREATE TABLE fact_o (order_id INT, customer_id INT, order_date TEXT, revenue INT);
+INSERT INTO fact_o VALUES (101,1,'2024-01-10',1660),(106,1,'2024-03-20',680);
+SELECT f.order_id, f.order_date, d.city
+FROM fact_o f
+JOIN dim_cust d ON d.customer_id = f.customer_id
+ AND f.order_date &gt;= d.valid_from AND f.order_date &lt; d.valid_to
+ORDER BY f.order_id;</code></pre>
+<pre class="code lang-text"><code>order_id  order_date  city 
+--------  ----------  -----
+101       2024-01-10  Pune 
+106       2024-03-20  Delhi</code></pre>
+<ul><li><strong>Answer</strong> The January order shows Pune, the March order shows Delhi. History is preserved.</li><li><strong>Check</strong> Each order matched exactly one dimension row: 2 orders in, 2 rows out. If a join like this ever returns more rows than the fact table, your validity periods overlap (a data bug). The interval is <strong>inclusive at the start, exclusive at the end</strong> (<code>&gt;= valid_from AND &lt; valid_to</code>) so the change date belongs to only one row.</li><li><strong>Alternative</strong> Many warehouses store the surrogate key in the fact table at load time (<code>customer_sk</code>), so the fact points straight to the right version and no date join is needed.</li></ul>
+<p><strong>SCD 3</strong> adds a column such as <code>previous_city</code>. It keeps one step of history only, and is used rarely. There are also hybrid types (SCD 4, 6); just know they exist.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting to filter <code>is_current = 1</code> when you want today's customers: each moved customer is counted twice. And forgetting that <code>COUNT(DISTINCT customer_id)</code>, not <code>COUNT(*)</code>, counts people in an SCD 2 table.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using SCD 2 for everything. Every tracked column multiplies rows. Track only attributes the business analyses over time (city, plan tier, sales region), and use SCD 1 for typo fixes.</div></div>
+<h3>Connection to the real job</h3>
+<p>SCD 2 is a favourite interview topic for data engineering. dbt offers <em>snapshots</em> that implement SCD 2 for you. In customer analytics ("did churn differ by plan tier at the time?"), history decides whether the answer is right.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> SCD 2 loads in warehouses; dbt snapshots.</li><li><strong>Data Analytics:</strong> "as-was" reporting of region or plan tier.</li><li><strong>ML:</strong> point-in-time correct features (no peeking at attributes the customer got later), which prevents data leakage.</li><li><strong>Finance:</strong> historical price lists and tax rates.</li></ul>
+<h3>Check yourself</h3>
+<ol><li>Which SCD type keeps full history?</li></ol>
+<p>Answer: Type 2.</p>
+<ol><li>Why does SCD 2 need a surrogate key?</li></ol>
+<p>Answer: The natural key (<code>customer_id</code>) repeats across versions, so each row needs its own unique key.</p>
+<ol><li>Why use <code>valid_to</code> as exclusive in the join?</li></ol>
+<p>Answer: So the change date matches only one version, not two.</p>
+<h2 id="s6-chapter-recap">Chapter recap</h2>
+<ul><li>An ER diagram lists entities, attributes and relationships. The foreign key goes on the "many" side; many-to-many needs a junction table.</li><li>Use surrogate primary keys, sensible types and consistent <code>snake_case</code> names.</li><li>Normalization stores each fact once. 1NF: single values. 2NF: no dependency on part of a key. 3NF: no dependency on non-key columns. BCNF: every determinant is a candidate key.</li><li>An FD <code>A → B</code> can be tested with <code>GROUP BY A HAVING COUNT(DISTINCT B) &gt; 1</code>.</li><li>A good decomposition is lossless: joining the parts returns the original rows.</li><li>OLTP uses normalized tables for fast safe writes; OLAP uses denormalized tables for fast big reads.</li><li>Denormalize only measured hot paths, and own the sync plan.</li><li>A star schema has one fact table (the grain) and flat dimension tables. A snowflake normalizes dimensions further. Star is the usual default.</li><li>SCD 1 overwrites, SCD 2 adds a row with validity dates, SCD 3 adds a column.</li><li>Always verify by totals: the star's <code>SUM(revenue)</code> must equal the source query.</li></ul>
+<h3>Cheat-sheet</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Topic</th><th>Rule or pattern</th></tr></thead><tbody><tr><td>1:N</td><td>FK on the many side</td></tr><tr><td>M:N</td><td>junction table with composite PK</td></tr><tr><td>FD test</td><td><code>SELECT a, COUNT(DISTINCT b) FROM t GROUP BY a HAVING COUNT(DISTINCT b) &gt; 1</code></td></tr><tr><td>2NF / 3NF</td><td>part-of-key and non-key dependencies move to their own table</td></tr><tr><td>Star query</td><td><code>FROM fact JOIN dim ON key ... GROUP BY dim columns</code></td></tr><tr><td>SCD 2 columns</td><td><code>sk, natural_key, attrs, valid_from, valid_to, is_current</code></td></tr><tr><td>SCD 2 join</td><td><code>f.date &gt;= d.valid_from AND f.date &lt; d.valid_to</code></td></tr><tr><td>Grain</td><td>"one row per ..." decided first</td></tr></tbody></table></div>
+<h2 id="s7-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 11.P.1</span> (easy) Where does the foreign key go: one <code>author</code> writes many <code>books</code>? <strong>Answer:</strong> On <code>books</code> (<code>books.author_id</code>), the many side.</p>
+<p class="problem"><span class="pl">Problem 11.P.2</span> (easy) Is a cell containing <code>'red,green,blue'</code> in 1NF? <strong>Answer:</strong> No. Use one row per value in a child table.</p>
+<p class="problem"><span class="pl">Problem 11.P.3</span> (what is the output?) In a table <code>t(a, b)</code> with rows (1,'x'), (1,'y'), (2,'z'), what does <code>SELECT a, COUNT(DISTINCT b) FROM t GROUP BY a HAVING COUNT(DISTINCT b) &gt; 1</code> return? <strong>Answer:</strong> One row: <code>a = 1</code>, count 2. So <code>a → b</code> does not hold.</p>
+<p class="problem"><span class="pl">Problem 11.P.4</span> (computation) A fact table has 50 million rows. A dimension has 200 cities. A summary table by city and day for 365 days has how many rows at most, and what is the reduction? <strong>Answer:</strong> 200 × 365 = 73,000 rows. 50,000,000 / 73,000 is about 685, so the dashboard reads about 685 times fewer rows.</p>
+<p class="problem"><span class="pl">Problem 11.P.5</span> (find the bug) A table has columns <code>(order_id, product_id, product_name, qty)</code> with PK <code>(order_id, product_id)</code>. Which normal form is violated and why? <strong>Answer:</strong> 2NF. <code>product_name</code> depends on <code>product_id</code> alone, only part of the key. Move it to <code>products</code>.</p>
+<p class="problem"><span class="pl">Problem 11.P.6</span> (find the bug) After an SCD 2 load, <code>COUNT(*)</code> of customers is 1,240 but the company has 1,100. What happened? <strong>Answer:</strong> Moved customers have two or more rows (one per version). Count current rows (<code>WHERE is_current = 1</code>) or <code>COUNT(DISTINCT customer_id)</code>.</p>
+<p class="problem"><span class="pl">Problem 11.P.7</span> (find the bug) The SCD 2 join returns 3 rows for 2 orders. Give the likely cause. <strong>Answer:</strong> Overlapping validity periods (for example both <code>valid_to = '2024-03-10'</code> and an inclusive <code>&lt;=</code> in the join), so an order matches two versions. Make the end exclusive and check for overlaps.</p>
+<p class="problem"><span class="pl">Problem 11.P.8</span> (scenario) Design a star schema for ride-share trips. Name the grain, one fact table, and four dimensions. <strong>Answer:</strong> Grain: one row per completed trip. Fact <code>fact_trips</code> (<code>trip_id</code>, keys, <code>distance_km</code>, <code>fare</code>, <code>duration_min</code>). Dimensions: <code>dim_date</code> (and a time-of-day dimension), <code>dim_rider</code>, <code>dim_driver</code>, <code>dim_location</code> (pickup, and a second role for drop-off), <code>dim_vehicle_type</code>.</p>
+<p class="problem"><span class="pl">Problem 11.P.9</span> (scenario) Marketing wants "revenue by customer region as it was when the order happened" but the region team often reassigns customers. What do you do? <strong>Answer:</strong> Make region an SCD 2 attribute in the customer dimension (valid dates), and join the fact by order date or store the dimension's surrogate key in the fact at load time.</p>
+<p class="problem"><span class="pl">Problem 11.P.10</span> (interview) When would you deliberately denormalize? <strong>Answer:</strong> When measurement shows a read path is hot and the join cost is real, and I have a sync plan (summary table with a refresh job, trigger, or single write path). For analytics I model a star schema. I normalize first because it prevents anomalies, then relax for evidence.</p>
+<p class="problem"><span class="pl">Problem 11.P.11</span> (interview) Explain OLTP vs OLAP and why you would not run a big report on the production OLTP database. <strong>Answer:</strong> OLTP is many short transactions needing low latency; OLAP is few heavy scans. A big report scans many rows, uses CPU, memory and I/O, and can hold resources that slow checkout. Run it on a replica or in a warehouse.</p>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning SQL for data roles. Teach me ER diagrams and relational schema design: entities, attributes, 1:1, 1:N and M:N relationships, junction tables, primary and foreign keys, naming conventions. Use a food-delivery app as the running example, draw ASCII diagrams, explain each step in simple English, and after each idea ask me one question before moving on.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data engineering. Teach me normalization from 1NF to BCNF with a messy single-table spreadsheet of orders. Show update, insert and delete anomalies with small numbers, then normalize step by step and prove the split is lossless with a join. Finish with 8 graded exercises without solutions, and wait for my answers.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional who understands everyday business processes but is new to data modeling. Explain OLTP versus OLAP, row stores versus column stores, and when to denormalize. Use a checkout system and a reporting dashboard as examples. Then give me 6 scenarios and ask me for each whether to normalize or denormalize, and why. Correct my answers kindly.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for data engineer interviews. Teach me star and snowflake schemas: fact tables, dimensions, grain, measures and the date dimension. Then ask me to design a star schema for a business of your choice, and review my design when I answer. Check grain, keys, and whether my example queries work. My design: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for data engineer interviews. Run a mock interview on slowly changing dimensions types 0 to 3 and schema design. Ask 8 questions one at a time, including a SQL question where I write an SCD 2 update and insert. After each answer, score it out of 5, show what I missed, and give a model answer in simple English.</pre></div><div class="readbtn"><button class="btn" data-read="study:sql:ch11">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch10.html">← Chapter 10: Indexes, EXPLAIN and Query Optimization</a><a class="btn" href="ch12.html">Chapter 12: Analytics SQL Patterns →</a></div></div><script src="../../assets/study.js"></script></body></html>

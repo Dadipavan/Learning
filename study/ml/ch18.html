@@ -1,0 +1,405 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 18: Project Lab 2, A Library From Scratch, a Validation Study and Customer Segments</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Machine Learning Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 18</div><h1>Project Lab 2, A Library From Scratch, a Validation Study and Customer Segments</h1><p>Three projects that prove you understand the machinery: build the algorithms yourself, measure how evaluation lies, and find groups you can trust.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-18-1-project-a-from-scratch-ml-library-in-numpy-tested-against-scikit-learn">18.1 Project: A From-Scratch ML Library in NumPy, Tested Against scikit-learn</a></li><li><a href="#s2-18-2-project-a-validation-and-hyperparameter-tuning-study-that-shows-leakage">18.2 Project: A Validation and Hyperparameter-Tuning Study That Shows Leakage</a></li><li><a href="#s3-18-3-project-customer-segmentation-with-clustering-and-stability-analysis">18.3 Project: Customer Segmentation With Clustering and Stability Analysis</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>Most candidates can call <code>model.fit()</code>. Far fewer can say what happens inside it, or how much to trust the score it prints. These three projects give you that evidence. In the first you write five classic algorithms in plain NumPy and check them against scikit-learn with automated tests. In the second you run a controlled study that shows, with numbers, how a wrong split or a leaky pipeline inflates a score. In the third you cluster shop customers and prove the groups are stable instead of accidental. Every code block was run (NumPy 2.5.3, scikit-learn 1.9.1, fixed seeds), and the outputs below are the real outputs. Use the method in Chapter 17, section 17.1 (repo layout, commit rhythm, README template, definition of done) for all three.</p>
+<p>Prerequisites: Chapter 2 (Linear Regression From Scratch), Chapter 4 (Logistic Regression and Classification), Chapter 5 (Support Vector Machines, k-Nearest Neighbours and Naive Bayes), Chapter 6 (Decision Trees and Random Forests), Chapter 8 (Validation Design and Leakage), Chapter 11 (Hyperparameter Tuning), Chapter 13 (Unsupervised Learning).</p>
+<h2 id="s1-18-1-project-a-from-scratch-ml-library-in-numpy-tested-against-scikit-learn">18.1 Project: A From-Scratch ML Library in NumPy, Tested Against scikit-learn</h2>
+<h3>Goal and why employers care</h3>
+<p>Build <code>mlscratch.py</code> with linear regression, logistic regression, k-nearest neighbours, a decision tree and k-means, about 80 lines in total, plus a test file that proves each one gives the same answers as scikit-learn. Interviewers love this because it shows two rare skills at once: you understand the algorithm, and you know how to <strong>test</strong> numerical code. "Matches scikit-learn to 4 decimals" is a strong sentence.</p>
+<h3>Skills used</h3>
+<p>Chapter 2 (Linear Regression From Scratch) for least squares; Chapter 4 (Logistic Regression and Classification) for the log-loss gradient and Newton's method; Chapter 5 (Support Vector Machines, k-Nearest Neighbours and Naive Bayes) for k-NN; Chapter 6 (Decision Trees and Random Forests) for Gini splits; Chapter 13 (Unsupervised Learning) for k-means.</p>
+<h3>Data</h3>
+<p>Generated inside the tests with <code>make_regression</code>, <code>make_classification</code> and <code>make_blobs</code>. Fixed seeds, so the tests are repeatable.</p>
+<h3>Architecture</h3>
+<pre class="code lang-text"><code>mlscratch-project/
+├── mlscratch.py          # five classes, NumPy only
+├── test_mlscratch.py     # one test per class, compares with scikit-learn
+├── README.md
+└── requirements.txt      # numpy, scikit-learn (for tests only)
+
+Design rule: the library imports ONLY numpy. scikit-learn is the "answer key"
+and appears only in the tests.</code></pre>
+<h3>Step-by-step build</h3>
+<ol><li><strong>Write the library one class at a time, test each class before the next.</strong> The complete library follows. Read the comments, because each class uses a <em>choice</em> that must match scikit-learn to pass.</li></ol>
+<pre class="code lang-python"><code>"""Tiny ML library in NumPy. Educational, not fast."""
+import numpy as np
+
+class LinearRegression:
+    def fit(self, X, y):
+        A = np.c_[np.ones(len(X)), X]
+        self.coef_ = np.linalg.lstsq(A, y, rcond=None)[0]
+        return self
+    def predict(self, X):
+        return np.c_[np.ones(len(X)), X] @ self.coef_
+
+class LogisticRegression:
+    """Newton's method (IRLS) with a small L2 penalty on the weights (not the intercept)."""
+    def __init__(self, C=1e6, n_iter=50):
+        self.lam, self.n_iter = 1.0 / C, n_iter
+    def fit(self, X, y):
+        A = np.c_[np.ones(len(X)), X]; w = np.zeros(A.shape[1])
+        R = self.lam * np.eye(A.shape[1]); R[0, 0] = 0
+        for _ in range(self.n_iter):
+            p = 1 / (1 + np.exp(-A @ w))
+            grad = A.T @ (p - y) + R @ w
+            H = A.T @ (A * (p * (1 - p))[:, None]) + R
+            step = np.linalg.solve(H, grad); w -= step
+            if np.abs(step).max() &lt; 1e-10: break
+        self.w_ = w; return self
+    def predict_proba(self, X):
+        p = 1 / (1 + np.exp(-(np.c_[np.ones(len(X)), X] @ self.w_)))
+        return np.c_[1 - p, p]
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] &gt;= .5).astype(int)
+
+class KNN:
+    def __init__(self, k=5): self.k = k
+    def fit(self, X, y): self.X_, self.y_ = np.asarray(X, float), np.asarray(y); return self
+    def predict(self, X):
+        d = ((np.asarray(X, float)[:, None, :] - self.X_[None, :, :]) ** 2).sum(-1)
+        idx = np.argsort(d, axis=1, kind="stable")[:, :self.k]
+        votes = self.y_[idx]
+        return np.array([np.bincount(v).argmax() for v in votes])
+
+class DecisionTree:
+    def __init__(self, max_depth=3, min_leaf=1): self.max_depth, self.min_leaf = max_depth, min_leaf
+    @staticmethod
+    def _gini(y): 
+        p = np.bincount(y) / len(y); return 1 - (p ** 2).sum()
+    def _best(self, X, y):
+        best = (None, None, self._gini(y)); n = len(y)
+        for j in range(X.shape[1]):
+            vals = np.unique(X[:, j])
+            for t in (vals[:-1] + vals[1:]) / 2:
+                L = X[:, j] &lt;= t
+                if L.sum() &lt; self.min_leaf or (~L).sum() &lt; self.min_leaf: continue
+                g = (L.sum() * self._gini(y[L]) + (~L).sum() * self._gini(y[~L])) / n
+                if g &lt; best[2] - 1e-12: best = (j, t, g)
+        return best
+    def _grow(self, X, y, depth):
+        if depth == self.max_depth or len(np.unique(y)) == 1: return int(np.bincount(y).argmax())
+        j, t, _ = self._best(X, y)
+        if j is None: return int(np.bincount(y).argmax())
+        L = X[:, j] &lt;= t
+        return (j, t, self._grow(X[L], y[L], depth + 1), self._grow(X[~L], y[~L], depth + 1))
+    def fit(self, X, y): self.tree_ = self._grow(np.asarray(X, float), np.asarray(y), 0); return self
+    def _one(self, x, node):
+        while isinstance(node, tuple): node = node[2] if x[node[0]] &lt;= node[1] else node[3]
+        return node
+    def predict(self, X): return np.array([self._one(x, self.tree_) for x in np.asarray(X, float)])
+
+class KMeans:
+    def __init__(self, k=3, init=None, n_iter=100, seed=0): self.k, self.init, self.n_iter, self.seed = k, init, n_iter, seed
+    def fit(self, X):
+        X = np.asarray(X, float)
+        if self.init is None:
+            rng = np.random.default_rng(self.seed); C = X[rng.choice(len(X), self.k, replace=False)]
+        else: C = np.array(self.init, float)
+        for _ in range(self.n_iter):
+            lab = ((X[:, None, :] - C[None]) ** 2).sum(-1).argmin(1)
+            newC = np.array([X[lab == c].mean(0) if (lab == c).any() else C[c] for c in range(self.k)])
+            if np.allclose(newC, C): break
+            C = newC
+        self.centers_, self.labels_ = C, lab
+        self.inertia_ = ((X - C[lab]) ** 2).sum()
+        return self
+    def predict(self, X): return ((np.asarray(X, float)[:, None, :] - self.centers_[None]) ** 2).sum(-1).argmin(1)</code></pre>
+<p>Why these choices: linear regression uses <code>lstsq</code> (stable least squares, better than inverting a matrix). Logistic regression uses Newton's method, which needs only a handful of iterations, and a penalty <code>1/C</code> on the weights but <strong>not</strong> on the intercept, which is how scikit-learn defines its penalty. k-NN uses a stable sort so ties break the same way each time. The tree tries every midpoint between sorted unique values and keeps the split with the lowest weighted Gini impurity. k-means uses Lloyd's loop: assign each point to the nearest centre, move each centre to the mean of its points, repeat until nothing moves.</p>
+<ol><li><strong>Write the tests.</strong> The comparison must use the same settings on both sides (same penalty, same starting centres).</li></ol>
+<pre class="code lang-python"><code>import numpy as np
+from sklearn.datasets import make_regression, make_classification, make_blobs
+from sklearn import linear_model, neighbors, tree, cluster
+import mlscratch as ms
+
+def test_linear():
+    X, y = make_regression(200, 4, noise=5, random_state=0)
+    a = ms.LinearRegression().fit(X, y); b = linear_model.LinearRegression().fit(X, y)
+    assert np.allclose(a.coef_[1:], b.coef_) and np.isclose(a.coef_[0], b.intercept_)
+    assert np.allclose(a.predict(X), b.predict(X))
+
+def test_logistic():
+    X, y = make_classification(300, 5, random_state=1)
+    a = ms.LogisticRegression(C=1.0).fit(X, y); b = linear_model.LogisticRegression(C=1.0, tol=1e-10, max_iter=1000).fit(X, y)
+    assert np.allclose(a.w_[1:], b.coef_[0], atol=1e-4) and np.isclose(a.w_[0], b.intercept_[0], atol=1e-4)
+    assert np.allclose(a.predict_proba(X)[:, 1], b.predict_proba(X)[:, 1], atol=1e-4)
+
+def test_knn():
+    X, y = make_classification(200, 4, random_state=2); Xt = X[:50] + .01
+    a = ms.KNN(5).fit(X, y).predict(Xt); b = neighbors.KNeighborsClassifier(5).fit(X, y).predict(Xt)
+    assert (a == b).all()
+
+def test_tree():
+    X, y = make_classification(200, 4, random_state=3)
+    a = ms.DecisionTree(max_depth=3).fit(X, y); b = tree.DecisionTreeClassifier(max_depth=3, random_state=0).fit(X, y)
+    agree = (a.predict(X) == b.predict(X)).mean(); print("tree agreement", agree)
+    assert agree &gt;= 0.99
+
+def test_kmeans():
+    X, _ = make_blobs(300, centers=3, random_state=4)
+    init = X[[0, 1, 2]]
+    a = ms.KMeans(3, init=init).fit(X); b = cluster.KMeans(3, init=init, n_init=1, algorithm="lloyd").fit(X)
+    assert np.allclose(a.centers_, b.cluster_centers_, atol=1e-6) and np.isclose(a.inertia_, b.inertia_)
+
+def test_logistic_shape_and_range():
+    X, y = make_classification(50, 3, n_informative=2, n_redundant=0, random_state=5); p = ms.LogisticRegression().fit(X, y).predict_proba(X)
+    assert p.shape == (50, 2) and np.allclose(p.sum(1), 1) and (p &gt;= 0).all()
+
+if __name__ == "__main__":      # tiny runner, so the file also works without pytest
+    for name, fn in list(globals().items()):
+        if name.startswith("test_"):
+            fn(); print("PASS", name)</code></pre>
+<ol><li><strong>Run them.</strong></li></ol>
+<pre class="code lang-bash"><code>python3 test_mlscratch.py</code></pre>
+<pre class="code lang-text"><code>PASS test_linear
+PASS test_logistic
+PASS test_knn
+tree agreement 1.0
+PASS test_tree
+PASS test_kmeans
+PASS test_logistic_shape_and_range</code></pre>
+<p>(If <code>pytest</code> is installed you can run <code>pytest -q</code> instead. It was not installed where this chapter was tested, so the file has a tiny runner at the bottom.)</p>
+<ol><li><strong>Break it on purpose, to see that your tests can fail.</strong> If we change <code>R[0, 0] = 0</code> to <code>pass</code> (so the intercept is also penalised), the weights still match to 1e-4, and only the <strong>intercept check</strong> catches the bug: the intercept becomes 0.0528 instead of scikit-learn's 0.0546. Running the test file then stops with an <code>AssertionError</code> at the line that compares intercepts. A test that cannot fail is not a test. Always include one deliberate-break check in your write-up.</li></ol>
+<ol><li><strong>Add a timing note.</strong> k-NN here builds an <code>n_test × n_train × features</code> array, which is simple but memory-hungry. Say so in the README. Honesty about limits is part of the project.</li></ol>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li>All five classes pass tests against scikit-learn: linear coefficients and predictions equal (<code>np.allclose</code>), logistic probabilities within 1e-4, k-NN predictions identical, tree agreement at least 0.99 on training data (we got 1.0), k-means centres within 1e-6 and equal inertia.</li><li>The library file imports only NumPy.</li><li>At least one deliberately broken version fails a test.</li><li>README states what is not implemented (no regularisation path, no pruning, no speed tuning).</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Different settings on the two sides.</strong> scikit-learn's logistic regression is penalised by default (<code>C=1.0</code>). Detect: results differ by a small, steady amount; print both settings. Fix: set <code>C</code> explicitly on both.</li><li><strong>Penalising the intercept.</strong> Detect: coefficients agree but the intercept is slightly off. Test the intercept separately.</li><li><strong>Random starts for k-means.</strong> Two runs reach different local optima. Detect: compare with a fixed <code>init</code>. Fix: pass the same starting centres to both.</li><li><strong>Test data that breaks the generator.</strong> <code>make_classification</code> raised <code>ValueError: Number of informative, redundant and repeated features must sum to less than the number of total features</code> when we first asked for 3 features with default settings. Fix: set <code>n_informative=2, n_redundant=0</code>. Read errors fully.</li><li><strong>Tolerance too loose.</strong> <code>atol=1e-1</code> passes almost anything. Detect: break the code on purpose and see if the test fails.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Add ridge regression and Lasso (coordinate descent), and test against scikit-learn.</li><li>Add a random forest from your tree (bootstrap rows, random feature subsets) and compare accuracy with scikit-learn's forest.</li><li>Add gradient descent versions of the linear and logistic models and plot loss against iteration (Chapter 11).</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. How do you know your implementation is right?</strong> I wrote tests that compare it with a trusted library under identical settings, and I broke my own code on purpose to confirm that the tests fail. Matching in one case is not proof, so I used several datasets and checked weights, probabilities and predictions.</p>
+<p><strong>Q2. Why Newton's method for logistic regression?</strong> The loss is smooth and convex, and Newton uses the curvature (the Hessian) to take big, well-aimed steps. It reaches the answer in a few iterations. The cost is solving a small linear system each step, which is fine for few features and slow for thousands.</p>
+<p><strong>Q3. What does k-means actually minimise, and what can go wrong?</strong> It minimises the sum of squared distances from each point to its centre (inertia). Each step lowers or keeps it, but it can stop at a local minimum, so the starting centres matter. That is why we run several starts.</p>
+<h3>README outline</h3>
+<p>Why this exists; the five algorithms with one line each; how to run the tests; table of "what is compared and to what tolerance"; the deliberate-break experiment; limits; next steps.</p>
+<h2 id="s2-18-2-project-a-validation-and-hyperparameter-tuning-study-that-shows-leakage">18.2 Project: A Validation and Hyperparameter-Tuning Study That Shows Leakage</h2>
+<h3>Goal and why employers care</h3>
+<p>Run three controlled experiments in which you <strong>know the true answer</strong>, so you can see exactly how much a careless evaluation lies. Employers care because the most expensive ML failures are not bad algorithms, they are inflated scores. A study like this is rare in portfolios and very convincing.</p>
+<h3>Skills used</h3>
+<p>Chapter 8 (Validation Design and Leakage) for splits, groups, time and pipelines; Chapter 11 (Hyperparameter Tuning) for random search and over-tuning; Chapter 6 (Decision Trees and Random Forests) for the models; Chapter 10 (Error Analysis, Debugging Models, and Comparing Models) for the shuffled-label idea.</p>
+<h3>Data</h3>
+<p>All generated, because we need to know the truth.</p>
+<ul><li><strong>Study A, Q1 (new customers).</strong> 400 customers, 12 visits each. Each customer has a fixed habit that makes their rows look alike, and a hidden personal tendency that drives their outcome. Random folds put the same customer in train and validation, so the model can memorise the customer.</li><li><strong>Study A, Q2 (next months).</strong> The link between feature <code>x1</code> and the outcome fades and flips sign over 12 months.</li><li><strong>Study B.</strong> 100 rows, 1,000 random features, labels that are pure coin flips. The true AUC is 0.5.</li><li><strong>Study C.</strong> A weak signal in 10 features, a small validation set of 60 rows, 100 random configurations of a decision tree, repeated 30 times.</li></ul>
+<h3>Architecture</h3>
+<pre class="code lang-text"><code>Study A: one dataset, several split strategies  ─►  compare each estimate with the TRUTH
+Study B: noise labels                           ─►  leaky vs pipeline selection
+Study C: many configurations, small validation  ─►  winner's validation score vs fresh score
+        all studies: fixed seeds, one script, one results table</code></pre>
+<h3>Step-by-step build</h3>
+<ol><li><strong>Put all three studies in one script (<code>study.py</code>).</strong> Read it once, then run it.</li></ol>
+<pre class="code lang-python"><code>import numpy as np, pandas as pd
+from sklearn.model_selection import KFold, GroupKFold, TimeSeriesSplit, cross_val_score, StratifiedKFold, ParameterSampler
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.pipeline import make_pipeline
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import roc_auc_score
+
+# ---------- Study A: split strategy ----------
+def make_visits(n_cust=400, per=12, seed=0):
+    rng = np.random.default_rng(seed); rows = []
+    for c in range(n_cust):
+        quirk = rng.normal(0, 1.5, 3); base = rng.normal(0, 2)      # customer-specific habit (identifies the customer)
+        for t in range(per):
+            x = quirk + rng.normal(0, .15, 3)
+            w1 = 1.0 - 0.25*t                                    # relationship changes with time
+            z = base + w1*x[1]
+            rows.append((c, t, *x, rng.binomial(1, 1/(1+np.exp(-z)))))
+    return pd.DataFrame(rows, columns=["cust","month","x0","x1","x2","y"])
+d = make_visits(); F = ["x0","x1","x2"]
+model = lambda: RandomForestClassifier(150, random_state=0, n_jobs=1)
+def cv(splitter, data, groups=None):
+    return cross_val_score(model(), data[F], data.y, groups=groups, cv=splitter, scoring="roc_auc").mean()
+# Question 1: "will it work for NEW customers?"  Truth = train on customers 0-299, score customers 300-399.
+old, new = d[d.cust &lt; 300], d[d.cust &gt;= 300]
+truth1 = roc_auc_score(new.y, model().fit(old[F], old.y).predict_proba(new[F])[:,1])
+print("rows", len(d), "customers", d.cust.nunique())
+print("Q1 new customers:")
+print(f"  random KFold(5)        : {cv(KFold(5, shuffle=True, random_state=0), old):.3f}")
+print(f"  GroupKFold(5) by cust  : {cv(GroupKFold(5), old, old.cust):.3f}")
+print(f"  TRUTH (unseen customers): {truth1:.3f}")
+
+# Question 2: "will it work next month?"  A drifting world with no repeated customers.
+def make_drift(n=6000, seed=5):
+    rng = np.random.default_rng(seed); t = np.sort(rng.integers(0, 12, n)); X = rng.normal(size=(n, 3))
+    z = (1.0 - 0.25*t) * X[:,1] + 0.5*X[:,2]               # the weight on x1 fades and flips sign
+    return pd.DataFrame(dict(month=t, x0=X[:,0], x1=X[:,1], x2=X[:,2], y=rng.binomial(1, 1/(1+np.exp(-z)))))
+dd = make_drift(); past, future = dd[dd.month &lt; 9], dd[dd.month &gt;= 9]
+truth2 = roc_auc_score(future.y, model().fit(past[F], past.y).predict_proba(future[F])[:,1])
+print("Q2 next months (train months 0-8, score months 9-11):")
+print(f"  random KFold(5)        : {cv(KFold(5, shuffle=True, random_state=0), past):.3f}")
+print(f"  TimeSeriesSplit(4)     : {cv(TimeSeriesSplit(4), past):.3f}")
+print(f"  TRUTH (future months)  : {truth2:.3f}")
+
+# ---------- Study B: leakage in feature selection (labels are pure noise) ----------
+cvs = StratifiedKFold(5, shuffle=True, random_state=0); W, R = [], []
+for seed in range(20):
+    rng = np.random.default_rng(seed); Xn = rng.normal(size=(100, 1000)); yn = rng.integers(0, 2, 100)
+    Xsel = SelectKBest(f_classif, k=20).fit_transform(Xn, yn)          # WRONG: selection saw every row
+    W.append(cross_val_score(LogisticRegression(max_iter=1000), Xsel, yn, cv=cvs, scoring="roc_auc").mean())
+    R.append(cross_val_score(make_pipeline(SelectKBest(f_classif, k=20), LogisticRegression(max_iter=1000)), Xn, yn, cv=cvs, scoring="roc_auc").mean())
+print(f"noise labels, mean of 20 datasets: select-then-CV (leak) AUC={np.mean(W):.3f}; selection inside pipeline AUC={np.mean(R):.3f}; truth 0.5")
+
+# ---------- Study C: over-tuning on a small validation set (30 repeats) ----------
+space = dict(max_depth=list(range(1,15)), min_samples_leaf=list(range(1,40)), max_features=[1,2,3,5,10], criterion=["gini","entropy"])
+def gen(rng, n):
+    X = rng.normal(size=(n, 10)); return X, (X[:,0] + 0.5*X[:,1] + rng.normal(0, 2.0, n) &gt; 0).astype(int)
+best_val, fresh_of_best, default_fresh = [], [], []
+for rep in range(30):
+    rng = np.random.default_rng(100+rep); Xt, yt = gen(rng, 150); Xv, yv = gen(rng, 60); Xf, yf = gen(rng, 5000)
+    sc = []
+    for p in ParameterSampler(space, 100, random_state=rep):
+        m = DecisionTreeClassifier(random_state=0, **p).fit(Xt, yt)
+        sc.append((roc_auc_score(yv, m.predict_proba(Xv)[:,1]), roc_auc_score(yf, m.predict_proba(Xf)[:,1])))
+    sc = np.array(sc); b = sc[:,0].argmax(); best_val.append(sc[b,0]); fresh_of_best.append(sc[b,1])
+print(f"mean best validation AUC={np.mean(best_val):.3f}; mean AUC of that same winner on 5000 fresh rows={np.mean(fresh_of_best):.3f}")</code></pre>
+<ol><li><strong>Run it and read the output.</strong></li></ol>
+<pre class="code lang-text"><code>rows 4800 customers 400
+Q1 new customers:
+  random KFold(5)        : 0.724
+  GroupKFold(5) by cust  : 0.560
+  TRUTH (unseen customers): 0.508
+Q2 next months (train months 0-8, score months 9-11):
+  random KFold(5)        : 0.593
+  TimeSeriesSplit(4)     : 0.571
+  TRUTH (future months)  : 0.533
+noise labels, mean of 20 datasets: select-then-CV (leak) AUC=0.906; selection inside pipeline AUC=0.509; truth 0.5
+mean best validation AUC=0.717; mean AUC of that same winner on 5000 fresh rows=0.611</code></pre>
+<ol><li><strong>Read each study.</strong></li></ol>
+<p><strong>Study A, new customers.</strong> Random KFold says AUC 0.724. Grouped CV (never splitting a customer across folds) says 0.560. The truth, scoring customers the model never saw, is 0.508, which is basically chance. Random folds are too optimistic by 0.22 because the model recognised customers. Grouped CV is much closer.</p>
+<p><strong>Study A, next months.</strong> Random KFold says 0.593, <code>TimeSeriesSplit</code> says 0.571, and the real future is 0.533. Both are optimistic, because the signal changed. The forward-in-time split is closer, and its gap (0.04) is the honest measure of how much the world shifted. A split cannot remove drift, it can only reveal it.</p>
+<p><strong>Study B.</strong> Selecting the 20 "best" features using all rows and then cross-validating gives AUC 0.906 on labels that are pure noise. Putting the selection inside the pipeline gives 0.509, matching the truth of 0.5. The wrong version is not a small mistake, it creates a fake model.</p>
+<p><strong>Study C.</strong> The winner of 100 configurations scores 0.717 on the validation set on average, but only 0.611 on 5,000 fresh rows. The 0.106 gap is <strong>selection optimism</strong>: picking the maximum of many noisy scores. With a bigger validation set, fewer configurations, or nested CV (Chapter 8) the gap shrinks.</p>
+<ol><li><strong>Make one figure.</strong> A bar chart of "estimate vs truth" for each study (matplotlib; not run here). Label the bars with numbers.</li></ol>
+<ol><li><strong>Write the rule book</strong> in the README: group when rows share an entity, go forward in time when the future is the target, put every learned step in the pipeline, and keep the final test untouched.</li></ol>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li>Every study reports the <strong>estimate and the truth</strong>, not just the estimate.</li><li>The leaky estimate is at least 0.2 above the truth in Study A (Q1) and Study B: 0.724 vs 0.508, and 0.906 vs 0.5. Pass.</li><li>The corrected method is within 0.06 of the truth: grouped CV is 0.052 above the truth (0.560 vs 0.508), the pipeline is 0.009 above. Pass.</li><li>Seeds fixed, runtime under 5 minutes, one command reproduces the table.</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Reusing one dataset's luck.</strong> A single run can mislead. Study B and C average over 20 and 30 repeats. Detect: change the seed and see if the story survives.</li><li><strong>Mixing up the question.</strong> Random CV is fine for "same customers, new rows", wrong for "new customers". Detect: write the deployment sentence first.</li><li><strong>Leaving the selection step outside the Pipeline.</strong> Detect: look for <code>fit_transform</code> on all data before <code>cross_val_score</code>.</li><li><strong>Believing a CV score after heavy tuning.</strong> Detect: count how many configurations you tried and compare the winner on fresh data.</li><li><strong>A study without a known truth.</strong> If you cannot say what the right answer is, you cannot measure the lie. Keep generators.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Add nested CV for Study C and show that its estimate (0.61 region) is much closer to the fresh score.</li><li>Add a "target leak" feature recorded after the event and show the score jump (Chapter 8).</li><li>Add stratified versus plain KFold on a rare-event dataset and show the variance of the estimates over 50 repeats.</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. Why did your cross-validation score drop when you grouped by customer?</strong> Because random folds let the model see the same customer in training and validation, so it learned the customer, not the pattern. Grouped CV only validates on customers it has never seen, which matches the real use of predicting for new customers.</p>
+<p><strong>Q2. What is selection optimism?</strong> If you try 100 configurations and pick the highest validation score, that highest number is partly luck. The luck does not transfer to new data. In my study the winner dropped from 0.717 to 0.611.</p>
+<p><strong>Q3. What is the simplest rule against leakage?</strong> Anything that learns from data (scaling, imputing, feature selection, encoding) must be fitted on the training part only. The easiest way to follow the rule is to put every such step inside a pipeline and cross-validate the pipeline.</p>
+<h3>README outline</h3>
+<p>The three questions; data generators; results table (estimate vs truth for each strategy); one figure; the rule book; limits (synthetic, one model family); reproduce; next steps.</p>
+<h2 id="s3-18-3-project-customer-segmentation-with-clustering-and-stability-analysis">18.3 Project: Customer Segmentation With Clustering and Stability Analysis</h2>
+<h3>Goal and why employers care</h3>
+<p>Group 1,600 shop customers by how recently, how often and how much they buy, then <strong>prove that the groups are stable</strong> instead of showing a pretty scatter plot. Marketing teams use segments constantly, and clustering always returns some groups, even in random data. A candidate who tests stability and names the segments in business words stands out.</p>
+<h3>Skills used</h3>
+<p>Chapter 13 (Unsupervised Learning) for k-means, silhouette and clustering ideas; Chapter 8 (Validation Design and Leakage) for the resampling mindset; Chapter 9 (Metrics, Thresholds, Calibration, Uncertainty) for the bootstrap; Chapter 16 (Explainability) for explaining segments by their averages.</p>
+<h3>Data</h3>
+<p>Generated. Three hidden customer types: loyal (recent, frequent, large baskets), bargain (middle recency, frequent, small baskets) and lapsed (long ago, rare, large baskets). We keep the hidden label only to check the result, as a real analyst would not have it.</p>
+<h3>Architecture</h3>
+<pre class="code lang-text"><code>shoppers table (recency, orders per year, average basket)
+   │  scale each column (mean 0, sd 1)
+   ▼
+k-means for k = 2..7 ─► silhouette, inertia
+   │                    bootstrap stability: refit on resamples, compare with ARI
+   ▼
+choose k (data + business meaning) ─► profile each segment ─► name them
+   ▼
+drift check: next period assigned by old centres vs refit</code></pre>
+<h3>Step-by-step build</h3>
+<ol><li><strong>Generate, scale, and run the whole analysis.</strong></li></ol>
+<pre class="code lang-python"><code>import numpy as np, pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import silhouette_score, adjusted_rand_score
+def make_shoppers(seed=0):
+    rng = np.random.default_rng(seed)
+    #        name     n   recency(mean,sd)  orders/yr(mean,sd)  basket(mean,sd)
+    spec = [("loyal",   500, (12, 5),   (12, 2),  (30, 4)),
+            ("bargain", 700, (40, 15),  (12, 3),  (14, 3)),
+            ("lapsed",  400, (160, 50), (2, 1),   (35, 10))]
+    parts = [pd.DataFrame(dict(recency=rng.normal(*r, n).clip(1), orders=rng.normal(*o, n).clip(1),
+                               basket=rng.normal(*m, n).clip(5), true=name)) for name, n, r, o, m in spec]
+    df = pd.concat(parts, ignore_index=True)
+    df["annual_spend"] = df.orders * df.basket
+    return df.sample(frac=1, random_state=0).reset_index(drop=True)
+df = make_shoppers(); F = ["recency","orders","basket"]
+print(df.groupby("true")[F+["annual_spend"]].mean().round(1))
+Xs = StandardScaler().fit_transform(df[F])
+print("k | silhouette | inertia | bootstrap-ARI(mean±sd)")
+def boot_stability(X, k, B=30, seed=0):
+    rng = np.random.default_rng(seed); ref = KMeans(k, n_init=10, random_state=0).fit(X).labels_; aris = []
+    for b in range(B):
+        idx = rng.choice(len(X), len(X), replace=True)
+        m = KMeans(k, n_init=10, random_state=b).fit(X[idx]); aris.append(adjusted_rand_score(ref, m.predict(X)))
+    return np.mean(aris), np.std(aris)
+for k in range(2, 8):
+    km = KMeans(k, n_init=10, random_state=0).fit(Xs); m, s = boot_stability(Xs, k)
+    print(f"{k} | {silhouette_score(Xs, km.labels_):.3f} | {km.inertia_:8.1f} | {m:.3f} ± {s:.3f}")
+km = KMeans(3, n_init=10, random_state=0).fit(Xs)
+print("ARI vs hidden truth:", round(adjusted_rand_score(df.true, km.labels_), 3))
+df["seg"] = km.labels_
+print(pd.crosstab(df.seg, df.true))
+print(df.groupby("seg")[F+["annual_spend"]].agg("mean").round(1).assign(size=df.groupby("seg").size()))
+# mistake: unscaled
+ku = KMeans(3, n_init=10, random_state=0).fit(df[F]); print("UNSCALED ARI vs truth:", round(adjusted_rand_score(df.true, ku.labels_),3))
+# seed stability with n_init=1
+aris=[adjusted_rand_score(KMeans(3,n_init=1,random_state=a).fit(Xs).labels_, KMeans(3,n_init=1,random_state=a+100).fit(Xs).labels_) for a in range(10)]
+print("n_init=1, seed-vs-seed ARI min/mean:", round(min(aris),3), round(np.mean(aris),3))
+# time stability: second period with slight drift
+d2 = make_shoppers(seed=9); X2 = StandardScaler().fit(df[F]).transform(d2[F])
+print("next-period: assign by old centres vs refit ARI:", round(adjusted_rand_score(km.predict(X2), KMeans(3,n_init=10,random_state=0).fit(X2).labels_),3))</code></pre>
+<ol><li><strong>Output.</strong></li></ol>
+<pre class="code lang-text"><code>         recency  orders  basket  annual_spend
+true                                          
+bargain     39.2    11.8    14.1         166.4
+lapsed     162.5     2.1    35.3          75.1
+loyal       11.9    11.9    30.2         358.1
+k | silhouette | inertia | bootstrap-ARI(mean±sd)
+2 | 0.613 |   1747.1 | 1.000 ± 0.000
+3 | 0.523 |   1057.0 | 0.999 ± 0.001
+4 | 0.472 |    855.4 | 0.944 ± 0.105
+5 | 0.427 |    674.3 | 0.965 ± 0.018
+6 | 0.428 |    575.1 | 0.951 ± 0.028
+7 | 0.425 |    525.8 | 0.844 ± 0.086
+ARI vs hidden truth: 0.968
+true  bargain  lapsed  loyal
+seg                         
+0         698       3     10
+1           0     396      0
+2           2       1    490
+     recency  orders  basket  annual_spend  size
+seg                                             
+0       39.0    11.8    14.2         166.4   711
+1      163.6     2.1    35.5          75.2   396
+2       11.9    11.9    30.4         360.0   493
+UNSCALED ARI vs truth: 0.396
+n_init=1, seed-vs-seed ARI min/mean: 0.414 0.826
+next-period: assign by old centres vs refit ARI: 0.998</code></pre>
+<ol><li><strong>Choose k.</strong> Silhouette (how well a point fits its own group compared with the next nearest, from -1 to 1) is highest at k = 2 (0.613) and drops after. Inertia (total squared distance to centres) always falls as k grows, so it cannot choose k alone. Bootstrap stability (ARI, the adjusted Rand index, where 1 means two clusterings are identical and about 0 means chance agreement) is perfect for k = 2 and 3 (1.000 and 0.999) and becomes shaky from k = 4 (0.944 with a large spread of 0.105). So k = 2 and 3 are defensible. We pick <strong>k = 3</strong> because three groups give three different business actions and the data says they are stable.</li></ol>
+<ol><li><strong>Profile and name.</strong> Segment 2 (493 customers): recency 12 days, 11.9 orders, basket 30.4, annual spend 360, so "loyal big baskets". Segment 0 (711): recency 39, 11.8 orders, basket 14.2, spend 166, so "frequent bargain hunters". Segment 1 (396): recency 164 days, 2.1 orders, basket 35.5, spend 75, so "lapsed". The crosstab against the hidden types shows only 16 of 1,600 customers in a different group, ARI 0.968.</li></ol>
+<ol><li><strong>Test the common mistakes on purpose.</strong> Without scaling, the ARI against the truth falls to 0.396, because recency (in days, up to hundreds) dominates distance while basket (single digits to tens) is almost ignored. With <code>n_init=1</code>, two runs with different seeds agree with an ARI of only 0.826 on average and 0.414 in the worst case. With <code>n_init=10</code> the result is steady.</li></ol>
+<ol><li><strong>Check drift.</strong> For a new period (fresh data from the same type of customers), assigning customers with the old centres agrees with a fresh clustering at ARI 0.998. In real data, repeat this every quarter.</li></ol>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li>k chosen with at least two pieces of evidence (silhouette, stability) plus business meaning, written down.</li><li>Bootstrap ARI at least 0.9 for the chosen k: 0.999. Pass.</li><li>Segments named and described with a table of averages and sizes, none smaller than 5 percent of customers (smallest: 396 of 1,600, 25 percent).</li><li>A scaling experiment and a seed experiment that show why the choices matter.</li><li>If hidden labels exist (synthetic), report ARI against them (0.968); with real data, say "no ground truth".</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Not scaling.</strong> Detect: ARI or silhouette changes a lot after standardising; one column has a much bigger range than the others.</li><li><strong>A single random start.</strong> Detect: run with two seeds and compare ARI (we saw 0.414 in the worst case).</li><li><strong>Trusting silhouette alone.</strong> It preferred k = 2 here. Detect: also check stability and whether the groups have different actions.</li><li><strong>Clusters in data with no clusters.</strong> k-means always returns groups. Detect: run the same stability analysis on shuffled columns; low ARI means there is no structure.</li><li><strong>Naming segments from one plot.</strong> Detect: back each name with a table of averages and sizes.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Try a Gaussian mixture or hierarchical clustering and compare with ARI.</li><li>Add a log transform for the skewed spend column and test whether stability improves.</li><li>Turn segments into a decision: estimate the extra revenue of a different offer per segment, with explicit assumptions.</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. How do you know your clusters are real?</strong> I resample the customers many times, recluster, and compare each result with the original using ARI. If the groups survive, they are stable. I also check that they have different averages that make business sense.</p>
+<p><strong>Q2. Why scale before k-means?</strong> k-means uses distance. A column measured in large numbers, like days, dominates a column measured in small numbers, like basket size. Standardising gives each column a fair vote. In my project, skipping it dropped ARI against the truth from 0.968 to 0.396.</p>
+<p><strong>Q3. How did you choose the number of clusters?</strong> I looked at silhouette and stability for k from 2 to 7. Silhouette liked 2, stability was excellent for 2 and 3, so I chose 3 because it gave three different actions. I wrote that the choice mixes data and judgement.</p>
+<h3>README outline</h3>
+<p>Business question; data and features (RFM: recency, frequency, monetary); scaling; choice of k with the table; segment profiles; stability and drift checks; mistakes I tested; limits; next steps.</p>
+<h2 id="s4-chapter-recap">Chapter recap</h2>
+<ul><li>Writing algorithms from scratch teaches what they do, and tests against a trusted library prove you did it right.</li><li>A test must be able to fail: break the code on purpose and watch it fail (an unpenalised-intercept bug passed the weight check and was caught only by the intercept check).</li><li>Known-truth experiments show how much evaluation lies: random CV on repeated customers gave 0.724 against a truth of 0.508.</li><li>Selection done outside the pipeline turned pure noise into AUC 0.906; inside the pipeline it gave 0.509.</li><li>The winner of many configurations is optimistic: 0.717 on validation, 0.611 on fresh rows.</li><li>A forward-in-time split cannot remove drift, but it reveals the size of the gap.</li><li>Clustering always returns groups. Scale the features, use several starts, and test stability with resampling.</li><li>Choose the number of groups from several pieces of evidence plus the business action each group enables.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Code or rule</th></tr></thead><tbody><tr><td>Grouped CV</td><td><code>GroupKFold(5)</code> with <code>groups=customer_id</code></td></tr><tr><td>Forward split</td><td><code>TimeSeriesSplit(4)</code> on time-sorted rows</td></tr><tr><td>Leak-free selection</td><td><code>make_pipeline(SelectKBest(f_classif, k=20), LogisticRegression())</code></td></tr><tr><td>Cluster agreement</td><td><code>adjusted_rand_score(labels_a, labels_b)</code> (1 = same, about 0 = chance)</td></tr><tr><td>Several starts</td><td><code>KMeans(k, n_init=10)</code></td></tr><tr><td>Newton step for logistic</td><td><code>w -= solve(H, grad)</code> with <code>H = XᵀWX + R</code></td></tr></tbody></table></div>
+<h2 id="s5-practice-set">Practice set</h2>
+<p><strong>1. (easy)</strong> In <code>mlscratch</code>, why is the library allowed to import only NumPy? <strong>Answer:</strong> So that it is truly from scratch. scikit-learn is the answer key and belongs only in the tests. Acceptance: your answer mentions the separation of library and reference.</p>
+<p><strong>2. (easy)</strong> The tests compare k-means centres with <code>atol=1e-6</code> and both use the same starting centres. Why must the starting centres match? <strong>Answer:</strong> k-means can end in different local optima from different starts, so identical results are only expected from identical starts.</p>
+<p><strong>3. (easy)</strong> Study B uses 20 datasets of noise. Why not 1? <strong>Answer:</strong> One dataset can by chance give a high or low score. The mean over 20 shows the typical effect (0.906 leaky and 0.509 correct).</p>
+<p><strong>4. (medium)</strong> Find the bug: <code>X = StandardScaler().fit_transform(X); cross_val_score(model, X, y, cv=5)</code>. <strong>Answer:</strong> The scaler saw the validation rows when computing means and spreads. The leak is usually small for scaling but large for feature selection. Fix with <code>make_pipeline(StandardScaler(), model)</code>.</p>
+<p><strong>5. (medium)</strong> Random KFold gives AUC 0.724 and grouped CV gives 0.560. The truth for new customers is 0.508. Which gap is the "leak", and how big is it? <strong>Answer:</strong> Random minus truth = 0.724 − 0.508 = 0.216. Grouped minus truth = 0.052.</p>
+<p><strong>6. (medium)</strong> Silhouette is best at k = 2 but you choose k = 3. Write one defensible sentence. <strong>Answer:</strong> "Silhouette preferred 2 groups, but stability was equally high for 3 (ARI 0.999) and three groups lead to three different marketing actions, so I chose 3 and documented that this is a judgement." Acceptance: mentions both evidence and action.</p>
+<p><strong>7. (interview)</strong> "How would you test that a from-scratch decision tree is correct?" <strong>Answer:</strong> Compare predictions with scikit-learn's tree using the same depth and the same split rule on several datasets, check the training accuracy of a very deep tree on separable data is 1.0, test tiny hand-solved examples (compute Gini by hand), and break the splitting rule on purpose to confirm tests fail.</p>
+<p><strong>8. (interview)</strong> "A teammate tuned 500 settings and reports the best cross-validation score as the expected performance. What is wrong, and what would you do?" <strong>Answer:</strong> The best of many noisy scores is optimistic (in our study 0.717 on validation fell to 0.611 on fresh data). Use nested cross-validation or a final untouched test set, report the gap, and reduce the number of configurations or enlarge the validation data.</p>
+<h2 id="s6-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles and I am building a from-scratch machine learning library in NumPy with tests against scikit-learn. Review my code and tests: [PASTE HERE]. Check whether both sides use identical settings (penalty, starting values, tie-breaking), whether tolerances are sensible, whether the intercept is tested, and whether the tests can really fail. Suggest three deliberate bugs I should inject to prove the tests work, and explain in simple English what each bug would break.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. I want to design a study that shows how a wrong validation strategy inflates a score. Help me plan it with generated data where I know the truth. Ask me for the deployment question first (new customers, next month, or same entities). Then give me a table of split strategies to compare, the truth I should measure each one against, how many repeats I need, and what result would show the leak. Explain each step simply and ask me to predict the outcome before you reveal it.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Here is my tuning code and its result: [PASTE HERE]. I tried [N] configurations and report the best cross-validation score. Explain selection optimism in simple English with a small numeric example. Then tell me how to measure the size of my optimism (fresh data, nested cross-validation), how many configurations are reasonable for my data size, and how to write the result in my README without overstating it.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles and I am doing a customer segmentation project with k-means. Here are my features and results: [PASTE HERE]. Review it step by step: scaling, skewed columns, number of starts, choice of k (silhouette, inertia, bootstrap stability with the adjusted Rand index), segment naming, and drift. For each weakness, give a small experiment I can run to prove or disprove it, and say what output would worry you.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Run a mock interview on my machine learning portfolio project: [PASTE README HERE]. Ask five questions one at a time, mixing a how-it-works question, a how-do-you-know-it-works question, a what-went-wrong question, a what-would-you-change question and a explain-it-to-a-manager question. Wait for my answer, then score it for correctness and clarity out of 5, show a better model answer in simple English, and continue.</pre></div><div class="readbtn"><button class="btn" data-read="study:ml:ch18">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch17.html">← Chapter 17: Project Lab 1, Prediction, Classificatio</a><a class="btn" href="appendix.html">Appendix: Cheat Sheet →</a></div></div><script src="../../assets/study.js"></script></body></html>

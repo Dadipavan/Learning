@@ -1,0 +1,323 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 12: Distributed Systems Fundamentals</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Linux, Git, Algorithms &amp; CS Foundations</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 12</div><h1>Distributed Systems Fundamentals</h1><p>What changes when one computer becomes many, and the small set of ideas that keep such systems correct.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-12-1-why-distributed-and-what-can-go-wrong">12.1 Why Distributed, and What Can Go Wrong</a></li><li><a href="#s2-12-2-replication-and-consistency">12.2 Replication and Consistency</a></li><li><a href="#s3-12-3-partitioning-and-consistent-hashing">12.3 Partitioning and Consistent Hashing</a></li><li><a href="#s4-12-4-consensus-and-leader-election">12.4 Consensus and Leader Election</a></li><li><a href="#s5-12-5-cap-and-pacelc">12.5 CAP and PACELC</a></li><li><a href="#s6-12-6-retries-timeouts-idempotency-and-backpressure">12.6 Retries, Timeouts, Idempotency and Backpressure</a></li><li><a href="#s7-chapter-recap">Chapter recap</a></li><li><a href="#s8-practice-set">Practice set</a></li><li><a href="#s9-prompt-pack">Prompt pack</a></li></ol></details><p>Think about an online shop that ran fine on one server, then went strange after the team added three more behind a load balancer. Some users saw old data, some requests were charged twice, and one slow node dragged everything down. These problems are not simple coding mistakes. They are the normal behaviour of <em>distributed systems</em>, systems that spread work and data over many computers connected by a network. In this chapter you learn the few ideas behind them: copies of data (replication), splitting data (partitioning), agreeing on one answer (consensus), the trade-off called CAP, and safe ways to handle failures (retries, idempotency, timeouts, backpressure). You will run small Python simulations, so every claim has a number behind it. We use one running example: an <em>orders service</em> that stores "order 77 = paid" on several machines.</p>
+<h2 id="s1-12-1-why-distributed-and-what-can-go-wrong">12.1 Why Distributed, and What Can Go Wrong</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">One cashier can serve only so many customers, and if she falls sick the shop closes. Hire three cashiers and you serve more people and survive one sick day. But now the three must agree on prices, and they can only talk by shouting across a noisy room. Messages get lost, and nobody can be sure if a silent cashier is busy or gone. That noisy room is the network.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Node</td><td>one computer (or one server process) in the system</td></tr><tr><td>Replica</td><td>one copy of the same data on a node</td></tr><tr><td>Latency</td><td>time one message takes</td></tr><tr><td>Partition (network)</td><td>the network breaks so two groups of nodes cannot talk</td></tr><tr><td>Partial failure</td><td>some parts fail while others work</td></tr><tr><td>Throughput</td><td>requests finished per second</td></tr></tbody></table></div>
+<h3>Why we do it</h3>
+<ul><li><strong>Scale:</strong> one machine has a limit on CPU, memory and disk.</li><li><strong>Availability:</strong> if one node dies, others keep working.</li><li><strong>Latency:</strong> put copies near users (Mumbai, Frankfurt, Virginia).</li></ul>
+<h3>The hard part: partial failure</h3>
+<p>On one computer, a program either works or crashes. In a distributed system, a request can fail in a confusing way: the message was lost, or the server did the work but its reply was lost, or the server is just slow. From the caller's side these look the same: <em>silence</em>. This is why timeouts and idempotency (12.6) matter so much.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Failure type</th><th>Example</th><th>What you see</th></tr></thead><tbody><tr><td>Crash</td><td>a node loses power</td><td>no reply ever</td></tr><tr><td>Omission</td><td>a packet is dropped</td><td>reply missing, node fine</td></tr><tr><td>Slow node</td><td>garbage collection pause, busy disk</td><td>reply very late</td></tr><tr><td>Network partition</td><td>switch fails between racks</td><td>two groups, each thinks the other is dead</td></tr><tr><td>Byzantine</td><td>a node sends wrong or malicious data</td><td>wrong replies (rare, hard)</td></tr></tbody></table></div>
+<p>Most systems you will use assume crashes, omissions and slowness, and not Byzantine faults.</p>
+<p class="problem"><span class="pl">Problem 12.1.1</span> One node is up 99% of the time. What is the downtime per year?</p>
+<table class="steps"><tr><th>Formula</th><td>downtime = (1 - availability) x time</td></tr><tr><th>Plug in</th><td>(1 - 0.99) x 365 days x 24 hours</td></tr><tr><th>Compute</th><td>0.01 x 8,760 = 87.6 hours</td></tr><tr><th>Answer</th><td>A single 99% node is down about 87.6 hours a year, almost 3.7 days.</td></tr><tr><th>Check</th><td>1% of 100 hours is 1 hour, so 1% of 8,760 hours is 87.6. Correct.</td></tr><tr><th>Why it matters</th><td>"Two nines" sounds good but is more than 3 days of downtime. Replication improves this.</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.1.2</span> You have 3 replicas, each up 99% of the time and failing independently. The service works when at least 2 of 3 are up. What is the availability?</p>
+<table class="steps"><tr><th>Formula</th><td>P(at least 2 of 3) = 3 x p² x (1 - p) + p³</td></tr><tr><th>Plug in</th><td>3 x 0.99² x 0.01 + 0.99³</td></tr><tr><th>Compute</th><td>3 x 0.9801 x 0.01 = 0.029403, and 0.99³ = 0.970299, total 0.999702</td></tr><tr><th>Answer</th><td>The availability is 0.999702, about 99.97%.</td></tr><tr><th>Check</th><td>Our Python run printed <code>3 replicas, each up 99%: P(at least 2 up) = 0.999702</code>. Downtime is 0.000298 x 8,760 = about 2.6 hours a year, down from 87.6.</td></tr><tr><th>Why it matters</th><td>Copies turn a weak part into a strong system. The catch: failures must really be independent. Two replicas in the same rack share a power cable and are not.</td></tr></table>
+<p>The code below (<code>ch12f.py</code>) computes the numbers used in this chapter's worked problems.</p>
+<pre class="code lang-python"><code>p=0.99
+print("3 replicas, each up 99%: P(at least 2 up) =", round(3*p*p*(1-p)+p**3,6))
+print("single node availability:", p)
+print("5 replicas, majority = 3: P(&gt;=3 up) =", round(sum(__import__('math').comb(5,k)*p**k*(1-p)**(5-k) for k in range(3,6)),8))
+q=0.3
+print("expected calls per request, max 3 tries, fail 30%:", round(1+q+q*q,2))
+print("if server is down (100% fail), calls per request with 3 tries:", 3)
+print("Little: L = lambda*W; 200 req/s * 0.05 s =", 200*0.05)
+print("Pool of 10 threads, 0.05s each -&gt; max throughput", 10/0.05, "req/s")</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>3 replicas, each up 99%: P(at least 2 up) = 0.999702
+single node availability: 0.99
+5 replicas, majority = 3: P(&gt;=3 up) = 0.99999015
+expected calls per request, max 3 tries, fail 30%: 1.39
+if server is down (100% fail), calls per request with 3 tries: 3
+Little: L = lambda*W; 200 req/s * 0.05 s = 10.0
+Pool of 10 threads, 0.05s each -&gt; max throughput 200.0 req/s</code></pre>
+<h3>Applications</h3>
+<ul><li>Data Engineering: Kafka clusters, HDFS, object stores keep 3 copies of data.</li><li>MLOps: model-serving replicas behind a load balancer.</li><li>GenAI: inference servers with many GPUs; one slow GPU slows the batch.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Assuming "the network is reliable" and "latency is zero". These are the first two famous false beliefs about distributed systems. Always design for lost, late and duplicated messages.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does a caller see when a server crashes versus when its reply is lost? Answer: The same thing: no reply (silence).</li><li>Why do 3 replicas beat 1 for availability? Answer: The service survives any single failure, and two failing together is rare.</li><li>When does the independence assumption fail? Answer: When nodes share a cause, such as one rack, one power line, one bad deployment.</li></ol>
+<h2 id="s2-12-2-replication-and-consistency">12.2 Replication and Consistency</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A teacher writes today's homework on the board (the leader). Students copy it to their notebooks (followers). A student who copies late has an old version. If you ask that student, you get a stale answer. If the teacher waits until every student confirms before saying "done", it is safe but slow, and one sleeping student blocks everybody.</div></div>
+<p><em>Replication</em> means keeping the same data on several nodes. There are two common designs.</p>
+<ul><li><strong>Leader-follower:</strong> all writes go to one leader, which copies them to followers. Reads can go to followers (fast, maybe stale).</li><li><strong>Leaderless (quorum):</strong> the client writes to several nodes and reads from several; the overlap gives fresh data.</li></ul>
+<p><em>Synchronous</em> replication waits for followers before saying "ok". <em>Asynchronous</em> replication says "ok" first and copies later (fast, but if the leader dies you can lose the last writes).</p>
+<figure><img src="images/ch12_replication.svg" alt="Leader-follower replication: the client writes to the leader, the leader copies to two followers" loading="lazy"/><figcaption>Leader-follower replication: the client writes to the leader, the leader copies to two followers</figcaption></figure>
+<p>How to read it: the arrow numbered 1 is the client write. The leader stores "order 77 = paid", then sends copies (arrows 2) to both followers. Only after enough followers confirm does the leader answer ok (label 3).</p>
+<h3>Quorum rule</h3>
+<p>With N replicas, write to W of them and read from R of them. If <strong>W + R &gt; N</strong>, every read set overlaps every write set in at least one node, so a read sees the latest write (when versions are compared). This is the quorum rule.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>N</th><th>W</th><th>R</th><th>W + R &gt; N?</th><th>Behaviour</th></tr></thead><tbody><tr><td>3</td><td>1</td><td>1</td><td>No (2 &gt; 3 false)</td><td>fast, can read stale data</td></tr><tr><td>3</td><td>2</td><td>2</td><td>Yes (4 &gt; 3)</td><td>balanced, fresh reads</td></tr><tr><td>3</td><td>3</td><td>1</td><td>Yes (4 &gt; 3)</td><td>writes need all nodes, reads are cheap</td></tr></tbody></table></div>
+<h3>Predict, Run, Explain</h3>
+<p>We simulate a write of version 1 to W random replicas, then a read from R random replicas, 10,000 times. Before you run it, predict: for W=1, R=1, what fraction of reads are stale? (Hint: the read hits the one fresh node with probability 1 out of 3.)</p>
+<pre class="code lang-python"><code>import random
+# quorum replication: N=3 replicas, write to W, read from R
+random.seed(1)
+class Cluster:
+    def __init__(s,n=3): s.rep=[(0,None)]*n  # (version,value)
+    def write(s,ver,val,W):
+        for i in random.sample(range(len(s.rep)),W): s.rep[i]=(ver,val)
+    def read(s,R):
+        got=[s.rep[i] for i in random.sample(range(len(s.rep)),R)]
+        return max(got)
+for W,R in [(1,1),(2,2),(3,1)]:
+    stale=0
+    for t in range(10000):
+        c=Cluster(); c.write(1,"new",W)
+        if c.read(R)[0]!=1: stale+=1
+    print(f"N=3 W={W} R={R} W+R&gt;N={W+R&gt;3}  stale reads: {stale} of 10000")</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>N=3 W=1 R=1 W+R&gt;N=False  stale reads: 6723 of 10000
+N=3 W=2 R=2 W+R&gt;N=True  stale reads: 0 of 10000
+N=3 W=3 R=1 W+R&gt;N=True  stale reads: 0 of 10000</code></pre>
+<p>Line by line: <code>write</code> updates <code>W</code> randomly chosen replicas to version 1. <code>read</code> picks <code>R</code> random replicas and returns the highest version it saw (<code>max</code> of tuples compares version first). If that version is not 1, the read is stale. With W=1, R=1, the read hits the fresh node with chance 1/3, so stale is 2/3 = 66.7%, and we measured 6,723 of 10,000. With W=2, R=2 or W=3, R=1, the sets must overlap, so 0 stale reads.</p>
+<p class="problem"><span class="pl">Problem 12.2.1</span> N = 5 replicas. You choose R = 2. What is the smallest W that guarantees fresh reads, and what is the cost?</p>
+<table class="steps"><tr><th>Formula</th><td>need W + R &gt; N</td></tr><tr><th>Plug in</th><td>W + 2 &gt; 5</td></tr><tr><th>Compute</th><td>W &gt; 3, so W = 4</td></tr><tr><th>Answer</th><td>W = 4: every write must reach 4 of 5 nodes. The service can lose only 1 node for writes.</td></tr><tr><th>Check</th><td>Take any 4 nodes written and any 2 nodes read from 5. Together 4 + 2 = 6 slots among 5 nodes, so at least one node is shared. Correct.</td></tr><tr><th>Why it matters</th><td>The rule lets you tune: heavy-read workloads choose a small R and large W.</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.2.2</span> N = 3, W = 2, R = 2. How many nodes can be down before writes fail? Before reads fail?</p>
+<table class="steps"><tr><th>Step 1</th><td>Writes need 2 nodes up, so 3 - 2 = 1 node may be down.</td></tr><tr><th>Step 2</th><td>Reads need 2 nodes up, same: 1 node may be down.</td></tr><tr><th>Answer</th><td>One node down is fine for both. Two nodes down stops both reads and writes (but not the whole cluster's data, which is still safe on the third node).</td></tr><tr><th>Check</th><td>With 1 down we have 2 up, which is exactly W and R. With 2 down we have 1 up, below 2.</td></tr></table>
+<h3>Consistency models, from strong to weak</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Model</th><th>Promise</th><th>Example</th></tr></thead><tbody><tr><td>Strong (linearizable)</td><td>reads always see the latest completed write, as if there is one copy</td><td>bank balance, leader election</td></tr><tr><td>Read-your-writes</td><td>you see your own updates</td><td>profile edit</td></tr><tr><td>Eventual</td><td>if writes stop, all copies become equal after some time</td><td>likes counter, DNS</td></tr></tbody></table></div>
+<p><em>Eventual consistency</em> needs a rule for conflicts. A simple one is last-write-wins (LWW): keep the value with the highest timestamp. It is easy but can silently drop an update. Our run of <code>ch12e.py</code> showed it: merging <code>{'x': (1, 'red')}</code> with <code>{'x': (2, 'blue')}</code> gave <code>{'x': (2, 'blue')}</code>.</p>
+<h3>Connection to the real job</h3>
+<p>Reading from a database read-replica right after writing may return old data (replication lag). Your data pipelines and dashboards may show yesterday's number for a moment. Anyone checking data must know whether they read from the leader or a follower.</p>
+<h3>Applications</h3>
+<ul><li>Data Engineering: Kafka partitions have leader and follower replicas; Cassandra uses tunable quorums.</li><li>Data Analytics: read replicas serve BI queries without loading the main database.</li><li>MLOps: feature stores keep an online copy that may lag the offline copy.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Thinking W + R &gt; N gives full "strong consistency" in all cases. With sloppy quorums, concurrent writes and clock problems, you can still see odd results. It is a good rule for freshness, not a total guarantee.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>N=5, W=3, R=3: is W+R&gt;N? Answer: Yes, 6 &gt; 5.</li><li>Asynchronous replication risk? Answer: If the leader dies before copying, the last writes can be lost.</li><li>What does eventual consistency promise? Answer: If updates stop, all replicas converge to the same value.</li></ol>
+<h2 id="s3-12-3-partitioning-and-consistent-hashing">12.3 Partitioning and Consistent Hashing</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A library with a million books cannot keep them all on one shelf. You split them: A to F in room 1, G to M in room 2, and so on. Now each room is small and many readers work in parallel. The question is: how do you decide which room holds which book, and what happens when you add a new room?</div></div>
+<p><em>Partitioning</em> (also called <em>sharding</em>) splits data across nodes, so each node holds only a part. Replication copies; partitioning splits. Big systems do both: each partition is replicated.</p>
+<p>Ways to choose the partition:</p>
+<ul><li><strong>Range:</strong> keys A-F here, G-M there. Good for range scans, but a popular range makes a <em>hot spot</em> (one overloaded node).</li><li><strong>Hash:</strong> <code>node = hash(key) mod N</code>. Spreads load evenly. But there is a trap.</li></ul>
+<h3>The trap with mod N</h3>
+<p>If you go from N=4 to N=5 nodes, almost every key changes node, and the whole cache or dataset must move. <strong>Consistent hashing</strong> fixes this. Put nodes on a circle (a ring) of hash values. Each key goes to the first node clockwise from its hash. Adding a node only takes keys from its neighbour. Using many <em>virtual nodes</em> (many points per machine) smooths the load.</p>
+<pre class="code lang-text"><code>          hash ring (0 ... max)
+       A1      B2
+     /            \
+   D3              C1       key k -&gt; go clockwise to the next node point
+     \            /
+       B1      A2</code></pre>
+<h3>Predict, Run, Explain</h3>
+<p>Before running it, predict: with 1,000 keys, roughly what fraction should move when a 5th node joins, for the best possible scheme? (Answer: 1/5 = 20%, since the new node should own one fifth.) Then compare mod N with the ring.</p>
+<pre class="code lang-python"><code>import hashlib, bisect
+def h(s): return int(hashlib.md5(s.encode()).hexdigest(),16)
+def simple_assign(keys, n): 
+    return {k: h(k)%n for k in keys}
+keys=[f"user{i}" for i in range(1000)]
+a=simple_assign(keys,4); b=simple_assign(keys,5)
+moved=sum(a[k]!=b[k] for k in keys)
+print("mod-N: keys moved going 4-&gt;5 nodes:",moved,"of 1000")
+
+class Ring:
+    def __init__(s,nodes,vnodes=100):
+        s.ring=sorted((h(f"{n}#{v}"),n) for n in nodes for v in range(vnodes))
+        s.hashes=[x[0] for x in s.ring]
+    def get(s,k):
+        i=bisect.bisect(s.hashes,h(k))%len(s.ring)
+        return s.ring[i][1]
+r4=Ring(["A","B","C","D"]); r5=Ring(["A","B","C","D","E"])
+moved=sum(r4.get(k)!=r5.get(k) for k in keys)
+print("ring: keys moved going 4-&gt;5 nodes:",moved,"of 1000")
+from collections import Counter
+print("ring load with 5 nodes:",sorted(Counter(r5.get(k) for k in keys).items()))</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>mod-N: keys moved going 4-&gt;5 nodes: 795 of 1000
+ring: keys moved going 4-&gt;5 nodes: 185 of 1000
+ring load with 5 nodes: [('A', 200), ('B', 230), ('C', 215), ('D', 170), ('E', 185)]</code></pre>
+<p>Line by line: <code>h</code> turns text into a big number using MD5 (used here only for spreading, not for security). With mod N, 795 of 1,000 keys moved, close to the 4/5 = 80% expected, because a key stays only when <code>h mod 4 == h mod 5</code>. The ring moved 185 of 1,000, near the ideal 200. The load per node on the ring ranged from 170 to 230, which is reasonably even with 100 virtual nodes per machine.</p>
+<p class="problem"><span class="pl">Problem 12.3.1</span> A cache has 4 nodes using mod N. A 5th node is added. What fraction of keys is expected to stay in place?</p>
+<table class="steps"><tr><th>Formula</th><td>a key stays when <code>h mod 4 = h mod 5</code>. For large random h, h mod 20 is uniform over 0..19.</td></tr><tr><th>Plug in</th><td>count residues r in 0..19 where r mod 4 = r mod 5</td></tr><tr><th>Compute</th><td>r = 0, 1, 2, 3 work (equal values), and r = 4 to 19 do not. That is 4 of 20.</td></tr><tr><th>Answer</th><td>4/20 = 20% stay, so 80% move.</td></tr><tr><th>Check</th><td>Our run moved 795 of 1,000 = 79.5%, matching 80%.</td></tr><tr><th>Why it matters</th><td>A cache flush of 80% means your database suddenly takes almost all traffic: a classic outage.</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.3.2</span> A database has 1,200 GB spread over 6 nodes evenly. You add a 7th node using ideal consistent hashing. How much data moves?</p>
+<table class="steps"><tr><th>Formula</th><td>the new node should own 1/7 of all data</td></tr><tr><th>Plug in</th><td>1,200 x 1/7</td></tr><tr><th>Compute</th><td>171.4 GB, taken in small shares from the 6 old nodes</td></tr><tr><th>Answer</th><td>About 171 GB move, not the roughly 1,029 GB (6/7 of the data) that mod N would move.</td></tr><tr><th>Check</th><td>1,200 x 6/7 = 1,028.6 GB for mod N. The ring moves 6 times less.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Choosing a partition key is the biggest design choice in Cassandra, DynamoDB, Kafka and Spark. A key with skew (for example <code>country = India</code> holds 60% of rows) creates a hot partition and the slowest task decides the job time. Think of a kitchen with several cooks: the slowest cook sets the time the whole table is served.</p>
+<h3>Applications</h3>
+<ul><li>Data Engineering: Kafka topic partitions, Spark <code>repartition</code>, warehouse distribution keys.</li><li>Machine Learning: sharded embedding tables and sharded training data.</li><li>Web and MLOps: cache clusters (memcached) and load balancing by session.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Picking a partition key like date or status. All today's writes go to one partition (a hot spot). Pick a key with many values and even traffic, such as user ID.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Replication or partitioning splits data? Answer: Partitioning. Replication copies.</li><li>Why do virtual nodes help? Answer: They spread each machine over many ring points, so load is more even.</li><li>What breaks when you add a node with mod N? Answer: Most keys change node.</li></ol>
+<h2 id="s4-12-4-consensus-and-leader-election">12.4 Consensus and Leader Election</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Five friends must choose one restaurant by text messages. Some phones are off, messages arrive late. They agree on a rule: a choice counts only when at least 3 of 5 say yes, and each person votes once per round. Because any two groups of 3 share a person, two different choices can never both win. That rule is a <em>majority quorum</em>.</div></div>
+<p><em>Consensus</em> means a group of nodes agrees on one value (or one order of events) even when some nodes fail. Famous algorithms are <strong>Paxos</strong> and <strong>Raft</strong>. Raft was designed to be easier to understand. You do not need to code them; you need the intuition.</p>
+<h3>Raft in 5 sentences</h3>
+<ol><li>One node is the <strong>leader</strong>. All writes go through it.</li><li>The leader sends each write to followers. The write is <em>committed</em> when a majority has stored it.</li><li>Followers expect heartbeats from the leader. If a follower hears nothing for a random time (for example 150 to 300 ms), it becomes a <strong>candidate</strong> and asks for votes.</li><li>A candidate that gets a majority of votes becomes the new leader of a new <em>term</em> (a number that only increases).</li><li>Random timeouts make it unlikely that two candidates start together, and if they do, they retry.</li></ol>
+<h3>Majority maths</h3>
+<p>A cluster of N nodes survives <code>floor((N - 1) / 2)</code> crashes.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Nodes N</th><th>Majority</th><th>Crashes tolerated</th></tr></thead><tbody><tr><td>3</td><td>2</td><td>1</td></tr><tr><td>4</td><td>3</td><td>1</td></tr><tr><td>5</td><td>3</td><td>2</td></tr><tr><td>7</td><td>4</td><td>3</td></tr></tbody></table></div>
+<p>Notice 4 nodes tolerate no more crashes than 3, so clusters use odd sizes.</p>
+<h3>Predict, Run, Explain</h3>
+<p>Predict: in a 5-node cluster, can it still elect a leader with 3 alive? With 2 alive?</p>
+<pre class="code lang-python"><code>import random
+random.seed(3)
+# simplified leader election: highest alive id wins (bully); and raft-style majority vote
+nodes={1:True,2:True,3:True,4:True,5:True}
+def bully():
+    return max(n for n,a in nodes.items() if a)
+print("leader:",bully()); nodes[5]=False; print("5 crashed, new leader:",bully())
+def majority(total,alive): return alive&gt;total//2
+for alive in (5,3,2):
+    print(f"5-node cluster, {alive} alive -&gt; can elect/commit? {majority(5,alive)}")
+# raft-like election with random timeouts
+def election():
+    t={n:random.uniform(150,300) for n in range(1,6)}
+    first=min(t,key=t.get)
+    return first,round(t[first],1)
+for term in range(1,4):
+    print("term",term,"first candidate (node, timeout ms):",election())
+# eventual consistency: last-write-wins merge
+a={"x":(1,"red")}; b={"x":(2,"blue")}
+merged={k:max(a.get(k,(0,)),b.get(k,(0,))) for k in {*a,*b}}
+print("LWW merge:",merged)</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>leader: 5
+5 crashed, new leader: 4
+5-node cluster, 5 alive -&gt; can elect/commit? True
+5-node cluster, 3 alive -&gt; can elect/commit? True
+5-node cluster, 2 alive -&gt; can elect/commit? False
+term 1 first candidate (node, timeout ms): (1, 185.7)
+term 2 first candidate (node, timeout ms): (2, 152.0)
+term 3 first candidate (node, timeout ms): (2, 220.5)
+LWW merge: {'x': (2, 'blue')}</code></pre>
+<p>Line by line: <code>bully</code> is a simple older method where the highest alive id leads: node 5 leads, and after it crashes node 4 takes over. <code>majority(5, alive)</code> is true only when <code>alive &gt; 2</code>, so 3 alive works and 2 alive does not. The <code>election</code> function mimics Raft's random timeout: the node with the smallest random timeout asks for votes first, and so usually wins without a clash. The numbers (timeouts in ms) are random with a fixed seed. Our simulation does not implement real vote messages or logs; it only shows the ideas.</p>
+<p class="problem"><span class="pl">Problem 12.4.1</span> A cluster has 7 nodes. How many can crash and the cluster still commit writes?</p>
+<table class="steps"><tr><th>Formula</th><td>crashes tolerated = floor((N - 1) / 2)</td></tr><tr><th>Plug in</th><td>floor((7 - 1) / 2)</td></tr><tr><th>Compute</th><td>floor(6 / 2) = 3</td></tr><tr><th>Answer</th><td>3 nodes can crash. The remaining 4 are still a majority of 7.</td></tr><tr><th>Check</th><td>Majority of 7 is 4 (since 4 &gt; 3.5). 7 - 3 = 4. Correct.</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.4.2</span> A network partition splits a 5-node cluster into groups of 3 and 2. What happens?</p>
+<table class="steps"><tr><th>Step 1</th><td>The group of 3 has a majority (3 &gt; 2.5), so it can elect a leader and commit writes.</td></tr><tr><th>Step 2</th><td>The group of 2 has no majority. It cannot commit writes, and its nodes will keep trying and failing to be elected.</td></tr><tr><th>Answer</th><td>Only the group of 3 serves writes. Two leaders cannot exist at the same time, because two majorities of 5 must share a node.</td></tr><tr><th>Check</th><td>3 + 2 = 5, and a second majority would need at least 3 more nodes, which do not exist.</td></tr><tr><th>Why it matters</th><td>This is how consensus avoids <em>split brain</em>: two parts both believing they lead and accepting conflicting writes.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Consensus runs under tools you use: etcd (Kubernetes' brain), ZooKeeper (older Kafka and Hadoop), Consul, and many databases. When Kubernetes becomes unavailable, often the reason is lost quorum in etcd.</p>
+<h3>Applications</h3>
+<ul><li>Data Engineering: Kafka controller election, HBase master election (via coordination services).</li><li>MLOps: Kubernetes control plane stores cluster state with Raft.</li><li>Databases: distributed SQL stores replicate each partition with Raft or Paxos.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Running an even number of nodes (such as 2 or 4) and believing it is safer. 2 nodes tolerate zero crashes, because the majority of 2 is 2.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why odd cluster sizes? Answer: An extra even node adds cost but no extra crash tolerance.</li><li>What stops two leaders at once? Answer: Any two majorities share a node, and each node votes once per term.</li><li>What is split brain? Answer: Two parts of the system each think they are the leader.</li></ol>
+<h2 id="s5-12-5-cap-and-pacelc">12.5 CAP and PACELC</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Two bank branches share a ledger by phone. The phone line breaks. A customer asks branch A for a balance. Branch A can either refuse to answer until the line is fixed (safe but unavailable) or answer with what it knows (available but maybe wrong). It cannot do both. That is CAP.</div></div>
+<p><strong>CAP theorem:</strong> when a network partition happens, a system must choose between <strong>Consistency</strong> (every read sees the latest write or gets an error) and <strong>Availability</strong> (every request gets an answer, maybe old). Partitions are a fact of life, so the real choice is between C and A <em>during a partition</em>. Saying "pick any 2 of 3" is misleading, because you cannot choose to skip partition tolerance on a real network.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Style</th><th>During a partition</th><th>Example behaviour</th></tr></thead><tbody><tr><td>CP</td><td>refuses some requests to stay correct</td><td>consensus stores, ledgers</td></tr><tr><td>AP</td><td>keeps answering, merges later</td><td>shopping cart, social feed, DNS</td></tr></tbody></table></div>
+<p><strong>PACELC</strong> adds the normal times: if there is a <strong>P</strong>artition, choose <strong>A</strong> or <strong>C</strong>; <strong>E</strong>lse (no partition), choose between <strong>L</strong>atency and <strong>C</strong>onsistency. Even on a healthy network, waiting for many replicas (consistency) costs latency. That makes PACELC more useful day to day.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example value</th><th>Where it appears</th></tr></thead><tbody><tr><td>Strong read</td><td>wait for the leader or a quorum</td><td>bank balance, inventory count</td></tr><tr><td>Fast read</td><td>local replica, may be stale</td><td>recommendation feed, analytics dashboard</td></tr><tr><td>Latency cost</td><td>extra cross-region round trip, often tens to hundreds of ms</td><td>multi-region writes</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 12.5.1</span> Your orders service has replicas in Mumbai and Frankfurt. A write must be confirmed by both before ok. The Mumbai-Frankfurt round trip is 120 ms and a local write takes 5 ms. What is the write latency for synchronous and for local-only?</p>
+<table class="steps"><tr><th>Step 1</th><td>Local-only: 5 ms.</td></tr><tr><th>Step 2</th><td>Synchronous: local write plus waiting for the remote confirmation, so about 5 + 120 = 125 ms.</td></tr><tr><th>Answer</th><td>Consistency costs about 125 ms against 5 ms, 25 times slower, and if the link breaks, writes stall (the "C over A" choice).</td></tr><tr><th>Check</th><td>125 / 5 = 25. The 120 ms figure is an assumed example; real values depend on the route.</td></tr><tr><th>Why it matters</th><td>This is the E-L-C trade-off of PACELC in plain numbers.</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.5.2</span> Classify each as CP or AP behaviour: (a) a seat-booking system refuses to sell when it cannot reach the master; (b) a shopping cart accepts items on any replica and merges later.</p>
+<table class="steps"><tr><th>Step 1</th><td>(a) prefers correctness (no double-selling) over answering: CP.</td></tr><tr><th>Step 2</th><td>(b) prefers answering over exact agreement: AP.</td></tr><tr><th>Answer</th><td>(a) CP, (b) AP.</td></tr><tr><th>Check</th><td>Ask: during a partition, does the system answer all requests? (a) no, (b) yes.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>When you test a database that claims "high availability", ask what happens to reads and writes when a node is cut off. A practice drill with failure injection (switch off one node on purpose) shows which side of CAP it chose.</p>
+<h3>Applications</h3>
+<ul><li>Data Engineering: Cassandra and DynamoDB are tunable (AP leaning); Spanner-like systems lean CP.</li><li>Data Analytics: dashboards accept stale data (AP); finance reports need correct data (CP).</li><li>GenAI: caches of embeddings can be stale without harm; usage billing cannot.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Saying "we are CA" for a multi-node system. On a network that can partition, a distributed system cannot give up partition tolerance. CA is only meaningful for a single node.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What do you choose between during a partition? Answer: Consistency and availability.</li><li>What does the "ELC" in PACELC add? Answer: Without a partition you still trade latency against consistency.</li><li>Is a shopping cart usually CP or AP? Answer: AP.</li></ol>
+<h2 id="s6-12-6-retries-timeouts-idempotency-and-backpressure">12.6 Retries, Timeouts, Idempotency and Backpressure</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You call a restaurant to book a table and the line goes silent. Did they hear you? You call again. If the second call books another table, you now have two. Retrying is natural, but it is only safe if the booking is <em>idempotent</em>: doing it twice gives the same result as doing it once.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Timeout</td><td>how long you wait before you give up on a reply</td></tr><tr><td>Retry</td><td>send the same request again after a failure</td></tr><tr><td>Backoff</td><td>wait longer between each retry</td></tr><tr><td>Jitter</td><td>add randomness to the wait so clients do not retry together</td></tr><tr><td>Idempotent</td><td>repeating the operation has no extra effect</td></tr><tr><td>Backpressure</td><td>a full or slow system tells senders to slow down or stop</td></tr><tr><td>Retry storm</td><td>many retries make an overloaded system fall over</td></tr></tbody></table></div>
+<h3>Retries</h3>
+<p>Retries fix short failures. If each call fails 30% of the time independently, then with at most 3 tries the failure chance is 0.3³ = 0.027, so success is 97.3%.</p>
+<h3>Predict, Run, Explain</h3>
+<p>Predict the success rate for 1, 2, 3 and 5 tries using <code>1 - 0.3^m</code>. Then run:</p>
+<pre class="code lang-python"><code>import random
+random.seed(7)
+# retries: server fails 30% of calls
+def call(p=0.3): return random.random()&gt;p
+def trial(max_try):
+    for t in range(1,max_try+1):
+        if call(): return True
+    return False
+for m in (1,2,3,5):
+    ok=sum(trial(m) for _ in range(100000))
+    print(f"max tries {m}: success {ok/1000:.1f}%   (theory {100*(1-0.3**m):.1f}%)")
+# backoff with full jitter
+def delays(n,base=0.1,cap=5):
+    return [round(random.uniform(0,min(cap,base*2**i)),3) for i in range(n)]
+print("full-jitter delays (s):",delays(6))
+print("max possible per attempt:",[min(5,0.1*2**i) for i in range(6)])
+# idempotency
+class Bank:
+    def __init__(s): s.bal=100; s.seen={}
+    def pay(s,key,amt):
+        if key in s.seen: return s.seen[key]
+        s.bal-=amt; s.seen[key]="paid"; return "paid"
+b=Bank()
+for _ in range(3): b.pay("order-77",30)
+print("with idempotency key, balance after 3 retries:",b.bal)
+b2=100
+for _ in range(3): b2-=30
+print("without key, balance after 3 retries:",b2)</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>max tries 1: success 69.8%   (theory 70.0%)
+max tries 2: success 90.9%   (theory 91.0%)
+max tries 3: success 97.3%   (theory 97.3%)
+max tries 5: success 99.7%   (theory 99.8%)
+full-jitter delays (s): [0.011, 0.01, 0.372, 0.638, 0.876, 1.882]
+max possible per attempt: [0.1, 0.2, 0.4, 0.8, 1.6, 3.2]
+with idempotency key, balance after 3 retries: 70
+without key, balance after 3 retries: 10</code></pre>
+<p>Line by line: <code>call</code> fails with chance 0.3. <code>trial(m)</code> tries up to m times. Our measured success rates (69.8, 90.9, 97.3, 99.7) match the theory (70.0, 91.0, 97.3, 99.8). In <code>delays</code>, the wait before attempt i is a random number between 0 and <code>min(cap, base x 2^i)</code>: <em>exponential backoff with full jitter</em>. The "max possible" list shows the upper limits 0.1, 0.2, 0.4, 0.8, 1.6, 3.2 s. The Bank class stores each <code>key</code> it has seen. With the key <code>order-77</code> sent three times, the balance dropped once (70). Without a key it dropped three times (10): a triple charge.</p>
+<p>Typical wrong version: retrying a payment with no idempotency key. The code <code>b2 -= 30</code> three times gave balance 10. The fix is the key, as in <code>Bank.pay</code>.</p>
+<p class="problem"><span class="pl">Problem 12.6.1</span> A service fails 30% of calls. Each request is tried up to 3 times. How many calls on average reach the server per request?</p>
+<table class="steps"><tr><th>Formula</th><td>expected calls = 1 + q + q² where q = failure rate (second call happens if first fails, third if two fail)</td></tr><tr><th>Plug in</th><td>1 + 0.3 + 0.3²</td></tr><tr><th>Compute</th><td>1 + 0.3 + 0.09 = 1.39</td></tr><tr><th>Answer</th><td>On average 1.39 calls per request: a 39% load increase.</td></tr><tr><th>Check</th><td>Our <code>ch12f.py</code> printed 1.39. If the server is fully down (q = 1), calls per request become 3, so retries triple the load.</td></tr><tr><th>Why it matters</th><td>Retries add load exactly when the server is weak. That is a <em>retry storm</em>. Backoff, jitter and a retry limit protect the server.</td></tr></table>
+<h3>Timeouts</h3>
+<p>Without a timeout, a slow server holds your thread forever. Choose a timeout slightly above the normal worst case (for example, near p99 latency), not a huge round number. Every layer should have a shorter timeout than the layer above, or the outer caller gives up while the inner work continues.</p>
+<h3>Backpressure and Little's law</h3>
+<p><em>Little's law</em>: the average number of requests inside a system <code>L</code> equals the arrival rate <code>λ</code> times the average time each spends inside <code>W</code>: <code>L = λ x W</code>. You can see it in a bank: customers arriving per minute x minutes each spends inside = customers in the bank right now. For a service, throughput x time per request = requests in flight.</p>
+<p class="problem"><span class="pl">Problem 12.6.2</span> A service handles 200 requests per second, each taking 0.05 s inside. How many requests are in flight on average, and what is the maximum throughput of a pool of 10 threads?</p>
+<table class="steps"><tr><th>Formula</th><td>L = λ x W, and max throughput = threads / W</td></tr><tr><th>Plug in</th><td>L = 200 x 0.05, and 10 / 0.05</td></tr><tr><th>Compute</th><td>L = 10, and 10 / 0.05 = 200 per second</td></tr><tr><th>Answer</th><td>About 10 requests are in flight, and 10 threads can do at most 200 requests per second. At 200 per second the pool is at its limit.</td></tr><tr><th>Check</th><td><code>ch12f.py</code> printed 10.0 and 200.0. If arrivals reach 220 per second, the queue grows by 20 each second without limit.</td></tr><tr><th>Why it matters</th><td>At the limit, tiny rises in load cause huge waiting. This is the knee in a waiting-time graph: a bank is calm at 80% busy and chaotic at 99% busy.</td></tr></table>
+<p>Now we compare an unbounded queue with a bounded one when arrivals (120 per second) beat service (100 per second). Predict: what happens after 10 seconds in each case?</p>
+<pre class="code lang-python"><code># backpressure: bounded queue vs unbounded. arrivals 120/s, service 100/s, 10 s
+def sim(limit):
+    q=0;drop=0;lat=[]
+    for sec in range(10):
+        for _ in range(120):
+            if limit is not None and q&gt;=limit: drop+=1
+            else: q+=1
+        done=min(q,100); q-=done
+    return q,drop
+for lim in (None,50):
+    q,d=sim(lim)
+    print(f"limit={lim}: queue left={q}, rejected={d}, wait for last queued = {q/100:.2f}s")
+# Little's law: L = lambda * W
+lam=100; W=0.2
+print("Little's law: throughput 100/s x 0.2s latency =",lam*W,"requests in flight")</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>limit=None: queue left=200, rejected=0, wait for last queued = 2.00s
+limit=50: queue left=0, rejected=700, wait for last queued = 0.00s
+Little's law: throughput 100/s x 0.2s latency = 20.0 requests in flight</code></pre>
+<p>Line by line: each second, 120 requests arrive and the system serves up to 100. With no limit, 20 extra requests pile up each second: after 10 seconds, 200 are waiting, and the last one waits 2 seconds, and it keeps growing. With a limit of 50, the queue fills to 50, the rest are rejected right away (70 per second, 700 in total), and every second the server clears the queue. Waiting stays short, but some users get an error. That is backpressure: be honest and fast about saying no, rather than slow for everyone. In a real system the rejected client should back off (return HTTP 429 or 503).</p>
+<h3>Connection to the real job</h3>
+<p>In a real service, a rising error rate with falling throughput after a peak is often a retry storm or missing backpressure. Good teams rehearse an overload beyond capacity (tools such as Locust or k6 can simulate it) to check that the system fails gracefully. In data pipelines, Kafka consumers apply backpressure by pausing when downstream is slow.</p>
+<h3>Applications</h3>
+<ul><li>Data Engineering: idempotent writes (upserts with a key) so a re-run of a failed job does not duplicate rows.</li><li>MLOps: model servers with bounded request queues and timeouts.</li><li>Payments and orders: idempotency keys on every POST.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Retrying instantly in a tight loop, or retrying non-idempotent actions. Always use backoff with jitter, a retry cap, and idempotency keys for actions that change data.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which operation is naturally idempotent: "set status to paid" or "add 30 to balance"? Answer: "Set status to paid".</li><li>Why add jitter? Answer: So thousands of clients do not all retry at the same moment.</li><li>500 requests per second, 0.2 s each. How many in flight? Answer: 100 (L = 500 x 0.2).</li></ol>
+<h2 id="s7-chapter-recap">Chapter recap</h2>
+<ul><li>A distributed system uses many computers over a network, for scale, availability and low latency.</li><li>The key difficulty is partial failure: silence can mean crash, loss or slowness.</li><li>Replication copies data. Partitioning splits data. Big systems do both.</li><li>Quorum rule: with N replicas, W + R &gt; N gives reads that overlap the latest write.</li><li>Consistent hashing moves only about 1/N of keys when a node is added. Mod N moves most of them (795 of 1,000 in our run).</li><li>Consensus (Raft, Paxos) needs a majority. Use odd cluster sizes. Majority prevents split brain.</li><li>CAP: during a partition choose consistency or availability. PACELC: otherwise choose latency or consistency.</li><li>Retry only with timeouts, backoff and jitter. Make writes idempotent with keys.</li><li>Backpressure protects a system: a bounded queue and fast rejection beat an unlimited queue.</li><li>Little's law (L = λ x W) links throughput, latency and concurrency.</li></ul>
+<p><strong>Cheat sheet</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Idea</th><th>Formula or rule</th><th>Example</th></tr></thead><tbody><tr><td>Replica availability</td><td>P(at least 2 of 3 up) = 3p²(1-p) + p³</td><td>p = 0.99 gives 0.999702</td></tr><tr><td>Quorum</td><td>W + R &gt; N</td><td>N=3, W=2, R=2</td></tr><tr><td>Crashes tolerated</td><td>floor((N-1)/2)</td><td>N=5 gives 2</td></tr><tr><td>Retries success</td><td>1 - q^m</td><td>q=0.3, m=3 gives 0.973</td></tr><tr><td>Backoff</td><td>wait = random(0, min(cap, base x 2^i))</td><td>base 0.1 s, cap 5 s</td></tr><tr><td>Little's law</td><td>L = λ x W</td><td>200 x 0.05 = 10</td></tr><tr><td>Pool throughput</td><td>threads / service time</td><td>10 / 0.05 = 200/s</td></tr></tbody></table></div>
+<h2 id="s8-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 12.7.1</span> (easy) How many nodes must be up in a 9-node Raft cluster to commit writes?</p>
+<p><strong>Answer:</strong> 5, because a majority of 9 is 5 (more than 4.5).</p>
+<p class="problem"><span class="pl">Problem 12.7.2</span> (easy) N = 3, W = 1, R = 3. Do reads always see the latest write?</p>
+<p><strong>Answer:</strong> Yes, W + R = 4 &gt; 3. Reads query all nodes, so they always meet the written node. Writes are fast but a write on one node can be lost if that node dies before copying.</p>
+<p class="problem"><span class="pl">Problem 12.7.3</span> (what is the output) In our simulation, what happens to the balance if the same payment is sent 3 times with the same idempotency key, starting at 100 with amount 30?</p>
+<p><strong>Answer:</strong> 70. Only the first request changes the balance. (Real output from the run above.)</p>
+<p class="problem"><span class="pl">Problem 12.7.4</span> (computation) Three nodes, each up 99.9% of the time, independent. The service needs at least 2 up. Availability?</p>
+<p><strong>Answer:</strong> 3 x 0.999² x 0.001 + 0.999³ = 0.002994 + 0.997003 = 0.999997 (about 99.9997%). Quick check by computing: 3 x 0.998001 x 0.001 = 0.002994003; 0.999³ = 0.997002999; sum = 0.999997002.</p>
+<p class="problem"><span class="pl">Problem 12.7.5</span> (computation) 1,000 req/s arrive, each takes 80 ms. How many concurrent requests are in the system? What if latency doubles to 160 ms?</p>
+<p><strong>Answer:</strong> L = 1,000 x 0.08 = 80, and with 0.16 s it becomes 160. Double latency, double concurrency, so connection pools must grow or requests wait.</p>
+<p class="problem"><span class="pl">Problem 12.7.6</span> (find the bug) A client retries a failed "create order" call up to 5 times, instantly, with no key. The customer is charged 3 times. What went wrong and how do you fix it?</p>
+<p><strong>Answer:</strong> The first calls succeeded on the server but replies were lost, so retries created new orders. Add an idempotency key per order (the server remembers it), use backoff with jitter, and set a retry limit.</p>
+<p class="problem"><span class="pl">Problem 12.7.7</span> (find the bug) A team shards data by <code>order_date</code>. One day the cluster slows down although most nodes are idle. Why?</p>
+<p><strong>Answer:</strong> Today's date is one key, so all new writes go to one partition (hot spot). Shard by a high-cardinality key such as <code>order_id</code>, or hash it.</p>
+<p class="problem"><span class="pl">Problem 12.7.8</span> (scenario) You add a node to a 10-node cache that uses <code>hash mod N</code>. What do you expect, and what is the better design?</p>
+<p><strong>Answer:</strong> About 10/11 = 91% of keys move (a key stays only when <code>h mod 10 = h mod 11</code>, which is 10 of every 110 residues, about 9%). The cache goes almost cold and the database is hit hard. Use consistent hashing so about 1/11 = 9% of keys move.</p>
+<p class="problem"><span class="pl">Problem 12.7.9</span> (interview) Explain CAP in two sentences to a manager.</p>
+<p><strong>Answer:</strong> When the network between our servers breaks, we must choose: refuse some requests to stay correct, or answer and risk old data. Our product decides which is worse (for example, wrong balance versus a stale feed).</p>
+<p class="problem"><span class="pl">Problem 12.7.10</span> (interview) Your service is slow; CPU is at 30% but latency is climbing under load, and clients retry. Give a plan.</p>
+<p><strong>Answer:</strong> Check queue length and thread pool use (Little's law: L = λ x W), find the slow dependency, add timeouts shorter than the caller's, add backoff with jitter and retry caps, and add a bounded queue with fast rejection. Re-test with load beyond the capacity point to confirm graceful failure.</p>
+<h2 id="s9-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data and AI roles, and English is my second language. Teach me replication and consistency in distributed systems: leader-follower, quorums with W + R &gt; N, and eventual versus strong consistency. Explain step by step in simple English with small numbers, then check my understanding with 3 questions, one at a time.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data engineering, and English is my second language. My topic is partitioning, sharding and consistent hashing. Give me 8 graded exercises with small numbers (including hot-spot partition keys and how many keys move when a node is added), but do not give solutions yet. Wait for my answers and then correct them.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data and AI roles. My topic is consensus (Raft and Paxos intuition), leader election and split brain. Quiz me one question at a time, starting with majority maths and ending with a scenario about a network partition. Give feedback after each answer and keep score.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data and AI roles, and English is my second language. My topic is CAP and PACELC. Review my explanation for these systems: [PASTE HERE: my notes about two databases I know and whether they favour consistency or availability]. Point out mistakes, give corrections in simple English, and give one real-world example for each point.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for data engineer and ML platform interviews. Run a mock interview on reliability in distributed systems: retries, backoff with jitter, idempotency keys, timeouts, backpressure and Little's law. Ask one question at a time, with a follow-up depending on my answer, then give me a score out of 10 with specific improvements.</pre></div><div class="readbtn"><button class="btn" data-read="study:cs:ch12">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch11.html">← Chapter 11: Recursion, Backtracking, Dynamic Program</a><a class="btn" href="ch13.html">Chapter 13: Computer Architecture and Compute for ML →</a></div></div><script src="../../assets/study.js"></script></body></html>

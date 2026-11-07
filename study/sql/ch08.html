@@ -1,0 +1,622 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 8: Window Functions in Depth</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#6a2fd0"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">SQL &amp; Databases Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 8</div><h1>Window Functions in Depth</h1><p>Calculations across related rows without collapsing them: ranking, previous and next row, running totals, moving averages, top-N per group, gaps and islands.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-8-1-the-over-clause-partition-by-and-order-by">8.1 The OVER Clause: PARTITION BY and ORDER BY</a></li><li><a href="#s2-8-2-ranking-functions-and-top-n-per-group">8.2 Ranking Functions and Top-N per Group</a></li><li><a href="#s3-8-3-offset-functions-lag-lead-first-value-last-value-nth-value">8.3 Offset Functions: LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE</a></li><li><a href="#s4-8-4-frames-running-totals-moving-averages-rows-vs-range">8.4 Frames: Running Totals, Moving Averages, ROWS vs RANGE</a></li><li><a href="#s5-8-5-patterns-gaps-and-islands-sessionization-median">8.5 Patterns: Gaps and Islands, Sessionization, Median</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p><code>GROUP BY</code> squeezes many rows into one. But many real questions need the detail rows <strong>and</strong> a number computed from their neighbours: "each order and its rank within the customer", "each month and the change from last month", "a running total of revenue", "the top 2 products in every category". These cannot be written cleanly with <code>GROUP BY</code>. <strong>Window functions</strong> solve them. They are the most tested SQL topic in data interviews and the biggest step up from beginner to professional. By the end you can rank, compare to the previous row, build running totals and moving averages, pick top-N per group, remove duplicates, and find streaks.</p>
+<p>For this chapter we save a helper query as a <strong>view</strong> (a named, saved query; Chapter 9 explains views). It gives one row per order with its total value.</p>
+<pre class="code lang-sql"><code>CREATE VIEW order_totals AS
+SELECT o.order_id, o.customer_id, o.order_date, o.status,
+       SUM(oi.qty * oi.unit_price) AS total
+FROM orders o JOIN order_items oi ON oi.order_id = o.order_id
+GROUP BY o.order_id, o.customer_id, o.order_date, o.status;
+
+SELECT COUNT(*) AS n_orders, SUM(total) AS all_revenue FROM order_totals;</code></pre>
+<pre class="code lang-text"><code>n_orders  all_revenue
+--------  -----------
+14        14560</code></pre>
+<h2 id="s1-8-1-the-over-clause-partition-by-and-order-by">8.1 The OVER Clause: PARTITION BY and ORDER BY</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Imagine a class mark sheet. A <code>GROUP BY</code> report prints one line per class: the class average. A window report keeps every student's line and <strong>adds a column</strong> with their class average next to their own mark. Each row looks through a "window" at the other rows of its class, and the rows are never merged.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Window function</strong>: a function followed by <code>OVER (...)</code>. It computes a value for each row using a set of related rows.</li><li><strong>Partition</strong>: a group of rows that belong together (like one class). <code>PARTITION BY customer_id</code> makes one partition per customer. No <code>PARTITION BY</code> means one partition: the whole table.</li><li><strong>Window ordering</strong>: <code>ORDER BY</code> inside <code>OVER</code> sorts the rows inside each partition, for functions that care about order.</li><li><strong>Frame</strong>: the sub-range of the partition used for each row (Section 8.4).</li></ul>
+<h3>Shape</h3>
+<pre class="code lang-text"><code>function(args) OVER (
+    PARTITION BY col1, col2     -- optional: split into groups
+    ORDER BY col3               -- optional: order inside each group
+    ROWS BETWEEN ... AND ...    -- optional: frame
+)</code></pre>
+<p>Any aggregate (<code>SUM</code>, <code>AVG</code>, <code>COUNT</code>, <code>MIN</code>, <code>MAX</code>) can be used as a window function by adding <code>OVER</code>. Window functions run <strong>after</strong> <code>WHERE</code>, <code>GROUP BY</code> and <code>HAVING</code>, and <strong>before</strong> <code>ORDER BY</code> and <code>LIMIT</code>. Because of this you cannot use them in <code>WHERE</code>; wrap the query in a CTE and filter outside (Snowflake, BigQuery and DuckDB have <code>QUALIFY</code> for this).</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Window idea</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>SUM(x) OVER ()</code></td><td>row's share of grand total</td><td>percent-of-total columns</td></tr><tr><td><code>AVG(x) OVER (PARTITION BY k)</code></td><td>row vs its group's average</td><td>outlier flags</td></tr><tr><td><code>ROW_NUMBER() OVER (...)</code></td><td>order within a user</td><td>"first purchase", dedup</td></tr><tr><td><code>LAG(x) OVER (ORDER BY t)</code></td><td>previous value</td><td>change since last period</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 8.1.1</span> (trivial) For each order, show its total and the share of all revenue. Show the first 4 orders. Predict: <code>SUM(total) OVER ()</code> equals 14560 on every row.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>SUM(total) OVER ()</code> has empty brackets: one partition, the whole table, so every row sees 14560.</td></tr><tr><th>Step 2</th><td>Share = <code>total / 14560 × 100</code>.</td></tr></table>
+<pre class="code lang-sql"><code>SELECT order_id, total,
+       SUM(total) OVER () AS grand_total,
+       ROUND(100.0 * total / SUM(total) OVER (), 1) AS share_pct
+FROM order_totals
+ORDER BY order_id
+LIMIT 4;</code></pre>
+<pre class="code lang-text"><code>order_id  total  grand_total  share_pct
+--------  -----  -----------  ---------
+101       1660   14560        11.4     
+102       600    14560        4.1      
+103       1020   14560        7.0      
+104       400    14560        2.7</code></pre>
+<ul><li><strong>Compute</strong> Order 101: <code>1660 / 14560 = 0.1140</code>, so 11.4 percent. Order 102: <code>600 / 14560 = 0.0412</code>, 4.1 percent.</li><li><strong>Check</strong> All 14 rows are still there (a <code>GROUP BY</code> would have given one row). Column <code>grand_total</code> is 14560 on each row.</li><li><strong>Answer</strong> Order 101 is 11.4 percent of revenue, 102 is 4.1, 103 is 7.0 (<code>1020 / 14560</code>), 104 is 2.7.</li><li><strong>Meaning</strong> You got detail and total on the same line, with no join back to a summary table.</li></ul>
+<p class="problem"><span class="pl">Problem 8.1.2</span> <code>PARTITION BY</code>: compare each order to the average of <strong>that customer's</strong> orders. Show customers 1 and 5.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>AVG(total) OVER (PARTITION BY customer_id)</code> makes one average per customer.</td></tr><tr><th>Step 2</th><td>Subtract to see whether the order is above or below the customer's norm.</td></tr></table>
+<pre class="code lang-sql"><code>SELECT customer_id, order_id, total,
+       ROUND(AVG(total) OVER (PARTITION BY customer_id), 1) AS cust_avg,
+       ROUND(total - AVG(total) OVER (PARTITION BY customer_id), 1) AS diff
+FROM order_totals
+WHERE customer_id IN (1, 5)
+ORDER BY customer_id, order_id;</code></pre>
+<pre class="code lang-text"><code>customer_id  order_id  total  cust_avg  diff  
+-----------  --------  -----  --------  ------
+1            101       1660   1140.0    520.0 
+1            103       1020   1140.0    -120.0
+1            106       1280   1140.0    140.0 
+1            111       600    1140.0    -540.0
+5            107       360    753.3     -393.3
+5            109       1500   753.3     746.7 
+5            113       400    753.3     -353.3</code></pre>
+<ul><li><strong>Compute</strong> Customer 1: totals 1660, 1020, 1280, 600; sum 4560, average <code>4560 / 4 = 1140</code>. Customer 5: totals 360, 1500, 400; sum 2260, average <code>2260 / 3 = 753.3</code>.</li><li><strong>Check</strong> For customer 1 the diffs are <code>+520, −120, +140, −540</code>, and they add to 0 (a mean's deviations always cancel).</li><li><strong>Answer</strong> Customer 1 average 1140; customer 5 average 753.3, with its refunded order 109 (1500) well above it.</li><li><strong>Meaning</strong> The filter <code>WHERE customer_id IN (1,5)</code> ran <strong>before</strong> the window, so the averages use only those customers' rows, which is right here because partitions are per customer.</li></ul>
+<p class="problem"><span class="pl">Problem 8.1.3</span> Window versus GROUP BY, side by side, and a named window. Count orders per customer in both ways.</p>
+<pre class="code lang-sql"><code>SELECT customer_id, COUNT(*) AS n_orders
+FROM order_totals GROUP BY customer_id ORDER BY customer_id;</code></pre>
+<pre class="code lang-text"><code>customer_id  n_orders
+-----------  --------
+1            4       
+2            3       
+3            1       
+4            2       
+5            3       
+6            1</code></pre>
+<pre class="code lang-sql"><code>SELECT DISTINCT customer_id, COUNT(*) OVER w AS n_orders
+FROM order_totals
+WINDOW w AS (PARTITION BY customer_id)
+ORDER BY customer_id;</code></pre>
+<pre class="code lang-text"><code>customer_id  n_orders
+-----------  --------
+1            4       
+2            3       
+3            1       
+4            2       
+5            3       
+6            1</code></pre>
+<ul><li><strong>Check</strong> Both give 4, 3, 1, 2, 3, 1 for customers 1 to 6.</li><li><strong>Answer</strong> Same numbers. The window version needed <code>DISTINCT</code> to remove repeated rows.</li><li><strong>Meaning</strong> If you want one row per group, use <code>GROUP BY</code>. Use windows when you want to keep every row. <code>WINDOW w AS (...)</code> names a window so that you can reuse it.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> GROUP BY customer_id             PARTITION BY customer_id
+ ---------------------            -------------------------------------
+ cust | n                         order | cust | total | cust_avg
+ 1    | 4          (4 rows -&gt; 1)  101   | 1    | 1660  | 1140   &lt;- partition 1
+ 3    | 1                         103   | 1    | 1020  | 1140
+                                  ...   (all rows kept)
+                                  104   | 3    | 400   | 400    &lt;- partition 2</code></pre>
+<h3>Connection to the real job</h3>
+<p>Percent-of-total, difference-from-average and "rank within group" columns are everyday dashboard needs. For example: each delivery's time next to the 90th percentile for its city.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> share of total, deviation from group average, ranking customers.</li><li><strong>Data Science:</strong> group-wise features such as "order value divided by the customer's average".</li><li><strong>Data Engineering:</strong> de-duplicating records (Section 8.2).</li><li><strong>Education:</strong> compare each student's mark with the class average.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Putting a window function in <code>WHERE</code> or <code>GROUP BY</code>. It fails (<code>window functions are not allowed in WHERE</code>). Compute it in a CTE or subquery, then filter. Another one: forgetting that <code>WHERE</code> runs first, so filtered-out rows are not in any window.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>How many rows does a window function return per input row?</li></ol>
+<p>Answer: One (rows are not collapsed).</p>
+<ol><li>What does <code>OVER ()</code> with empty brackets mean?</li></ol>
+<p>Answer: One partition: the whole result.</p>
+<ol><li>Can you use a window function in WHERE?</li></ol>
+<p>Answer: No. Use a CTE or subquery.</p>
+<h2 id="s2-8-2-ranking-functions-and-top-n-per-group">8.2 Ranking Functions and Top-N per Group</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">In a race, runners get positions. If two runners tie for second place, what is the next runner's position, third or fourth? Different sports answer differently, and SQL gives you all the answers: <code>ROW_NUMBER</code> (never tie), <code>RANK</code> (ties share, then skip), <code>DENSE_RANK</code> (ties share, no skip).</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Tie</strong>: two rows with equal values in the ordering column.</li><li><strong>Percentile rank</strong>: the position of a row as a fraction between 0 and 1.</li><li><strong>Top-N per group</strong>: the best N rows inside each partition.</li></ul>
+<h3>Definitions</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Function</th><th>Behaviour with ties</th><th>Values for 10, 20, 20, 30 (ascending)</th></tr></thead><tbody><tr><td><code>ROW_NUMBER()</code></td><td>unique number, ties broken arbitrarily unless you add a tiebreaker</td><td>1, 2, 3, 4</td></tr><tr><td><code>RANK()</code></td><td>ties share a number; next number is skipped</td><td>1, 2, 2, 4</td></tr><tr><td><code>DENSE_RANK()</code></td><td>ties share a number; no skip</td><td>1, 2, 2, 3</td></tr><tr><td><code>NTILE(n)</code></td><td>splits ordered rows into <code>n</code> buckets of nearly equal size</td><td>e.g. <code>NTILE(2)</code>: 1, 1, 2, 2</td></tr><tr><td><code>PERCENT_RANK()</code></td><td><code>(rank − 1) / (rows − 1)</code></td><td>0, 0.33, 0.33, 1</td></tr><tr><td><code>CUME_DIST()</code></td><td><code>rows up to and including this value / total rows</code></td><td>0.25, 0.75, 0.75, 1</td></tr></tbody></table></div>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Function</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>ROW_NUMBER</code></td><td>latest record per key</td><td>de-duplication</td></tr><tr><td><code>RANK</code>/<code>DENSE_RANK</code></td><td>leaderboard with ties</td><td>competition tables, "top 3 salaries"</td></tr><tr><td><code>NTILE(4)</code></td><td>quartiles of customers by spend</td><td>RFM scoring, deciles</td></tr><tr><td><code>PERCENT_RANK</code></td><td>"this order is in the top 20 percent"</td><td>percentile labels</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 8.2.1</span> (trivial) Rank all 14 orders by total, biggest first, using all five functions. Predict: three pairs of orders tie (1500 twice, 600 twice, 400 twice).</p>
+<table class="steps"><tr><th>Step 1</th><td>Order by <code>total DESC</code>, and <code>order_id</code> as tiebreaker for <code>ROW_NUMBER</code>.</td></tr><tr><th>Step 2</th><td>Add the other functions. <code>RANK</code> and <code>DENSE_RANK</code> must order by <code>total</code> only, otherwise the tiebreaker would hide the ties.</td></tr></table>
+<pre class="code lang-sql"><code>SELECT order_id, total,
+       ROW_NUMBER() OVER (ORDER BY total DESC, order_id) AS row_num,
+       RANK()       OVER (ORDER BY total DESC)           AS rnk,
+       DENSE_RANK() OVER (ORDER BY total DESC)           AS dense_rnk,
+       NTILE(4)     OVER (ORDER BY total DESC, order_id) AS quartile,
+       ROUND(PERCENT_RANK() OVER (ORDER BY total DESC), 3) AS pct_rank
+FROM order_totals
+ORDER BY total DESC, order_id;</code></pre>
+<pre class="code lang-text"><code>order_id  total  row_num  rnk  dense_rnk  quartile  pct_rank
+--------  -----  -------  ---  ---------  --------  --------
+114       2100   1        1    1          1         0.0     
+112       1800   2        2    2          1         0.077   
+101       1660   3        3    3          1         0.154   
+105       1500   4        4    4          1         0.231   
+109       1500   5        4    4          2         0.231   
+106       1280   6        6    5          2         0.385   
+103       1020   7        7    6          2         0.462   
+108       900    8        8    7          2         0.538   
+102       600    9        9    8          3         0.615   
+111       600    10       9    8          3         0.615   
+110       440    11       11   9          3         0.769   
+104       400    12       12   10         4         0.846   
+113       400    13       12   10         4         0.846   
+107       360    14       14   11         4         1.0</code></pre>
+<ul><li><strong>Compute</strong> Sorted totals: 2100, 1800, 1660, 1500, 1500, 1280, 1020, 900, 600, 600, 440, 400, 400, 360. <code>RANK</code>: 1, 2, 3, 4, 4, 6, 7, 8, 9, 9, 11, 12, 12, 14. <code>DENSE_RANK</code>: 1, 2, 3, 4, 4, 5, 6, 7, 8, 8, 9, 10, 10, 11. <code>NTILE(4)</code> of 14 rows: the first two buckets get 4 rows, the last two get 3 (14 = 4+4+3+3). <code>PERCENT_RANK = (rank − 1) / 13</code>: for rank 4, <code>3 / 13 = 0.231</code>; for rank 14, <code>13 / 13 = 1</code>.</li><li><strong>Check</strong> Rank 4 appears twice and the next rank is 6, as computed. The last <code>RANK</code> is 14 while the last <code>DENSE_RANK</code> is 11, which confirms the "skip". <code>ROW_NUMBER</code> and <code>NTILE</code> use the extra <code>order_id</code> tiebreaker, so they never tie.</li><li><strong>Answer</strong> See the printed table.</li><li><strong>Meaning</strong> If the question says "top 3 orders", then <code>RANK &lt;= 3</code> returns 3 rows, but <code>RANK &lt;= 4</code> returns 5 rows because of the tie. Always decide how ties should behave before choosing the function.</li></ul>
+<p class="problem"><span class="pl">Problem 8.2.2</span> Top-N per group: the two largest orders of each customer.</p>
+<table class="steps"><tr><th>Step 1</th><td>Rank inside each customer: <code>ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY total DESC)</code>.</td></tr><tr><th>Step 2</th><td>Window functions cannot be filtered in <code>WHERE</code>, so put step 1 in a CTE and filter <code>rn &lt;= 2</code> outside.</td></tr></table>
+<pre class="code lang-sql"><code>WITH ranked AS (
+  SELECT customer_id, order_id, total,
+         ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY total DESC, order_id) AS rn
+  FROM order_totals
+)
+SELECT customer_id, order_id, total, rn
+FROM ranked
+WHERE rn &lt;= 2
+ORDER BY customer_id, rn;</code></pre>
+<pre class="code lang-text"><code>customer_id  order_id  total  rn
+-----------  --------  -----  --
+1            101       1660   1 
+1            106       1280   2 
+2            114       2100   1 
+2            108       900    2 
+3            104       400    1 
+4            112       1800   1 
+4            105       1500   2 
+5            109       1500   1 
+5            113       400    2 
+6            110       440    1</code></pre>
+<ul><li><strong>Compute</strong> Customer 1: 1660 (101), 1280 (106). Customer 2: 2100 (114), 900 (108). Customer 3: only 104 (400). Customer 4: 1800 (112), 1500 (105). Customer 5: 1500 (109), 400 (113). Customer 6: only 110 (440).</li><li><strong>Check</strong> <code>2 + 2 + 1 + 2 + 2 + 1 = 10</code> rows.</li><li><strong>Answer</strong> Ten rows as printed.</li><li><strong>Meaning</strong> A customer with fewer than N orders simply returns fewer rows. This pattern is the answer to "top 3 products per category" and "latest 5 events per user".</li></ul>
+<p class="problem"><span class="pl">Problem 8.2.3</span> Top product per category by revenue, keeping ties (<code>RANK</code>).</p>
+<pre class="code lang-sql"><code>WITH rev AS (
+  SELECT p.category, p.name, SUM(oi.qty * oi.unit_price) AS revenue
+  FROM order_items oi JOIN products p ON p.product_id = oi.product_id
+  GROUP BY p.category, p.name
+), ranked AS (
+  SELECT *, RANK() OVER (PARTITION BY category ORDER BY revenue DESC) AS r FROM rev
+)
+SELECT category, name, revenue FROM ranked WHERE r = 1 ORDER BY category;</code></pre>
+<pre class="code lang-text"><code>category     name       revenue
+-----------  ---------  -------
+Electronics  Keyboard   6000   
+Home         Desk Lamp  3600   
+Stationery   Notebook   1120</code></pre>
+<ul><li><strong>Check</strong> Electronics: Keyboard 6000 beats Mouse 3000. Home: Desk Lamp 3600 (Mug never sold, so is absent). Stationery: Notebook 1120 beats Pen Pack 840.</li><li><strong>Answer</strong> Keyboard, Desk Lamp, Notebook.</li><li><strong>Meaning</strong> The <code>GROUP BY</code> ran first, then the window ranked the grouped rows. Windows can sit on top of aggregates.</li></ul>
+<p class="problem"><span class="pl">Problem 8.2.4</span> Deduplication: a table has repeated emails; keep only the newest row per email.</p>
+<pre class="code lang-sql"><code>CREATE TABLE raw_users (id INTEGER, email TEXT, updated_at TEXT);
+INSERT INTO raw_users VALUES
+ (1,'a@x.com','2024-01-01'),(2,'a@x.com','2024-02-01'),
+ (3,'b@x.com','2024-01-15'),(4,'a@x.com','2024-02-01');
+
+WITH numbered AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY email ORDER BY updated_at DESC, id DESC) AS rn
+  FROM raw_users
+)
+SELECT id, email, updated_at FROM numbered WHERE rn = 1 ORDER BY id;</code></pre>
+<pre class="code lang-text"><code>id  email    updated_at
+--  -------  ----------
+3   b@x.com  2024-01-15
+4   a@x.com  2024-02-01</code></pre>
+<ul><li><strong>Check</strong> <code>a@x.com</code> has three rows, two share the latest date 2024-02-01 (ids 2 and 4). The tiebreaker <code>id DESC</code> picks id 4. <code>b@x.com</code> has one row (id 3).</li><li><strong>Answer</strong> Rows with id 3 and 4 survive.</li><li><strong>Meaning</strong> The tiebreaker matters: without it, the winner among ties is arbitrary and can change between runs. Dedup this way before loading into a warehouse.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> PARTITION BY category ORDER BY revenue DESC
+ Electronics:  Keyboard 6000 (rn 1)   Mouse 3000 (rn 2)
+ Home:         Desk Lamp 3600 (rn 1)
+ Stationery:   Notebook 1120 (rn 1)   Pen Pack 840 (rn 2)
+ WHERE rn = 1 keeps the first row of each box.</code></pre>
+<h3>Connection to the real job</h3>
+<p>"Top N per group", "latest record per key" and "remove duplicates" are three of the five most common SQL interview problems, and daily work for data engineers. <code>NTILE</code> drives RFM scoring (Chapter 12).</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> top products, top customers, deciles of spend.</li><li><strong>Data Engineering:</strong> dedup on <code>ROW_NUMBER = 1</code>, keep latest per key (CDC feeds).</li><li><strong>Machine Learning:</strong> train/validation splits by <code>NTILE</code>, stratified samples.</li><li><strong>Logistics:</strong> slowest 5 deliveries per city.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><code>ROW_NUMBER</code> with no tiebreaker, and using <code>RANK</code> for "top 1 per group" without realising ties return several rows. Also, <code>ORDER BY</code> inside <code>OVER</code> only orders the window; the final result order needs its own <code>ORDER BY</code>.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Ranks of values 5, 5, 7 (descending 7, 5, 5) with <code>RANK</code>?</li></ol>
+<p>Answer: 1, 2, 2.</p>
+<ol><li>Same with <code>DENSE_RANK</code> if there were one more value of 3 after them?</li></ol>
+<p>Answer: 7 is 1, 5 and 5 are 2, 3 is 3 (no skip).</p>
+<ol><li>Why use a CTE to filter <code>ROW_NUMBER() = 1</code>?</li></ol>
+<p>Answer: Window functions cannot be in <code>WHERE</code>.</p>
+<h2 id="s3-8-3-offset-functions-lag-lead-first-value-last-value-nth-value">8.3 Offset Functions: LAG, LEAD, FIRST_VALUE, LAST_VALUE, NTH_VALUE</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Looking at today's temperature, you want yesterday's. In a spreadsheet you point at the cell above. <code>LAG</code> is "the cell above"; <code>LEAD</code> is "the cell below". <code>FIRST_VALUE</code> is the top of the group; <code>LAST_VALUE</code> the bottom.</div></div>
+<h3>Definitions</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Function</th><th>Returns</th></tr></thead><tbody><tr><td><code>LAG(x, n, default)</code></td><td>the value of <code>x</code> from <code>n</code> rows earlier (default 1) in the window order; <code>default</code> if there is none (else NULL)</td></tr><tr><td><code>LEAD(x, n, default)</code></td><td>the value <code>n</code> rows later</td></tr><tr><td><code>FIRST_VALUE(x)</code></td><td><code>x</code> from the first row of the frame</td></tr><tr><td><code>LAST_VALUE(x)</code></td><td><code>x</code> from the last row of the <strong>frame</strong> (see the trap below)</td></tr><tr><td><code>NTH_VALUE(x, n)</code></td><td><code>x</code> from the n-th row of the frame</td></tr></tbody></table></div>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Function</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>LAG(revenue)</code></td><td>last month's revenue</td><td>MoM growth</td></tr><tr><td><code>LAG(revenue, 12)</code></td><td>same month last year</td><td>YoY growth</td></tr><tr><td><code>LAG(order_date)</code></td><td>days since previous order</td><td>churn and repeat-purchase analysis</td></tr><tr><td><code>FIRST_VALUE</code></td><td>first purchase category</td><td>acquisition analysis</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 8.3.1</span> Month-over-month growth of paid revenue.</p>
+<table class="steps"><tr><th>Formula</th><td><code>growth % = (this month − previous month) / previous month × 100</code></td></tr><tr><th>Step 1</th><td>Monthly paid revenue in a CTE: 2260, 2520, 2980, 4900.</td></tr><tr><th>Step 2</th><td><code>LAG(revenue)</code> brings the previous month's value onto each row.</td></tr></table>
+<pre class="code lang-sql"><code>WITH monthly AS (
+  SELECT substr(order_date,1,7) AS month, SUM(total) AS revenue
+  FROM order_totals WHERE status = 'paid' GROUP BY 1
+)
+SELECT month, revenue,
+       LAG(revenue) OVER (ORDER BY month) AS prev_revenue,
+       revenue - LAG(revenue) OVER (ORDER BY month) AS change,
+       ROUND(100.0 * (revenue - LAG(revenue) OVER (ORDER BY month))
+             / LAG(revenue) OVER (ORDER BY month), 1) AS growth_pct
+FROM monthly ORDER BY month;</code></pre>
+<pre class="code lang-text"><code>month    revenue  prev_revenue  change  growth_pct
+-------  -------  ------------  ------  ----------
+2024-01  2260     NULL          NULL    NULL      
+2024-02  2520     2260          260     11.5      
+2024-03  2980     2520          460     18.3      
+2024-04  4900     2980          1920    64.4</code></pre>
+<ul><li><strong>Compute</strong> Feb: <code>(2520 − 2260) / 2260 = 260 / 2260 = 0.1150</code>, 11.5 percent. Mar: <code>460 / 2520 = 0.1825</code>, 18.3 percent. Apr: <code>1920 / 2980 = 0.6443</code>, 64.4 percent. January has no previous month, so everything is NULL.</li><li><strong>Check</strong> <code>2260 + 260 = 2520</code>, <code>2520 + 460 = 2980</code>, <code>2980 + 1920 = 4900</code>.</li><li><strong>Answer</strong> Growth: NULL, 11.5, 18.3, 64.4 percent.</li><li><strong>Meaning</strong> April's jump is large. Before celebrating, ask whether April simply had more refunds fixed or a campaign. The query tells you <em>what</em>, not <em>why</em>.</li></ul>
+<p class="problem"><span class="pl">Problem 8.3.2</span> Year-over-year with <code>LAG(revenue, 12)</code>: we build a 14-month sales table (2023-01 to 2024-02).</p>
+<pre class="code lang-sql"><code>CREATE TABLE sales_m (month TEXT, revenue INTEGER);
+INSERT INTO sales_m VALUES
+ ('2023-01',100),('2023-02',110),('2023-03',120),('2023-04',130),('2023-05',140),('2023-06',150),
+ ('2023-07',160),('2023-08',170),('2023-09',180),('2023-10',190),('2023-11',200),('2023-12',210),
+ ('2024-01',130),('2024-02',121);
+
+SELECT month, revenue,
+       LAG(revenue, 12) OVER (ORDER BY month) AS same_month_last_year,
+       ROUND(100.0 * (revenue - LAG(revenue, 12) OVER (ORDER BY month))
+             / LAG(revenue, 12) OVER (ORDER BY month), 1) AS yoy_pct
+FROM sales_m
+WHERE month &gt;= '2023-12'
+ORDER BY month;</code></pre>
+<pre class="code lang-text"><code>month    revenue  same_month_last_year  yoy_pct
+-------  -------  --------------------  -------
+2023-12  210      NULL                  NULL   
+2024-01  130      NULL                  NULL   
+2024-02  121      NULL                  NULL</code></pre>
+<p>Careful, this contains a trap: the <code>WHERE</code> runs before the window, so rows before 2023-12 are removed and <code>LAG(…, 12)</code> finds nothing. Run the fix, which filters after the window:</p>
+<pre class="code lang-sql"><code>WITH calc AS (
+  SELECT month, revenue,
+         LAG(revenue, 12) OVER (ORDER BY month) AS last_year
+  FROM sales_m
+)
+SELECT month, revenue, last_year,
+       ROUND(100.0 * (revenue - last_year) / last_year, 1) AS yoy_pct
+FROM calc WHERE month &gt;= '2024-01' ORDER BY month;</code></pre>
+<pre class="code lang-text"><code>month    revenue  last_year  yoy_pct
+-------  -------  ---------  -------
+2024-01  130      100        30.0   
+2024-02  121      110        10.0</code></pre>
+<ul><li><strong>Compute</strong> January 2024 versus January 2023: <code>(130 − 100) / 100 = 0.30</code>, 30 percent. February: <code>(121 − 110) / 110 = 0.10</code>, 10 percent.</li><li><strong>Check</strong> The first query shows NULLs (the trap); the second shows 100 and 110 as last year's values.</li><li><strong>Answer</strong> YoY growth is 30.0 percent for January and 10.0 percent for February 2024.</li><li><strong>Meaning</strong> The lesson: filter <em>after</em> a window with a CTE if the window needs the rows you would filter out. Also <code>LAG(x, 12)</code> assumes every month is present; a missing month would shift the comparison. A calendar (date spine, Chapter 5) protects against that.</li></ul>
+<p class="problem"><span class="pl">Problem 8.3.3</span> Days between a customer's consecutive orders, with <code>LAG</code> on a date. Customer 1.</p>
+<pre class="code lang-sql"><code>SELECT order_id, order_date,
+       LAG(order_date) OVER (ORDER BY order_date) AS prev_date,
+       CAST(julianday(order_date) - julianday(LAG(order_date) OVER (ORDER BY order_date)) AS INTEGER) AS days_gap
+FROM order_totals
+WHERE customer_id = 1
+ORDER BY order_date;</code></pre>
+<pre class="code lang-text"><code>order_id  order_date  prev_date   days_gap
+--------  ----------  ----------  --------
+101       2024-01-10  NULL        NULL    
+103       2024-02-03  2024-01-10  24      
+106       2024-03-05  2024-02-03  31      
+111       2024-04-02  2024-03-05  28</code></pre>
+<ul><li><strong>Compute</strong> Jan 10 to Feb 3 is <code>21 + 3 = 24</code> days. Feb 3 to Mar 5 is <code>26 + 5 = 31</code> (2024 is a leap year, February has 29 days). Mar 5 to Apr 2 is <code>26 + 2 = 28</code>.</li><li><strong>Check</strong> <code>24 + 31 + 28 = 83</code>, and Jan 10 to Apr 2 is <code>21 + 29 + 31 + 2 = 83</code> days.</li><li><strong>Answer</strong> Gaps of 24, 31 and 28 days.</li><li><strong>Meaning</strong> Customer 1 buys about monthly. Averaging these gaps gives the "repeat purchase interval".</li></ul>
+<p class="problem"><span class="pl">Problem 8.3.4</span> The <code>LAST_VALUE</code> trap. For customer 1's orders, show the first and last order date in every row.</p>
+<pre class="code lang-sql"><code>SELECT order_id, order_date,
+       FIRST_VALUE(order_date) OVER (ORDER BY order_date) AS first_date,
+       LAST_VALUE(order_date)  OVER (ORDER BY order_date) AS last_wrong,
+       LAST_VALUE(order_date)  OVER (ORDER BY order_date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS last_right,
+       NTH_VALUE(total, 2) OVER (ORDER BY order_date
+            ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS second_order_total
+FROM order_totals WHERE customer_id = 1 ORDER BY order_date;</code></pre>
+<pre class="code lang-text"><code>order_id  order_date  first_date  last_wrong  last_right  second_order_total
+--------  ----------  ----------  ----------  ----------  ------------------
+101       2024-01-10  2024-01-10  2024-01-10  2024-04-02  1020              
+103       2024-02-03  2024-01-10  2024-02-03  2024-04-02  1020              
+106       2024-03-05  2024-01-10  2024-03-05  2024-04-02  1020              
+111       2024-04-02  2024-01-10  2024-04-02  2024-04-02  1020</code></pre>
+<ul><li><strong>Check</strong> The true last date is 2024-04-02. <code>last_wrong</code> equals each row's own date; <code>last_right</code> is 2024-04-02 everywhere. The second order (103) has total 1020.</li><li><strong>Answer</strong> With the default frame <code>LAST_VALUE</code> returns the current row. Fix by widening the frame.</li><li><strong>Meaning</strong> When a window has <code>ORDER BY</code>, the default frame ends at the <em>current row</em>, so "the last row of the frame" is the current row. Section 8.4 explains frames.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> month     revenue   LAG(revenue)   LAG(revenue, 12)
+ 2023-01     100        NULL           NULL
+ 2023-02     110        100            NULL
+   ...
+ 2023-12     210        200            NULL
+ 2024-01     130        210            100     &lt;- 12 rows above
+ 2024-02     121        130            110     &lt;- 12 rows above</code></pre>
+<p>Read it as: <code>LAG</code> only looks backwards along the ordering you give in <code>OVER (ORDER BY ...)</code>, and <code>LEAD</code> looks forwards.</p>
+<h3>Connection to the real job</h3>
+<p>Growth rates (MoM, WoW, YoY), "time since last event", and churn signals use <code>LAG</code>. Product analytics (first-touch attribution) uses <code>FIRST_VALUE</code>.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> growth rates, change since last period, first and last touch.</li><li><strong>Data Science and ML:</strong> lag features for time series (value yesterday, value a week ago).</li><li><strong>Data Engineering:</strong> detect changes between consecutive snapshots.</li><li><strong>Healthcare:</strong> change in average waiting time between consecutive months.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using <code>LAG(x, 12)</code> over data with missing months, and filtering with <code>WHERE</code> before the window removes the rows <code>LAG</code> needs. Also the <code>LAST_VALUE</code> default-frame trap above.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does <code>LAG(x, 2)</code> return on the first row?</li></ol>
+<p>Answer: NULL (no row two above), unless you give a default.</p>
+<ol><li>Why does <code>LAST_VALUE</code> often look wrong?</li></ol>
+<p>Answer: The default frame ends at the current row.</p>
+<ol><li>Where do you filter if a window needs earlier rows?</li></ol>
+<p>Answer: Outside, in an outer query or CTE.</p>
+<h2 id="s4-8-4-frames-running-totals-moving-averages-rows-vs-range">8.4 Frames: Running Totals, Moving Averages, ROWS vs RANGE</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A running total is a pedometer: at each day it shows the sum so far. A moving average is a smoothing glass that looks at the last 7 days only. The <em>frame</em> says exactly which rows each row may look at.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Frame</strong>: the range of rows, inside the partition, used for this row's calculation.</li><li><strong><code>UNBOUNDED PRECEDING</code></strong>: from the first row of the partition. <strong><code>CURRENT ROW</code></strong>: this row. <strong><code>n PRECEDING / n FOLLOWING</code></strong>: n rows (or n units for <code>RANGE</code>) before or after. <strong><code>UNBOUNDED FOLLOWING</code></strong>: to the last row.</li><li><strong>Peers</strong>: rows with the same <code>ORDER BY</code> value.</li></ul>
+<h3>Definitions</h3>
+<ul><li><code>ROWS BETWEEN a AND b</code>: counts <strong>physical rows</strong>.</li><li><code>RANGE BETWEEN a AND b</code>: uses the <strong>value</strong> of the <code>ORDER BY</code> column; all peers are treated as one.</li><li><code>GROUPS</code> (SQLite 3.28+, PostgreSQL 11+): counts groups of peers.</li><li><strong>Default frame</strong> when <code>ORDER BY</code> is present: <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>. With no <code>ORDER BY</code>: the whole partition.</li></ul>
+<figure><img src="images/window_frame.svg" alt="A moving-average frame: for the March row the frame covers February and March only." loading="lazy"/><figcaption>A moving-average frame: for the March row the frame covers February and March only.</figcaption></figure>
+<p>How to read the picture: each box is a row ordered by month. The red arrow marks the current row (March). The blue shaded boxes are the frame <code>1 PRECEDING to CURRENT ROW</code>, which includes February and March. The average is taken only over those two boxes. For the next row (April) the frame slides one box to the right.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Frame</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>UNBOUNDED PRECEDING to CURRENT ROW</code></td><td>running total</td><td>cumulative revenue, year-to-date</td></tr><tr><td><code>6 PRECEDING to CURRENT ROW</code></td><td>7-day moving average</td><td>smoothing noisy metrics</td></tr><tr><td>whole partition</td><td><code>UNBOUNDED PRECEDING to UNBOUNDED FOLLOWING</code></td><td>share of group total, last value</td></tr><tr><td><code>RANGE 30 PRECEDING</code></td><td>last 30 days by date value</td><td>rolling-window KPIs</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 8.4.1</span> (trivial) Running total of monthly paid revenue, and a 2-month moving average.</p>
+<pre class="code lang-sql"><code>WITH monthly AS (
+  SELECT substr(order_date,1,7) AS month, SUM(total) AS revenue
+  FROM order_totals WHERE status = 'paid' GROUP BY 1
+)
+SELECT month, revenue,
+       SUM(revenue) OVER (ORDER BY month ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS running_total,
+       ROUND(AVG(revenue) OVER (ORDER BY month ROWS BETWEEN 1 PRECEDING AND CURRENT ROW), 1) AS avg_2m
+FROM monthly ORDER BY month;</code></pre>
+<pre class="code lang-text"><code>month    revenue  running_total  avg_2m
+-------  -------  -------------  ------
+2024-01  2260     2260           2260.0
+2024-02  2520     4780           2390.0
+2024-03  2980     7760           2750.0
+2024-04  4900     12660          3940.0</code></pre>
+<ul><li><strong>Compute</strong> Running total: <code>2260</code>, <code>2260 + 2520 = 4780</code>, <code>4780 + 2980 = 7760</code>, <code>7760 + 4900 = 12660</code>. Moving average: Jan has only itself, 2260. Feb <code>(2260 + 2520) / 2 = 2390</code>. Mar <code>(2520 + 2980) / 2 = 2750</code>. Apr <code>(2980 + 4900) / 2 = 3940</code>.</li><li><strong>Check</strong> The final running total 12660 equals the total paid revenue.</li><li><strong>Answer</strong> Running totals 2260, 4780, 7760, 12660; two-month averages 2260, 2390, 2750, 3940.</li><li><strong>Meaning</strong> At the start the frame is short (one row), so the first moving averages use fewer values. Decide whether to show or hide them.</li></ul>
+<p class="problem"><span class="pl">Problem 8.4.2</span> ROWS versus RANGE with ties. Values 10, 20, 20, 30. What are the running sums?</p>
+<table class="steps"><tr><th>Step 1</th><td><code>ROWS</code>: add row by row: 10, 30, 50, 80.</td></tr><tr><th>Step 2</th><td><code>RANGE</code> (the default): both 20s are peers, so each sees the sum including all of its peers: row 2 and row 3 both show <code>10 + 20 + 20 = 50</code>.</td></tr></table>
+<pre class="code lang-sql"><code>CREATE TABLE t (v INTEGER);
+INSERT INTO t VALUES (10),(20),(20),(30);
+
+SELECT v,
+       SUM(v) OVER (ORDER BY v ROWS  BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS rows_sum,
+       SUM(v) OVER (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS range_sum,
+       SUM(v) OVER (ORDER BY v) AS default_sum
+FROM t;</code></pre>
+<pre class="code lang-text"><code>v   rows_sum  range_sum  default_sum
+--  --------  ---------  -----------
+10  10        10         10         
+20  30        50         50         
+20  50        50         50         
+30  80        80         80</code></pre>
+<ul><li><strong>Check</strong> <code>ROWS</code> gives 10, 30, 50, 80. <code>RANGE</code> and the default give 10, 50, 50, 80.</li><li><strong>Answer</strong> The two 20s get 30 and 50 under <code>ROWS</code> but 50 and 50 under <code>RANGE</code>.</li><li><strong>Meaning</strong> This is a famous bug: a "running total" on a date column with several rows on the same date jumps in a surprising way. Say <code>ROWS</code> when you mean physical rows.</li></ul>
+<p class="problem"><span class="pl">Problem 8.4.3</span> Running total per customer and a Pareto (cumulative share) of product revenue.</p>
+<pre class="code lang-sql"><code>WITH rev AS (
+  SELECT p.name, SUM(oi.qty * oi.unit_price) AS revenue
+  FROM order_items oi JOIN products p ON p.product_id = oi.product_id GROUP BY p.name
+)
+SELECT name, revenue,
+       SUM(revenue) OVER (ORDER BY revenue DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS cumulative,
+       ROUND(100.0 * SUM(revenue) OVER (ORDER BY revenue DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+             / SUM(revenue) OVER (), 1) AS cum_pct
+FROM rev ORDER BY revenue DESC;</code></pre>
+<pre class="code lang-text"><code>name       revenue  cumulative  cum_pct
+---------  -------  ----------  -------
+Keyboard   6000     6000        41.2   
+Desk Lamp  3600     9600        65.9   
+Mouse      3000     12600       86.5   
+Notebook   1120     13720       94.2   
+Pen Pack   840      14560       100.0</code></pre>
+<ul><li><strong>Compute</strong> Cumulative: <code>6000</code>, <code>9600</code>, <code>12600</code>, <code>13720</code>, <code>14560</code>. Percent of 14560: <code>41.2</code>, <code>65.9</code>, <code>86.5</code>, <code>94.2</code>, <code>100.0</code>.</li><li><strong>Check</strong> The last value is 100.0 percent.</li><li><strong>Answer</strong> The top two products give 65.9 percent of revenue; the top three give 86.5 percent.</li><li><strong>Meaning</strong> This is the "80/20" (Pareto) view: a few products carry most revenue.</li></ul>
+<p class="problem"><span class="pl">Problem 8.4.4</span> <code>RANGE</code> with a numeric offset: for each order, how many orders happened in the previous 30 days (including itself)? We verify the window answer with a plain correlated subquery.</p>
+<pre class="code lang-sql"><code>SELECT order_id, order_date,
+       COUNT(*) OVER (ORDER BY julianday(order_date) RANGE BETWEEN 30 PRECEDING AND CURRENT ROW) AS orders_30d,
+       (SELECT COUNT(*) FROM orders o2
+        WHERE julianday(o2.order_date) BETWEEN julianday(o.order_date) - 30 AND julianday(o.order_date)) AS check_count
+FROM orders o ORDER BY order_date;</code></pre>
+<pre class="code lang-text"><code>order_id  order_date  orders_30d  check_count
+--------  ----------  ----------  -----------
+101       2024-01-10  1           1          
+102       2024-01-15  2           2          
+103       2024-02-03  3           3          
+104       2024-02-10  3           3          
+105       2024-02-20  3           3          
+106       2024-03-05  3           3          
+107       2024-03-07  4           4          
+108       2024-03-18  4           4          
+109       2024-03-25  4           4          
+110       2024-03-30  5           5          
+111       2024-04-02  6           6          
+112       2024-04-09  5           5          
+113       2024-04-15  6           6          
+114       2024-04-20  6           6</code></pre>
+<ul><li><strong>Check</strong> The two columns are identical on every row. For example order 106 (March 5): orders from February 4 to March 5 are 104 (Feb 10), 105 (Feb 20) and 106, plus nothing else (103 is February 3, one day too early), so 3.</li><li><strong>Answer</strong> <code>orders_30d</code> equals <code>check_count</code>.</li><li><strong>Meaning</strong> A date-based <code>RANGE</code> frame is the right tool for "last 30 days", because it is based on days, not on a fixed number of rows. PostgreSQL supports <code>RANGE BETWEEN INTERVAL '30 days' PRECEDING AND CURRENT ROW</code> on date columns (not run here).</li></ul>
+<h3>Connection to the real job</h3>
+<p>Running totals (year-to-date), moving averages (7-day smoothing of daily active users) and rolling windows are in every dashboard. For a hospital: a rolling 7-day average of appointments per day.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> YTD revenue, 7-day averages, Pareto charts.</li><li><strong>Data Science and ML:</strong> rolling-mean and rolling-sum features (the SQL version of pandas <code>rolling</code>).</li><li><strong>Data Engineering:</strong> incremental running balances.</li><li><strong>Banking:</strong> rolling 7-day count of transactions at a branch.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting that the default frame with <code>ORDER BY</code> is <code>RANGE</code>, which treats ties as one, and that <code>LAST_VALUE</code> needs a widened frame. Write the frame explicitly.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Default frame when <code>OVER</code> has <code>ORDER BY</code>?</li></ol>
+<p>Answer: <code>RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW</code>.</p>
+<ol><li>What is the frame for a 7-day moving average over daily rows?</li></ol>
+<p>Answer: <code>ROWS BETWEEN 6 PRECEDING AND CURRENT ROW</code>.</p>
+<ol><li>Difference between ROWS and RANGE?</li></ol>
+<p>Answer: ROWS counts rows; RANGE uses values and treats ties as one.</p>
+<h2 id="s5-8-5-patterns-gaps-and-islands-sessionization-median">8.5 Patterns: Gaps and Islands, Sessionization, Median</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Look at a calendar where you ticked the days you went to the gym. A run of consecutive ticks is an <strong>island</strong>. The blank stretch between two islands is a <strong>gap</strong>. The question "what is my longest streak?" is an islands question. The trick: if you subtract the day's <em>position in the list</em> from the day itself, all days in one island give the same number.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Island</strong>: a maximal run of consecutive values (days, ids).</li><li><strong>Gap</strong>: missing values between two islands.</li><li><strong>Session</strong>: a burst of events by one user with pauses shorter than a time limit (for example 30 minutes).</li></ul>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Islands</td><td>login streaks</td><td>engagement, subscription continuity</td></tr><tr><td>Gaps</td><td>missing days of data</td><td>data-quality (missing partitions)</td></tr><tr><td>Sessions</td><td>clicks grouped by 30-minute rule</td><td>web analytics</td></tr><tr><td>Median</td><td>typical order value</td><td>skew-resistant averages</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 8.5.1</span> Islands. A user logged in on these days of March 2024: 1, 2, 3, 5, 6, 9. Find each streak.</p>
+<table class="steps"><tr><th>Step 1</th><td>Number the rows in date order: 1, 2, 3, 4, 5, 6.</td></tr><tr><th>Step 2</th><td>Subtract the row number from the day number: <code>1−1=0, 2−2=0, 3−3=0, 5−4=1, 6−5=1, 9−6=3</code>. Equal differences mean the same island.</td></tr><tr><th>Step 3</th><td>Group by that difference.</td></tr></table>
+<pre class="code lang-sql"><code>CREATE TABLE logins (day TEXT);
+INSERT INTO logins VALUES ('2024-03-01'),('2024-03-02'),('2024-03-03'),
+                          ('2024-03-05'),('2024-03-06'),('2024-03-09');
+
+WITH numbered AS (
+  SELECT day,
+         julianday(day) - ROW_NUMBER() OVER (ORDER BY day) AS grp
+  FROM logins
+)
+SELECT MIN(day) AS island_start, MAX(day) AS island_end, COUNT(*) AS days_in_streak
+FROM numbered GROUP BY grp ORDER BY island_start;</code></pre>
+<pre class="code lang-text"><code>island_start  island_end  days_in_streak
+------------  ----------  --------------
+2024-03-01    2024-03-03  3             
+2024-03-05    2024-03-06  2             
+2024-03-09    2024-03-09  1</code></pre>
+<ul><li><strong>Check</strong> Three islands: March 1 to 3 (3 days), March 5 to 6 (2 days), March 9 (1 day). <code>3 + 2 + 1 = 6</code> logins.</li><li><strong>Answer</strong> The longest streak is 3 days.</li><li><strong>Meaning</strong> The "date minus row number" trick turns a hard problem into a plain <code>GROUP BY</code>. It needs one row per day (use <code>DISTINCT</code> first if there can be duplicates).</li></ul>
+<p class="problem"><span class="pl">Problem 8.5.2</span> Gaps with <code>LEAD</code>: list the missing stretches.</p>
+<pre class="code lang-sql"><code>SELECT day AS last_day_before_gap,
+       LEAD(day) OVER (ORDER BY day) AS next_login,
+       CAST(julianday(LEAD(day) OVER (ORDER BY day)) - julianday(day) AS INTEGER) - 1 AS missing_days
+FROM logins
+ORDER BY day;</code></pre>
+<pre class="code lang-text"><code>last_day_before_gap  next_login  missing_days
+-------------------  ----------  ------------
+2024-03-01           2024-03-02  0           
+2024-03-02           2024-03-03  0           
+2024-03-03           2024-03-05  1           
+2024-03-05           2024-03-06  0           
+2024-03-06           2024-03-09  2           
+2024-03-09           NULL        NULL</code></pre>
+<ul><li><strong>Check</strong> Rows where <code>missing_days</code> is above 0: March 3 to March 5 misses 1 day (the 4th); March 6 to March 9 misses 2 days (the 7th and 8th). Consecutive days show 0, and the last row shows NULL.</li><li><strong>Answer</strong> Two gaps, of 1 and 2 days.</li><li><strong>Meaning</strong> Filter <code>missing_days &gt; 0</code> (in an outer query) to get the gap list, which is the standard check for missing data partitions.</li></ul>
+<p class="problem"><span class="pl">Problem 8.5.3</span> Sessionization: events by one user at these times: 09:00, 09:10, 09:20, 10:15, 10:20, 12:00. A new session starts when the gap to the previous event is more than 30 minutes.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>LAG</code> gives the previous event time; compute the gap in minutes.</td></tr><tr><th>Step 2</th><td>Mark a row with 1 if it starts a new session (first event or gap above 30), else 0.</td></tr><tr><th>Step 3</th><td>A running sum of those marks gives the session number.</td></tr></table>
+<pre class="code lang-sql"><code>CREATE TABLE clicks (user_id TEXT, ts TEXT);
+INSERT INTO clicks VALUES
+ ('u1','2024-03-05 09:00:00'),('u1','2024-03-05 09:10:00'),('u1','2024-03-05 09:20:00'),
+ ('u1','2024-03-05 10:15:00'),('u1','2024-03-05 10:20:00'),('u1','2024-03-05 12:00:00');
+
+WITH gaps AS (
+  SELECT user_id, ts,
+         (strftime('%s', ts) - strftime('%s', LAG(ts) OVER (PARTITION BY user_id ORDER BY ts))) / 60.0 AS gap_min
+  FROM clicks
+), flagged AS (
+  SELECT *, CASE WHEN gap_min IS NULL OR gap_min &gt; 30 THEN 1 ELSE 0 END AS new_session FROM gaps
+), sessions AS (
+  SELECT *, SUM(new_session) OVER (PARTITION BY user_id ORDER BY ts) AS session_no FROM flagged
+)
+SELECT user_id, session_no, MIN(ts) AS started, MAX(ts) AS ended, COUNT(*) AS events
+FROM sessions GROUP BY user_id, session_no ORDER BY session_no;</code></pre>
+<pre class="code lang-text"><code>user_id  session_no  started              ended                events
+-------  ----------  -------------------  -------------------  ------
+u1       1           2024-03-05 09:00:00  2024-03-05 09:20:00  3     
+u1       2           2024-03-05 10:15:00  2024-03-05 10:20:00  2     
+u1       3           2024-03-05 12:00:00  2024-03-05 12:00:00  1</code></pre>
+<ul><li><strong>Compute</strong> Gaps in minutes: NULL, 10, 10, 55, 5, 100. Flags: 1, 0, 0, 1, 0, 1. Running sum: 1, 1, 1, 2, 2, 3.</li><li><strong>Check</strong> Events per session: 3, 2, 1, total 6.</li><li><strong>Answer</strong> Three sessions: 09:00 to 09:20 (3 events), 10:15 to 10:20 (2 events), 12:00 (1 event).</li><li><strong>Meaning</strong> "Flag the start, then running sum" is the general recipe for turning boundaries into group ids. Chapter 12 uses it on bigger data.</li></ul>
+<p class="problem"><span class="pl">Problem 8.5.4</span> Median of order totals with windows (SQLite has no median function). The median is the middle value; for an even count it is the average of the two middle values.</p>
+<pre class="code lang-sql"><code>WITH ordered AS (
+  SELECT total,
+         ROW_NUMBER() OVER (ORDER BY total) AS rn,
+         COUNT(*) OVER () AS n
+  FROM order_totals
+)
+SELECT AVG(total) AS median
+FROM ordered
+WHERE rn IN ((n + 1) / 2, (n + 2) / 2);</code></pre>
+<pre class="code lang-text"><code>median
+------
+960.0</code></pre>
+<ul><li><strong>Compute</strong> 14 sorted totals: 360, 400, 400, 440, 600, 600, 900, 1020, 1280, 1500, 1500, 1660, 1800, 2100. With <code>n = 14</code>: <code>(14+1)/2 = 7</code> and <code>(14+2)/2 = 8</code> (integer division). The 7th is 900 and the 8th is 1020. Median <code>(900 + 1020) / 2 = 960</code>.</li><li><strong>Check</strong> Seven values are at or below 900 and seven at or above 1020. The mean order total is <code>14560 / 14 = 1040</code>, a little above the median.</li><li><strong>Answer</strong> 960.</li><li><strong>Meaning</strong> Half of all orders are below 960 rupees. Median beats mean when a few huge orders pull the mean up.</li></ul>
+<pre class="code lang-sql"><code>-- PostgreSQL syntax, not run here
+-- PostgreSQL: median and percentiles are built in
+SELECT percentile_cont(0.5)  WITHIN GROUP (ORDER BY total) AS median,
+       percentile_cont(0.9)  WITHIN GROUP (ORDER BY total) AS p90,
+       percentile_disc(0.95) WITHIN GROUP (ORDER BY total) AS p95
+FROM order_totals;</code></pre>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> days:      1  2  3  .  5  6  .  .  9
+ row no:    1  2  3     4  5        6
+ day - rn:  0  0  0     1  1        3
+            [island A ] [island B ] [C]</code></pre>
+<h3>Connection to the real job</h3>
+<p>These patterns are daily work: retention streaks, subscription continuity, "missing hour" checks on data feeds, web-session metrics, and medians for skewed data like revenue and waiting times. The percentiles you read in delivery or exam reports (p90, p95) correspond to <code>percentile_cont</code> or <code>percentile_disc</code> in SQL.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> streaks, sessions per user, median basket size.</li><li><strong>Data Engineering:</strong> detect missing partitions (gaps), build sessions in clickstream pipelines.</li><li><strong>Data Science and ML:</strong> session features, longest-streak features.</li><li><strong>Logistics:</strong> median and 90th percentile of delivery times per city in SQL.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Running the islands trick on data with duplicate days (the row number then outruns the date and splits islands). Remove duplicates first. And for sessions: choose and document the timeout (30 minutes is a convention, not a law).</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>In the islands trick, what stays equal inside one island?</li></ol>
+<p>Answer: <code>day − row_number</code>.</p>
+<ol><li>How do you turn "session start flags" into session numbers?</li></ol>
+<p>Answer: A running <code>SUM</code> of the flags.</p>
+<ol><li>Which PostgreSQL function gives the median?</li></ol>
+<p>Answer: <code>percentile_cont(0.5) WITHIN GROUP (ORDER BY x)</code>.</p>
+<h2 id="s6-chapter-recap">Chapter recap</h2>
+<ul><li>A window function adds a computed column without collapsing rows; the window is set by <code>OVER (PARTITION BY ... ORDER BY ... frame)</code>.</li><li>Windows run after <code>WHERE</code>/<code>GROUP BY</code>, so filter on them in an outer query or CTE.</li><li><code>ROW_NUMBER</code> is unique, <code>RANK</code> skips after ties, <code>DENSE_RANK</code> does not; always add a tiebreaker to <code>ROW_NUMBER</code>.</li><li>Top-N per group and dedup are <code>ROW_NUMBER() ... WHERE rn &lt;= N</code> inside a CTE.</li><li><code>LAG</code>/<code>LEAD</code> look at neighbouring rows; use them for MoM, YoY and gaps between events.</li><li>The default frame with <code>ORDER BY</code> is <code>RANGE ... CURRENT ROW</code>, so ties merge; state <code>ROWS</code> explicitly. <code>LAST_VALUE</code> needs a full frame.</li><li>Running totals use <code>UNBOUNDED PRECEDING</code>; moving averages use <code>n PRECEDING</code>.</li><li>Islands: <code>date − ROW_NUMBER()</code> is constant within a streak. Sessions: flag starts, then running <code>SUM</code>.</li><li>Median: middle row(s) with <code>ROW_NUMBER</code>, or <code>percentile_cont</code> in PostgreSQL.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Need</th><th>Pattern</th></tr></thead><tbody><tr><td>Share of total</td><td><code>x / SUM(x) OVER ()</code></td></tr><tr><td>Rank in group</td><td><code>RANK() OVER (PARTITION BY g ORDER BY x DESC)</code></td></tr><tr><td>Top N per group</td><td>CTE with <code>ROW_NUMBER()</code>, filter <code>rn &lt;= N</code></td></tr><tr><td>Dedup</td><td><code>ROW_NUMBER() OVER (PARTITION BY key ORDER BY updated DESC) = 1</code></td></tr><tr><td>Previous value</td><td><code>LAG(x) OVER (ORDER BY t)</code></td></tr><tr><td>Running total</td><td><code>SUM(x) OVER (ORDER BY t ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)</code></td></tr><tr><td>7-day average</td><td><code>AVG(x) OVER (ORDER BY t ROWS BETWEEN 6 PRECEDING AND CURRENT ROW)</code></td></tr><tr><td>Islands</td><td><code>GROUP BY date - ROW_NUMBER() OVER (ORDER BY date)</code></td></tr></tbody></table></div>
+<h2 id="s7-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 8.P.1</span> (easy) For each product show its price and the average price of its category.</p>
+<pre class="code lang-sql"><code>SELECT name, category, price,
+       AVG(price) OVER (PARTITION BY category) AS category_avg
+FROM products ORDER BY category, price;</code></pre>
+<pre class="code lang-text"><code>name       category     price  category_avg
+---------  -----------  -----  ------------
+Mouse      Electronics  600    1050.0      
+Keyboard   Electronics  1500   1050.0      
+Mug        Home         250    575.0       
+Desk Lamp  Home         900    575.0       
+Notebook   Stationery   80     100.0       
+Pen Pack   Stationery   120    100.0</code></pre>
+<p><strong>Answer:</strong> Electronics average 1050 (600 and 1500), Home 575 (250 and 900), Stationery 100 (80 and 120).</p>
+<p class="problem"><span class="pl">Problem 8.P.2</span> (easy) Number the customers by signup date, oldest first.</p>
+<pre class="code lang-sql"><code>SELECT customer_id, name, signup_date,
+       ROW_NUMBER() OVER (ORDER BY signup_date) AS signup_order
+FROM customers;</code></pre>
+<pre class="code lang-text"><code>customer_id  name   signup_date  signup_order
+-----------  -----  -----------  ------------
+1            Asha   2024-01-05   1           
+2            Ravi   2024-01-12   2           
+3            Meena  2024-01-20   3           
+4            John   2024-02-02   4           
+5            Priya  2024-02-14   5           
+6            Kabir  2024-03-01   6           
+7            Sana   2024-03-15   7           
+8            Tom    2024-04-01   8</code></pre>
+<p><strong>Answer:</strong> Asha 1, Ravi 2, Meena 3, John 4, Priya 5, Kabir 6, Sana 7, Tom 8 (signup dates are all different and already in id order).</p>
+<p class="problem"><span class="pl">Problem 8.P.3</span> (what is the output?) What do <code>RANK</code> and <code>DENSE_RANK</code> return for the values 90, 80, 80, 70 in descending order?</p>
+<pre class="code lang-sql"><code>SELECT v, RANK() OVER (ORDER BY v DESC) AS r, DENSE_RANK() OVER (ORDER BY v DESC) AS d
+FROM (SELECT 90 AS v UNION ALL SELECT 80 UNION ALL SELECT 80 UNION ALL SELECT 70)
+ORDER BY v DESC;</code></pre>
+<pre class="code lang-text"><code>v   r  d
+--  -  -
+90  1  1
+80  2  2
+80  2  2
+70  4  3</code></pre>
+<p><strong>Answer:</strong> <code>RANK</code>: 1, 2, 2, 4. <code>DENSE_RANK</code>: 1, 2, 2, 3.</p>
+<p class="problem"><span class="pl">Problem 8.P.4</span> (find the bug) This query is meant to show the top order per customer but fails. Why, and what is the fix?</p>
+<pre class="code lang-sql"><code>-- SELECT customer_id, order_id FROM order_totals
+-- WHERE ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY total DESC) = 1;</code></pre>
+<p><strong>Answer:</strong> Window functions are not allowed in <code>WHERE</code>. Put the <code>ROW_NUMBER()</code> in a CTE or subquery as a column <code>rn</code>, then filter <code>rn = 1</code> outside.</p>
+<p class="problem"><span class="pl">Problem 8.P.5</span> The previous order total for each order of customer 2, and whether the total went up.</p>
+<pre class="code lang-sql"><code>SELECT order_id, order_date, total,
+       LAG(total) OVER (ORDER BY order_date) AS prev_total,
+       CASE WHEN total &gt; LAG(total) OVER (ORDER BY order_date) THEN 'up' ELSE 'not up' END AS trend
+FROM order_totals WHERE customer_id = 2 ORDER BY order_date;</code></pre>
+<pre class="code lang-text"><code>order_id  order_date  total  prev_total  trend 
+--------  ----------  -----  ----------  ------
+102       2024-01-15  600    NULL        not up
+108       2024-03-18  900    600         up    
+114       2024-04-20  2100   900         up</code></pre>
+<p><strong>Answer:</strong> Orders 102 (600, no previous so <code>not up</code>), 108 (900, up from 600), 114 (2100, up from 900).</p>
+<p class="problem"><span class="pl">Problem 8.P.6</span> Cumulative number of orders by date (running count), one row per order.</p>
+<pre class="code lang-sql"><code>SELECT order_id, order_date,
+       COUNT(*) OVER (ORDER BY order_date, order_id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS orders_so_far
+FROM orders ORDER BY order_date, order_id;</code></pre>
+<pre class="code lang-text"><code>order_id  order_date  orders_so_far
+--------  ----------  -------------
+101       2024-01-10  1            
+102       2024-01-15  2            
+103       2024-02-03  3            
+104       2024-02-10  4            
+105       2024-02-20  5            
+106       2024-03-05  6            
+107       2024-03-07  7            
+108       2024-03-18  8            
+109       2024-03-25  9            
+110       2024-03-30  10           
+111       2024-04-02  11           
+112       2024-04-09  12           
+113       2024-04-15  13           
+114       2024-04-20  14</code></pre>
+<p><strong>Answer:</strong> The last row shows 14. The running count goes 1, 2, ..., 14 because every order has its own date.</p>
+<p class="problem"><span class="pl">Problem 8.P.7</span> Customers split into 2 halves by total paid spend (<code>NTILE(2)</code>, highest first).</p>
+<pre class="code lang-sql"><code>WITH spend AS (
+  SELECT customer_id, SUM(total) AS spent FROM order_totals WHERE status = 'paid' GROUP BY customer_id
+)
+SELECT customer_id, spent, NTILE(2) OVER (ORDER BY spent DESC) AS half FROM spend ORDER BY spent DESC;</code></pre>
+<pre class="code lang-text"><code>customer_id  spent  half
+-----------  -----  ----
+1            4560   1   
+2            3600   1   
+4            3300   1   
+5            760    2   
+6            440    2</code></pre>
+<p><strong>Answer:</strong> Five paying customers: the first 3 rows (1, 2, 4) get half 1 and the last 2 (5, 6) get half 2. <code>NTILE</code> gives the extra row to the first group.</p>
+<p class="problem"><span class="pl">Problem 8.P.8</span> (scenario) The product team wants "each user's first purchase category and the days between first and second purchase". Which functions? <strong>Answer:</strong> <code>FIRST_VALUE</code> (or <code>ROW_NUMBER = 1</code>) of category per user ordered by date; <code>LAG(order_date)</code> or <code>NTH_VALUE(order_date, 2)</code> for the second purchase, then a date difference. Put them in a CTE, filter in the outer query.</p>
+<p class="problem"><span class="pl">Problem 8.P.9</span> (interview) Find the 3rd highest distinct salary per department. Which function and why? <strong>Answer:</strong> <code>DENSE_RANK() OVER (PARTITION BY dept ORDER BY salary DESC)</code> and keep rank 3. <code>DENSE_RANK</code> handles ties without skipping; <code>ROW_NUMBER</code> would give a wrong answer when salaries tie.</p>
+<p class="problem"><span class="pl">Problem 8.P.10</span> (interview) Explain the difference between <code>ROWS</code> and <code>RANGE</code> frames, with an example where they differ. <strong>Answer:</strong> <code>ROWS</code> counts physical rows; <code>RANGE</code> includes all peer rows with the same <code>ORDER BY</code> value. For values 10, 20, 20, 30 a running sum with <code>ROWS</code> gives 10, 30, 50, 80, but <code>RANGE</code> gives 10, 50, 50, 80.</p>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional in India moving into data roles, and English is my second language. Teach me Chapter 8 topic: "SQL window functions: OVER, PARTITION BY and ORDER BY". Use a small orders table. Show the difference between GROUP BY and a window function with tiny tables, then ask me to predict outputs for 5 queries, one at a time, and check my reasoning.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: ranking functions (ROW_NUMBER, RANK, DENSE_RANK, NTILE) and top-N per group and deduplication. Give me 8 graded exercises on an employees and sales schema you define, without solutions at first. When I paste my answers, review the tie handling and the use of CTEs, and explain mistakes simply.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. Teach me LAG, LEAD, FIRST_VALUE, LAST_VALUE, window frames (ROWS versus RANGE) running totals and moving averages. I am a beginner. Use monthly revenue numbers I can verify by hand, show the frame as a picture in text, and explain the LAST_VALUE trap. After each idea ask me one check question and wait.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. Teach me gaps and islands and sessionization in SQL step by step: row number minus date trick, LAG gap flags, running sum of flags. I am preparing for data-analyst interviews. Use small tables, make me predict intermediate columns, then give me 3 new practice problems and review my answers when I paste them.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. Run a mock SQL interview focused on window functions: second highest salary per department, month-over-month growth, 7-day moving average, remove duplicates keeping the latest, longest login streak. One question at a time, grade me out of 10, show the model solution in PostgreSQL, and name one common mistake each time.</pre></div><div class="readbtn"><button class="btn" data-read="study:sql:ch08">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch07.html">← Chapter 7: Set Operations, Pivot and Unpivot, GROUP</a><a class="btn" href="ch09.html">Chapter 9: DDL, DML, Constraints, Upserts and Trans →</a></div></div><script src="../../assets/study.js"></script></body></html>

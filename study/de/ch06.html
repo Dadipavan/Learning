@@ -1,0 +1,204 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 6: Orchestration with Apache Airflow (and Its Alternatives)</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Engineering &amp; Big Data</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 6</div><h1>Orchestration with Apache Airflow (and Its Alternatives)</h1><p>Running many dependent jobs on time, in order, with retries, alerts and safe re-runs.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-6-1-the-ideas-dags-schedules-data-intervals-retries">6.1 The Ideas: DAGs, Schedules, Data Intervals, Retries</a></li><li><a href="#s2-6-2-airflow-in-practice-code-components-and-best-practices">6.2 Airflow in Practice: Code, Components and Best Practices</a></li><li><a href="#s3-6-3-alternatives-event-driven-triggers-and-lineage">6.3 Alternatives, Event-Driven Triggers and Lineage</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>By now you can write one script that loads orders, one that checks quality, one that builds a mart. But who runs them every night, in the right order, and what happens if step 2 fails? A person with a cron table and a lot of worry? That does not scale to 200 jobs. An <strong>orchestrator</strong> is the program that knows the order, the schedule, the retry rules and the history of every run. Apache Airflow is the most widely used one, and you will meet it in most data engineering interviews. In this chapter you will learn the ideas (DAG, task, schedule, data interval, catchup, backfill, idempotent task), run a small scheduler of your own to see them move, read real Airflow code, and compare Airflow with Dagster, Prefect, Azure Data Factory and others.</p>
+<p>Honest note: Airflow is not installed in this sandbox and cannot be downloaded here, so every Airflow snippet is labelled <strong>not run here</strong>. The mini scheduler we run is our own teaching toy, not Airflow.</p>
+<h2 id="s1-6-1-the-ideas-dags-schedules-data-intervals-retries">6.1 The Ideas: DAGs, Schedules, Data Intervals, Retries</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A cooking plan: wash rice, cook rice, make curry, serve. "Cook rice" cannot start before "wash rice". The plan is a list of steps plus arrows saying "this before that", with no loops (you never wash rice again because you served). A <strong>DAG</strong> (Directed Acyclic Graph) is exactly such a plan: <em>directed</em> because arrows have a direction, <em>acyclic</em> because there are no cycles.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th><th>ShopKart example</th></tr></thead><tbody><tr><td>DAG</td><td>The whole workflow: tasks and their dependencies</td><td><code>daily_orders</code></td></tr><tr><td>Task</td><td>One unit of work</td><td><code>extract</code>, <code>validate</code>, <code>transform</code>, <code>load</code></td></tr><tr><td>Operator</td><td>A template for a kind of task</td><td><code>BashOperator</code>, <code>PythonOperator</code>, a SQL operator</td></tr><tr><td>Task instance</td><td>One task for one run</td><td><code>extract</code> for 2024-06-01</td></tr><tr><td>DAG run</td><td>One execution of the DAG for one data interval</td><td>the run for 2024-06-01</td></tr><tr><td>Schedule</td><td>When runs are created</td><td>daily at midnight</td></tr><tr><td>Data interval</td><td>The slice of data time a run is responsible for</td><td>2024-06-01 00:00 to 2024-06-02 00:00</td></tr><tr><td>Logical date</td><td>The start of the data interval (the <code>ds</code> value)</td><td>2024-06-01</td></tr><tr><td>Retry</td><td>Run a failed task again, after a delay</td><td>2 retries, 5 minutes apart</td></tr><tr><td>Catchup</td><td>Create runs for all past intervals since the start date</td><td>on or off</td></tr><tr><td>Backfill</td><td>Run past intervals on purpose</td><td>recompute March</td></tr><tr><td>Idempotent task</td><td>Re-running gives the same result</td><td>overwrites the day's partition</td></tr></tbody></table></div>
+<figure><img src="images/de_airflow_dag.svg" alt="An Airflow DAG: extract, validate, transform, load, notify as boxes with arrows" loading="lazy"/><figcaption>An Airflow DAG: extract, validate, transform, load, notify as boxes with arrows</figcaption></figure>
+<p>How to read the picture: each box is a task, each arrow means "the right one starts only after the left one succeeds". If <code>transform</code> fails, Airflow retries it. If it still fails, <code>load</code> and <code>notify</code> are marked "upstream failed" and do not run. You fix the cause and <strong>clear</strong> (re-run) just <code>transform</code>, and the later tasks follow.</p>
+<h3>The most confusing idea: data interval versus run time</h3>
+<p>A daily DAG for the data of June 1st can only run <em>after</em> June 1st is over, so it actually starts on June 2nd at 00:00. The run's <strong>logical date</strong> is June 1st (the start of the interval), and it runs at the interval's end. Think of a shop that closes at night: the sales report for Monday is made on Tuesday morning, but the report is called "Monday's report".</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Run label (logical date)</th><th>Data interval covered</th><th>Actually starts at</th></tr></thead><tbody><tr><td>2024-06-01</td><td>2024-06-01 00:00 to 2024-06-02 00:00</td><td>2024-06-02 00:00</td></tr><tr><td>2024-06-02</td><td>2024-06-02 00:00 to 2024-06-03 00:00</td><td>2024-06-03 00:00</td></tr></tbody></table></div>
+<p>Your task must use the interval (the <code>ds</code>, <code>data_interval_start</code>, <code>data_interval_end</code> values given by Airflow), never <code>now()</code>. Then a backfill of old dates works.</p>
+<p class="problem"><span class="pl">Problem 6.1.1</span> A daily DAG has <code>start_date = 2024-01-01</code> and <code>catchup = True</code>. Today is 2024-03-01 at 00:00 (the DAG was just deployed). How many runs does Airflow create, and what is the last one's data interval?</p>
+<table class="steps"><tr><th>Formula</th><td>runs = number of complete intervals between start and now</td></tr><tr><th>Plug in</th><td>from 2024-01-01 to 2024-03-01 (2024 is a leap year, February has 29 days)</td></tr><tr><th>Compute</th><td>January 31 + February 29 = 60 intervals</td></tr><tr><th>Answer</th><td>60 runs. The last is the logical date 2024-02-29, covering 2024-02-29 00:00 to 2024-03-01 00:00. (Verified by date arithmetic in Python: <code>(date(2024,3,1) − date(2024,1,1)).days = 60</code>.)</td></tr><tr><th>Check</th><td>The first interval is 01-01 to 01-02 and the last ends exactly at the current time, so the count of whole days between the two dates is the count of intervals.</td></tr><tr><th>Why it matters</th><td>With <code>catchup=True</code> and an old start date, deploying a DAG can launch hundreds of runs at once. With <code>catchup=False</code> only the latest interval runs. The default of this setting has differed between Airflow versions, so always set it explicitly.</td></tr></table>
+<p class="problem"><span class="pl">Problem 6.1.2</span> Each of those 60 runs takes 10 minutes. <code>max_active_runs = 4</code>. How long does the catch-up take?</p>
+<table class="steps"><tr><th>Formula</th><td>time = ⌈runs / parallel runs⌉ × time per run</td></tr><tr><th>Plug in</th><td>⌈60 / 4⌉ × 10</td></tr><tr><th>Compute</th><td>15 × 10 = 150 minutes</td></tr><tr><th>Answer</th><td>150 minutes (2.5 hours), assuming nothing else is limiting.</td></tr><tr><th>Check</th><td>4 runs at a time × 15 rounds = 60 runs.</td></tr><tr><th>Why it matters</th><td>A backfill is a sudden rush of work on your source database and warehouse, like a hundred customers walking into a bank at once. You limit parallelism on purpose (the same idea as opening only a few counters at a time).</td></tr></table>
+<h3>Predict, Run, Explain: a tiny scheduler</h3>
+<p>This is <strong>our own toy</strong> (about 25 lines) that shows what an orchestrator does: order tasks by dependency, retry failures, skip tasks that already succeeded, and write results idempotently by date. <code>extract</code> is rigged to fail once. Before you run it: how many attempts will <code>extract</code> need on the first date? What does the "clear one task and re-run" step do?</p>
+<pre class="code lang-python"><code>import graphlib, datetime
+fails_left = {"extract": 1}          # extract fails once, then works
+state, outputs = {}, {}              # state: (task, date) -&gt; 'success'
+def extract(ds):
+    if fails_left.get("extract", 0) &gt; 0:
+        fails_left["extract"] -= 1; raise ConnectionError("source timeout")
+    outputs[("raw", ds)] = [1, 2, 3]
+def transform(ds): outputs[("clean", ds)] = [x * 10 for x in outputs[("raw", ds)]]
+def load(ds):      outputs[("mart", ds)] = sum(outputs[("clean", ds)])     # overwrite by date key
+TASKS = {"extract": (extract, []), "transform": (transform, ["extract"]), "load": (load, ["transform"])}
+def run_dag(ds, retries=2):
+    order = graphlib.TopologicalSorter({k: v[1] for k, v in TASKS.items()}).static_order()
+    for t in order:
+        if state.get((t, ds)) == "success": print(f"  {ds} {t}: skipped (already success)"); continue
+        for attempt in range(1, retries + 2):
+            try:
+                TASKS[t][0](ds); state[(t, ds)] = "success"; print(f"  {ds} {t}: success (attempt {attempt})"); break
+            except Exception as e:
+                print(f"  {ds} {t}: attempt {attempt} failed: {e}")
+        else:
+            print(f"  {ds} {t}: FAILED, downstream not run"); return
+start = datetime.date(2024, 6, 1)
+for d in range(3):
+    ds = (start + datetime.timedelta(days=d)).isoformat(); print("run for", ds); run_dag(ds)
+print("clear one task and re-run (backfill/rerun):")
+del state[("load", "2024-06-02")]; run_dag("2024-06-02")
+print({k: v for k, v in outputs.items() if k[0] == "mart"})</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>run for 2024-06-01
+  2024-06-01 extract: attempt 1 failed: source timeout
+  2024-06-01 extract: success (attempt 2)
+  2024-06-01 transform: success (attempt 1)
+  2024-06-01 load: success (attempt 1)
+run for 2024-06-02
+  2024-06-02 extract: success (attempt 1)
+  2024-06-02 transform: success (attempt 1)
+  2024-06-02 load: success (attempt 1)
+run for 2024-06-03
+  2024-06-03 extract: success (attempt 1)
+  2024-06-03 transform: success (attempt 1)
+  2024-06-03 load: success (attempt 1)
+clear one task and re-run (backfill/rerun):
+  2024-06-02 extract: skipped (already success)
+  2024-06-02 transform: skipped (already success)
+  2024-06-02 load: success (attempt 1)
+{('mart', '2024-06-01'): 60, ('mart', '2024-06-02'): 60, ('mart', '2024-06-03'): 60}</code></pre>
+<p><strong>Explain, line by line.</strong></p>
+<ul><li><code>graphlib.TopologicalSorter(...).static_order()</code> turns the dependency map into a valid order: extract, transform, load. This is the core of "DAG".</li><li>The first <code>extract</code> attempt raises <code>ConnectionError</code>; the retry loop tries again and succeeds on attempt 2. Airflow's <code>retries</code> and <code>retry_delay</code> do this.</li><li>The 'clear and re-run' step deleted the success record of <code>load</code> for June 2 only. The scheduler skips the two tasks that already succeeded and re-runs <code>load</code>. That is what clearing one task in the Airflow UI does.</li><li>Output is written under a date key: <code>outputs[("mart", ds)] = ...</code> overwrites. Running <code>load</code> again for June 2 left the mart value at 60, not 120. <strong>Check:</strong> the clean list [10, 20, 30] sums to 60 for each date, and there are exactly 3 mart entries for 3 dates, no more. <em>Interpretation:</em> this is an idempotent task. If the task had done <code>total += sum(...)</code>, the re-run would have double counted (the same trap as Problem 1.4.1).</li></ul>
+<h3>Connection to the real job</h3>
+<p>You will rarely write a scheduler. You will constantly decide <em>what is one task</em>, <em>what are its inputs and outputs by date</em>, and <em>what happens when it runs twice</em>. Those are design skills, and they transfer to every orchestrator.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> nightly ELT, backfills, SLA monitoring.</li><li><strong>Data Analytics:</strong> refreshing marts before the 8 a.m. report.</li><li><strong>Machine Learning / MLOps:</strong> weekly retraining pipelines (data pull, train, evaluate, register, deploy).</li><li><strong>Operations:</strong> scheduled capacity checks with results loaded to a warehouse.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using <code>datetime.now()</code> or "yesterday" computed inside the task. A re-run next week loads the wrong day. Use the logical date from the scheduler.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why must a DAG be acyclic? Answer: with a cycle no task could ever be first, and the run would never finish.</li><li>A run with logical date June 1 starts when? Answer: at the end of its interval, June 2 00:00.</li><li>What makes a task safe to retry? Answer: it is idempotent, overwriting its own date's output.</li></ol>
+<h2 id="s2-6-2-airflow-in-practice-code-components-and-best-practices">6.2 Airflow in Practice: Code, Components and Best Practices</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Airflow is a building with five rooms: a <strong>scheduler</strong> (decides what to run), a <strong>metadata database</strong> (remembers everything), <strong>workers</strong> (do the work, via an executor), a <strong>web server</strong> (the UI) and a <strong>DAG folder</strong> (the plans, written in Python). You write plans; the building runs them.</div></div>
+<h3>A classic DAG (not run here)</h3>
+<pre class="code lang-python"><code># Airflow 2.x style (not run here). Check your version's import paths.
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.bash import BashOperator
+from airflow.operators.python import PythonOperator
+
+default_args = {"owner": "data-eng", "retries": 2, "retry_delay": timedelta(minutes=5)}
+
+def load_orders(ds, **_):
+    # ds is the logical date as 'YYYY-MM-DD'. Overwrite that day's partition: idempotent.
+    print(f"loading orders for {ds}")
+
+with DAG(
+    dag_id="daily_orders",
+    start_date=datetime(2024, 1, 1),
+    schedule="@daily",          # older versions: schedule_interval
+    catchup=False,
+    max_active_runs=1,
+    default_args=default_args,
+    tags=["shopkart"],
+) as dag:
+    extract  = BashOperator(task_id="extract", bash_command="python extract.py --date {{ ds }}")
+    validate = PythonOperator(task_id="validate", python_callable=lambda **_: print("checks"))
+    load     = PythonOperator(task_id="load", python_callable=load_orders)
+    extract &gt;&gt; validate &gt;&gt; load           # &gt;&gt; means "then"</code></pre>
+<p>Key pieces: <code>{{ ds }}</code> is a <strong>Jinja template</strong> that Airflow fills with the logical date when the task runs. The <code>&gt;&gt;</code> operator sets dependencies. Each task in a DAG file is just a <em>definition</em>; the file must be fast to parse because the scheduler re-reads it often.</p>
+<h3>The TaskFlow API (not run here)</h3>
+<p>TaskFlow lets you write plain Python functions and decorate them. Return values are passed between tasks automatically (stored via XCom, below).</p>
+<pre class="code lang-python"><code># Airflow 2.x/3.x style (not run here). In Airflow 3 the imports come from airflow.sdk;
+# in 2.x from airflow.decorators. Check the version you use.
+from datetime import datetime
+from airflow.decorators import dag, task
+
+@dag(start_date=datetime(2024, 1, 1), schedule="@daily", catchup=False)
+def orders_taskflow():
+    @task
+    def extract(ds=None):
+        return {"day": ds, "rows": 1000}            # small metadata only!
+
+    @task
+    def validate(meta: dict):
+        assert meta["rows"] &gt; 0, "empty extract"
+        return meta
+
+    @task
+    def load(meta: dict):
+        print("loaded", meta["rows"], "rows for", meta["day"])
+
+    load(validate(extract()))
+
+orders_taskflow()</code></pre>
+<h3>More Airflow vocabulary</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Meaning</th><th>Practice</th></tr></thead><tbody><tr><td>Operator</td><td>Pre-built task type (Bash, Python, SQL, Spark, cloud service operators from provider packages)</td><td>prefer provider operators or hooks over hand-written API calls</td></tr><tr><td>Sensor</td><td>A task that waits for something (a file, a partition, an external task)</td><td>use <code>mode="reschedule"</code> so it does not hold a worker slot while waiting</td></tr><tr><td>Hook</td><td>A reusable connection helper to an external system</td><td>used inside tasks to talk to Postgres, S3, etc.</td></tr><tr><td>Connection</td><td>Stored credentials and host info (in the metadata DB or a secrets backend)</td><td>never hard-code passwords in the DAG file</td></tr><tr><td>Variable</td><td>Small key-value configuration</td><td>keep few; do not call <code>Variable.get</code> at the top level of the DAG file (it runs on every parse)</td></tr><tr><td>XCom</td><td>A small message passed between tasks (stored in the metadata DB)</td><td>pass IDs, paths and counts, never DataFrames</td></tr><tr><td>Dynamic task mapping</td><td>create one task instance per item at run time with <code>.expand()</code></td><td>one task per file or per table without writing a loop in the DAG</td></tr><tr><td>Pool</td><td>A named limit on how many tasks run at once</td><td>protect a database: <code>pool="warehouse", slots=5</code></td></tr><tr><td>Retries / SLA</td><td>retry count and delay; time expectations</td><td>SLA features changed between versions; check the docs of your version</td></tr><tr><td>Executor</td><td>How tasks are run: Local, Celery (a pool of worker machines), Kubernetes (a pod per task)</td><td>Celery for steady load, Kubernetes for isolation and bursty work</td></tr><tr><td>Trigger rule</td><td>when a task runs relative to upstream results</td><td><code>all_done</code> for cleanup tasks that must run even after failure</td></tr></tbody></table></div>
+<p>Dynamic task mapping (not run here):</p>
+<pre class="code lang-python"><code>@task
+def list_files(): return ["a.csv", "b.csv", "c.csv"]
+@task
+def process(path): print("processing", path)
+process.expand(path=list_files())        # makes 3 task instances at run time</code></pre>
+<h3>Deployment and testing</h3>
+<ul><li><strong>Deploy:</strong> the scheduler, web server and workers can run in Docker or on Kubernetes (the official Helm chart exists); managed services include Amazon MWAA, Google Cloud Composer, Azure Data Factory's Managed Airflow and Astronomer. DAG files are synced from Git (Chapter 12).</li><li><strong>Test:</strong><ol><li><em>Import test:</em> load all DAG files with <code>DagBag</code> and assert there are no import errors.</li><li><em>Structure test:</em> assert task ids, dependencies, retries, and that <code>catchup</code> is set.</li><li><em>Unit test:</em> put the real logic in plain Python functions (like <code>clean_amount</code> in Chapter 5) and test them without Airflow.</li><li><em>Run test:</em> <code>dag.test()</code> (available in recent Airflow versions) runs a DAG in one process for local debugging.</li></ol></li></ul>
+<pre class="code lang-python"><code># not run here: a DAG import test with pytest
+from airflow.models import DagBag
+def test_no_import_errors():
+    bag = DagBag(dag_folder="dags/", include_examples=False)
+    assert bag.import_errors == {}, bag.import_errors
+def test_daily_orders_has_retries():
+    dag = DagBag(dag_folder="dags/", include_examples=False).get_dag("daily_orders")
+    assert dag.default_args["retries"] &gt;= 1</code></pre>
+<p class="problem"><span class="pl">Problem 6.2.1</span> A task returns a 400 MB pandas DataFrame and the next task takes it as an argument through XCom. What goes wrong and what is the fix?</p>
+<table class="steps"><tr><th>Step 1</th><td>XCom values are stored in the metadata database; 400 MB would bloat the database and slow the whole scheduler.</td></tr><tr><th>Step 2</th><td>Write the data to object storage or a table (for example <code>s3://lake/staging/orders/ds=2024-06-01/</code>), and return only the path.</td></tr><tr><th>Answer</th><td>Pass a path (a few bytes) instead of the data (400 MB). That is 400,000,000 / ~100 = 4 million times smaller for a 100-byte path.</td></tr><tr><th>Check</th><td>The next task reads the path and loads the data itself, so XCom holds a short string.</td></tr><tr><th>Why it matters</th><td>"No heavy work or big data in the scheduler or XCom" is a top interview answer.</td></tr></table>
+<p class="problem"><span class="pl">Problem 6.2.2</span> A warehouse allows 5 concurrent loads. Your DAG has 40 table-load tasks that each take 3 minutes. With a pool of 5 slots, how long do they take in total, and how long without a pool if all 40 start together and each slows down proportionally?</p>
+<table class="steps"><tr><th>Formula</th><td>with pool: ⌈tasks / slots⌉ × time per task</td></tr><tr><th>Plug in</th><td>⌈40 / 5⌉ × 3 = 8 × 3 = 24 minutes</td></tr><tr><th>Without a pool</th><td>40 tasks compete for 5 slots; if the work is fully shared the total work is the same, 40 × 3 / 5 = 24 minutes at best, but in practice queries time out, retries pile up and it takes longer or fails.</td></tr><tr><th>Answer</th><td>24 minutes with a pool, predictable; without a pool, no better than 24 minutes and often a failure.</td></tr><tr><th>Check</th><td>8 rounds × 5 tasks = 40 tasks.</td></tr><tr><th>Why it matters</th><td>Pools protect shared systems. It is the orchestration version of a restaurant that seats only as many guests as the kitchen can cook for.</td></tr></table>
+<h3>Best practices (the interview list)</h3>
+<ol><li><strong>Idempotent tasks</strong> keyed by logical date (overwrite partition, MERGE).</li><li><strong>Atomic tasks</strong>: one clear job each; if it fails, you know what to re-run.</li><li><strong>No heavy work in the DAG file or the scheduler</strong>: the DAG file only defines tasks. Heavy work runs in workers or external systems (Spark, warehouse).</li><li><strong>Small XComs</strong>: paths and ids, not data.</li><li><strong>Secrets in connections or a secrets backend</strong>, never in code.</li><li><strong>Retries with delay</strong> for transient failures, but fail fast for logic errors.</li><li><strong>Alerts on failure and on SLA misses</strong> with a link to the runbook.</li><li><strong>Set <code>catchup</code> and <code>max_active_runs</code> explicitly</strong>; use pools for shared resources.</li><li><strong>Test DAGs</strong> (import test) in CI; keep logic in importable modules.</li><li><strong>Time zones</strong>: schedule in UTC internally; convert for display.</li></ol>
+<h3>Connection to the real job</h3>
+<p>Typical task list: "Add a new table to the nightly pipeline", "Backfill March after a bug", "Investigate why DAG X is late". Each needs the ideas above.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> ELT schedules, dbt runs (a task that calls <code>dbt build</code>), Spark job submission, data quality gates.</li><li><strong>ML Engineering:</strong> training and batch scoring DAGs.</li><li><strong>Analytics Engineering:</strong> run order between ingestion and dbt.</li><li><strong>FinOps:</strong> shut down clusters after the DAG with a cleanup task using <code>trigger_rule="all_done"</code>.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Putting expensive code (database calls, large imports, API calls) at the top level of a DAG file. The scheduler runs that code every few seconds when it parses the file, and it can freeze the whole system.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is an XCom for? Answer: passing small values (ids, paths) between tasks.</li><li>What does a sensor in <code>reschedule</code> mode do? Answer: it frees its worker slot between checks while waiting.</li><li>Why pools? Answer: to limit concurrency against a shared resource.</li></ol>
+<h2 id="s3-6-3-alternatives-event-driven-triggers-and-lineage">6.3 Alternatives, Event-Driven Triggers and Lineage</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Airflow thinks in <em>tasks</em> ("run this script at 2 a.m."). Newer tools think in <em>data assets</em> ("this table should be fresh; what do I need to run to make it so?"). Both get your tables built; they differ in what you declare.</div></div>
+<div class="tablewrap"><table class="data"><thead><tr><th>Tool</th><th>Idea</th><th>Strength</th><th>Watch out for</th></tr></thead><tbody><tr><td>Airflow</td><td>task-based DAGs in Python, huge ecosystem</td><td>most jobs, most integrations, managed offerings everywhere</td><td>local dev and testing can be heavy; scheduler tuning</td></tr><tr><td>Dagster</td><td><strong>asset-based</strong>: you declare tables (assets) and their upstream assets; partitions and sensors built in</td><td>great local dev, testing and lineage</td><td>smaller ecosystem than Airflow</td></tr><tr><td>Prefect</td><td>Python functions with <code>@flow</code> and <code>@task</code>, dynamic workflows, simple deployment</td><td>fast to start, dynamic</td><td>different concepts from Airflow</td></tr><tr><td>Mage</td><td>notebook-like pipeline builder</td><td>low-code feel</td><td>smaller community</td></tr><tr><td>Azure Data Factory (ADF)</td><td>managed, visual pipelines and copy activities, integration runtimes, triggers</td><td>strong in Azure shops, connectors</td><td>complex logic gets awkward; JSON definitions</td></tr><tr><td>AWS Step Functions</td><td>managed state machines for AWS services</td><td>serverless, reliable, good for event-driven AWS flows</td><td>AWS-specific</td></tr><tr><td>Argo Workflows</td><td>Kubernetes-native workflows defined in YAML</td><td>good if you live in Kubernetes</td><td>steeper learning</td></tr><tr><td>cron</td><td>a line in a file</td><td>perfect for one simple script</td><td>no dependencies, no retry history, no UI, no backfill</td></tr></tbody></table></div>
+<p>Rule of thumb: <strong>one script, no dependencies, no one cares if it fails: cron.</strong> Anything with dependencies, retries, alerts, backfills or more than one person: an orchestrator.</p>
+<p>A taste of the asset style (<strong>not run here</strong>, Dagster-like):</p>
+<pre class="code lang-python"><code>from dagster import asset
+@asset
+def raw_orders(): ...
+@asset
+def clean_orders(raw_orders): ...          # depends on raw_orders by argument name
+@asset
+def revenue_by_city(clean_orders): ...</code></pre>
+<h3>Event-driven triggers and dependencies between pipelines</h3>
+<p>Not everything should run on a clock. <strong>Event-driven</strong> pipelines run when something happens: a file lands in a bucket (S3 event, Event Grid), a message arrives, or an upstream dataset is updated. In Airflow, <em>Datasets</em> (called <em>Assets</em> in newer versions) let a DAG run when an upstream DAG updates a dataset, and an <code>ExternalTaskSensor</code> waits for a task in another DAG. Prefer data-aware triggers to "run B at 3 a.m. because A usually ends by 2:30", which breaks the first slow night.</p>
+<h3>Lineage and metadata</h3>
+<p><strong>Lineage</strong> answers "where did this column come from and what depends on it?". <strong>OpenLineage</strong> is an open standard for emitting lineage events from jobs (Airflow, Spark, dbt can emit them). Catalogs such as <strong>DataHub</strong> and <strong>Amundsen</strong> (and cloud-native ones) collect metadata, ownership and lineage, and make data searchable. You use lineage when a source column changes ("which dashboards break?") and during incidents ("which downstream tables are affected?"). More in Chapter 12.</p>
+<p class="problem"><span class="pl">Problem 6.3.1</span> Pick a tool for each: (a) a single script that copies a log file to S3 nightly; (b) 300 dbt models plus ingestion plus ML retraining with a team of 8; (c) a Kubernetes-heavy company wants YAML-defined, container-per-step workflows; (d) an Azure shop that mostly copies SaaS data into Synapse with minimal code.</p>
+<table class="steps"><tr><th>Step 1</th><td>(a) cron (or a scheduled cloud function).</td></tr><tr><th>Step 2</th><td>(b) Airflow or Dagster: dependencies, retries, backfills and visibility matter.</td></tr><tr><th>Step 3</th><td>(c) Argo Workflows.</td></tr><tr><th>Step 4</th><td>(d) Azure Data Factory.</td></tr><tr><th>Answer</th><td>(a) cron, (b) Airflow or Dagster, (c) Argo, (d) ADF.</td></tr><tr><th>Check</th><td>Each match follows the "match the tool to the complexity and the platform" rule; (b) has two valid answers.</td></tr><tr><th>Why it matters</th><td>Interviewers want a reasoned choice, not a favourite tool.</td></tr></table>
+<p class="problem"><span class="pl">Problem 6.3.2</span> Pipeline A usually finishes at 2:30 a.m. Pipeline B is scheduled for 3:00 a.m. and reads A's output. One night A is slow and finishes at 3:20 a.m. What does B read, and how do you fix the design?</p>
+<table class="steps"><tr><th>Step 1</th><td>B starts at 3:00 and reads yesterday's data (or half-written data): wrong or stale.</td></tr><tr><th>Step 2</th><td>Remove the time guess: make B depend on A's completion (a dataset trigger, sensor, or put both in one DAG).</td></tr><tr><th>Answer</th><td>B reads stale or partial data for 20 minutes of overlap. Fix with a data-aware dependency so B starts when A is done.</td></tr><tr><th>Check</th><td>With a dependency, B starts at 3:20 whatever the delay, and the data it reads is complete.</td></tr></table>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> choosing and migrating orchestrators; Dagster for asset-centric platforms.</li><li><strong>Cloud engineering:</strong> ADF or Step Functions glue for managed services.</li><li><strong>Governance:</strong> lineage for impact analysis and audits.</li><li><strong>Analytics Engineering:</strong> asset-based freshness ("this dashboard table must be under 1 hour old").</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Scheduling dependent pipelines by clock guesses. Use real dependencies, so that a slow night does not corrupt the next job.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Task-based or asset-based: Airflow versus Dagster? Answer: Airflow is task-based, Dagster is asset-based.</li><li>When is cron enough? Answer: one simple script with no dependencies and low stakes.</li><li>What is OpenLineage? Answer: an open standard for emitting lineage metadata from jobs.</li></ol>
+<h2 id="s4-chapter-recap">Chapter recap</h2>
+<ul><li>An orchestrator runs tasks in dependency order (a DAG), on a schedule, with retries, alerts, history and backfills.</li><li>A run's logical date is the start of its data interval; it runs after the interval ends. Use it, never <code>now()</code>.</li><li><code>catchup=True</code> creates a run for every past interval; set it and <code>max_active_runs</code> explicitly.</li><li>Idempotent, date-keyed tasks make retries and backfills safe.</li><li>Airflow parts: scheduler, metadata DB, executor and workers, web server, DAG folder.</li><li>TaskFlow turns Python functions into tasks; XCom carries only small values; sensors should reschedule; pools limit concurrency.</li><li>Keep the DAG file light and put heavy work in workers or external engines; test DAGs with an import test and unit tests of the logic.</li><li>Dagster (assets), Prefect, Mage, ADF, Step Functions, Argo and cron are alternatives; choose by complexity and platform; use data-aware triggers; lineage via OpenLineage and catalogs.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Rule</th></tr></thead><tbody><tr><td>Catch-up runs</td><td>complete intervals between start_date and now</td></tr><tr><td>Backfill time</td><td>⌈runs / parallel runs⌉ × time per run</td></tr><tr><td>Dependency</td><td><code>a &gt;&gt; b &gt;&gt; c</code></td></tr><tr><td>Templated date</td><td><code>{{ ds }}</code></td></tr><tr><td>Task body</td><td>overwrite or MERGE by logical date</td></tr><tr><td>XCom</td><td>ids and paths only</td></tr></tbody></table></div>
+<h2 id="s5-practice-set">Practice set</h2>
+<p><strong>1.</strong> (easy) What does DAG stand for? <strong>Answer:</strong> Directed Acyclic Graph.</p>
+<p><strong>2.</strong> (easy) Which date does <code>{{ ds }}</code> hold for the run that processes June 5th data? <strong>Answer:</strong> <code>2024-06-05</code> (the logical date; it runs on June 6th).</p>
+<p><strong>3.</strong> A weekly DAG (<code>@weekly</code>) with start_date 2024-01-07 and catchup=True; now is 2024-02-04 00:00. Number of runs? <strong>Answer:</strong> intervals start Jan 7, 14, 21, 28 and each ends a week later; the interval starting Jan 28 ends Feb 4 (now), so it is complete: 4 runs.</p>
+<p><strong>4.</strong> What is the output order from the toy scheduler for tasks extract &gt;&gt; transform &gt;&gt; load? <strong>Answer:</strong> extract, transform, load, because the topological order respects every arrow.</p>
+<p><strong>5.</strong> Find the bug: <code>PythonOperator(python_callable=load, op_kwargs={"day": datetime.now().date()})</code>. <strong>Answer:</strong> <code>now()</code> is evaluated when the DAG file is parsed, not at the logical date, so reruns and backfills use the wrong day. Use <code>{{ ds }}</code>.</p>
+<p><strong>6.</strong> 120 tasks, pool of 6 slots, 2 minutes each. Time? <strong>Answer:</strong> ⌈120 / 6⌉ × 2 = 20 × 2 = 40 minutes.</p>
+<p><strong>7.</strong> A sensor polls every 60 seconds for 6 hours in <code>poke</code> mode and holds a worker slot. What is better? <strong>Answer:</strong> <code>mode="reschedule"</code> or a deferrable sensor (event-driven), which frees the slot between checks.</p>
+<p><strong>8.</strong> Why is <code>Variable.get("x")</code> at the top of a DAG file a problem? <strong>Answer:</strong> it runs on every parse (every few seconds) and queries the metadata database each time; read variables inside tasks or with templates.</p>
+<p><strong>9.</strong> (interview) "How do you make an Airflow pipeline safe to re-run?" <strong>Answer:</strong> Idempotent tasks keyed by logical date (partition overwrite or MERGE), no use of <code>now()</code>, state and data updated atomically, retries for transient errors, and tests for a double-run producing the same result.</p>
+<p><strong>10.</strong> (interview) "Airflow versus Dagster?" <strong>Answer:</strong> Airflow is task-centric with the largest ecosystem and many managed offerings. Dagster is asset-centric (you declare data products and their dependencies), with strong local development, testing and lineage. Choose Airflow for ecosystem and hiring pool; Dagster when asset freshness and developer experience are the priority.</p>
+<p><strong>11.</strong> (scenario) Your nightly DAG missed the 6 a.m. report deadline twice this week. How do you investigate and prevent it? <strong>Answer:</strong> Look at task durations over time (the Gantt view or logs) to find the slow task; check queueing (pool or executor slots), upstream late arrival, and data growth. Fix by parallelising or optimising the slow task, adjusting pools, or starting earlier through a data-aware trigger; add an SLA/freshness alert before 6 a.m. rather than after.</p>
+<h2 id="s6-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me Apache Airflow concepts: DAG, task, operator, schedule, data interval, logical date, catchup and backfill. Use a daily orders pipeline with real dates, and explain why a run for June 1 starts on June 2. Then ask me 3 questions one at a time about data intervals and catchup counts.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: writing idempotent Airflow tasks and safe backfills. Show a non-idempotent task, the double-counting bug after a retry, and the fix using partition overwrite or MERGE by logical date. Then give me 6 graded exercises where I must find the idempotency bug, with no solutions. I will paste my answers: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am learning data engineering. Explain the Airflow architecture (scheduler, metadata database, executor, workers, web server), XComs, sensors, pools, dynamic task mapping and the TaskFlow API. Use a restaurant analogy. Then write a short TaskFlow DAG for me to review and ask me to list its 3 weaknesses.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: choosing between cron, Airflow, Dagster, Prefect, Azure Data Factory, AWS Step Functions and Argo Workflows. Give me 6 realistic company situations and ask me to choose and justify each one in 2 sentences. Then critique my reasoning and say when each tool would be a poor choice.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am applying for data engineer roles. Run a mock interview on orchestration: Airflow design, scheduling semantics, retries, backfills, idempotency, testing DAGs, event-driven triggers and lineage. Ask 8 questions one at a time. After each answer, score it 1 to 5, give a model answer in simple English, and one follow-up. My answers: [PASTE HERE]</pre></div><div class="readbtn"><button class="btn" data-read="study:de:ch06">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch05.html">← Chapter 5: Data Quality and Testing</a><a class="btn" href="ch07.html">Chapter 7: dbt, the Tool That Turns SQL into a Test →</a></div></div><script src="../../assets/study.js"></script></body></html>

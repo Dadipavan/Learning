@@ -1,0 +1,246 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 5: PyTorch Essentials</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Deep Learning &amp; Computer Vision</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 5</div><h1>PyTorch Essentials</h1><p>Tensors, automatic differentiation, `nn.Module`, `Dataset`/`DataLoader`, the training loop, GPUs, mixed precision, and what a framework does for you.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-5-1-tensors-and-autograd">5.1 Tensors and Autograd</a></li><li><a href="#s2-5-2-nn-module-dataset-dataloader-and-the-training-loop">5.2 `nn.Module`, `Dataset`, `DataLoader` and the Training Loop</a></li><li><a href="#s3-5-3-gpus-mixed-precision-accumulation-checkpoints-and-reproducibility">5.3 GPUs, Mixed Precision, Accumulation, Checkpoints and Reproducibility</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>In a job you will not write backpropagation by hand. You will write PyTorch, the most used deep learning framework in research and a large part of industry. A framework gives you three gifts: fast array math on GPUs (tensors), automatic gradients (autograd), and ready-made layers and tools. This chapter shows you what each gift really is. We could not install PyTorch in the environment where this document was written, so every PyTorch snippet below is short, standard, and marked <strong>not run here</strong>. To keep our rule "real outputs only", the ideas themselves are demonstrated with code that <em>did</em> run: a 40-line automatic-differentiation engine in plain Python, mini-batching in NumPy, float16 experiments, gradient accumulation and checkpoint-resume tests. By the end you can read and write a standard PyTorch training script and explain every line.</p>
+<div class="callout blue"><div class="lab">PROFESSOR'S NOTE</div><div class="txt">PyTorch commands change slowly but they do change. If a function here fails for you, check the official docs for your installed version. The structure (tensor, module, loss, optimizer, loop) has been stable for years.</div></div>
+<h2 id="s1-5-1-tensors-and-autograd">5.1 Tensors and Autograd</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A tensor is a NumPy array that can live on a GPU and remember how it was made. Imagine a spreadsheet where every cell remembers the formula that produced it. When you ask "how does the final cell change if I change cell B2?", the sheet walks the formulas backward and tells you. That is autograd.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Tensor</td><td>An n-dimensional array: a number (0-D), a list (1-D), a table (2-D), a stack of tables (3-D)...</td></tr><tr><td>Shape</td><td>The size along each dimension, such as <code>(32, 3, 224, 224)</code></td></tr><tr><td>dtype</td><td>The number type: <code>float32</code>, <code>float16</code>, <code>int64</code></td></tr><tr><td>Device</td><td>Where the tensor lives: <code>cpu</code> or <code>cuda</code> (an NVIDIA GPU)</td></tr><tr><td>Autograd</td><td>The system that records operations and computes gradients automatically</td></tr><tr><td>Leaf tensor</td><td>A tensor you created that needs gradients, such as a weight</td></tr></tbody></table></div>
+<h3>PyTorch basics (not run here)</h3>
+<pre class="code lang-python"><code>import torch
+a = torch.tensor([[1., 2.], [3., 4.]])      # 2x2 float32 tensor
+b = torch.ones(2, 2)
+c = a @ b + 1                                # matrix multiply, then add
+w = torch.tensor(2.0, requires_grad=True)    # ask PyTorch to track gradients
+loss = (w * 3 - 1) ** 2                      # loss = (3w - 1)^2
+loss.backward()                              # fills w.grad
+print(w.grad)                                # d loss/dw = 2*(3w-1)*3 = 30</code></pre>
+<p>By hand: at <code>w = 2</code>, <code>3w−1 = 5</code>, the loss is 25, and <code>d/dw = 2·5·3 = 30</code>. PyTorch would print <code>tensor(30.)</code>. We have not run PyTorch here, but the number comes from the formula, which you can check on paper.</p>
+<h3>What autograd really does: a working mini-engine</h3>
+<p>Instead of trusting a black box, let us build one. The class below stores a number, remembers the inputs that made it (<code>parents</code>), and stores a small function (<code>back</code>) that passes gradient to those inputs. This idea is exactly the one inside PyTorch (it is also the design of Andrej Karpathy's well-known <em>micrograd</em> teaching library).</p>
+<p class="problem"><span class="pl">Problem 5.1.1</span> Use the mini-engine to differentiate the Chapter 2 network and compare with the hand-computed gradients.</p>
+<table class="steps"><tr><th>Step 1</th><td>Build the graph by ordinary arithmetic on <code>Value</code> objects. Each <code>+</code>, <code>*</code>, <code>sigmoid</code>, <code>log</code> records its parents.</td></tr><tr><th>Step 2</th><td>Call <code>L.backward()</code>. It sorts the graph (a "topological order" means every node comes after its parents), then walks it in reverse. Each node adds <code>local slope × incoming gradient</code> to its parents' <code>grad</code>.</td></tr><tr><th>Step 3</th><td>Read <code>.grad</code> from the weights.</td></tr><tr><th>Answer</th><td>The engine gives <code>L = 0.6519</code>, <code>dW1[0][1] = −0.109579</code>, <code>dW2 = (−0.3092, −0.3502)</code>, <code>db2 = −0.479</code>. These equal Chapter 2's hand and NumPy results.</td></tr><tr><th>Check</th><td><code>−0.109579</code> matches the Chapter 2 gradient exactly, and the finite-difference value <code>−0.1095794</code> printed there.</td></tr><tr><th>Interpretation</th><td>Autograd is not magic: it is the chain rule, applied automatically to whatever arithmetic you wrote. Any arithmetic made of differentiable pieces gets gradients for free.</td></tr></table>
+<p>Before you run it, predict: will the engine's <code>dW2</code> equal <code>dz₂ × h</code>, the value we found by hand in Chapter 2?</p>
+<pre class="code lang-python"><code>import math
+class Value:
+    def __init__(s, data, parents=(), back=None):
+        s.data = float(data); s.grad = 0.0; s._p = parents; s._b = back
+    def __add__(s, o):
+        o = o if isinstance(o, Value) else Value(o); out = Value(s.data + o.data, (s, o))
+        def b(): s.grad += out.grad; o.grad += out.grad
+        out._b = b; return out
+    def __mul__(s, o):
+        o = o if isinstance(o, Value) else Value(o); out = Value(s.data * o.data, (s, o))
+        def b(): s.grad += o.data * out.grad; o.grad += s.data * out.grad
+        out._b = b; return out
+    def sigmoid(s):
+        v = 1/(1 + math.exp(-s.data)); out = Value(v, (s,))
+        def b(): s.grad += v*(1-v) * out.grad
+        out._b = b; return out
+    def log(s):
+        out = Value(math.log(s.data), (s,))
+        def b(): s.grad += out.grad / s.data
+        out._b = b; return out
+    def backward(s):
+        order, seen = [], set()
+        def topo(v):
+            if id(v) not in seen:
+                seen.add(id(v))
+                for p in v._p: topo(p)
+                order.append(v)
+        topo(s); s.grad = 1.0
+        for v in reversed(order):
+            if v._b: v._b()
+
+x = [1., 2.]
+W1 = [[Value(.1), Value(.2)], [Value(.3), Value(.4)]]; b1 = [Value(.1), Value(-.1)]
+W2 = [Value(.5), Value(-.6)]; b2 = Value(.2)
+h = [(W1[i][0]*x[0] + W1[i][1]*x[1] + b1[i]).sigmoid() for i in range(2)]
+p = (W2[0]*h[0] + W2[1]*h[1] + b2).sigmoid()
+L = p.log() * (-1)
+L.backward()
+print("L", round(L.data,4), "dW1[0][1]", round(W1[0][1].grad,6),
+      "dW2", [round(w.grad,4) for w in W2], "db2", round(b2.grad,4))</code></pre>
+<pre class="code lang-text"><code>L 0.6519 dW1[0][1] -0.109579 dW2 [-0.3092, -0.3502] db2 -0.479</code></pre>
+<p><strong>Line by line:</strong> each operator (<code>__add__</code>, <code>__mul__</code>) makes a new <code>Value</code> and defines <code>b</code>, the local backward rule. Why <code>+=</code> and not <code>=</code>? A weight can be used in many places, and its gradient is the <em>sum</em> of the contributions (this is the multivariable chain rule). <code>topo</code> makes sure a node's <code>grad</code> is complete before it passes gradient on. <code>L = p.log() * (-1)</code> is <code>−ln p</code>, binary cross-entropy for <code>y = 1</code>.</p>
+<div class="callout cream"><div class="lab">KEY INSIGHT</div><div class="txt">PyTorch's <code>loss.backward()</code> is this algorithm with tensors instead of single numbers, written in C++ and run on a GPU. When you call <code>.detach()</code>, <code>torch.no_grad()</code> or <code>requires_grad=False</code>, you are telling the engine to stop recording or stop walking.</div></div>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> w ──┐
+     ├─ (×) ─ a ─ (−1) ─ b ─ (square) ─ loss
+ 3 ──┘
+ forward: record each box and its inputs.
+ backward: start at loss with grad 1, walk back, multiply by each box's local slope.</code></pre>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>requires_grad=True</code></td><td>weights of a layer</td><td>All model parameters</td></tr><tr><td><code>.grad</code></td><td>filled after <code>backward()</code></td><td>Gradient clipping and logging read it</td></tr><tr><td><code>torch.no_grad()</code></td><td>inference or evaluation</td><td>Saves memory (no graph kept)</td></tr><tr><td><code>.detach()</code></td><td>cut a tensor from the graph</td><td>Target networks, logging values</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Deep learning:</strong> training every model.</li><li><strong>Scientific computing:</strong> differentiable simulations and physics.</li><li><strong>Optimization:</strong> any problem where you can write the loss as arithmetic.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Calling <code>backward()</code> twice without <code>zero_grad()</code>. PyTorch adds new gradients to old ones (like our <code>+=</code>), so the second step uses the total of both. Clear them each step.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why does <code>Value.backward</code> use <code>+=</code> for the gradient? Answer: a value can feed several operations; its gradient is the sum of the parts.</li><li>What does <code>torch.no_grad()</code> save? Answer: memory and time, because no graph is recorded.</li><li>What is the shape of a batch of 32 RGB images of 224×224 in PyTorch's usual layout? Answer: <code>(32, 3, 224, 224)</code>.</li></ol>
+<h2 id="s2-5-2-nn-module-dataset-dataloader-and-the-training-loop">5.2 <code>nn.Module</code>, <code>Dataset</code>, <code>DataLoader</code> and the Training Loop</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Training is a kitchen. The <code>Dataset</code> is the pantry (knows how to fetch one item). The <code>DataLoader</code> is the waiter who brings plates of 32 items at a time in a random order. The <code>nn.Module</code> is the recipe. The loss tells you how far the dish is from perfect, and the optimizer is the cook who adjusts the recipe.</div></div>
+<h3>The standard pieces (not run here)</h3>
+<pre class="code lang-python"><code>import torch, torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+
+class Moons(Dataset):
+    def __init__(self, X, y): self.X = torch.tensor(X, dtype=torch.float32); self.y = torch.tensor(y)
+    def __len__(self): return len(self.X)
+    def __getitem__(self, i): return self.X[i], self.y[i]
+
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.body = nn.Sequential(nn.Linear(2, 16), nn.ReLU(), nn.Linear(16, 2))
+    def forward(self, x): return self.body(x)        # returns logits, no softmax
+
+model = Net()
+loader = DataLoader(Moons(X, y), batch_size=32, shuffle=True)
+loss_fn = nn.CrossEntropyLoss()                        # expects logits
+opt = torch.optim.AdamW(model.parameters(), lr=1e-2, weight_decay=0.01)
+
+for epoch in range(100):
+    model.train()
+    for xb, yb in loader:
+        opt.zero_grad()                  # 1. clear old gradients
+        loss = loss_fn(model(xb), yb)    # 2. forward + loss
+        loss.backward()                  # 3. backward
+        opt.step()                       # 4. update weights</code></pre>
+<p>Memorize the four-line heartbeat: <code>zero_grad</code>, forward and loss, <code>backward</code>, <code>step</code>.</p>
+<ul><li><code>nn.Linear(2, 16)</code> holds <code>W</code> (16×2) and <code>b</code> (16): 48 parameters. It is our Chapter 2 layer (PyTorch stores <code>W</code> as <code>out × in</code> and computes <code>x @ Wᵀ + b</code>).</li><li><code>nn.Module</code> automatically registers every sub-layer and parameter you assign in <code>__init__</code>, so <code>model.parameters()</code> finds them all.</li><li><code>DataLoader</code> handles batching, shuffling and (with <code>num_workers</code>) loading in background processes.</li><li><code>model.train()</code> and <code>model.eval()</code> switch dropout and BatchNorm behaviour (Chapter 3).</li></ul>
+<h3>Evaluation loop (not run here)</h3>
+<pre class="code lang-python"><code>model.eval()
+correct = 0
+with torch.no_grad():
+    for xb, yb in loader:
+        correct += (model(xb).argmax(1) == yb).sum().item()
+print(correct / len(loader.dataset))</code></pre>
+<h3>Mini-batching, run for real in NumPy</h3>
+<p>The DataLoader's job is simple: shuffle, then cut into batches. Here is the same idea in NumPy, so you can see it and verify counts.</p>
+<p class="problem"><span class="pl">Problem 5.2.1</span> A dataset has 200 examples. With batch size 32, how many batches does one epoch have, and what is the size of the last one? How many weight updates in 100 epochs?</p>
+<table class="steps"><tr><th>Formula</th><td>batches per epoch <code>= ⌈N / batch size⌉</code>.</td></tr><tr><th>Plug in</th><td><code>⌈200 / 32⌉</code>.</td></tr><tr><th>Compute</th><td><code>200/32 = 6.25</code>, so 7 batches: six of 32 and a last one of <code>200 − 192 = 8</code>. In 100 epochs: <code>7 × 100 = 700</code> updates.</td></tr><tr><th>Answer</th><td>7 batches per epoch (the last has 8 examples), and 700 updates in 100 epochs.</td></tr><tr><th>Check</th><td><code>6×32 + 8 = 200</code>.</td></tr><tr><th>Why it matters</th><td>The number of updates (not epochs) is what a learning-rate schedule counts. PyTorch's <code>DataLoader(drop_last=True)</code> would drop the 8-example batch and give 6 batches per epoch.</td></tr></table>
+<p class="problem"><span class="pl">Problem 5.2.2</span> Run the epoch loop with mini-batches in NumPy (using the network from Chapter 2) and compare with full-batch training.</p>
+<table class="steps"><tr><th>Step 1</th><td>Each epoch: shuffle indices with a seeded generator, cut into batches of 32, do forward, backward and a step per batch.</td></tr><tr><th>Step 2</th><td>Use <code>lr = 0.1</code> and 100 epochs (700 updates), compare with full-batch's 300 updates at <code>lr = 0.5</code> from Chapter 2.</td></tr><tr><th>Compute</th><td>Run the code below.</td></tr></table>
+<pre class="code lang-python"><code>exec(open("ch2_mlp.py").read())     # data X, y and class MLP from Chapter 2, saved to a file
+import math
+N = len(X)
+print("batches per epoch", math.ceil(N/32), "last batch", N - 32*(math.ceil(N/32)-1))
+m = MLP([2,16,2], seed=0); rng = np.random.default_rng(0)
+for epoch in range(100):
+    idx = rng.permutation(N)
+    for s in range(0, N, 32):
+        b = idx[s:s+32]
+        m.forward(X[b]); gW, gb = m.backward(y[b])
+        for k in range(len(m.W)):
+            m.W[k] -= 0.1*gW[k]; m.b[k] -= 0.1*gb[k]
+    if epoch % 20 == 0 or epoch == 99:
+        print(epoch, round(m.loss(X,y),4), "acc", (m.forward(X).argmax(1) == y).mean())</code></pre>
+<pre class="code lang-text"><code>batches per epoch 7 last batch 8
+0 0.4375 acc 0.805
+20 0.2505 acc 0.89
+40 0.2279 acc 0.9
+60 0.207 acc 0.915
+80 0.1835 acc 0.92
+99 0.1669 acc 0.935</code></pre>
+<ul><li><strong>Check</strong> The code confirms 7 batches with a last batch of 8. After 700 mini-batch updates at <code>lr = 0.1</code>, the loss is <code>0.1669</code> and accuracy 93.5%.</li><li><strong>Answer</strong> After the very first epoch the loss was already <code>0.4375</code> (against <code>0.4415</code> after one full-batch step in Chapter 2), because we had made 7 updates instead of 1. At the end, full-batch training with <code>lr = 0.5</code> got to <code>0.0471</code> in 300 steps, while mini-batch with the smaller <code>lr = 0.1</code> got <code>0.1669</code> in 700 updates. The difference comes from the learning rate (5 times smaller here), not from batching itself. Comparing runs fairly means matching the learning rate.</li><li><strong>Interpretation</strong> Mini-batches give a noisy but much more frequent signal: 7 updates per epoch rather than 1. This is why SGD uses batches: for a dataset of 10 million examples, one full-batch update would be extremely slow.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> data on disk ─▶ Dataset[i] ─▶ DataLoader (shuffle, batch, workers) ─▶ batch (32 x features)
+                                                                           │
+   ┌────────────────────────── training loop ──────────────────────────────┘
+   ▼
+ zero_grad ─▶ forward ─▶ loss ─▶ backward ─▶ step ─▶ (next batch)</code></pre>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Piece</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>Dataset.__getitem__</code></td><td>read image <code>i</code> and apply augmentation</td><td>Custom data pipelines</td></tr><tr><td><code>DataLoader(num_workers=4)</code></td><td>parallel loading</td><td>Keeps the GPU busy (performance tuning!)</td></tr><tr><td><code>batch_size</code></td><td>32, 256</td><td>Memory and speed tradeoff</td></tr><tr><td><code>model.state_dict()</code></td><td>the learned numbers</td><td>Saving and loading models</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Computer vision:</strong> <code>Dataset</code> reads images from disk and augments them.</li><li><strong>NLP/GenAI:</strong> <code>DataLoader</code> serves tokenized batches (see <code>study/genai/</code>).</li><li><strong>MLOps:</strong> data loading is often the bottleneck; profile it like any other service.</li><li><strong>Efficiency work:</strong> GPU utilization near 30% usually means a slow data pipeline, like a chef standing idle because the delivery of ingredients is late (a "starved consumer" problem).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting <code>shuffle=True</code> on training data (when the file is sorted by class, each batch has a single class and learning is poor), or using it on validation data (harmless but makes comparisons across runs confusing).</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What are the four lines of the training heartbeat? Answer: <code>zero_grad</code>, forward + loss, <code>backward</code>, <code>step</code>.</li><li>Why does <code>forward</code> return logits, not probabilities? Answer: <code>CrossEntropyLoss</code> applies log-softmax itself.</li><li>1000 examples, batch size 100, 10 epochs: number of updates? Answer: 100.</li></ol>
+<h2 id="s3-5-3-gpus-mixed-precision-accumulation-checkpoints-and-reproducibility">5.3 GPUs, Mixed Precision, Accumulation, Checkpoints and Reproducibility</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A CPU is a few very smart workers. A GPU is thousands of simple workers doing the same small job at once. Neural networks are mostly giant matrix multiplications, which is the perfect job for thousands of simple workers. Mixed precision is like measuring with a cheaper, shorter ruler where possible, to go faster and to fit more on the desk.</div></div>
+<h3>Moving to the GPU (not run here)</h3>
+<pre class="code lang-python"><code>device = "cuda" if torch.cuda.is_available() else "cpu"
+model = model.to(device)
+for xb, yb in loader:
+    xb, yb = xb.to(device), yb.to(device)       # data must be on the same device</code></pre>
+<p>If model and data are on different devices you get a <code>RuntimeError</code> saying tensors are on different devices. Always move both.</p>
+<p><strong>CUDA</strong> is NVIDIA's programming platform for GPUs. <strong>GPU memory</strong> (VRAM) is the usual limit: if you see <code>CUDA out of memory</code>, reduce the batch size, use mixed precision, or use gradient accumulation (below). Free GPUs: Google Colab and Kaggle notebooks (limits and availability change; check their pages).</p>
+<h3>Memory math: why training needs more memory</h3>
+<p>Training stores weights, gradients, and optimizer state (Adam keeps two extra numbers per weight), plus activations.</p>
+<p class="problem"><span class="pl">Problem 5.3.1</span> How much GPU memory is needed just for weights, gradients and Adam state in float32, for models of 100 million, 1 billion and 7 billion parameters?</p>
+<table class="steps"><tr><th>Formula</th><td>bytes per parameter <code>= 4 (weights) + 4 (gradients) + 8 (Adam m and v) = 16</code>.</td></tr><tr><th>Plug in</th><td><code>16 × P</code>.</td></tr><tr><th>Compute</th><td><code>16 × 10⁸ = 1.6 GB</code>; <code>16 × 10⁹ = 16 GB</code>; <code>16 × 7×10⁹ = 112 GB</code>.</td></tr><tr><th>Answer</th><td>1.6 GB, 16 GB and 112 GB, before counting activations.</td></tr><tr><th>Check</th><td>The code printed exactly these numbers.</td></tr><tr><th>Interpretation</th><td>A 7-billion-parameter model cannot be fully trained on a single 24 GB GPU. This is why methods like mixed precision, sharding (FSDP, Chapter 14) and LoRA (see <code>study/genai/</code>) exist.</td></tr></table>
+<h3>Mixed precision: fp16 and bf16</h3>
+<p>Standard numbers are <strong>float32</strong> (32 bits). <strong>float16</strong> uses 16 bits: half the memory and much faster on modern GPUs, but a small range (the largest number is 65504, the smallest positive about 6×10⁻⁸). <strong>bfloat16</strong> also uses 16 bits but keeps float32's range with fewer digits of accuracy. Training with fp16 needs <strong>loss scaling</strong>: multiply the loss by a big factor (like 1024) so tiny gradients do not become 0, and divide the gradients back before the update.</p>
+<p class="problem"><span class="pl">Problem 5.3.2</span> See fp16 and bf16 limits with real numbers.</p>
+<table class="steps"><tr><th>Plug in</th><td>Convert <code>70000</code>, <code>1e-8</code>, <code>1001.3</code> to fp16; emulate bf16 (the top 16 bits of a float32).</td></tr><tr><th>Compute</th><td>Run the code.</td></tr><tr><th>Answer</th><td><code>70000</code> becomes <code>inf</code> in fp16 but stays about 69632 in our bf16 emulation. <code>1e-8</code> becomes <code>0.0</code> in fp16 but about <code>9.95e-9</code> in bf16. <code>1001.3</code> becomes <code>1001.5</code> in fp16 and <code>1000.0</code> in bf16.</td></tr><tr><th>Check</th><td><code>1e-8</code> is below fp16's smallest subnormal (<code>6e-08</code>), so it underflows to zero. With scaling by 1024 it survives: <code>1e-8 × 1024 = 1.025e-05</code> in fp16 and unscaled <code>1.0012e-08</code>.</td></tr><tr><th>Interpretation</th><td>fp16 has more digits but a small range, so it needs loss scaling. bf16 has a big range (like float32) but fewer digits, so it usually needs no scaling. (Our emulation truncates; real hardware rounds to nearest, so exact bf16 digits differ a little.)</td></tr></table>
+<pre class="code lang-python"><code>print("fp16 max", np.finfo(np.float16).max, "fp16 tiny subnormal", np.finfo(np.float16).smallest_subnormal)
+print("70000 -&gt; fp16", np.float16(70000))
+print("1e-8 -&gt; fp16", np.float16(1e-8), " x1024 -&gt;", np.float16(1e-8*1024),
+      "unscaled back", float(np.float16(1e-8*1024))/1024)
+print("1+0.0004 in fp16", np.float16(1)+np.float16(0.0004), "in fp32", np.float32(1)+np.float32(0.0004))
+def bf16(a):
+    a = np.float32(a); return (a.view(np.uint32) &amp; np.uint32(0xFFFF0000)).view(np.float32)
+for v in [1001.3, 70000., 1e-8]:
+    print(v, "fp16", np.float16(v), "bf16", float(bf16(v)))</code></pre>
+<pre class="code lang-text"><code>fp16 max 6.55e+04 fp16 tiny subnormal 6e-08
+70000 -&gt; fp16 inf
+1e-8 -&gt; fp16 0.0  x1024 -&gt; 1.025e-05 unscaled back 1.0011717677116394e-08
+1+0.0004 in fp16 1.0 in fp32 1.0004
+1001.3 fp16 1.0015e+03 bf16 1000.0
+70000.0 fp16 inf bf16 69632.0
+1e-08 fp16 0.0 bf16 9.953510016202927e-09</code></pre>
+<p>(NumPy also printed an "overflow encountered in cast" warning for <code>70000</code>.) Note <code>1 + 0.0004</code> in fp16 stays exactly <code>1.0</code>: the update was lost. This is why frameworks keep a float32 master copy of the weights and run only the heavy math in 16 bits.</p>
+<p>The PyTorch recipe (not run here):</p>
+<pre class="code lang-python"><code>scaler = torch.amp.GradScaler()                   # needed for fp16; bf16 usually does not need it
+for xb, yb in loader:
+    opt.zero_grad()
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        loss = loss_fn(model(xb.to("cuda")), yb.to("cuda"))
+    scaler.scale(loss).backward()
+    scaler.step(opt); scaler.update()</code></pre>
+<h3>Gradient accumulation</h3>
+<p>Want a batch of 256 but only 64 fit in memory? Run 4 micro-batches of 64, add up their gradients (each loss divided by 4), and then take one step.</p>
+<p class="problem"><span class="pl">Problem 5.3.3</span> Verify that accumulation equals one big batch.</p>
+<table class="steps"><tr><th>Step 1</th><td>Make a linear model <code>w</code> with 3 weights and 8 examples; loss is the mean squared error.</td></tr><tr><th>Step 2</th><td>Compute the gradient <code>2Xᵀ(Xw − y)/8</code> on all 8 examples.</td></tr><tr><th>Step 3</th><td>Compute the same from 4 micro-batches of 2, each averaged over 2 then divided by 4, and sum.</td></tr><tr><th>Answer</th><td>Both give <code>[-0.1139, 0.6338, -0.4902]</code>.</td></tr><tr><th>Check</th><td><code>np.allclose</code> returned <code>True</code>.</td></tr><tr><th>Interpretation</th><td>Accumulation is mathematically the same as a larger batch (for losses that are means; it differs for BatchNorm, whose statistics are per micro-batch).</td></tr></table>
+<pre class="code lang-python"><code>r = np.random.default_rng(0); X = r.normal(size=(8,3)); y = r.normal(size=8); w = r.normal(size=3)
+g_full = 2*X.T@(X@w - y)/8
+g_acc = np.zeros(3)
+for i in range(4):
+    xb, yb = X[2*i:2*i+2], y[2*i:2*i+2]
+    g_acc += 2*xb.T@(xb@w - yb)/2/4
+print("full", g_full, "accum", g_acc, "equal", np.allclose(g_full, g_acc))</code></pre>
+<pre class="code lang-text"><code>full [-0.1139  0.6338 -0.4902] accum [-0.1139  0.6338 -0.4902] equal True</code></pre>
+<h3>Checkpointing and reproducibility</h3>
+<p>A <strong>checkpoint</strong> is a saved snapshot: model weights, optimizer state, the step number, and (ideally) the random seed. A resumed run must continue as if it had never stopped. The common mistake is to save only the weights.</p>
+<p class="problem"><span class="pl">Problem 5.3.4</span> Train 100 steps of momentum SGD. Compare with training 50, saving, loading and training 50 more, with and without the optimizer's momentum.</p>
+<table class="steps"><tr><th>Step 1</th><td>Run 100 steps straight: final weights <code>[1.0008, −2.0033, 0.5037]</code>.</td></tr><tr><th>Step 2</th><td>Run 50, save weights, momentum and step to a file, reload, run 50 more.</td></tr><tr><th>Step 3</th><td>Reload only the weights and restart momentum from 0.</td></tr><tr><th>Answer</th><td>Saving everything gives identical weights (<code>True</code>). Saving only the weights gives different ones: <code>[0.998, −1.9977, 0.5013]</code>.</td></tr><tr><th>Check</th><td><code>np.array_equal(full, resumed)</code> is <code>True</code> for the complete checkpoint.</td></tr><tr><th>Interpretation</th><td>Optimizer state is part of the model's training state. For Adam it has two numbers per weight (<code>m</code> and <code>v</code>), twice the size of the weights themselves.</td></tr></table>
+<p>Reproducibility checklist (PyTorch calls, not run here): <code>torch.manual_seed(0)</code>, <code>numpy.random.seed(0)</code>, <code>random.seed(0)</code>; <code>torch.use_deterministic_algorithms(True)</code> (may be slower and may raise errors for some operations); set <code>worker_init_fn</code> for DataLoader workers; record library versions and the git commit.</p>
+<h3><code>torch.compile</code> and the wider ecosystem</h3>
+<ul><li><strong><code>torch.compile(model)</code></strong> (PyTorch 2.x) turns your model into optimized code for speed, with one line. Speedups depend on model and hardware; measure on your own workload.</li><li><strong>PyTorch Lightning</strong> removes boilerplate (training loop, GPU handling, logging, checkpoints).</li><li><strong>TensorFlow/Keras</strong> is another major framework (common in older production systems and mobile). <strong>JAX</strong> is a NumPy-like library with automatic differentiation and compilation, popular in research. You only need awareness now.</li><li><strong>ONNX</strong> is a standard model file format for moving models between frameworks and runtimes (Chapter 14).</li><li><strong>Hardware and scaling:</strong> GPUs (NVIDIA CUDA is dominant) hold data in VRAM. For several GPUs, <strong>DDP</strong> (each GPU holds a full copy and shares gradients), <strong>FSDP</strong> and <strong>DeepSpeed</strong> (split weights, gradients and optimizer state across GPUs) are the standard tools. Awareness is enough today; Chapter 14 covers them.</li></ul>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>bf16 autocast</td><td>one <code>with</code> block</td><td>Fine-tuning large models</td></tr><tr><td>Gradient accumulation</td><td>4 micro-batches of 64</td><td>Fitting a large effective batch in small GPU memory</td></tr><tr><td>Checkpoint every 1000 steps</td><td>saves 16 bytes/param</td><td>Recovering from a crashed overnight job</td></tr><tr><td>Seeds and versions</td><td>in the experiment log</td><td>Reproducing a result for a reviewer</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Deep learning:</strong> every large training job uses mixed precision and checkpoints.</li><li><strong>MLOps:</strong> experiment tracking records seed, git commit, config and data version.</li><li><strong>Cloud engineering:</strong> pick GPU size by the memory math in 5.3.1.</li><li><strong>Efficiency work:</strong> GPU utilization, data-loader throughput and memory are your dashboards, like a hospital board showing free beds, staff on shift and waiting patients.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Saving only <code>model.state_dict()</code> and then resuming training. The learning-rate scheduler and the optimizer state must be saved and restored too, or the resumed run behaves differently (Problem 5.3.4). Also, do not compare timing of GPU code without synchronizing (<code>torch.cuda.synchronize()</code>); GPU calls return before the work finishes.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>How many bytes per parameter for weights, gradients and Adam state in float32? Answer: 16.</li><li>Why does fp16 need loss scaling? Answer: tiny gradients underflow to 0 because fp16's smallest number is about <code>6e-8</code>.</li><li>Does accumulation over 4 micro-batches equal one big batch? Answer: yes for mean losses, except for batch-dependent layers like BatchNorm.</li></ol>
+<h2 id="s4-chapter-recap">Chapter recap</h2>
+<ul><li>A tensor is an array with a shape, a dtype and a device; autograd records operations to compute gradients.</li><li>Autograd is the chain rule automated; our 40-line engine reproduced the hand gradients exactly.</li><li><code>nn.Module</code> holds layers and parameters; <code>Dataset</code> and <code>DataLoader</code> serve batches.</li><li>The heartbeat: <code>zero_grad</code>, forward + loss, <code>backward</code>, <code>step</code>.</li><li>Always call <code>model.train()</code> and <code>model.eval()</code> at the right times, and use <code>torch.no_grad()</code> for inference.</li><li>Training memory is about 16 bytes per parameter (fp32 + Adam) plus activations.</li><li>fp16 has a small range and needs loss scaling; bf16 has a big range and less precision.</li><li>Gradient accumulation equals a bigger batch; checkpoints must include optimizer state.</li><li>Frameworks and tools to know by name: <code>torch.compile</code>, Lightning, Keras, JAX, ONNX, DDP/FSDP/DeepSpeed.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Meaning</th></tr></thead><tbody><tr><td><code>opt.zero_grad(); loss.backward(); opt.step()</code></td><td>one update (not run here)</td></tr><tr><td><code>model.eval(); with torch.no_grad():</code></td><td>inference mode (not run here)</td></tr><tr><td><code>x.to("cuda")</code></td><td>move to GPU (not run here)</td></tr><tr><td><code>torch.autocast(...)</code> + <code>GradScaler</code></td><td>mixed precision (not run here)</td></tr><tr><td><code>torch.save({"model":..., "opt":..., "step":...}, path)</code></td><td>checkpoint (not run here)</td></tr><tr><td>memory ≈ <code>16 × params</code> bytes</td><td>fp32 + Adam, no activations</td></tr></tbody></table></div>
+<h2 id="s5-practice-set">Practice set</h2>
+<p><strong>1.</strong> (easy) <code>w = 2</code>, loss <code>(3w − 1)²</code>. What is <code>d loss / dw</code>? <strong>Answer:</strong> <code>2(3w − 1)·3 = 2·5·3 = 30</code>.</p>
+<p><strong>2.</strong> (easy) What shape is the tensor of 10 grayscale 28×28 images in <code>(N, C, H, W)</code> layout? <strong>Answer:</strong> <code>(10, 1, 28, 28)</code>.</p>
+<p><strong>3.</strong> (easy) 1000 examples, batch 64, <code>drop_last=False</code>. Batches per epoch? <strong>Answer:</strong> <code>⌈1000/64⌉ = 16</code> (15 full batches and one with 40).</p>
+<p><strong>4.</strong> (medium) What is the output? <code>np.float16(70000)</code> <strong>Answer:</strong> <code>inf</code> (with an overflow warning), because the largest fp16 number is 65504.</p>
+<p><strong>5.</strong> (medium) How much memory for weights, gradients and Adam state (fp32) for a 350-million-parameter model? <strong>Answer:</strong> <code>16 × 350×10⁶ = 5.6 GB</code>.</p>
+<p><strong>6.</strong> (medium) Find the bug: <code>for xb, yb in loader: loss = loss_fn(model(xb), yb); loss.backward(); opt.step()</code>. <strong>Answer:</strong> missing <code>opt.zero_grad()</code>. Gradients accumulate across iterations (not run here).</p>
+<p><strong>7.</strong> (medium) Find the bug: <code>RuntimeError: Expected all tensors to be on the same device</code>. <strong>Answer:</strong> the model is on the GPU but the batch is on the CPU (or the reverse). Call <code>.to(device)</code> on both.</p>
+<p><strong>8.</strong> (medium) Why do you keep a float32 master copy of weights in mixed precision? <strong>Answer:</strong> small updates vanish in fp16 (<code>1 + 0.0004 = 1.0</code>), so the weights themselves would stop changing.</p>
+<p><strong>9.</strong> (hard) You want an effective batch of 512 but only 64 fits. Give the accumulation settings, and say how to scale the loss. <strong>Answer:</strong> 8 micro-batches of 64; divide each micro-batch loss by 8 before <code>backward()</code>, call <code>opt.step()</code> and <code>zero_grad()</code> once every 8 micro-batches.</p>
+<p><strong>10.</strong> (interview) "What happens when you call <code>loss.backward()</code>?" <strong>Answer:</strong> PyTorch walks the recorded computation graph in reverse order, applies each operation's local derivative with the chain rule, and adds the results into the <code>.grad</code> field of every tensor that has <code>requires_grad=True</code>.</p>
+<p><strong>11.</strong> (interview) "Why is <code>model.eval()</code> not the same as <code>torch.no_grad()</code>?" <strong>Answer:</strong> <code>eval()</code> changes behaviour of layers like dropout and BatchNorm. <code>no_grad()</code> stops the recording of the graph to save memory. For inference you normally use both.</p>
+<p><strong>12.</strong> (scenario) Your training job uses 30% GPU utilization and the loss is fine. What do you check? <strong>Answer:</strong> the data pipeline: increase <code>num_workers</code>, use <code>pin_memory=True</code>, cache decoded data, reduce augmentation cost, increase batch size. The GPU is waiting for data, like a fast server behind a slow load balancer.</p>
+<h2 id="s6-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me "PyTorch tensors and autograd". Start from NumPy arrays, explain requires_grad, backward, grad and no_grad with tiny numbers I can verify by hand, and compare with a small hand-written automatic differentiation class. Ask me one check question after each idea. If I answer wrongly, explain simply and ask again.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Explain "the PyTorch training loop with nn.Module, Dataset, DataLoader, loss and optimizer" line by line. Use a tiny classification example. Ask me to predict what happens if I remove zero_grad, forget model.eval, or pass probabilities to CrossEntropyLoss. Then give me 5 broken training loops and ask me to find the bug in each, one at a time.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles and am learning deep learning, and English is not my first language. Teach me "mixed precision (fp16, bf16), loss scaling and GPU memory math for training". Use real numbers: the range of fp16, why 1e-8 underflows, and how many GB 7 billion parameters need with Adam. After each concept ask me to compute a number myself and then check it.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, with English as my second language. Review my PyTorch training script for correctness and efficiency: zero_grad placement, train/eval modes, device placement, gradient accumulation, checkpoint contents, seeding and DataLoader settings. Explain each problem in simple words and show the corrected code. My script: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles and am preparing for AI engineer interviews, and English is my second language. Run a mock interview on "PyTorch fundamentals and practical training": autograd, the training loop, GPU memory, mixed precision, gradient accumulation, checkpoints, data-loader bottlenecks. Ask one question at a time, grade me out of 10, show the ideal answer, and ask a harder follow-up. Do 8 questions.</pre></div><div class="readbtn"><button class="btn" data-read="study:dl:ch05">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch04.html">← Chapter 4: Debugging Training</a><a class="btn" href="ch06.html">Chapter 6: Convolutional Neural Networks →</a></div></div><script src="../../assets/study.js"></script></body></html>

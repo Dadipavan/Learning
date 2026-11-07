@@ -1,0 +1,351 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 9: Object Detection, Segmentation and OCR</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#357a70"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Deep Learning &amp; Computer Vision</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 9</div><h1>Object Detection, Segmentation and OCR</h1><p>Find where things are, outline them pixel by pixel, read the text on them, and measure how good the answer is.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-9-1-boxes-iou-and-non-maximum-suppression">9.1 Boxes, IoU and Non-Maximum Suppression</a></li><li><a href="#s2-9-2-evaluating-detectors-precision-recall-ap-and-map">9.2 Evaluating Detectors: Precision, Recall, AP and mAP</a></li><li><a href="#s3-9-3-detector-families-r-cnn-ssd-yolo-and-detr">9.3 Detector Families: R-CNN, SSD, YOLO and DETR</a></li><li><a href="#s4-9-4-segmentation-semantic-instance-panoptic-u-net-and-sam">9.4 Segmentation: Semantic, Instance, Panoptic, U-Net and SAM</a></li><li><a href="#s5-9-5-ocr-and-other-vision-tasks">9.5 OCR and Other Vision Tasks</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p>A classifier says "this photo contains a car". A real product asks harder questions: where is each car, how many are there, which pixels belong to the road, what does the number plate say? A warehouse camera must count boxes, a bank must read cheques, and a hospital tool must outline a tumour. This chapter teaches the three jobs that answer those questions: <strong>detection</strong> (a box and a label per object), <strong>segmentation</strong> (a label per pixel) and <strong>OCR</strong> (reading text). The most important skill is judging the result, so we compute IoU, precision-recall, AP and mAP by hand and in code. By the end you will be able to read a detection paper's results table, explain how YOLO, DETR, U-Net and SAM differ, and decide which tool fits a business problem. We build on Chapter 6 (CNN backbones), Chapter 7 (pretrained backbones and fine-tuning) and Chapter 8 (thresholding, morphology, connected components for cleaning masks). Transformers in DETR and SAM are taught in Chapters 11 and 12.</p>
+<div class="callout blue"><div class="lab">PROFESSOR'S NOTE</div><div class="txt">PyTorch, <code>torchvision</code>, <code>ultralytics</code>, Tesseract and EasyOCR are not installed where this chapter was written. All numbers below come from NumPy code I ran. Library code is short, standard and marked "not run here". The helper <code>iou</code> defined in Section 9.1 is reused by later snippets.</div></div>
+<h2 id="s1-9-1-boxes-iou-and-non-maximum-suppression">9.1 Boxes, IoU and Non-Maximum Suppression</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A detector draws a rectangle around each object. How do we say the rectangle is "right"? We lay it over the true rectangle and compare how much they share. Think of two sheets of paper on a desk: the shared part divided by the total area covered by either sheet is the score. Two identical sheets give 1; two sheets that do not touch give 0.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Bounding box</td><td>A rectangle around an object, written <code>(x1, y1, x2, y2)</code> (top-left and bottom-right corners)</td></tr><tr><td>Ground truth (GT)</td><td>The correct boxes drawn by human labellers</td></tr><tr><td>Prediction</td><td>A box from the model, with a class and a confidence score between 0 and 1</td></tr><tr><td>IoU (intersection over union)</td><td><code>area of overlap / area of union</code> of two boxes (or two masks)</td></tr><tr><td>NMS (non-maximum suppression)</td><td>Cleanup step that removes duplicate boxes for the same object</td></tr><tr><td>Anchor</td><td>A reference box shape (for example tall and thin) that older detectors adjust to fit objects</td></tr></tbody></table></div>
+<p>Image coordinates start at the top-left: <code>x</code> grows to the right, <code>y</code> grows <strong>downwards</strong>. Box formats differ: Pascal VOC uses <code>(x1, y1, x2, y2)</code> in pixels, COCO uses <code>(x, y, width, height)</code> in pixels, YOLO text files use <code>(class, x_centre, y_centre, width, height)</code> normalised to 0 to 1. Mixing formats is a classic silent bug.</p>
+<p class="problem"><span class="pl">Problem 9.1.1</span> Compute the IoU of ground truth <code>(10, 10, 50, 50)</code> and prediction <code>(30, 20, 70, 60)</code>.</p>
+<table class="steps"><tr><th>Formula</th><td><code>IoU = intersection / (area A + area B − intersection)</code>.</td></tr><tr><th>Step 1</th><td>Overlap rectangle: left edge <code>max(10, 30) = 30</code>, top <code>max(10, 20) = 20</code>, right <code>min(50, 70) = 50</code>, bottom <code>min(50, 60) = 50</code>. Width <code>50 − 30 = 20</code>, height <code>50 − 20 = 30</code>, so intersection <code>= 20 × 30 = 600</code>.</td></tr><tr><th>Step 2</th><td>Areas: GT <code>40 × 40 = 1600</code>, prediction <code>40 × 40 = 1600</code>.</td></tr><tr><th>Step 3</th><td>Union <code>= 1600 + 1600 − 600 = 2600</code>.</td></tr><tr><th>Answer</th><td><code>IoU = 600 / 2600 = 0.2308</code>.</td></tr><tr><th>Check</th><td>If the boxes were disjoint, <code>max(0, ...)</code> makes the intersection 0 and IoU 0. If identical, intersection equals both areas, IoU 1. The code prints <code>0.0</code> and <code>1.0</code> for those.</td></tr><tr><th>Interpretation</th><td>The prediction is the right size but shifted by 20 and 10 pixels, and the score is only 0.23: a fail by any normal standard. The usual bar for "correct" is IoU of at least 0.5.</td></tr></table>
+<figure><img src="images/iou_boxes.svg" alt="Two boxes, their overlap in green, and the IoU arithmetic" loading="lazy"/><figcaption>Two boxes, their overlap in green, and the IoU arithmetic</figcaption></figure>
+<p>How to read it: blue is the ground truth, orange is the prediction, green is the overlap. The text on the right repeats the arithmetic: overlap 600, union 2600, IoU 0.2308.</p>
+<p>Before you run it, predict: if the prediction is the GT shifted right by only 5 pixels, will the IoU be above 0.7? What about a shift of 10 pixels?</p>
+<pre class="code lang-python"><code>import numpy as np
+def iou(a, b):
+    """boxes are (x1, y1, x2, y2) with x1&lt;x2, y1&lt;y2"""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    area = lambda r: (r[2] - r[0]) * (r[3] - r[1])
+    return inter / (area(a) + area(b) - inter)
+gt   = (10, 10, 50, 50)
+pred = (30, 20, 70, 60)
+print("IoU", round(iou(gt, pred), 4))
+print("identical", iou(gt, gt), " disjoint", iou(gt, (60, 60, 90, 90)))
+print("shifted by 5 px:", round(iou(gt, (15, 10, 55, 50)), 4), " by 10 px:", round(iou(gt, (20, 10, 60, 50)), 4))</code></pre>
+<pre class="code lang-text"><code>IoU 0.2308
+identical 1.0  disjoint 0.0
+shifted by 5 px: 0.7778  by 10 px: 0.6</code></pre>
+<p><strong>Line by line.</strong> <code>ix1, iy1</code> take the larger of the left and top edges; <code>ix2, iy2</code> take the smaller of the right and bottom edges; <code>max(0, ...)</code> handles boxes that do not overlap (a negative width would otherwise give a false positive area). With a shift of 5 pixels on a 40-pixel box: overlap <code>35 × 40 = 1400</code>, union <code>1600 + 1600 − 1400 = 1800</code>, IoU <code>0.7778</code>. A shift of 10 pixels gives overlap <code>30 × 40 = 1200</code>, union <code>2000</code>, IoU <code>0.6</code>. So being off by one quarter of the box width still passes the 0.5 bar. IoU is also used for masks (Section 9.4), where "area" means pixel count.</p>
+<h3>Non-maximum suppression (NMS)</h3>
+<p>A detector looks at thousands of positions, so it often fires several times on one object. NMS keeps the best box and deletes its near-copies:</p>
+<ol><li>Sort boxes by confidence, highest first.</li><li>Keep the top box. Delete every remaining box whose IoU with it is above a threshold (commonly 0.5).</li><li>Repeat with the next remaining box.</li></ol>
+<p class="problem"><span class="pl">Problem 9.1.2</span> Five boxes with scores <code>0.90, 0.80, 0.70, 0.85, 0.60</code>. Box 0 <code>(10,10,50,50)</code>, box 1 <code>(12,12,52,52)</code>, box 2 <code>(14,8,54,48)</code>, box 3 <code>(100,100,140,140)</code>, box 4 <code>(30,30,70,70)</code>. Run NMS at threshold 0.5.</p>
+<table class="steps"><tr><th>Step 1</th><td>Highest score is box 0 (0.90): keep it.</td></tr><tr><th>Step 2</th><td>IoU of box 0 with box 1: overlap <code>38 × 38 = 1444</code>, union <code>1600 + 1600 − 1444 = 1756</code>, IoU <code>0.822</code>. This is above 0.5, so box 1 is deleted. With box 2: <code>0.747</code>, deleted. With box 4: overlap <code>20 × 20 = 400</code>, union <code>2800</code>, IoU <code>0.143</code>, kept for now.</td></tr><tr><th>Step 3</th><td>Next highest remaining: box 3 (0.85), far away, keep it. Then box 4 (0.60), keep it.</td></tr><tr><th>Answer</th><td>Kept boxes: 0, 3, 4. Two duplicates (1 and 2) were removed.</td></tr><tr><th>Check</th><td>The code prints the same IoUs and <code>kept at 0.5: [0, 3, 4]</code>. With threshold 0.9 nothing is removed, because no duplicate overlaps that much.</td></tr><tr><th>Interpretation</th><td>The threshold is a tuning choice. Too low: two real, touching objects (a crowd) are merged into one. Too high: duplicates survive and count as false positives. DETR (Section 9.3) removes the need for NMS.</td></tr></table>
+<pre class="code lang-python"><code>def nms(boxes, scores, thr=0.5):
+    order = list(np.argsort(scores)[::-1]); keep = []
+    while order:
+        i = order.pop(0); keep.append(int(i))
+        order = [j for j in order if iou(boxes[i], boxes[j]) &lt; thr]
+    return keep
+boxes = [(10,10,50,50), (12,12,52,52), (14,8,54,48), (100,100,140,140), (30,30,70,70)]
+scores = np.array([0.90, 0.80, 0.70, 0.85, 0.60])
+for j in (1, 2, 4): print(f"IoU(box0, box{j}) = {iou(boxes[0], boxes[j]):.3f}")
+print("kept at 0.5:", nms(boxes, scores, 0.5))
+print("kept at 0.9:", nms(boxes, scores, 0.9))</code></pre>
+<pre class="code lang-text"><code>IoU 0.2308
+identical 1.0  disjoint 0.0
+shifted by 5 px: 0.7778  by 10 px: 0.6
+IoU(box0, box1) = 0.822
+IoU(box0, box2) = 0.747
+IoU(box0, box4) = 0.143
+kept at 0.5: [0, 3, 4]
+kept at 0.9: [0, 3, 1, 2, 4]</code></pre>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>IoU threshold</td><td>0.5 (PASCAL), 0.5 to 0.95 (COCO)</td><td>Deciding what counts as a correct detection</td></tr><tr><td>NMS threshold</td><td>0.45 to 0.7</td><td>An inference setting you tune for crowded versus sparse scenes</td></tr><tr><td>Box format</td><td>VOC, COCO, YOLO</td><td>Converting labelling-tool exports to training format</td></tr><tr><td>Confidence threshold</td><td>0.25 to 0.5</td><td>Operating point: fewer false alarms versus fewer misses</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Retail:</strong> count products on shelves; flag empty slots.</li><li><strong>Manufacturing:</strong> locate defects, then measure their size.</li><li><strong>Traffic and smart cities:</strong> vehicles and pedestrians counted per lane.</li><li><strong>Healthcare:</strong> find nodules in scans for a doctor to review.</li><li><strong>MLOps:</strong> monitoring box-size and score distributions in production to detect drift.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Confusing <code>(x, y, w, h)</code> with <code>(x1, y1, x2, y2)</code>. If IoU of a prediction with itself is not 1.0, or IoU values look absurdly low, check formats first. Also remember <code>y</code> grows downwards, so "top" has the smaller <code>y</code>.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>IoU of two identical boxes? Answer: 1.</li><li>Two boxes of area 100 overlap on 50. IoU? Answer: <code>50 / (100 + 100 − 50) = 0.333</code>.</li><li>What does NMS delete? Answer: lower-scoring boxes that overlap a higher-scoring box above the IoU threshold.</li></ol>
+<h2 id="s2-9-2-evaluating-detectors-precision-recall-ap-and-map">9.2 Evaluating Detectors: Precision, Recall, AP and mAP</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A detector gives you a ranked list of guesses, best first. Imagine reading the list from the top. At the start nearly every guess is right (high precision) but you have found few of the real objects (low recall). As you read further you find more objects but also more wrong guesses. A single curve, precision against recall, shows this trade-off. The area under that curve is AP, a score from 0 to 1. mAP is the average of AP across classes.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>True positive (TP)</td><td>A prediction with the right class and IoU at or above the threshold with a GT box that no other prediction has already claimed</td></tr><tr><td>False positive (FP)</td><td>A prediction that matches nothing (wrong place, wrong class, or a duplicate)</td></tr><tr><td>False negative (FN)</td><td>A real object no prediction found</td></tr><tr><td>Precision</td><td><code>TP / (TP + FP)</code>: of the boxes I drew, how many are right</td></tr><tr><td>Recall</td><td><code>TP / (TP + FN)</code>: of the real objects, how many did I find</td></tr><tr><td>AP (average precision)</td><td>Area under the precision-recall curve for one class</td></tr><tr><td>mAP</td><td>Mean of AP over all classes (and, in COCO, over IoU thresholds too)</td></tr></tbody></table></div>
+<p>You know precision and recall from the machine-learning document; the new idea is that for detection, "correct" needs the IoU test, and the score ranking turns one operating point into a whole curve.</p>
+<h3>Procedure</h3>
+<ol><li>For one class, sort all predictions in the whole test set by confidence, highest first.</li><li>Walk down the list. Mark each prediction TP or FP using IoU ≥ 0.5 (each GT box can be matched only once).</li><li>After each step, compute cumulative precision <code>cumTP / (cumTP + cumFP)</code> and recall <code>cumTP / total GT</code>.</li><li>Make the precision values non-increasing (replace each by the largest precision to its right: the "envelope"), then add up <code>Δrecall × precision</code> over the steps.</li></ol>
+<p class="problem"><span class="pl">Problem 9.2.1</span> The test set has 4 real cars. The detector gives 6 car predictions, ranked by confidence, judged <code>TP, TP, FP, TP, FP, TP</code>. Compute precision, recall and AP at IoU 0.5.</p>
+<table class="steps"><tr><th>Step 1</th><td>After rank 1: TP=1, FP=0: precision <code>1/1 = 1.0</code>, recall <code>1/4 = 0.25</code>. Rank 2: TP=2, precision <code>2/2 = 1.0</code>, recall <code>0.5</code>.</td></tr><tr><th>Step 2</th><td>Rank 3 is an FP: TP=2, FP=1, precision <code>2/3 = 0.667</code>, recall <code>0.5</code> (unchanged). Rank 4 TP: TP=3, FP=1, precision <code>3/4 = 0.75</code>, recall <code>0.75</code>.</td></tr><tr><th>Step 3</th><td>Rank 5 FP: precision <code>3/5 = 0.6</code>, recall <code>0.75</code>. Rank 6 TP: TP=4, FP=2, precision <code>4/6 = 0.667</code>, recall <code>1.0</code>.</td></tr><tr><th>Step 4</th><td>Envelope (largest precision to the right): <code>1.0, 1.0, 0.75, 0.75, 0.667, 0.667</code>.</td></tr><tr><th>Step 5</th><td>AP = sum over recall steps: <code>0.25 × 1.0 + 0.25 × 1.0 + 0.25 × 0.75 + 0.25 × 0.667 = 0.25 + 0.25 + 0.1875 + 0.1667 = 0.8542</code>.</td></tr><tr><th>Answer</th><td>AP at IoU 0.5 for "car" is <code>0.854</code>.</td></tr><tr><th>Check</th><td>AP must lie between final precision (0.667) and 1.0. Perfect ranking (all TP first) would give exactly 1.0. The code prints <code>AP@0.5 = 0.8542</code>.</td></tr><tr><th>Interpretation</th><td>The detector finds all four cars, but two wrong boxes with fairly high scores (ranks 3 and 5) pull AP down. Raising the confidence threshold would remove them at the cost of recall.</td></tr></table>
+<p>Before you run it, predict: if the list were <code>TP, TP, TP, TP, FP, FP</code>, what would AP be?</p>
+<pre class="code lang-python"><code># 6 detections for class "car", ranked by confidence; 4 real cars in the dataset
+tp = np.array([1, 1, 0, 1, 0, 1])          # 1 = matched a real car with IoU &gt;= 0.5 (not already matched)
+n_gt = 4
+ctp = tp.cumsum(); cfp = (1 - tp).cumsum()
+prec = ctp / (ctp + cfp); rec = ctp / n_gt
+print("rank      ", np.arange(1, 7))
+print("precision ", prec.round(3))
+print("recall    ", rec.round(3))
+# AP = area under the precision envelope (all-point interpolation)
+mrec = np.concatenate([[0], rec, [1]]); mpre = np.concatenate([[0], prec, [0]])
+for i in range(len(mpre) - 2, -1, -1): mpre[i] = max(mpre[i], mpre[i + 1])   # make precision non-increasing
+idx = np.where(mrec[1:] != mrec[:-1])[0]
+ap = ((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]).sum()
+print("envelope  ", mpre[1:-1].round(3))
+print("AP@0.5 =", round(float(ap), 4))</code></pre>
+<pre class="code lang-text"><code>IoU 0.2308
+identical 1.0  disjoint 0.0
+shifted by 5 px: 0.7778  by 10 px: 0.6
+rank       [1 2 3 4 5 6]
+precision  [1.    1.    0.667 0.75  0.6   0.667]
+recall     [0.25 0.5  0.5  0.75 0.75 1.  ]
+envelope   [1.    1.    0.75  0.75  0.667 0.667]
+AP@0.5 = 0.8542</code></pre>
+<p><strong>Line by line.</strong> <code>cumsum</code> gives running TP and FP counts. We pad with <code>0</code> at the start and the end, then the <code>for</code> loop walks from the right and sets each precision to the maximum of itself and everything to its right (the envelope). <code>idx</code> finds the places where recall changes, and the sum multiplies each recall step by the envelope precision there. (The answer to the prediction: with <code>TP, TP, TP, TP, FP, FP</code> recall reaches 1.0 at rank 4 with precision 1.0, so AP = 1.0; the later false positives come too late to matter. Ranking matters, not just counts.)</p>
+<h3>From AP to mAP</h3>
+<p><strong>mAP@0.5</strong> (the older PASCAL VOC style) averages AP over classes at IoU 0.5. <strong>mAP@[.5:.95]</strong> (COCO style, often just "mAP" or "AP") also averages over ten IoU thresholds <code>0.50, 0.55, ..., 0.95</code>, so it rewards <em>tight</em> boxes. COCO also reports AP for small, medium and large objects, and AP at 0.5 and 0.75 separately. Always check which definition a paper or tool uses before comparing numbers.</p>
+<p class="problem"><span class="pl">Problem 9.2.2</span> Three classes have AP@0.5 of <code>0.8542</code> (car, from above), <code>0.80</code> (person), <code>0.55</code> (dog). What is mAP@0.5? Then a model has AP over the ten COCO thresholds of <code>0.80, 0.77, 0.73, 0.68, 0.62, 0.55, 0.46, 0.35, 0.21, 0.07</code> (made-up numbers for practice). What is mAP@[.5:.95]?</p>
+<table class="steps"><tr><th>Formula</th><td>mean <code>= sum / count</code>.</td></tr><tr><th>Step 1</th><td><code>(0.8542 + 0.80 + 0.55) / 3 = 2.2042 / 3 = 0.7347</code>.</td></tr><tr><th>Step 2</th><td>Sum of the ten AP values: <code>0.80 + 0.77 + 0.73 + 0.68 + 0.62 + 0.55 + 0.46 + 0.35 + 0.21 + 0.07 = 5.24</code>; divided by 10 is <code>0.524</code>.</td></tr><tr><th>Answer</th><td>mAP@0.5 is <code>0.735</code>. The COCO-style mAP is <code>0.524</code>.</td></tr><tr><th>Check</th><td>The code below prints <code>mAP@0.5 = 0.7347</code> and <code>mAP@[.5:.95] = 0.524</code>.</td></tr><tr><th>Interpretation</th><td>The same model gets 0.80 at the loose bar and only 0.07 at the strictest bar: it finds objects but draws them loosely. A COCO mAP of 0.524 is much lower than an mAP@0.5 of 0.80, so never compare the two directly.</td></tr></table>
+<pre class="code lang-python"><code>ap_car, ap_person, ap_dog = 0.8542, 0.80, 0.55   # AP@0.5 per class (car = the 0.8542 computed above; the other two are made-up)
+print("mAP@0.5 =", round((ap_car + ap_person + ap_dog) / 3, 4))
+# COCO style: average AP over IoU thresholds 0.50, 0.55, ..., 0.95 (made-up values that fall as the bar rises)
+ap_by_thr = np.array([0.80, 0.77, 0.73, 0.68, 0.62, 0.55, 0.46, 0.35, 0.21, 0.07])
+print("thresholds", np.round(np.arange(0.5, 1.0, 0.05), 2))
+print("mAP@[.5:.95] =", round(float(ap_by_thr.mean()), 3))</code></pre>
+<pre class="code lang-text"><code>IoU 0.2308
+identical 1.0  disjoint 0.0
+shifted by 5 px: 0.7778  by 10 px: 0.6
+mAP@0.5 = 0.7347
+thresholds [0.5  0.55 0.6  0.65 0.7  0.75 0.8  0.85 0.9  0.95]
+mAP@[.5:.95] = 0.524</code></pre>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Precision-recall curve</td><td>one curve per class</td><td>Choosing a confidence threshold for production</td></tr><tr><td>mAP@0.5</td><td>0.735</td><td>Quick comparison of two models on one dataset</td></tr><tr><td>mAP@[.5:.95]</td><td>0.524</td><td>Papers and leaderboards (COCO)</td></tr><tr><td>Per-class AP</td><td>dog 0.55</td><td>Finding the classes that need more data</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Model selection:</strong> compare YOLO sizes on your own validation set by mAP and speed.</li><li><strong>Safety systems:</strong> pick a threshold that keeps recall above a required level, then report precision.</li><li><strong>Data work:</strong> per-class AP and the most confident false positives point to label errors.</li><li><strong>MLOps:</strong> track mAP on a fixed golden set for every new model version.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reporting accuracy or a single precision number for a detector. Detection has no "true negatives" in the usual sense, so accuracy is meaningless. Report mAP (say which one), plus precision and recall at your production threshold. Another mistake is evaluating on training images or on near-duplicates of them.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>If a detector draws one extra box on a real object that is already matched, is it TP or FP? Answer: FP (a duplicate).</li><li>Why does mAP@[.5:.95] come out lower than mAP@0.5? Answer: it includes strict IoU thresholds like 0.9 and 0.95 that few boxes pass.</li><li>Does a high-confidence false positive hurt AP more than a low-confidence one? Answer: yes, because it appears early in the ranking and lowers precision at more recall levels.</li></ol>
+<h2 id="s3-9-3-detector-families-r-cnn-ssd-yolo-and-detr">9.3 Detector Families: R-CNN, SSD, YOLO and DETR</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Imagine looking for your friend in a crowd. Strategy one: first pick a few hundred "possible people" regions, then examine each carefully (two-stage; accurate, slower). Strategy two: glance once over a grid and say "there is probably someone here, about this size" (one-stage; fast). Strategy three: let a set of questions ("who is the first person? the second?") each pick one object directly (DETR).</div></div>
+<h3>Two-stage detectors: the R-CNN family</h3>
+<ol><li><strong>R-CNN</strong> (2014): propose about 2,000 regions with an old algorithm (selective search), run a CNN on each crop separately, classify with an SVM and adjust the box. Accurate but extremely slow, because the CNN ran 2,000 times per image.</li><li><strong>Fast R-CNN:</strong> run the CNN <strong>once</strong> on the whole image to get a feature map, then pool the features inside each proposed region (RoI pooling) into a fixed size.</li><li><strong>Faster R-CNN:</strong> replace the old proposal algorithm with a small network, the <strong>Region Proposal Network (RPN)</strong>, that scores a set of anchor boxes at each position of the feature map and proposes regions. Detection became end to end and much faster. It remains a strong, accurate baseline.</li><li><strong>Mask R-CNN:</strong> Faster R-CNN plus a third branch that predicts a pixel mask inside each box (instance segmentation, Section 9.4), and RoIAlign to avoid rounding errors.</li></ol>
+<h3>One-stage detectors: SSD, RetinaNet, YOLO</h3>
+<p>One-stage detectors skip proposals and predict boxes and classes directly from the feature map.</p>
+<ul><li><strong>SSD</strong> predicts boxes from several feature-map scales so it can find both small and large objects.</li><li><strong>RetinaNet</strong> introduced <strong>focal loss</strong>: it down-weights the huge number of easy background examples so that training focuses on hard ones. (Remember cross-entropy from the Math PDF; focal loss multiplies it by <code>(1 − p)^γ</code>.)</li><li><strong>YOLO</strong> ("You Only Look Once") divides the image into a grid. Each cell is responsible for objects whose <strong>centre</strong> falls inside it.</li></ul>
+<p class="problem"><span class="pl">Problem 9.3.1</span> YOLO-style assignment. The image is 448×448 and the grid is 7×7 (each cell is 64 pixels). An object box is <code>(100, 150, 260, 330)</code>. Which cell is responsible, and what are its targets?</p>
+<table class="steps"><tr><th>Step 1</th><td>Centre: <code>x = (100 + 260)/2 = 180</code>, <code>y = (150 + 330)/2 = 240</code>. Box width <code>160</code>, height <code>180</code>.</td></tr><tr><th>Step 2</th><td>Cell: column <code>= floor(180 / 64) = 2</code>, row <code>= floor(240 / 64) = 3</code>. So cell <code>(row 3, col 2)</code>.</td></tr><tr><th>Step 3</th><td>Position inside the cell: <code>x = 180/64 − 2 = 0.8125</code>, <code>y = 240/64 − 3 = 0.75</code>. Size relative to the image: <code>w = 160/448 = 0.357</code>, <code>h = 180/448 = 0.402</code>.</td></tr><tr><th>Step 4</th><td>In YOLOv1 each cell outputs <code>B = 2</code> boxes with 5 numbers each (<code>x, y, w, h, confidence</code>) plus <code>C = 20</code> class probabilities, so the output is <code>7 × 7 × (2·5 + 20) = 7 × 7 × 30 = 1470</code> numbers per image.</td></tr><tr><th>Answer</th><td>Cell <code>(3, 2)</code> must predict the object with targets <code>x = 0.812</code>, <code>y = 0.75</code>, <code>w = 0.357</code>, <code>h = 0.402</code>, confidence 1. All other cells are trained to output confidence 0.</td></tr><tr><th>Check</th><td>The code prints the same cell and values and <code>1470</code>.</td></tr><tr><th>Interpretation</th><td>One forward pass gives all detections, which is why YOLO runs in real time. The weakness of the original grid design was small, crowded objects (one cell could only predict a couple of objects).</td></tr></table>
+<pre class="code lang-python"><code># YOLO-style grid assignment: 448x448 image, 7x7 grid, one object box
+W = H = 448; S = 7; cell = W / S
+box = (100, 150, 260, 330)                         # x1, y1, x2, y2 in pixels
+cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+bw, bh = box[2] - box[0], box[3] - box[1]
+col, row = int(cx // cell), int(cy // cell)
+tx, ty = cx / cell - col, cy / cell - row          # centre position inside its cell (0..1)
+print("centre", (cx, cy), "-&gt; cell (row, col) =", (row, col))
+print("target: x_in_cell", round(tx, 3), "y_in_cell", round(ty, 3), "w", round(bw / W, 3), "h", round(bh / H, 3), "confidence 1")
+B, C = 2, 20
+print("YOLOv1 output size per image:", S * S * (B * 5 + C))</code></pre>
+<pre class="code lang-text"><code>IoU 0.2308
+identical 1.0  disjoint 0.0
+shifted by 5 px: 0.7778  by 10 px: 0.6
+centre (180.0, 240.0) -&gt; cell (row, col) = (3, 2)
+target: x_in_cell 0.812 y_in_cell 0.75 w 0.357 h 0.402 confidence 1
+YOLOv1 output size per image: 1470</code></pre>
+<p>Later YOLO versions (v3 onwards, and the widely used YOLOv8 and its successors from the Ultralytics library) added multi-scale prediction (feature pyramids), better backbones and necks, and, in recent versions, <strong>anchor-free</strong> heads (predict the box relative to a point instead of to a preset anchor shape). Version numbers and names change fast, so check the current documentation. Detectors are also sold in sizes (nano, small, medium, large) trading accuracy for speed.</p>
+<h3>DETR: detection as a set prediction</h3>
+<p><strong>DETR</strong> (DEtection TRansformer) uses a CNN backbone plus a transformer (Chapter 11). It starts with a fixed number (for example 100) of learned <strong>object queries</strong>. Each query outputs one box and class, or "no object". There are no anchors and no NMS. The catch: training must decide which prediction answers which real object. DETR does a <strong>one-to-one matching</strong> (Hungarian algorithm) that minimises total cost, then trains matched predictions on their object and the unmatched ones on "no object".</p>
+<p class="problem"><span class="pl">Problem 9.3.2</span> Three predictions, two real objects. The cost matrix (lower is better; rows are predictions, columns are real objects) is <code>[[0.2, 0.9], [0.8, 0.1], [0.7, 0.6]]</code>. Find the matching.</p>
+<table class="steps"><tr><th>Step 1</th><td>List all ways to assign two different predictions to objects 0 and 1. For example (pred 0 to object 0, pred 1 to object 1): <code>0.2 + 0.1 = 0.3</code>.</td></tr><tr><th>Step 2</th><td>Others: (0,2): <code>0.2 + 0.6 = 0.8</code>; (1,0): <code>0.8 + 0.9 = 1.7</code>; (1,2): <code>0.8 + 0.6 = 1.4</code>; (2,0): <code>0.7 + 0.9 = 1.6</code>; (2,1): <code>0.7 + 0.1 = 0.8</code>.</td></tr><tr><th>Answer</th><td>The best is prediction 0 for object 0 and prediction 1 for object 1, total cost <code>0.3</code>. Prediction 2 is trained to say "no object".</td></tr><tr><th>Check</th><td>The code finds the same result by trying all pairs (fine for 3 predictions; the Hungarian algorithm is the efficient way for 100, <code>scipy.optimize.linear_sum_assignment</code>).</td></tr><tr><th>Interpretation</th><td>One-to-one matching teaches the model not to output duplicates, which is why NMS is unnecessary. Original DETR trained slowly and was weak on small objects; later variants (Deformable DETR, RT-DETR and others) fixed much of this.</td></tr></table>
+<pre class="code lang-python"><code>from itertools import permutations
+# DETR-style one-to-one matching: 3 predictions, 2 real objects (+ 1 "no object")
+cost = np.array([[0.2, 0.9],      # cost[i][j] = how badly prediction i fits real object j
+                 [0.8, 0.1],
+                 [0.7, 0.6]])
+best = min(permutations(range(3), 2), key=lambda p: cost[p[0], 0] + cost[p[1], 1])
+total = cost[best[0], 0] + cost[best[1], 1]
+print("prediction for object 0:", best[0], "| for object 1:", best[1], "| total cost", round(float(total), 2))
+print("left-over prediction -&gt; trained to say 'no object':", ({0, 1, 2} - set(best)).pop())
+greedy0 = int(cost[:, 0].argmin()); print("greedy pick for object 0:", greedy0)</code></pre>
+<pre class="code lang-text"><code>IoU 0.2308
+identical 1.0  disjoint 0.0
+shifted by 5 px: 0.7778  by 10 px: 0.6
+prediction for object 0: 0 | for object 1: 1 | total cost 0.3
+left-over prediction -&gt; trained to say 'no object': 2
+greedy pick for object 0: 0</code></pre>
+<h3>Choosing a detector</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Need</th><th>Typical choice</th></tr></thead><tbody><tr><td>Real-time video, edge device, good accuracy</td><td>One-stage YOLO-family or SSD-type, small size, exported to ONNX or TensorRT (Chapter 14)</td></tr><tr><td>Highest accuracy, time not critical</td><td>Two-stage (Faster R-CNN family) or a large modern detector</td></tr><tr><td>Fewer hand-tuned parts, end-to-end</td><td>DETR variants</td></tr><tr><td>Both boxes and masks</td><td>Mask R-CNN or YOLO segmentation variants</td></tr><tr><td>Tiny dataset</td><td>Start from a pretrained detector and fine-tune (Chapter 7)</td></tr></tbody></table></div>
+<h3>Library code (not run here)</h3>
+<pre class="code lang-python"><code># Ultralytics YOLO: fine-tune a pretrained model on your labelled data (not run here)
+from ultralytics import YOLO
+model = YOLO("yolov8n.pt")                       # a small pretrained checkpoint
+model.train(data="parts.yaml", epochs=50, imgsz=640)   # parts.yaml lists image folders and class names
+results = model.predict("test.jpg", conf=0.25)   # confidence threshold
+
+# torchvision Faster R-CNN with a pretrained backbone (not run here)
+import torchvision
+det = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT")
+det.eval()   # forward(list_of_image_tensors) returns boxes, labels, scores per image</code></pre>
+<p>Not run here. Argument names and default weights differ between library versions; read the current documentation. Labelling tools (CVAT, Label Studio, Chapter 7) export YOLO or COCO format.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Grid cell responsible</td><td>cell (3, 2)</td><td>Understanding why small crowded objects are hard</td></tr><tr><td><code>conf=0.25</code></td><td>confidence threshold</td><td>Operating point of a deployed detector</td></tr><tr><td>1470 outputs</td><td>7×7×30</td><td>Debugging output shapes and label encoding</td></tr><tr><td>Hungarian matching</td><td>cost matrix</td><td>Training DETR and also matching tracked objects between frames</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Retail and logistics:</strong> YOLO on shelf cameras and parcel belts.</li><li><strong>Autonomous driving and drones:</strong> one-stage and DETR-style detectors for vehicles, signs, people.</li><li><strong>Healthcare:</strong> two-stage detectors for small lesions where accuracy matters most.</li><li><strong>Sports and media:</strong> player and ball detection plus tracking.</li><li><strong>Document AI:</strong> detecting layout regions (tables, figures) before reading them.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Choosing a detector by paper accuracy alone. Measure on <em>your</em> images, at <em>your</em> input size, on <em>your</em> hardware: speed (the time taken per image) and mAP together. A model that wins by one mAP point but is three times slower may be the wrong choice.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is the main speed difference between R-CNN and Fast R-CNN? Answer: Fast R-CNN runs the CNN once per image instead of once per proposal.</li><li>Why does DETR not need NMS? Answer: one-to-one matching during training teaches each real object to get exactly one prediction.</li><li>In a 7×7 grid on a 448 image, which cell holds an object centred at <code>(180, 240)</code>? Answer: row 3, column 2.</li></ol>
+<h2 id="s4-9-4-segmentation-semantic-instance-panoptic-u-net-and-sam">9.4 Segmentation: Semantic, Instance, Panoptic, U-Net and SAM</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A box says "a cat is somewhere in this rectangle". Segmentation colours in the cat. It is the difference between circling a lake on a map and tracing its shoreline. Doctors measure tumour volume, self-driving cars find the drivable road, and phone apps blur the background all because of pixel-level labels.</div></div>
+<h3>Kinds of segmentation</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Type</th><th>Question answered</th><th>Output</th><th>Example</th></tr></thead><tbody><tr><td>Semantic</td><td>What class is each pixel?</td><td>One class per pixel; two cars merge into one "car" region</td><td>Road, sky, building</td></tr><tr><td>Instance</td><td>Which object does each pixel belong to?</td><td>A separate mask per object</td><td>Car 1, car 2, person 3</td></tr><tr><td>Panoptic</td><td>Both: "things" (countable) as instances, "stuff" (sky, road) as classes</td><td>Every pixel gets a class and, for things, an instance ID</td><td>Full scene understanding</td></tr></tbody></table></div>
+<h3>U-Net: the workhorse for masks</h3>
+<p>A <strong>U-Net</strong> is an encoder-decoder shaped like a "U". The <strong>encoder</strong> (left side) is a CNN that repeatedly halves the image size and doubles the channels, learning "what" is there. The <strong>decoder</strong> (right side) repeatedly doubles the size again (by upsampling or a transposed convolution) to get back to full resolution, learning "where". <strong>Skip connections</strong> copy the encoder features at each level and concatenate them onto the decoder features, so fine details lost in downsampling (exact borders) come back. The last layer is a 1×1 convolution with one output channel per class. (Remember the ResNet skip connection from Chapter 6: that adds; U-Net concatenates.)</p>
+<p class="problem"><span class="pl">Problem 9.4.1</span> Trace the size and channels of a U-Net with a 256×256 input where the encoder channels are <code>64, 128, 256, 512, 1024</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>Encoder: level 0 is <code>256×256×64</code>; after each pooling the size halves and the channels double: <code>128×128×128</code>, <code>64×64×256</code>, <code>32×32×512</code>, <code>16×16×1024</code> (the bottleneck).</td></tr><tr><th>Step 2</th><td>Decoder: upsample by 2 to <code>32×32</code>, concatenate with the encoder's <code>32×32×512</code> map: <code>512 + 512 = 1024</code> channels, convolve back to 512. Repeat up to <code>256×256</code> with <code>64 + 64 = 128</code> channels, convolve to 64.</td></tr><tr><th>Step 3</th><td>Final 1×1 convolution maps 64 channels to the number of classes.</td></tr><tr><th>Answer</th><td>The decoder sizes are <code>32, 64, 128, 256</code> with concatenated channels <code>1024, 512, 256, 128</code>; the output is a <code>256×256</code> map, same size as the input.</td></tr><tr><th>Check</th><td>Output size equals input size, which is what segmentation needs. The code prints the same table.</td></tr><tr><th>Interpretation</th><td>The skip connections carry high-resolution edges, which is why U-Net draws sharp boundaries even from few training images. That is why it dominates medical imaging and is the backbone idea in diffusion models too (Chapter 13).</td></tr></table>
+<p>The upsampling step can be a <strong>transposed convolution</strong>: each input pixel "paints" a copy of the kernel, scaled by its value, onto a larger output.</p>
+<p class="problem"><span class="pl">Problem 9.4.2</span> Transposed convolution with kernel <code>[[1, 0.5], [0.5, 0.25]]</code>, stride 2, input <code>[[1, 2], [3, 4]]</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>Input pixel <code>1</code> paints <code>1 × kernel = [[1, 0.5], [0.5, 0.25]]</code> into the top-left 2×2 block of the 4×4 output.</td></tr><tr><th>Step 2</th><td>Pixel <code>2</code> paints <code>[[2, 1], [1, 0.5]]</code> into the top-right block; pixel <code>3</code> paints <code>[[3, 1.5], [1.5, 0.75]]</code> bottom-left; pixel <code>4</code> paints <code>[[4, 2], [2, 1]]</code> bottom-right.</td></tr><tr><th>Answer</th><td>A 4×4 map, shown in the output below (for example the first row is <code>1, 0.5, 2, 1</code>).</td></tr><tr><th>Check</th><td>The sum of the output equals <code>(1+2+3+4) × (1 + 0.5 + 0.5 + 0.25) = 10 × 2.25 = 22.5</code>. Adding the printed numbers gives the same.</td></tr><tr><th>Interpretation</th><td>The learned kernel decides how to fill in the detail. Simple bilinear upsampling plus a normal convolution is a common alternative that avoids chequerboard artefacts.</td></tr></table>
+<pre class="code lang-python"><code># U-Net (original paper style, padded convs): size and channels at each level for a 256x256 input
+h, c = 256, 1
+chs = [64, 128, 256, 512, 1024]
+print("encoder")
+for lvl, ch in enumerate(chs):
+    print(f"  level {lvl}: {h}x{h}x{ch}")
+    if lvl &lt; 4: h //= 2
+print("decoder (upsample x2, concat with encoder level, 2 convs)")
+for lvl in range(3, -1, -1):
+    h *= 2; ch = chs[lvl]
+    print(f"  level {lvl}: up to {h}x{h}, concat {ch}+{ch} = {2*ch} channels -&gt; conv -&gt; {ch}")
+print("final 1x1 conv -&gt; classes")
+# transposed conv 2x2 stride 2 on a 2x2 input: each input value paints a 2x2 block weighted by the kernel
+x = np.array([[1., 2.], [3., 4.]]); k = np.array([[1., 0.5], [0.5, 0.25]])
+out = np.zeros((4, 4))
+for i in range(2):
+    for j in range(2): out[2*i:2*i+2, 2*j:2*j+2] += x[i, j] * k
+print(out)</code></pre>
+<pre class="code lang-text"><code>IoU 0.2308
+identical 1.0  disjoint 0.0
+shifted by 5 px: 0.7778  by 10 px: 0.6
+encoder
+  level 0: 256x256x64
+  level 1: 128x128x128
+  level 2: 64x64x256
+  level 3: 32x32x512
+  level 4: 16x16x1024
+decoder (upsample x2, concat with encoder level, 2 convs)
+  level 3: up to 32x32, concat 512+512 = 1024 channels -&gt; conv -&gt; 512
+  level 2: up to 64x64, concat 256+256 = 512 channels -&gt; conv -&gt; 256
+  level 1: up to 128x128, concat 128+128 = 256 channels -&gt; conv -&gt; 128
+  level 0: up to 256x256, concat 64+64 = 128 channels -&gt; conv -&gt; 64
+final 1x1 conv -&gt; classes
+[[1.   0.5  2.   1.  ]
+ [0.5  0.25 1.   0.5 ]
+ [3.   1.5  4.   2.  ]
+ [1.5  0.75 2.   1.  ]]</code></pre>
+<h3>Measuring masks: IoU, Dice and the accuracy trap</h3>
+<p>For masks, IoU uses pixel counts: <code>IoU = |A ∩ B| / |A ∪ B|</code>. The <strong>Dice</strong> score is <code>2|A ∩ B| / (|A| + |B|)</code>. They are related (Dice is always at least IoU for the same pair). <strong>Pixel accuracy</strong> is dangerous: if the object covers 2% of the image, predicting "all background" gets 98%.</p>
+<p class="problem"><span class="pl">Problem 9.4.3</span> Compare a predicted and true 4×4 mask. Prediction has 5 object pixels, truth has 7, and 4 pixels are in both. Compute IoU and Dice, and the pixel accuracy of the grid below.</p>
+<table class="steps"><tr><th>Step 1</th><td>Intersection <code>= 4</code>. Union <code>= 5 + 7 − 4 = 8</code>.</td></tr><tr><th>Step 2</th><td>IoU <code>= 4 / 8 = 0.5</code>. Dice <code>= 2 × 4 / (5 + 7) = 8 / 12 = 0.6667</code>.</td></tr><tr><th>Step 3</th><td>Pixel accuracy: 16 pixels; the masks disagree on <code>(5 − 4) + (7 − 4) = 4</code> pixels, so <code>12/16 = 0.75</code>.</td></tr><tr><th>Answer</th><td>IoU 0.5, Dice 0.667, pixel accuracy 0.75.</td></tr><tr><th>Check</th><td><code>Dice = 2·IoU/(1 + IoU) = 1/1.5 = 0.667</code>, as the code confirms.</td></tr><tr><th>Interpretation</th><td>Pixel accuracy (0.75) looks much better than the real overlap (0.5) because most of the grid is background. Report IoU or Dice. Dice is also a common loss function for training on imbalanced masks (<code>1 − Dice</code>).</td></tr></table>
+<pre class="code lang-python"><code>pred = np.array([[0,1,1,0],[0,1,1,0],[0,1,0,0],[0,0,0,0]])
+gt   = np.array([[0,0,1,1],[0,1,1,1],[0,1,1,0],[0,0,0,0]])
+inter = (pred &amp; gt).sum(); a, b = pred.sum(), gt.sum(); union = (pred | gt).sum()
+print("pred area", a, "gt area", b, "intersection", inter, "union", union)
+print("IoU  ", round(inter / union, 4))
+print("Dice ", round(2 * inter / (a + b), 4))
+# pixel accuracy is fooled by background
+print("pixel accuracy", (pred == gt).mean())</code></pre>
+<pre class="code lang-text"><code>IoU 0.2308
+identical 1.0  disjoint 0.0
+shifted by 5 px: 0.7778  by 10 px: 0.6
+pred area 5 gt area 7 intersection 4 union 8
+IoU   0.5
+Dice  0.6667
+pixel accuracy 0.75</code></pre>
+<h3>Other models you will meet</h3>
+<ul><li><strong>DeepLab</strong> uses <strong>dilated (atrous) convolutions</strong>: a 3×3 kernel with gaps between taps sees a wider area without shrinking the map, and a module (ASPP) combines several dilation rates to see multiple scales.</li><li><strong>Mask R-CNN</strong> gives instance masks: a box from Faster R-CNN, then a small mask for the object inside the box.</li><li><strong>SAM</strong> (Segment Anything, from Meta) is a <strong>promptable</strong> foundation model. You give a prompt (a click, several points, or a box) and it returns masks. It has a large image encoder (a Vision Transformer), a light prompt encoder and a fast mask decoder, and was trained on a very large dataset of about 1 billion masks on 11 million images. It does not know class names by itself; it outlines "things" you point at. Newer versions add video; check the current release. Typical use: a human clicks, SAM makes the mask, and you use these masks to speed up labelling, or you combine SAM with a detector (the detector gives boxes, SAM turns boxes into masks).</li></ul>
+<p>Chapter 8's tools still help: clean predicted masks with closing and opening, drop connected components below a minimum area, and read areas and bounding boxes from them.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Semantic mask</td><td>road, car, sky</td><td>Driving scenes, satellite land use</td></tr><tr><td>Instance mask</td><td>one per tablet</td><td>Counting touching objects</td></tr><tr><td>U-Net</td><td>medical scans, defects</td><td>The default small-data segmentation model</td></tr><tr><td>SAM</td><td>box or click prompt</td><td>Fast annotation and zero-shot cut-outs</td></tr><tr><td>Dice loss</td><td><code>1 − Dice</code></td><td>Training when the object is a tiny part of the image</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Healthcare:</strong> organ and tumour outlines, cell counting.</li><li><strong>Agriculture and remote sensing:</strong> crop fields, flood extent, deforestation.</li><li><strong>Automotive:</strong> drivable space and lane segmentation.</li><li><strong>Photo and video apps:</strong> background blur and removal.</li><li><strong>GenAI:</strong> segmentation masks guide image editing and inpainting (Chapter 13).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reporting pixel accuracy for segmentation, or resizing masks with bilinear interpolation (which creates in-between class numbers). Use nearest-neighbour for masks and report IoU or Dice per class.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Difference between semantic and instance segmentation? Answer: semantic labels pixels by class only; instance separates each object of the same class.</li><li>What do U-Net skip connections add? Answer: high-resolution detail from the encoder, concatenated into the decoder.</li><li>IoU 0.5 means Dice is? Answer: <code>2 × 0.5 / 1.5 = 0.667</code>.</li></ol>
+<h2 id="s5-9-5-ocr-and-other-vision-tasks">9.5 OCR and Other Vision Tasks</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">OCR (optical character recognition) turns a picture of text into text a computer can search and copy. Two steps: first find where the text is (detection), then read each piece (recognition). It is object detection followed by a very small classifier of letters, with a spell-checker idea on top.</div></div>
+<h3>The OCR pipeline</h3>
+<ol><li><strong>Preprocess:</strong> grey, resize, fix skew, remove noise, binarise (all from Chapter 8; for clean scans this still matters, while modern models cope better with photos).</li><li><strong>Detect text regions:</strong> lines or words (detection models, or layout analysis).</li><li><strong>Recognise:</strong> convert each region to characters. Classic approach: CNN features, then a sequence model (Chapter 10) with a CTC loss (a loss that aligns a long feature sequence to a shorter text without needing character positions).</li><li><strong>Post-process:</strong> dictionary or language-model correction, field validation (a date must look like a date), and keep the position for layout.</li></ol>
+<div class="tablewrap"><table class="data"><thead><tr><th>Tool</th><th>What it is</th><th>Typical use</th></tr></thead><tbody><tr><td>Tesseract</td><td>Classic open-source engine, now with an LSTM recogniser</td><td>Clean printed documents, many languages</td></tr><tr><td>EasyOCR</td><td>Python library with deep text detector and recogniser</td><td>Quick start, photos, many scripts</td></tr><tr><td>PaddleOCR</td><td>Production-grade toolkit with strong multilingual models</td><td>Documents, receipts, Chinese and many other languages</td></tr><tr><td>TrOCR</td><td>Transformer encoder-decoder (image in, text out)</td><td>Handwriting and printed lines, fine-tunable</td></tr><tr><td>Vision-language models</td><td>OCR-free reading of a whole page (Chapter 12)</td><td>Forms and tables with layout understanding</td></tr></tbody></table></div>
+<p>For Indian languages, check that the model supports your script; results differ a lot between tools.</p>
+<h3>Measuring OCR: character and word error rate</h3>
+<p><strong>Character error rate (CER)</strong> is the <strong>edit distance</strong> (the smallest number of single-character insertions, deletions and substitutions that turns the output into the truth) divided by the length of the true text. <strong>Word error rate (WER)</strong> does the same on words.</p>
+<p class="problem"><span class="pl">Problem 9.5.1</span> Truth: <code>INVOICE 2024-0517</code>. OCR output: <code>INV0ICE 2O24-517</code> (a zero for the letter O, the letter O for a zero, and one digit dropped). Compute CER and WER.</p>
+<table class="steps"><tr><th>Step 1</th><td>Compare character by character: <code>O</code> became <code>0</code> (1 substitution), <code>0</code> became <code>O</code> in <code>2024</code> (1 substitution), and one <code>0</code> is missing in <code>0517</code> (1 deletion). Total edit distance <code>3</code>.</td></tr><tr><th>Step 2</th><td>The truth has 17 characters (counting the space and hyphen), so <code>CER = 3 / 17 = 0.1765</code>.</td></tr><tr><th>Step 3</th><td>Words: truth has 2 words and both are wrong in the output, so <code>WER = 2 / 2 = 1.0</code>.</td></tr><tr><th>Answer</th><td>CER is 17.6%, WER is 100%.</td></tr><tr><th>Check</th><td>The code prints <code>edits 3 CER 0.1765</code> and <code>WER 1.0</code>.</td></tr><tr><th>Interpretation</th><td>A reader would accept 83% of characters as right, but a search for the invoice number finds nothing: WER is what matters for lookups. For fields like invoice numbers and amounts, validate with rules (checksum, regex, known values) and send low-confidence fields to a human.</td></tr></table>
+<pre class="code lang-python"><code>def edit_distance(a, b):
+    d = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        prev, d[0] = d[0], i
+        for j, cb in enumerate(b, 1):
+            prev, d[j] = d[j], min(d[j] + 1, d[j - 1] + 1, prev + (ca != cb))
+    return d[-1]
+truth = "INVOICE 2024-0517"
+ocr   = "INV0ICE 2O24-517"
+e = edit_distance(truth, ocr)
+print("edits", e, "CER", round(e / len(truth), 4))
+w_t, w_o = truth.split(), ocr.split()
+print("WER", edit_distance(w_t, w_o) / len(w_t))</code></pre>
+<pre class="code lang-text"><code>IoU 0.2308
+identical 1.0  disjoint 0.0
+shifted by 5 px: 0.7778  by 10 px: 0.6
+edits 3 CER 0.1765
+WER 1.0</code></pre>
+<p>Library calls (not run here):</p>
+<pre class="code lang-python"><code>import pytesseract, easyocr
+from PIL import Image
+text = pytesseract.image_to_string(Image.open("scan.png"), lang="eng")   # needs the Tesseract program installed
+reader = easyocr.Reader(["en"])                                          # downloads models on first use
+result = reader.readtext("photo.jpg")   # list of (box, text, confidence)</code></pre>
+<p>Not run here. Tools need installation and model downloads, and argument details change between versions. Document pipelines for RAG (parsing PDFs and scans into text) are covered in <code>study/genai/</code>.</p>
+<h3>Face detection and recognition: be careful</h3>
+<p><strong>Face detection</strong> finds faces (boxes). <strong>Face recognition</strong> decides <em>who</em> it is: a network maps each face to an <strong>embedding</strong> (a list of numbers, such as 128 or 512) trained so that photos of the same person are close and different people are far. You compare two embeddings by cosine similarity and accept the match if it is above a <strong>threshold</strong>. Two error types trade off: the <strong>false accept rate (FAR)</strong>, strangers accepted, and the <strong>false reject rate (FRR)</strong>, the right person rejected.</p>
+<p class="problem"><span class="pl">Problem 9.5.2</span> In a simulation, same-person embeddings have mean cosine similarity about 0.52 to the reference and different people about 0. What happens as we move the threshold from 0.2 to 0.5?</p>
+<table class="steps"><tr><th>Step 1</th><td>At 0.2, almost every same-person photo passes (FRR 0.000) but 3.3% of strangers pass too (FAR 0.033).</td></tr><tr><th>Step 2</th><td>At 0.3 both errors are under 1%. At 0.4 FRR rises to 8.7% with FAR 0.</td></tr><tr><th>Step 3</th><td>At 0.5, FRR is 41%: nearly half of the genuine matches are rejected.</td></tr><tr><th>Answer</th><td>Raising the threshold lowers false accepts and raises false rejects; here a value near 0.3 balances them.</td></tr><tr><th>Check</th><td>The code prints the four rows; FAR falls and FRR rises monotonically.</td></tr><tr><th>Interpretation</th><td>Choose the threshold by the cost of each error. A phone unlock can allow some false rejects (try again). A security door should keep FAR extremely low. Always measure on data like your real users, because accuracy differs across skin tones, ages and camera conditions.</td></tr></table>
+<pre class="code lang-python"><code>rng = np.random.default_rng(0)
+def unit(v): return v / np.linalg.norm(v)
+person = unit(rng.normal(size=64))
+same = [unit(person + 1.6 * unit(rng.normal(size=64))) for _ in range(300)]   # other photos of the same person
+others = [unit(rng.normal(size=64)) for _ in range(300)]                      # different people
+s_same = np.array([person @ v for v in same]); s_diff = np.array([person @ v for v in others])
+print("same-person cosine mean", s_same.mean().round(3), " different-person mean", s_diff.mean().round(3))
+for thr in (0.2, 0.3, 0.4, 0.5):
+    frr = (s_same &lt; thr).mean(); far = (s_diff &gt;= thr).mean()
+    print(f"threshold {thr}: false reject rate {frr:.3f}, false accept rate {far:.3f}")</code></pre>
+<pre class="code lang-text"><code>IoU 0.2308
+identical 1.0  disjoint 0.0
+shifted by 5 px: 0.7778  by 10 px: 0.6
+same-person cosine mean 0.517  different-person mean -0.007
+threshold 0.2: false reject rate 0.000, false accept rate 0.033
+threshold 0.3: false reject rate 0.007, false accept rate 0.007
+threshold 0.4: false reject rate 0.087, false accept rate 0.000
+threshold 0.5: false reject rate 0.410, false accept rate 0.000</code></pre>
+<div class="callout blue"><div class="lab">PROFESSOR'S NOTE</div><div class="txt">Responsible use. Face recognition identifies people and is regulated or restricted in many places; in India, personal data rules (the DPDP Act) apply to biometric and image data. Get consent, say clearly why you collect the data, keep it minimal and secure, test for bias across groups, never use it for hidden surveillance, and keep a human in the loop for decisions that affect people. Face <em>detection</em> (for example, to blur faces for privacy) is a much safer use than <em>recognition</em>. The same care applies to scraping photos and to licence-plate or ID-card reading.</div></div>
+<h3>Other tasks, in one table (awareness)</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Task</th><th>What it does</th><th>Typical approach</th></tr></thead><tbody><tr><td>Pose estimation</td><td>Finds body joints (keypoints)</td><td>Heatmap or keypoint heads (OpenPose style, YOLO pose, RTMPose)</td></tr><tr><td>Tracking</td><td>Keeps the same ID for an object across video frames</td><td>Detect each frame, then match boxes between frames by IoU or appearance (Hungarian matching, as in 9.3), for example SORT and ByteTrack</td></tr><tr><td>Video understanding</td><td>Actions, events</td><td>3D CNNs (Chapter 6) or video transformers</td></tr><tr><td>Depth estimation</td><td>Distance per pixel from one image</td><td>Networks trained on depth data; foundation models exist</td></tr><tr><td>3D vision</td><td>Shapes and scenes in 3D</td><td>Point clouds, multi-view geometry, neural radiance fields (awareness only)</td></tr></tbody></table></div>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>CER and WER</td><td>17.6% and 100%</td><td>Choosing and monitoring an OCR engine</td></tr><tr><td>Field validation</td><td>regex, checksum</td><td>Making OCR safe for invoices and forms</td></tr><tr><td>Embedding threshold</td><td>cosine 0.3</td><td>Face or product matching trade-offs</td></tr><tr><td>IoU tracking</td><td>match box to previous frame</td><td>Counting people or vehicles in video</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Finance and operations:</strong> read invoices, cheques, IDs, number plates (with consent and law in mind).</li><li><strong>Logistics:</strong> read labels on parcels.</li><li><strong>Accessibility:</strong> read text aloud for visually impaired users.</li><li><strong>Public sector:</strong> digitise scanned records, including Indian-language archives.</li><li><strong>GenAI:</strong> OCR feeds document search and question answering (see <code>study/genai/</code>).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Trusting OCR output without checking confidence or validating fields. The classic confusions are <code>0</code> and <code>O</code>, <code>1</code> and <code>l</code>, <code>5</code> and <code>S</code>. Use validation rules, and measure CER and WER on a sample of <em>your</em> documents, not the vendor's demo.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>CER with 2 edits on a 10-character truth? Answer: <code>2 / 10 = 0.2</code>.</li><li>Which is riskier ethically: face detection or recognition? Answer: recognition, because it identifies people.</li><li>What does raising the face-match threshold do? Answer: fewer false accepts, more false rejects.</li></ol>
+<h2 id="s6-chapter-recap">Chapter recap</h2>
+<ul><li>Detection gives a box, a class and a score per object; segmentation gives a class (or an ID) per pixel; OCR turns text in an image into characters.</li><li>IoU is overlap divided by union; 0.5 is the usual "correct" bar. Our example boxes had IoU <code>600/2600 = 0.2308</code>.</li><li>NMS keeps the highest-scoring box and removes overlapping duplicates; the threshold is a tuning choice.</li><li>AP is the area under the precision-recall curve (0.8542 in our example); mAP averages over classes, and COCO mAP also averages over IoU 0.5 to 0.95. Always say which one you report.</li><li>R-CNN family: accurate, two-stage; YOLO and SSD: one pass, fast; DETR: transformer with object queries and one-to-one matching, no NMS.</li><li>U-Net: encoder-decoder with concatenating skip connections; SAM: promptable segmentation with a ViT encoder; semantic, instance and panoptic differ in whether objects are separated.</li><li>Evaluate masks with IoU or Dice, not pixel accuracy.</li><li>OCR quality is measured by CER and WER; validate fields and keep humans in the loop.</li><li>Face recognition trades FAR against FRR by threshold, and needs consent, bias testing and legal care.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / command / pattern</th><th>Meaning</th></tr></thead><tbody><tr><td><code>IoU = inter / (A + B − inter)</code></td><td>box or mask overlap</td></tr><tr><td><code>precision = TP/(TP+FP)</code>, <code>recall = TP/(TP+FN)</code></td><td>detection quality at one threshold</td></tr><tr><td><code>AP = Σ Δrecall × envelope precision</code></td><td>area under the PR curve</td></tr><tr><td><code>Dice = 2·inter / (A + B)</code></td><td>mask overlap, also a loss</td></tr><tr><td>YOLO cell <code>= (floor(cx/cell), floor(cy/cell))</code></td><td>which cell predicts the object</td></tr><tr><td><code>CER = edit_distance / len(truth)</code></td><td>OCR error rate</td></tr><tr><td><code>YOLO("yolov8n.pt").train(data=...)</code></td><td>Ultralytics fine-tune (not run here)</td></tr></tbody></table></div>
+<h2 id="s7-practice-set">Practice set</h2>
+<p><strong>1.</strong> (easy) IoU of <code>(0, 0, 10, 10)</code> and <code>(5, 0, 15, 10)</code>. <strong>Answer:</strong> overlap <code>5 × 10 = 50</code>, union <code>100 + 100 − 50 = 150</code>, IoU <code>0.333</code>.</p>
+<p><strong>2.</strong> (easy) Precision and recall: 8 predictions, 6 correct, 10 real objects. <strong>Answer:</strong> precision <code>6/8 = 0.75</code>, recall <code>6/10 = 0.6</code>.</p>
+<p><strong>3.</strong> (easy) Is <code>(x, y, w, h) = (10, 20, 30, 40)</code> the same box as <code>(x1, y1, x2, y2) = (10, 20, 30, 40)</code>? <strong>Answer:</strong> no. The first ends at <code>(40, 60)</code>; the second ends at <code>(30, 40)</code>.</p>
+<p><strong>4.</strong> (medium) Compute AP for judged predictions <code>TP, FP, TP</code> with 2 real objects. <strong>Answer:</strong> precision <code>1.0, 0.5, 0.667</code>; recall <code>0.5, 0.5, 1.0</code>. Envelope <code>1.0, 0.667, 0.667</code>. AP <code>= 0.5 × 1.0 + 0.5 × 0.667 = 0.8333</code>.</p>
+<p><strong>5.</strong> (medium) A 64×64 mask has a 4×4 object. A model predicts all background. Pixel accuracy and IoU? <strong>Answer:</strong> pixel accuracy <code>(4096 − 16)/4096 = 0.996</code>; IoU <code>0</code> (no overlap with the object).</p>
+<p><strong>6.</strong> (medium) What is the output of <code>iou((0,0,2,2), (2,0,4,2))</code>? <strong>Answer:</strong> <code>0.0</code>: the boxes only touch at an edge, so the overlap width <code>min(2,4) − max(0,2) = 0</code>.</p>
+<p><strong>7.</strong> (medium) Find the bug: <code>inter = (ix2 - ix1) * (iy2 - iy1)</code> with no <code>max(0, ...)</code>. <strong>Answer:</strong> for disjoint boxes both factors can be negative and their product positive, giving a false overlap (for example <code>(−10) × (−10) = 100</code>). Clip each side at 0.</p>
+<p><strong>8.</strong> (medium) Size check: a U-Net bottleneck is <code>16×16×1024</code> after 4 poolings. The input size? <strong>Answer:</strong> <code>16 × 2⁴ = 256</code>, so the input was <code>256×256</code>.</p>
+<p><strong>9.</strong> (hard) A detector has AP@0.5 = 0.82 but COCO mAP = 0.41. What does that tell you? <strong>Answer:</strong> it finds objects but its boxes are loose: AP drops at strict IoU thresholds. Improve localisation (better box regression loss, higher input resolution, more precise labels).</p>
+<p><strong>10.</strong> (hard) OCR truth <code>AB 12</code>, output <code>A8 1Z</code>. Compute CER and WER. <strong>Answer:</strong> the characters <code>B</code> to <code>8</code> and <code>2</code> to <code>Z</code> differ: 2 substitutions over 5 characters gives CER <code>0.4</code>. Both words are wrong, WER <code>1.0</code>.</p>
+<p><strong>11.</strong> (interview) "Explain mAP to a non-technical manager." <strong>Answer:</strong> "We rank the detector's guesses from most to least confident. For each class we measure how many correct objects we have found against how many wrong guesses we made along the way, and average that over classes. It is a single score from 0 to 1 that rewards finding objects without crying wolf. COCO mAP also requires tighter boxes."</p>
+<p><strong>12.</strong> (interview/scenario) "You must count tablets on a tray from a phone photo. They sometimes touch. Which approach and why?" <strong>Answer:</strong> if tablets are well separated, classical thresholding plus connected components (Chapter 8) is enough. If they touch, use instance segmentation (Mask R-CNN or a YOLO segmentation model fine-tuned from a pretrained checkpoint, Chapter 7) or a detector with a small box per tablet, or watershed to split touching blobs. Evaluate with mAP or count error on 50 labelled photos, choose the confidence threshold by precision and recall, and report the miscount rate to the user.</p>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me "IoU and non-maximum suppression" for object detection. Use small boxes with real coordinates, walk me through intersection, union and IoU step by step, and then run NMS on five boxes with scores. Ask me to compute each IoU before you show it, and finish with 3 check questions.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning computer vision, and English is not my first language. Explain "precision, recall, AP and mAP for object detection" using a ranked list of 8 predictions that I can compute by hand. Show the precision-recall table, the envelope step and the final AP. Then explain the difference between mAP at IoU 0.5 and COCO mAP at IoU 0.5 to 0.95. Quiz me on each step before moving on.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Compare "R-CNN family, SSD, YOLO and DETR" for object detection. For each give the main idea in two sentences, one strength, one weakness, and one number I can verify (for example the YOLOv1 output size 7 by 7 by 30). Then give me a decision table for choosing a detector and 5 scenario questions, one at a time.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, with English as my second language. Teach me "image segmentation": semantic versus instance versus panoptic, U-Net with skip connections, Dice and IoU for masks, and what SAM does. Use a 4 by 4 mask example with real numbers. Then review my segmentation or detection evaluation code for mistakes such as pixel accuracy on imbalanced masks or box format errors. My code: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for computer vision interviews, and English is my second language. Run a mock interview on "object detection, segmentation and OCR": IoU, NMS, mAP, YOLO versus DETR, U-Net, SAM, CER and WER, and the ethics of face recognition. Ask 8 questions one at a time, grade each out of 10, give the ideal short answer, then ask a harder follow-up.</pre></div><div class="readbtn"><button class="btn" data-read="study:dl:ch09">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch08.html">← Chapter 8: Classical Image Processing</a><a class="btn" href="ch10.html">Chapter 10: Sequence Models: RNN, LSTM, GRU, Seq2Seq →</a></div></div><script src="../../assets/study.js"></script></body></html>

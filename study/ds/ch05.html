@@ -1,0 +1,312 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 5: Feature Engineering I: Transformations, Encoding, Dates, Text and Geo</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Science in Practice</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 5</div><h1>Feature Engineering I: Transformations, Encoding, Dates, Text and Geo</h1><p>How to turn raw columns into numbers a model can learn from, and how to do it without cheating.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-5-1-numeric-transformations">5.1 Numeric Transformations</a></li><li><a href="#s2-5-2-encoding-categories-and-target-encoding-done-safely">5.2 Encoding Categories (and Target Encoding Done Safely)</a></li><li><a href="#s3-5-3-dates-cycles-and-missing-value-indicators">5.3 Dates, Cycles and Missing-Value Indicators</a></li><li><a href="#s4-5-4-text-and-geo-features">5.4 Text and Geo Features</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>On tabular data, good features usually beat a fancier algorithm. A model sees only numbers. If you give it a skewed amount column, a text field, a pincode with 400 levels and a timestamp, it cannot use them as they are. Feature engineering is the craft of turning each of them into numbers that carry the signal. In this chapter you will learn the core transformations for numbers, the encodings for categories (including the dangerous target encoding and how to do it safely), the tricks for dates, text and locations, and the habit of testing each idea instead of trusting it. By the end you will be able to take any raw table, list what a human expert would look at, and turn each answer into a feature computed only from data available at prediction time. (Chapter 6 continues with behavioural features, selection and pipelines.)</p>
+<p><strong>Running example.</strong> The churn table of Chapter 3 (2,562 active customers at T = 2025-01-01, churn rate 25.4%). The helper <code>features(T)</code> from Chapter 3 gives <code>orders_90d</code>, <code>spend_90d</code>, <code>avg_order</code>, <code>recency_days</code>, <code>tenure_days</code>. We fit a plain logistic regression (a basic classifier that adds up weighted features; see <code>study/ml/</code>) on a stratified 70/30 split with seed 0, and report AUC on the 30% test part. <strong>Method.</strong> Ask: "what would a human expert look at to make this decision?" Turn each answer into a number. Then test whether it helps.</p>
+<pre class="code lang-python"><code>from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+
+d = features(pd.Timestamp("2025-01-01"))       # helper from Chapter 3
+tr, te = train_test_split(d, test_size=0.3, random_state=0, stratify=d.churn)
+def fit_auc(Xtr, Xte):
+    m = LogisticRegression(max_iter=3000).fit(Xtr, tr.churn)
+    return round(roc_auc_score(te.churn, m.predict_proba(Xte)[:, 1]), 3)
+base = ["orders_90d", "recency_days"]
+print("AUC base (orders_90d, recency):", fit_auc(tr[base], te[base]))</code></pre>
+<pre class="code lang-text"><code>AUC base (orders_90d, recency): 0.883</code></pre>
+<p>Every idea below is compared against this 0.883.</p>
+<h2 id="s1-5-1-numeric-transformations">5.1 Numeric Transformations</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Imagine a ruler where every centimetre in the first metre is a real centimetre, but each metre after is squeezed so that 1 cm means 100 times more. Most of your data is in the first metre, and a few huge values are far away. A log transform is that squeezed ruler: it gives rich customers and normal customers a comparable scale.</div></div>
+<p><strong>Why transform?</strong> Many models (linear, distance-based, neural) work better when values are not heavily skewed. A few giant values can dominate a model. Tree models are less sensitive to monotone transforms (they only compare "greater than"), but still benefit from ratios and good bins.</p>
+<p><strong>The tools</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Tool</th><th>What it does</th><th>Formula</th><th>When</th></tr></thead><tbody><tr><td>log1p</td><td>Compress a long right tail; works at 0</td><td><code>log(1 + x)</code></td><td>money, counts, time</td></tr><tr><td>sqrt</td><td>Milder compression</td><td><code>√x</code></td><td>counts</td></tr><tr><td>Box-Cox / Yeo-Johnson</td><td>Learns the best power for you</td><td><code>((x+1)^λ − 1)/λ</code> (Yeo-Johnson for x ≥ 0)</td><td>when log is too strong or too weak; Yeo-Johnson also allows zero and negatives</td></tr><tr><td>Clipping (winsorising)</td><td>Cap extremes at percentiles</td><td><code>min(max(x, p1), p99)</code></td><td>outliers that are real but extreme</td></tr><tr><td>Binning</td><td>Cut into groups</td><td>equal-width, quantile, or supervised</td><td>non-linear effects, interpretability</td></tr><tr><td>Scaling</td><td>Make units comparable</td><td><code>(x − mean)/sd</code></td><td>linear, distance, neural models (not needed for trees)</td></tr><tr><td>Ratios and differences</td><td>Compare two quantities</td><td><code>a / b</code>, <code>a − b</code></td><td>domain knowledge</td></tr></tbody></table></div>
+<p><strong>Worked problem</strong></p>
+<p class="problem"><span class="pl">Problem 5.1.1</span> Compute <code>log1p</code> and <code>sqrt</code> for the values 0, 9, 99, 999, and say which compresses the tail more.</p>
+<table class="steps"><tr><th>Formula</th><td><code>log1p(x) = ln(1 + x)</code>, <code>sqrt(x) = √x</code></td></tr><tr><th>Plug in</th><td>x = 0, 9, 99, 999</td></tr><tr><th>Compute</th><td>log1p: ln(1) = 0, ln(10) = 2.303, ln(100) = 4.605, ln(1000) = 6.908. sqrt: 0, 3, 9.95, 31.61.</td></tr><tr><th>Answer</th><td>Log turns the range 0 to 999 into 0 to 6.9 (a 1000-fold spread squeezed to about 7 units); sqrt gives 0 to 31.6. Log compresses more.</td></tr><tr><th>Check</th><td><code>ln(1 + 999) = ln(1000) = 6.908</code> because e^6.908 = 1000.</td></tr><tr><th>Why it matters</th><td>A model that adds numbers would treat a customer spending Rs 999 as 100 times a customer spending Rs 9 under the raw scale, but only 3 times under the log scale. Which is right depends on the business: log means "each doubling matters equally".</td></tr></table>
+<p><strong>Run on the real data.</strong> Before you run it, predict: which of log1p, sqrt and Yeo-Johnson removes the skew of <code>spend_90d</code> best?</p>
+<pre class="code lang-python"><code>from sklearn.preprocessing import PowerTransformer
+print("skew spend:", round(d.spend_90d.skew(), 2), "log1p:", round(np.log1p(d.spend_90d).skew(), 2),
+      "sqrt:", round(np.sqrt(d.spend_90d).skew(), 2))
+pt = PowerTransformer(method="yeo-johnson").fit(tr[["spend_90d"]])
+print("yeo-johnson skew:", round(float(pd.Series(pt.transform(d[["spend_90d"]]).ravel()).skew()), 2),
+      " lambda", round(pt.lambdas_[0], 3))
+lo, hi = d.spend_90d.quantile([0.01, 0.99]); print("1%/99% quantile:", round(lo), round(hi), " max", round(d.spend_90d.max()))
+clipped = d.spend_90d.clip(lo, hi)
+print("clipped max", round(clipped.max()), " mean before/after", round(d.spend_90d.mean()), round(clipped.mean()))</code></pre>
+<pre class="code lang-text"><code>skew spend: 2.17 log1p: -0.43 sqrt: 0.78
+yeo-johnson skew: -0.03  lambda 0.161
+1%/99% quantile: 207 24601  max 41357
+clipped max 24601  mean before/after 5261 5193</code></pre>
+<p>Line by line: <code>skew()</code> is 0 for a symmetric shape. The raw skew is 2.17 (long tail). <code>sqrt</code> brings it to 0.78 (still skewed), <code>log1p</code> overshoots to -0.43, and Yeo-Johnson, which learned a power <code>λ = 0.161</code> (close to 0, which is the log case) from the training rows only, gives -0.03. <code>quantile([0.01, 0.99])</code> finds the 1st and 99th percentile; <code>clip</code> caps values at them: the max falls from 41,357 to 24,601 and the mean from 5,261 to 5,193.</p>
+<p><strong>Worked problem</strong></p>
+<p class="problem"><span class="pl">Problem 5.1.2</span> Apply the Yeo-Johnson formula by hand for λ = 0.161 and x = 3,512.9 (the median spend), using <code>((x + 1)^λ − 1) / λ</code>.</p>
+<table class="steps"><tr><th>Formula</th><td><code>((x + 1)^λ − 1) / λ</code> (for x ≥ 0 and λ ≠ 0)</td></tr><tr><th>Plug in</th><td><code>((3513.9)^0.161 − 1) / 0.161</code></td></tr><tr><th>Compute</th><td><code>ln(3513.9) = 8.164</code>; <code>8.164 × 0.161 = 1.3144</code>; <code>e^1.3144 = 3.722</code>; <code>(3.722 − 1) / 0.161 = 16.9</code></td></tr><tr><th>Answer</th><td>The median spend becomes about 16.9 on the transformed scale (a number the model sees instead of 3,513). (Scikit-learn then also standardises to mean 0, so you would see a different final number.)</td></tr><tr><th>Check</th><td>With λ near 0 the formula tends to <code>ln(x + 1)</code> = 8.16, which is the log case; 16.9 is the same idea on a stretched scale.</td></tr><tr><th>Why it matters</th><td>Using the same λ (learned on training data only) for test data keeps the pipeline honest. If you fit λ on all data you leak a tiny bit of test information.</td></tr></table>
+<p><strong>Does it help the model?</strong> We test binning, log, and a <em>ratio</em> feature. The ratio compares recency with the customer's own normal gap between orders: if a customer usually orders every 10 days (9 orders in 90 days) and has been silent for 30 days, the ratio is <code>30 / (90/9) = 3.0</code> ("three missed cycles").</p>
+<pre class="code lang-python"><code>from sklearn.preprocessing import KBinsDiscretizer
+kb = KBinsDiscretizer(n_bins=5, encode="onehot-dense", strategy="quantile").fit(tr[["recency_days"]])
+print("quantile bin edges recency:", kb.bin_edges_[0].round(0))
+Xb_tr = np.c_[tr[["orders_90d"]].values, kb.transform(tr[["recency_days"]])]
+Xb_te = np.c_[te[["orders_90d"]].values, kb.transform(te[["recency_days"]])]
+print("AUC with binned recency   :", fit_auc(Xb_tr, Xb_te))
+for df in (tr, te):
+    df["log_rec"] = np.log1p(df.recency_days)
+    df["rec_ratio"] = df.recency_days / (90 / df.orders_90d)    # recency compared with the usual gap
+print("AUC with log recency      :", fit_auc(tr[["orders_90d", "log_rec"]], te[["orders_90d", "log_rec"]]))
+print("AUC + ratio feature (recency / usual gap):", fit_auc(tr[base + ["rec_ratio"]], te[base + ["rec_ratio"]]))</code></pre>
+<pre class="code lang-text"><code>quantile bin edges recency: [ 1.  3.  7. 14. 34. 90.]
+AUC with binned recency   : 0.871
+AUC with log recency      : 0.88
+AUC + ratio feature (recency / usual gap): 0.889</code></pre>
+<p>Read it: the quantile bins put roughly 20% of customers in each of five groups (edges at 1, 3, 7, 14, 34, 90 days). Binning (0.871) and log (0.880) did <em>not</em> beat the raw recency (0.883), because logistic regression on a single raw column already catches the main pattern. The ratio feature, which encodes domain knowledge about each customer's own rhythm, gave the only gain: 0.883 to 0.889. This is the typical pattern: <strong>domain ratios beat generic transforms</strong>.</p>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>raw spend:  |#######.......  .   .      .            .     |  long right tail
+log spend:  |    ..#######.....          |                      roughly bell-shaped
+clipped:    |#######.......  .   .  [cap]                 |  tail cut at the 99th percentile</code></pre>
+<p><strong>Connection to the real job.</strong> In credit scoring you bin income and age on purpose (so a scorecard is readable, Chapter 11). In forecasting you take the log of sales so that percentage changes become additive. In logistics, delivery times are right-skewed (a few very late parcels), so you analyse them on a log scale or by percentile.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Data Science: log of amounts for linear models; ratios such as debt-to-income.</li><li>Machine Learning: scaling for neural nets and k-nearest neighbours.</li><li>Finance/BFSI: binning for scorecards, winsorising extreme transactions.</li><li>Analytics: percent change and ratios in KPI design.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Fitting the transformer (mean, λ, quantile cut-offs) on the whole dataset before splitting. The test set must not influence any learned number. Fit on training rows, apply to test rows; a scikit-learn <code>Pipeline</code> (Chapter 6) does this automatically.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why <code>log1p</code> and not <code>log</code>?</li></ol>
+<p>Answer: <code>log(0)</code> is undefined; <code>log1p(0) = 0</code>.</p>
+<ol><li>Do tree models need scaling?</li></ol>
+<p>Answer: no; they only compare thresholds.</p>
+<ol><li>A 99th-percentile clip changes a few values. What does it protect?</li></ol>
+<p>Answer: the model from being dominated by a few extreme values.</p>
+<h2 id="s2-5-2-encoding-categories-and-target-encoding-done-safely">5.2 Encoding Categories (and Target Encoding Done Safely)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A model cannot read "Pune". You must turn the city into numbers. Giving Pune the number 5 and Delhi the number 2 says "Pune is 2.5 times Delhi", which is nonsense. The art of encoding is to give the model the information in the category without inventing an order that is not there.</div></div>
+<p><strong>Words you need</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th><th>Example</th></tr></thead><tbody><tr><td>Cardinality</td><td>Number of distinct categories</td><td><code>city</code>: 6; <code>pincode</code>: about 400</td></tr><tr><td>One-hot</td><td>One 0/1 column per category</td><td><code>plan_pro</code> = 1 for pro</td></tr><tr><td>Ordinal</td><td>Integer codes for a real order</td><td>small = 1, medium = 2, large = 3</td></tr><tr><td>Frequency encoding</td><td>Replace by how common the category is</td><td>Pune = 10.3% of rows</td></tr><tr><td>Target encoding</td><td>Replace by the average target in that category</td><td>pincode 560001 churns 31%</td></tr><tr><td>Hashing</td><td>Map categories into a fixed number of columns by a hash function</td><td>400 pincodes into 16 columns</td></tr></tbody></table></div>
+<p><strong>Choosing an encoding</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Cardinality</th><th>Order exists?</th><th>Good choice</th></tr></thead><tbody><tr><td>2 to about 15</td><td>no</td><td>one-hot</td></tr><tr><td>any</td><td>yes (sizes, grades)</td><td>ordinal</td></tr><tr><td>15 to thousands</td><td>no</td><td>frequency, target encoding (with care), hashing, or embeddings</td></tr><tr><td>huge (user_id)</td><td>no</td><td>usually do not use the id; use aggregates (Chapter 6); or learned embeddings</td></tr></tbody></table></div>
+<p>For rare categories, group everything below a count (for example under 5 rows) into "other".</p>
+<p><strong>Run the simple ones.</strong></p>
+<pre class="code lang-python"><code>print(d.city.value_counts().to_dict())
+oh = pd.get_dummies(d[["plan", "channel"]], drop_first=True); print("one-hot columns:", list(oh.columns))
+freq = d.city.map(d.city.value_counts(normalize=True)); print("frequency encoding Pune:", round(freq[d.city == "Pune"].iloc[0], 3))</code></pre>
+<pre class="code lang-text"><code>{'Other': 526, 'Mumbai': 525, 'Bengaluru': 504, 'Delhi': 497, 'Pune': 264, 'Chennai': 246}
+one-hot columns: ['plan_pro', 'channel_organic', 'channel_referral']
+frequency encoding Pune: 0.103</code></pre>
+<p><code>drop_first=True</code> removes one column per feature (<code>plan_free</code>, <code>channel_ads</code>): it is implied when the others are 0, and keeping all would make columns perfectly dependent. Pune frequency is 264 / 2,562 = 0.103.</p>
+<p><strong>Target encoding, and why it can cheat.</strong> Replace each category by the mean of the target in that category. It is powerful for high-cardinality columns, but dangerous: for a category with 3 rows, the mean <em>contains the row's own label</em>. The model will learn "the encoded value tells the label" on training data, which does not hold on new data. This is leakage through the encoder.</p>
+<p>We create a <code>pincode</code> column with about 400 levels and <em>no real relationship with churn</em> (random). A safe method must give test AUC about 0.5.</p>
+<p class="problem"><span class="pl">Problem 5.2.1</span> Compare three encoders: naive, out-of-fold with smoothing, and scikit-learn's <code>TargetEncoder</code> (which uses internal cross-fitting). We feed each encoded column alone into a logistic regression.</p>
+<table class="steps"><tr><th>Step 1</th><td>Naive: mean churn per pincode computed on the training rows, applied to the same training rows.</td></tr><tr><th>Step 2</th><td>Out-of-fold (OOF): split training rows into 5 folds; encode each fold using the means from the other 4 folds, so a row never sees its own label. Add <em>smoothing</em>: <code>encoded = (sum + m × global_mean) / (count + m)</code> with <code>m = 20</code>, which pulls small categories toward the global mean.</td></tr><tr><th>Step 3</th><td>Compare train and test AUC.</td></tr></table>
+<pre class="code lang-python"><code>rng = np.random.default_rng(5)
+d["pincode"] = rng.integers(0, 400, len(d)).astype(str)          # random: no signal
+tr, te = train_test_split(d, test_size=0.3, random_state=0, stratify=d.churn)
+means = tr.groupby("pincode").churn.mean(); gm = tr.churn.mean()
+tr_naive = tr.pincode.map(means); te_naive = te.pincode.map(means).fillna(gm)
+
+from sklearn.model_selection import KFold
+def oof_te(train, test, col="pincode", k=5, smooth=20, seed=0):
+    gm = train.churn.mean(); out = pd.Series(index=train.index, dtype=float)
+    for a, b in KFold(k, shuffle=True, random_state=seed).split(train):
+        s = train.iloc[a].groupby(col).churn.agg(["sum", "count"])
+        enc = (s["sum"] + smooth * gm) / (s["count"] + smooth)
+        out.iloc[b] = train.iloc[b][col].map(enc).fillna(gm).values
+    s = train.groupby(col).churn.agg(["sum", "count"]); enc = (s["sum"] + smooth * gm) / (s["count"] + smooth)
+    return out, test[col].map(enc).fillna(gm)
+
+def single_auc(a_tr, a_te):
+    m = LogisticRegression(max_iter=1000).fit(np.c_[a_tr], tr.churn)
+    return (round(roc_auc_score(tr.churn, m.predict_proba(np.c_[a_tr])[:, 1]), 3),
+            round(roc_auc_score(te.churn, m.predict_proba(np.c_[a_te])[:, 1]), 3))
+print("levels:", d.pincode.nunique(), " mean rows per level (train):", round(len(tr) / 400, 1))
+print("naive TE  train AUC, test AUC:", single_auc(tr_naive, te_naive))
+a_tr, a_te = oof_te(tr, te)
+print("OOF+smooth TE train AUC, test AUC:", single_auc(a_tr, a_te))
+from sklearn.preprocessing import TargetEncoder
+te_sk = TargetEncoder(target_type="binary", random_state=0)
+print("sklearn TargetEncoder train, test AUC:",
+      single_auc(te_sk.fit_transform(tr[["pincode"]], tr.churn).ravel(), te_sk.transform(te[["pincode"]]).ravel()))</code></pre>
+<pre class="code lang-text"><code>levels: 396  mean rows per level (train): 4.5
+naive TE  train AUC, test AUC: (0.812, 0.476)
+OOF+smooth TE train AUC, test AUC: (0.531, 0.469)
+sklearn TargetEncoder train, test AUC: (0.529, 0.474)</code></pre>
+<ul><li><strong>Answer</strong> The naive encoder reports train AUC 0.812 for a column that contains <em>no signal</em>, and 0.476 on test (no better than a coin flip). The out-of-fold and scikit-learn encoders give about 0.53 on train and 0.47 on test: honest, "no signal here".</li><li><strong>Check</strong> Since the column was random, true AUC must be 0.5; test AUC near 0.47 is noise (test set has only about 195 churners, so standard error of AUC is about 0.02 to 0.03). The naive train AUC of 0.81 is impossible for random data without cheating.</li><li><strong>Why it matters</strong> In a notebook with a random split, a naive target encoder on a real high-cardinality column (merchant id, pincode) can inflate offline AUC and hurt production. Rule: <em>always encode the training rows out-of-fold; encode validation/test/serving rows with means from all training rows.</em></li></ul>
+<p><strong>Smoothing by hand.</strong> A pincode has 3 training rows with churn [1, 0, 1]. Raw mean = 2/3 = 0.667. With global mean 0.254 and m = 20: <code>(2 + 20 × 0.254) / (3 + 20) = (2 + 5.08) / 23 = 0.308</code>. The small group is pulled almost to the global rate because 3 rows is weak evidence. A pincode with 300 rows would barely move.</p>
+<p><strong>Hashing and learned embeddings.</strong> <code>FeatureHasher(n_features=16)</code> maps each pincode to one of 16 columns by a hash, with no lookup table and a fixed size; different pincodes can collide, which is accepted. <em>Embeddings</em> are small learned vectors for each category (used in neural networks and recommenders, Chapter 10 and <code>study/ml/</code>).</p>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>Naive target encoding (category with 3 rows)   row's own label inside its own feature
+   label y=1  -&gt; encoded = mean(1,0,1) = 0.667   the model "sees" y
+
+Out-of-fold:  rows of fold 3 are encoded with means from folds 1,2,4,5 only
+   fold1 fold2 fold3 fold4 fold5
+          |&lt;- statistics come from the other folds -&gt;|</code></pre>
+<p><strong>Connection to the real job.</strong> Credit and fraud models have merchant, device and pincode columns with thousands of levels. Competitions are won and lost on safe target encoding. In interviews: "how do you encode a high-cardinality categorical?" has the OOF answer.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Fraud: merchant and device categories (hashing, OOF target encoding).</li><li>E-commerce: product category, brand (frequency, embeddings).</li><li>Telecom: plan type, tower id.</li><li>Healthcare: diagnosis codes (grouped, embedded).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Target encoding on the whole dataset before splitting, or encoding training rows with their own labels. Symptoms: huge train score, mediocre validation. A second mistake: ordinal-coding an unordered category (Pune = 5), which invents an order.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why <code>drop_first=True</code>?</li></ol>
+<p>Answer: one column is implied by the others; keeping all makes columns perfectly dependent.</p>
+<ol><li>What does smoothing do?</li></ol>
+<p>Answer: pulls small categories' encoded values toward the global mean.</p>
+<ol><li>How is a training row encoded in OOF target encoding?</li></ol>
+<p>Answer: using statistics from other folds, never its own label.</p>
+<h2 id="s3-5-3-dates-cycles-and-missing-value-indicators">5.3 Dates, Cycles and Missing-Value Indicators</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A timestamp like "2025-03-04 20:15" carries many hidden facts: a Tuesday, evening, month end, near a festival. The model cannot see them in a raw date. You unpack the date into the facts a human would use. And hours are a clock, not a line: 11 pm and midnight are neighbours.</div></div>
+<p><strong>Typical date features</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Feature</th><th>Code</th><th>Why</th></tr></thead><tbody><tr><td>year, month, day of week, hour</td><td><code>ts.dt.month</code>, <code>ts.dt.dayofweek</code>, <code>ts.dt.hour</code></td><td>calendar effects</td></tr><tr><td>is_weekend, is_month_end, is_payday</td><td>boolean</td><td>salary-day shopping</td></tr><tr><td>is_holiday, days to next holiday</td><td>from a calendar list</td><td>Diwali, Holi, Eid, IPL season, sale events</td></tr><tr><td>days since an event</td><td><code>(T - event_date).dt.days</code></td><td>recency, tenure</td></tr><tr><td>time to next event</td><td><code>(next_event - T).dt.days</code></td><td>days until contract renewal</td></tr><tr><td>cyclical encoding</td><td>sin and cos of the angle</td><td>hour, day, month wrap around</td></tr></tbody></table></div>
+<p><strong>Holiday features.</strong> Keep a calendar table with date, name and region. Holidays differ across Indian states and religions, and festival dates move every year (check an official calendar; the dates below are an example, not a reference).</p>
+<pre class="code lang-python"><code>cal = pd.DataFrame({"date": pd.date_range("2024-10-28", "2024-11-03")})
+hol = pd.to_datetime(["2024-10-31", "2024-11-01"])        # example festival dates; verify with an official calendar
+cal["dow"] = cal.date.dt.day_name().str[:3]
+cal["is_weekend"] = (cal.date.dt.dayofweek &gt;= 5).astype(int)
+cal["is_holiday"] = cal.date.isin(hol).astype(int)
+nxt = cal.date.map(lambda t: min([x for x in hol if x &gt;= t], default=pd.NaT))
+cal["days_to_next_holiday"] = (nxt - cal.date).dt.days
+print(cal.to_string(index=False))</code></pre>
+<pre class="code lang-text"><code>      date dow  is_weekend  is_holiday  days_to_next_holiday
+2024-10-28 Mon           0           0                   3.0
+2024-10-29 Tue           0           0                   2.0
+2024-10-30 Wed           0           0                   1.0
+2024-10-31 Thu           0           1                   0.0
+2024-11-01 Fri           0           1                   0.0
+2024-11-02 Sat           1           0                   NaN
+2024-11-03 Sun           1           0                   NaN</code></pre>
+<p>(Read the columns by name: on 31 Oct, <code>is_weekend</code> is 0 and <code>is_holiday</code> is 1.) The countdown <code>3, 2, 1, 0</code> lets a model see demand building before a festival. After the last known holiday the value is <code>NaN</code>: you must supply the full calendar for the period you predict.</p>
+<p><strong>Cyclical encoding.</strong> Hours run 0 to 23, then wrap to 0. As a plain number, 23 and 0 are 23 apart, which is wrong. Map hour h to a point on a circle: <code>sin_h = sin(2π h / 24)</code>, <code>cos_h = cos(2π h / 24)</code>.</p>
+<p class="problem"><span class="pl">Problem 5.3.1</span> Compute the distance between hour 23 and hour 0, and between hour 1 and hour 0, in raw form and on the circle.</p>
+<table class="steps"><tr><th>Formula</th><td>point(h) = (sin(2πh/24), cos(2πh/24)); distance = straight-line distance between points</td></tr><tr><th>Plug in</th><td>h = 23: (sin(−15°), cos(−15°)) = (−0.2588, 0.9659); h = 0: (0, 1); h = 1: (0.2588, 0.9659)</td></tr><tr><th>Compute</th><td>distance(23, 0) = √(0.2588² + (1 − 0.9659)²) = √(0.06699 + 0.00116) = √0.06815 = 0.261. The same for hour 1 vs hour 0 by symmetry.</td></tr><tr><th>Answer</th><td>On the circle, 23 and 0 are as close as 1 and 0 (0.261 each); as raw numbers they are 23 apart versus 1 apart.</td></tr><tr><th>Check</th><td>Chord for a 15° angle on a unit circle = <code>2 sin(7.5°) = 2 × 0.1305 = 0.261</code> ✓; the code printed 0.261 for both.</td></tr><tr><th>Why it matters</th><td>A model with raw hour cannot learn "midnight and 11 pm are alike". Cyclical features fix it for hours, weekdays and months.</td></tr></table>
+<p class="problem"><span class="pl">Problem 5.3.2</span> Does it matter? We simulate two weeks of hourly order volume for an online shop that peaks at 8 pm, and fit a straight-line regression using (a) the raw hour and (b) sin/cos.</p>
+<pre class="code lang-python"><code>hrs = pd.date_range("2025-03-03", periods=24 * 14, freq="h")
+h = hrs.hour.values
+rng = np.random.default_rng(1)
+load = 200 + 150 * np.sin(2 * np.pi * (h - 14) / 24) + rng.normal(0, 15, len(h))   # peak at 20:00
+ev = pd.DataFrame({"hour": h, "load": load})
+ev["sin_h"] = np.sin(2 * np.pi * h / 24); ev["cos_h"] = np.cos(2 * np.pi * h / 24)
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import r2_score
+m1 = LinearRegression().fit(ev[["hour"]], ev.load); print("R2 linear on raw hour :", round(r2_score(ev.load, m1.predict(ev[["hour"]])), 3))
+m2 = LinearRegression().fit(ev[["sin_h", "cos_h"]], ev.load); print("R2 linear on sin/cos  :", round(r2_score(ev.load, m2.predict(ev[["sin_h", "cos_h"]])), 3))</code></pre>
+<pre class="code lang-text"><code>R2 linear on raw hour : 0.388
+R2 linear on sin/cos  : 0.984</code></pre>
+<ul><li><strong>Answer</strong> A linear model explains 38.8% of the variance from the raw hour but 98.4% from sin and cos.</li><li><strong>Check</strong> R² (R-squared) is the share of variance explained, 1 is perfect. Because the true pattern is a sine wave plus noise (sd 15 against amplitude 150), 98% is the right ceiling.</li><li><strong>Why it matters</strong> The right encoding made a plain linear model nearly perfect. Tree models can approximate cycles by splitting, but they need more data to do so.</li></ul>
+<p><strong>Missing-value indicators.</strong> Missingness is often informative (Chapter 3: age missing for 14.9% of churners vs 4.4% of stayers). Add <code>is_missing</code> next to the imputed value. We test with age only (median filled), using 5-fold cross-validation (the average of five train/test splits), because on a single split this weak signal is too noisy: on our seed-0 split the AUC went 0.563 to 0.466 by luck.</p>
+<pre class="code lang-python"><code>from sklearn.model_selection import cross_val_score, StratifiedKFold
+cv = StratifiedKFold(5, shuffle=True, random_state=0)
+for cols in (["age_imp"], ["age_imp", "age_missing"], ["age_missing"]):
+    s = cross_val_score(LogisticRegression(max_iter=2000), d[cols], d.churn, cv=cv, scoring="roc_auc")
+    print(cols, s.round(3), s.mean().round(3))</code></pre>
+<pre class="code lang-text"><code>['age_imp'] [0.563 0.548 0.532 0.505 0.479] 0.525
+['age_imp', 'age_missing'] [0.574 0.606 0.579 0.552 0.522] 0.567
+['age_missing'] [0.52  0.566 0.556 0.553 0.54 ] 0.547</code></pre>
+<p>The two helper columns come from the Chapter 3 plant (seed 11) like this:</p>
+<pre class="code lang-python"><code>r = np.random.default_rng(11)
+d["age_raw"] = d.age.copy()
+d.loc[r.random(len(d)) &lt; 0.07, "age_raw"] = -1
+d.loc[r.random(len(d)) &lt; np.where(d.churn == 1, 0.18, 0.05), "age_raw"] = np.nan
+d["age_clean"] = d.age_raw.replace(-1, np.nan)          # -1 is a default code, so it becomes missing
+d["age_missing"] = d.age_clean.isna().astype(int)
+d["age_imp"] = d.age_clean.fillna(d.age_clean.median())</code></pre>
+<ul><li><strong>Answer</strong> Age alone is barely better than chance (0.525), the missing flag alone gives 0.547, and both give 0.567. The <em>blank</em> is more useful than the <em>value</em>.</li><li><strong>Check</strong> The five fold scores for each model vary by about 0.05, so differences of 0.01 are noise; 0.525 to 0.567 is a stable gain across all five folds.</li><li><strong>Why it matters</strong> If you only impute and forget the flag, you throw away the signal. Also: when a result is weak, use cross-validation, not one lucky split.</li></ul>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>hour as a line:   0 ---- 6 ---- 12 ---- 18 ---- 23         23 and 0 far apart (wrong)
+hour as a circle:        6
+                   0 +-------+ 12      23 and 0 are neighbours (right)
+                        18</code></pre>
+<p><strong>Connection to the real job.</strong> Demand, traffic and load all have daily and weekly rhythms, so calendar features are the first thing to add in forecasting (Chapter 9). For delivery or waiting-time work, hour-of-day, day-of-week and "is a sale day" are classic features to explain delays.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Forecasting: day of week, month, festival flags, payday.</li><li>E-commerce: "days to sale event", seasonality.</li><li>AIOps: hour/weekday patterns in load and incidents.</li><li>Telecom and banking: time since last transaction, time to contract end.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using the <em>future</em> calendar in the wrong way, or computing "days since last holiday" with a calendar that already includes dates after T. Holidays are known in advance, so "days to next holiday" is allowed; "orders on the next holiday" is not. Another mistake: ignoring time zones, which shifts events by a day.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why use sin and cos for hours?</li></ol>
+<p>Answer: hours wrap around, so 23 and 0 should be close.</p>
+<ol><li>Is "days to next holiday" leakage?</li></ol>
+<p>Answer: no, holiday dates are known in advance.</p>
+<ol><li>Why keep a missing flag after imputing?</li></ol>
+<p>Answer: the fact that a value was missing may predict the target.</p>
+<h2 id="s4-5-4-text-and-geo-features">5.4 Text and Geo Features</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A support ticket is a paragraph of words; a customer is a point on a map. A model needs numbers. For text, you can count simple things (length, urgent words) or give each word a weight by how special it is (TF-IDF). For places, you can use distances ("how far is the nearest warehouse?") and areas, because "near" is what matters, not raw latitude numbers.</div></div>
+<p><strong>Text features, from simple to rich</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Level</th><th>Idea</th><th>Example</th></tr></thead><tbody><tr><td>Simple counts</td><td>length, number of words, <code>!</code> marks, contains "urgent"</td><td><code>n_chars</code>, <code>has_urgent</code></td></tr><tr><td>Bag of words</td><td>one column per word, value = count</td><td>"refund" appears 1 time</td></tr><tr><td>TF-IDF</td><td>count × how rare the word is across tickets</td><td>"refund" has more weight than "please"</td></tr><tr><td>Embeddings</td><td>a dense vector learned by a language model, close meanings = close vectors</td><td>semantic search (<code>study/ml/</code>, Deep Learning documents)</td></tr></tbody></table></div>
+<p><em>TF-IDF</em> stands for term frequency, inverse document frequency: <code>tfidf(w, doc) = count(w in doc) × log(N / number of docs containing w)</code> (scikit-learn uses a smoothed version). Words that appear in every document ("please") get weight near 0; rare, specific words get larger weight.</p>
+<p class="problem"><span class="pl">Problem 5.4.1</span> We generate 3,000 synthetic tickets; 30% are refund requests (words like "refund", "money back", "charged twice"), the rest are other topics, with filler words. Compare length features with TF-IDF for predicting <code>refund</code>.</p>
+<pre class="code lang-python"><code>rs = np.random.default_rng(3)
+refund_w = ["refund", "money back", "cancel order", "charged twice", "reimburse"]
+other_w = ["login", "password", "delivery late", "app crash", "address change", "invoice copy", "update phone"]
+filler = ["please", "help", "urgent", "hello", "thanks", "I am", "since morning", "again", "very", "support"]
+rows = []
+for i in range(3000):
+    y = rs.random() &lt; 0.3
+    words = list(rs.choice(refund_w if y else other_w, 1)) + list(rs.choice(other_w, 1)) + list(rs.choice(filler, rs.integers(3, 9)))
+    if y and rs.random() &lt; 0.3: words = words[1:]
+    rs.shuffle(words); rows.append((" ".join(words), int(y)))
+tk = pd.DataFrame(rows, columns=["text", "refund"])</code></pre>
+<p>Now the features and the two models:</p>
+<pre class="code lang-python"><code>from sklearn.feature_extraction.text import TfidfVectorizer
+tk["n_chars"] = tk.text.str.len(); tk["n_words"] = tk.text.str.split().str.len()
+tk["has_urgent"] = tk.text.str.contains("urgent").astype(int)
+ttr, tte = train_test_split(tk, test_size=0.3, random_state=0)
+cols = ["n_chars", "n_words", "has_urgent"]
+m = LogisticRegression(max_iter=1000).fit(ttr[cols], ttr.refund)
+print("text: length/count features AUC:", round(roc_auc_score(tte.refund, m.predict_proba(tte[cols])[:, 1]), 3))
+tf = TfidfVectorizer(ngram_range=(1, 2), min_df=3).fit(ttr.text)
+m = LogisticRegression(max_iter=1000).fit(tf.transform(ttr.text), ttr.refund)
+print("text: TF-IDF AUC:", round(roc_auc_score(tte.refund, m.predict_proba(tf.transform(tte.text))[:, 1]), 3), " vocab size", len(tf.vocabulary_))
+coef = pd.Series(m.coef_[0], index=tf.get_feature_names_out()).sort_values(ascending=False)
+print("top words:", coef.head(5).round(2).to_dict())</code></pre>
+<pre class="code lang-text"><code>text: length/count features AUC: 0.609
+text: TF-IDF AUC: 0.99  vocab size 439
+top words: {'reimburse': 4.96, 'refund': 4.76, 'money back': 2.68, 'back': 2.68, 'money': 2.68}</code></pre>
+<p>The tickets, for example <code>'very please password I am very refund'</code>, are made by this generator (each ticket is one topic phrase, one extra phrase and some filler words in random order; refund tickets sometimes lose their refund phrase, which adds noise):</p>
+<ul><li><strong>Answer</strong> Length features give AUC 0.609; TF-IDF gives 0.990, and the model's top words are exactly the refund words.</li><li><strong>Check</strong> The top words are <code>reimburse</code>, <code>refund</code>, <code>money back</code>: the model learned the intended pattern. <code>ngram_range=(1, 2)</code> allows two-word phrases such as "money back" (vocabulary of 439 words and pairs). <code>min_df=3</code> ignores words seen in fewer than 3 tickets.</li><li><strong>Why it matters</strong> Cheap length features are a fine baseline, but the words carry the signal. Note that this dataset is easy by design; real tickets have noise, spelling mistakes, Hinglish (Hindi written in English letters) and sarcasm, so expect lower numbers and consider embeddings.</li></ul>
+<p><strong>Fit the vectoriser on training text only</strong>, like any transformer: the vocabulary and the rarity weights are learned numbers.</p>
+<p><strong>Geo features.</strong> Latitude and longitude are not good raw features (a model would need to learn curved geography). Better:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Feature</th><th>How</th><th>Example</th></tr></thead><tbody><tr><td>Distance</td><td>haversine (great-circle distance on a sphere)</td><td>km to nearest warehouse, store, branch</td></tr><tr><td>Region labels</td><td>state, city, pincode (encode as in 5.2)</td><td>"Maharashtra"</td></tr><tr><td>Clusters</td><td>k-means on coordinates</td><td>customer hot-spots</td></tr><tr><td>Grid cells</td><td>round coordinates, or geohash / H3 hexagons</td><td>one id per 0.1-degree cell</td></tr><tr><td>Density</td><td>number of points per cell</td><td>orders per cell in the last 30 days</td></tr></tbody></table></div>
+<p>Haversine formula: <code>a = sin²(Δφ/2) + cos φ₁ cos φ₂ sin²(Δλ/2)</code>, <code>distance = 2R arcsin(√a)</code> with R = 6,371 km, φ latitude and λ longitude in radians.</p>
+<pre class="code lang-python"><code>def haversine(lat1, lon1, lat2, lon2, R=6371.0):
+    p1, p2 = np.radians(lat1), np.radians(lat2); dphi = p2 - p1; dl = np.radians(lon2 - lon1)
+    a = np.sin(dphi / 2) ** 2 + np.cos(p1) * np.cos(p2) * np.sin(dl / 2) ** 2
+    return 2 * R * np.arcsin(np.sqrt(a))
+print("Mumbai-Pune km:", round(float(haversine(19.0760, 72.8777, 18.5204, 73.8567)), 1))
+print("Delhi-Bengaluru km:", round(float(haversine(28.6139, 77.2090, 12.9716, 77.5946)), 1))</code></pre>
+<pre class="code lang-text"><code>Mumbai-Pune km: 120.2
+Delhi-Bengaluru km: 1739.8</code></pre>
+<p class="problem"><span class="pl">Problem 5.4.2</span> Build "distance to nearest warehouse" for 600 customers spread around Mumbai, Delhi and Bengaluru, with warehouses near Mumbai (19.2, 72.9) and Delhi (28.5, 77.3). Then cluster the customers and put them in 0.1-degree grid cells.</p>
+<pre class="code lang-python"><code>g = np.random.default_rng(4)
+centers = np.array([[19.07, 72.88], [28.61, 77.21], [12.97, 77.59]])
+pts = np.vstack([c0 + g.normal(0, 0.15, (200, 2)) for c0 in centers])
+wh = np.array([[19.2, 72.9], [28.5, 77.3]])
+dist = np.min([haversine(pts[:, 0], pts[:, 1], w[0], w[1]) for w in wh], axis=0)
+print("median km", round(float(np.median(dist)), 1), " Bengaluru-cluster median", round(float(np.median(dist[400:])), 0))
+from sklearn.cluster import KMeans
+km = KMeans(3, n_init=10, random_state=0).fit(pts)
+print("KMeans cluster sizes:", np.bincount(km.labels_).tolist())
+cell = (np.floor(pts[:, 0] * 10) / 10).astype(str) + "_" + (np.floor(pts[:, 1] * 10) / 10).astype(str)
+print("grid cells of 0.1 degree:", len(set(cell)), "for", len(pts), "points")</code></pre>
+<pre class="code lang-text"><code>median km 31.0  Bengaluru-cluster median 855.0
+KMeans cluster sizes: [200, 200, 200]
+grid cells of 0.1 degree: 151 for 600 points</code></pre>
+<ul><li><strong>Answer</strong> The median customer is 31 km from the nearest warehouse; Bengaluru customers are about 855 km from the nearest one (Mumbai), which is a strong "too far to deliver quickly" feature. K-means recovers the three cities exactly (200 each). The 600 points fall in 151 grid cells, i.e. about 4 per cell.</li><li><strong>Check</strong> The distances make geographic sense: Bengaluru to Mumbai is about 840 km by air; our median of 855 km includes points up to 0.15 degrees away.</li><li><strong>Why it matters</strong> Delivery time, shipping cost and fraud ("billing address far from delivery address") are all distance features. H3 (a hexagon grid system) and geohash (a string code per rectangle) work like our grid cells but nest at several sizes; they were not run here (<code>h3</code> library not installed). Responsible use: location is sensitive personal data (Chapter 2); use coarse cells where possible.</li></ul>
+<p><strong>Connection to the real job.</strong> Ticket routing and review mining use text features; delivery, ride-hailing and quick-commerce use geo features all day. A typical interview exercise: "build features for ETA prediction": distance, time of day, weather, restaurant prep time.</p>
+<p><strong>Applications</strong></p>
+<ul><li>NLP in business: ticket classification, review sentiment, invoice field extraction.</li><li>Logistics: distance, route and zone features for ETA.</li><li>Fraud: address mismatch distance, impossible travel between two card swipes.</li><li>Real estate and retail: location density, footfall.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Fitting TF-IDF on all text (including test) and using raw latitude/longitude as numbers. The first leaks the vocabulary; the second hides distance relationships. Also never treat ZIP codes or pincodes as numbers: 560001 is not "bigger" than 400001 in any useful way.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which has more weight in TF-IDF: "please" or "refund"?</li></ol>
+<p>Answer: "refund", because it is rarer across documents.</p>
+<ol><li>Why use haversine and not plain subtraction of coordinates?</li></ol>
+<p>Answer: the Earth is a sphere; degrees of longitude shrink away from the equator.</p>
+<ol><li>Name two ways to turn coordinates into categories.</li></ol>
+<p>Answer: grid cells or geohash/H3; k-means clusters.</p>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>Features are the highest-leverage skill on tabular data; ask what a human expert would look at.</li><li>Skewed numbers: log1p, sqrt or Yeo-Johnson (spend skew 2.17 became -0.03); clip real outliers; fit all learned values on the training rows only.</li><li>Generic transforms did not help our model (binning 0.871, log 0.880 versus 0.883); a domain ratio did (0.889).</li><li>Encode categories by cardinality: one-hot (small), ordinal (real order), frequency, hashing, embeddings, or target encoding (large).</li><li>Target encoding must be out-of-fold and smoothed: naive gave train AUC 0.812 on a random column; safe versions gave 0.53 and honest test 0.47.</li><li>Unpack dates into calendar and event features; encode cycles with sin and cos (R-squared 0.388 to 0.984).</li><li>Keep missing-value flags: age flag lifted cross-validated AUC from 0.525 to 0.567.</li><li>Text: start with counts, then TF-IDF (0.609 to 0.990 on an easy task); fit on train only.</li><li>Geo: distances (haversine), clusters and grid cells rather than raw coordinates.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Task</th><th>Pattern</th><th>Example</th></tr></thead><tbody><tr><td>Log of skewed value</td><td><code>np.log1p(x)</code></td><td>skew 2.17 to -0.43</td></tr><tr><td>Clip outliers</td><td><code>x.clip(q01, q99)</code></td><td>max 41,357 to 24,601</td></tr><tr><td>Quantile bins</td><td><code>KBinsDiscretizer(5, strategy="quantile")</code></td><td>edges 1, 3, 7, 14, 34, 90</td></tr><tr><td>One-hot</td><td><code>pd.get_dummies(df, drop_first=True)</code></td><td><code>plan_pro</code></td></tr><tr><td>Smoothed target mean</td><td><code>(sum + m·gm) / (count + m)</code></td><td>(2 + 20×0.254)/23 = 0.308</td></tr><tr><td>OOF encoding</td><td>encode fold k with other folds</td><td>KFold(5)</td></tr><tr><td>Cyclical</td><td><code>sin(2πh/24)</code>, <code>cos(2πh/24)</code></td><td>23 and 0 distance 0.261</td></tr><tr><td>TF-IDF</td><td><code>TfidfVectorizer(ngram_range=(1,2), min_df=3)</code></td><td>AUC 0.99</td></tr><tr><td>Haversine</td><td><code>2R·arcsin(√a)</code>, R = 6371</td><td>Mumbai-Pune 120.2 km</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 5.P.1</span> (easy) Compute <code>log1p(19)</code>. <strong>Answer:</strong> ln(20) = 2.996.</p>
+<p class="problem"><span class="pl">Problem 5.P.2</span> (easy) A city appears in 150 of 1,000 rows. What is its frequency encoding? <strong>Answer:</strong> 0.15.</p>
+<p class="problem"><span class="pl">Problem 5.P.3</span> (easy) How many columns does one-hot encoding of <code>channel</code> (3 levels) create with <code>drop_first=True</code>? <strong>Answer:</strong> 2.</p>
+<p class="problem"><span class="pl">Problem 5.P.4</span> (medium) A category has 5 rows with churn [1, 1, 0, 1, 0]; global mean 0.25; smoothing m = 10. Smoothed encoding? <strong>Answer:</strong> (3 + 10 × 0.25) / (5 + 10) = 5.5 / 15 = 0.367.</p>
+<p class="problem"><span class="pl">Problem 5.P.5</span> (medium) What is the output? <code>np.sin(2*np.pi*6/24).round(1)</code> and <code>np.cos(2*np.pi*6/24).round(1)</code>. <strong>Answer:</strong> 1.0 and 0.0 (hour 6 is at 90 degrees on the circle).</p>
+<p class="problem"><span class="pl">Problem 5.P.6</span> (medium) Find the bug: <code>te = TargetEncoder().fit_transform(X_all, y_all)</code> then split into train and test. <strong>Answer:</strong> The encoder saw all labels, including those of test rows (leakage). Split first, fit the encoder on training rows, and use <code>fit_transform</code> (cross-fitted) for train and <code>transform</code> for test.</p>
+<p class="problem"><span class="pl">Problem 5.P.7</span> (medium) A feature <code>days_to_next_holiday</code> is computed using a calendar that is published in advance. Is it leakage? What if the calendar is built from "days with unusually high sales"? <strong>Answer:</strong> The official calendar is fine (known before T). A calendar built from sales is leakage (it uses the outcome).</p>
+<p class="problem"><span class="pl">Problem 5.P.8</span> (hard) Distance between two points on the equator, longitudes 72.0 and 73.0, same latitude 0. Use haversine. <strong>Answer:</strong> Δφ = 0, Δλ = 1° = 0.017453 rad; a = sin²(0.0087266) = 7.6154e-5; √a = 0.0087266; distance = 2 × 6371 × 0.0087266 = 111.19 km.</p>
+<p class="problem"><span class="pl">Problem 5.P.9</span> (interview) "How do you handle a categorical column with 50,000 levels?" <strong>Answer:</strong> Do not one-hot it. Group rare levels, then use frequency encoding, out-of-fold smoothed target encoding, hashing, or embeddings. Check train versus validation gap to catch leakage, and handle unseen levels at serving by falling back to the global mean.</p>
+<p class="problem"><span class="pl">Problem 5.P.10</span> (interview) "You have a timestamp column. What features do you create for a demand model?" <strong>Answer:</strong> Hour, day of week, month, weekend, month end, payday, holiday flag and days to next holiday, days since last event, cyclical sin/cos for hour and month, and lag features (Chapter 6, Chapter 9). I would check time zone first and make sure every feature uses only information available at the prediction time.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional at an Indian MNC moving into data science, and English is my second language. Teach me numeric feature transformations (log1p, sqrt, Yeo-Johnson, clipping, binning, scaling, ratios) step by step with a small table of order amounts. For each transform tell me when it helps and when it does not, and ask me one check question before moving on.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Topic: "categorical encoding and safe target encoding (out-of-fold, smoothing)". Explain with a tiny table of 12 rows with a pincode column, compute a naive and an out-of-fold smoothed encoding by hand, and show me why the naive one leaks. Then give me 6 exercises, without solutions, that I will answer and you will grade.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional new to data science. Topic: "date, holiday and cyclical features, and missing-value indicators". Quiz me one question at a time using Indian examples (Diwali, payday, IPL season, hourly web traffic). Include numeric questions on sin/cos encoding and on whether a feature leaks. Wait for my answer, grade it, and explain. Ask 10 questions.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Review my feature engineering plan below for a prediction problem. Check each feature for: when the value is known compared with the prediction time, leakage through encoders or scalers fitted on all data, treatment of missing values, handling of unseen categories and sensible use of text or location data. Suggest concrete fixes in simple English. My plan: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for data science interviews in India. Run a mock interview on feature engineering: "encode a 50,000-level categorical", "features from a timestamp", "features for delivery ETA", "why did your validation AUC drop in production". Ask one question at a time, score me out of 10, give a model answer and one follow-up. Do 8 rounds.</pre></div><div class="readbtn"><button class="btn" data-read="study:ds:ch05">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch04.html">← Chapter 4: Statistical Thinking: Ways Data Fools Yo</a><a class="btn" href="ch06.html">Chapter 6: Feature Engineering II: Behavioural Feat →</a></div></div><script src="../../assets/study.js"></script></body></html>

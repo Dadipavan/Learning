@@ -1,0 +1,465 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 12: Analytics SQL Patterns</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">SQL &amp; Databases Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 12</div><h1>Analytics SQL Patterns</h1><p>Funnels, cohort retention, RFM, MoM and YoY, sessionization, deduplication and data-quality queries: the questions every analyst is asked in the first month of a job.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-12-1-funnel-analysis-and-churn">12.1 Funnel Analysis and Churn</a></li><li><a href="#s2-12-2-cohort-retention">12.2 Cohort Retention</a></li><li><a href="#s3-12-3-rfm-segmentation-and-customer-lifetime-value">12.3 RFM Segmentation and Customer Lifetime Value</a></li><li><a href="#s4-12-4-period-over-period-running-totals-mom-and-yoy">12.4 Period-over-Period: Running Totals, MoM and YoY</a></li><li><a href="#s5-12-5-sessionization-and-gaps-and-islands">12.5 Sessionization and Gaps and Islands</a></li><li><a href="#s6-12-6-deduplication-late-data-and-data-quality-queries">12.6 Deduplication, Late Data and Data-Quality Queries</a></li><li><a href="#s7-chapter-recap">Chapter recap</a></li><li><a href="#s8-practice-set">Practice set</a></li><li><a href="#s9-prompt-pack">Prompt pack</a></li></ol></details><p>A manager never asks "write me a LEFT JOIN". She asks: "Of the people who viewed a product, how many paid?", "Do customers who joined in January still buy in April?", "Who are our best customers?", "Is revenue growing?". Each of these is a known <strong>pattern</strong>: a standard shape of SQL that thousands of analysts reuse. In this chapter you will learn the six most common patterns, built only from tools you already know (joins from Chapter 4, CTEs from Chapter 5, <code>CASE</code> and dates from Chapter 6, window functions from the window chapters). By the end you can answer all the questions above on real data, and check that your answer is not silently wrong.</p>
+<p>We reuse the shop database from Chapter 2 (customers, products, orders, order_items) and add small new tables when a pattern needs them. All outputs below were produced with <code>sqlite3</code>. Date functions differ by database, so each dialect-specific piece is marked and the differences are collected in Chapter 14.</p>
+<h2 id="s1-12-1-funnel-analysis-and-churn">12.1 Funnel Analysis and Churn</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A funnel is a leaking pipe. 100 people enter at the top (view a product). Some leave before the next stage (add to cart), more leave before checkout, and only a few come out at the bottom (pay). The analyst's job is to measure how many are left after each stage, and to find the stage where the pipe leaks most. It is like an online shop checkout: you check how many visitors complete step 1, step 2, step 3.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th></tr></thead><tbody><tr><td>Event</td><td>One row saying "user X did action Y at time T"</td></tr><tr><td>Funnel step</td><td>One stage in the ordered path (view, cart, checkout, pay)</td></tr><tr><td>Conversion rate</td><td>Users who reached a step, divided by users who reached an earlier step, as a percent</td></tr><tr><td>Churn</td><td>A customer who was active in one period and not active in the next</td></tr></tbody></table></div>
+<h3>How it works</h3>
+<ol><li>Turn the event log into <strong>one row per user</strong>, with the first time they did each step (<code>MIN</code> + <code>CASE</code>, the conditional aggregation of Chapter 3).</li><li>Mark a user as "reached step N" only if the earlier steps happened <strong>earlier in time</strong>.</li><li>Count users per step and divide.</li></ol>
+<p>Our running table for this section:</p>
+<pre class="code lang-sql"><code>CREATE TABLE events (user_id INTEGER, event TEXT, ts TEXT);
+INSERT INTO events VALUES
+ (1,'view','2024-05-01 10:00:00'),(1,'cart','2024-05-01 10:05:00'),(1,'checkout','2024-05-01 10:09:00'),(1,'pay','2024-05-01 10:12:00'),
+ (2,'view','2024-05-01 11:00:00'),(2,'cart','2024-05-01 11:30:00'),(2,'checkout','2024-05-01 11:40:00'),
+ (3,'view','2024-05-01 12:00:00'),(3,'cart','2024-05-01 12:02:00'),
+ (4,'view','2024-05-01 13:00:00'),
+ (5,'view','2024-05-01 14:00:00'),(5,'view','2024-05-01 14:01:00'),(5,'cart','2024-05-01 14:03:00'),(5,'checkout','2024-05-01 14:05:00'),(5,'pay','2024-05-01 14:08:00'),
+ (6,'view','2024-05-01 15:00:00'),(6,'pay','2024-05-01 15:02:00');</code></pre>
+<p>User 5 viewed twice (a repeat). User 6 paid without a cart or checkout (maybe a "buy now" link, or a tracking bug).</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 12.1.1</span> (tiny) How many rows and how many distinct users have a <code>view</code> event? Predict: user 5 has two views, so rows and users differ.</p>
+<pre class="code lang-sql"><code>SELECT COUNT(*) AS views_rows, COUNT(DISTINCT user_id) AS viewers
+FROM events WHERE event='view';</code></pre>
+<pre class="code lang-text"><code>views_rows  viewers
+----------  -------
+7           6      </code></pre>
+<ul><li><strong>Answer</strong> 7 rows but 6 people.</li><li><strong>Why it matters</strong> A funnel counts <strong>people</strong>, not events. <code>COUNT(*)</code> would inflate step 1 and make every conversion rate look worse.</li></ul>
+<p class="problem"><span class="pl">Problem 12.1.2</span> Build the strict funnel: a user counts at a step only if all earlier steps happened earlier in time.</p>
+<table class="steps"><tr><th>Step 1</th><td>One row per user with the first time of each step.</td></tr><tr><th>Step 2</th><td>Use <code>CASE</code> to give 1 or 0 for "reached step N in order". A comparison with <code>NULL</code> gives <code>NULL</code>, which is not true, so the <code>ELSE 0</code> catches users who never did the step.</td></tr><tr><th>Step 3</th><td>Sum the 1s, then compute percentages.</td></tr></table>
+<pre class="code lang-sql"><code>WITH t AS (
+ SELECT user_id,
+  MIN(CASE WHEN event='view'     THEN ts END) t_view,
+  MIN(CASE WHEN event='cart'     THEN ts END) t_cart,
+  MIN(CASE WHEN event='checkout' THEN ts END) t_check,
+  MIN(CASE WHEN event='pay'      THEN ts END) t_pay
+ FROM events GROUP BY user_id),
+s AS (
+ SELECT user_id,
+  1 AS s1,
+  CASE WHEN t_cart  &gt; t_view  THEN 1 ELSE 0 END AS s2,
+  CASE WHEN t_check &gt; t_cart  AND t_cart &gt; t_view THEN 1 ELSE 0 END AS s3,
+  CASE WHEN t_pay &gt; t_check AND t_check &gt; t_cart AND t_cart &gt; t_view THEN 1 ELSE 0 END AS s4
+ FROM t),
+c AS (SELECT SUM(s1) a, SUM(s2) b, SUM(s3) c, SUM(s4) d FROM s)
+SELECT 'view' step, a users, 100.0 AS pct_of_top, NULL AS pct_of_prev FROM c
+UNION ALL SELECT 'cart', b, ROUND(100.0*b/a,1), ROUND(100.0*b/a,1) FROM c
+UNION ALL SELECT 'checkout', c, ROUND(100.0*c/a,1), ROUND(100.0*c/b,1) FROM c
+UNION ALL SELECT 'pay', d, ROUND(100.0*d/a,1), ROUND(100.0*d/c,1) FROM c;</code></pre>
+<pre class="code lang-text"><code>step      users  pct_of_top  pct_of_prev
+--------  -----  ----------  -----------
+view      6      100.0                  
+cart      4      66.7        66.7       
+checkout  3      50.0        75.0       
+pay       2      33.3        66.7</code></pre>
+<ul><li><strong>Check by hand</strong> Users 1, 2, 3, 5 carted after viewing: 4. Of those, 1, 2, 5 checked out: 3. Of those, 1 and 5 paid: 2. User 6 paid but is not counted, because the cart and checkout steps are missing.</li><li><strong>Answer</strong> 6 viewers, 4 carted (66.7%), 3 reached checkout (75% of carts), 2 paid (66.7% of checkouts), overall 33.3%.</li><li><strong>Meaning</strong> The biggest leak, as a share of the previous step, is view to cart: 1 in 3 viewers leaves. With real traffic that is where you would start testing.</li></ul>
+<p class="problem"><span class="pl">Problem 12.1.3</span> (combine) Monthly churn from the shop: customers with a paid order in March who have no paid order in April.</p>
+<pre class="code lang-sql"><code>WITH a AS (SELECT DISTINCT customer_id, substr(order_date,1,7) ym
+           FROM orders WHERE status='paid')
+SELECT COUNT(*) AS active_mar,
+  SUM(NOT EXISTS (SELECT 1 FROM a b WHERE b.customer_id=a.customer_id AND b.ym='2024-04')) AS churned,
+  ROUND(100.0*SUM(NOT EXISTS (SELECT 1 FROM a b
+        WHERE b.customer_id=a.customer_id AND b.ym='2024-04'))/COUNT(*),1) AS churn_pct
+FROM a WHERE ym='2024-03';</code></pre>
+<pre class="code lang-text"><code>active_mar  churned  churn_pct
+----------  -------  ---------
+4           1        25.0     </code></pre>
+<ul><li><strong>Check</strong> March buyers: customers 1, 2, 5, 6. April buyers: 1, 2, 4, 5. Only customer 6 is missing in April: 1 of 4, so 25%.</li><li><strong>Answer</strong> Churn from March to April is 25%.</li><li><strong>Meaning</strong> One in four active customers did not come back the next month. <code>NOT EXISTS</code> is the anti-join of Chapter 4. <code>SUM(boolean)</code> works in SQLite and MySQL; in PostgreSQL write <code>SUM(CASE WHEN ... THEN 1 ELSE 0 END)</code> (not run here).</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> 6 users  view   ############################  100%
+ 4 users  cart   ###################           66.7%   (-2 left)
+ 3 users  check  ##############                50.0%   (-1 left)
+ 2 users  pay    #########                     33.3%   (-1 left)</code></pre>
+<p>Each bar is the number of distinct users who reached that step in the correct order. The shorter the next bar, the bigger the leak between the two steps.</p>
+<h3>Connection to the real job</h3>
+<p>Product and marketing analysts get funnel questions weekly. Data engineers build the "one row per user" table once so that dashboards do not recompute it.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> checkout funnel, onboarding funnel, signup funnel.</li><li><strong>Operations:</strong> a hospital visit is a funnel (register, consult, test, pharmacy); the longest queue shows the weak step.</li><li><strong>Data Science:</strong> drop-off rates feed churn-prediction features.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Counting events instead of distinct users, and ignoring the order of steps. User 6 paid without a cart. A sloppy "did they ever pay" count gives 3 payers, the strict funnel gives 2. Decide your rule first, write it down, then query.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why do we use <code>MIN(ts)</code> per step? Answer: to get the first time the user did it, one value per user.</li><li>In 12.1.2, why is <code>pct_of_prev</code> for checkout <code>100.0*c/b</code>? Answer: it divides checkout users (3) by cart users (4) to get 75%.</li><li>What does a user with <code>t_cart</code> NULL get at step 2? Answer: 0, because <code>NULL &gt; t_view</code> is not true and the <code>ELSE</code> branch runs.</li></ol>
+<h2 id="s2-12-2-cohort-retention">12.2 Cohort Retention</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A school follows each admission batch separately. "Of the 2024 batch, how many are still enrolled after 1 year, after 2 years?" You compare batches fairly because each is measured from its own start. A <strong>cohort</strong> is a group of customers who started in the same period. <strong>Retention</strong> is the share of the cohort still active n periods later.</div></div>
+<h3>How it works</h3>
+<ol><li>Find each customer's <strong>cohort</strong>: the month of their first paid order.</li><li>For every later paid month compute <strong>month_n</strong> = months between the cohort month and that month.</li><li>Count distinct customers per (cohort, month_n). Divide by cohort size (month 0).</li></ol>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 12.2.1</span> (tiny) In which month did customers 1 and 2 start? Predict: customer 1's first paid order is 101 (January 10), customer 2's is 102 (January 15).</p>
+<pre class="code lang-sql"><code>SELECT customer_id, MIN(substr(order_date,1,7)) AS cohort
+FROM orders WHERE status='paid' AND customer_id IN (1,2) GROUP BY customer_id;</code></pre>
+<pre class="code lang-text"><code>customer_id  cohort 
+-----------  -------
+1            2024-01
+2            2024-01</code></pre>
+<ul><li><strong>Answer</strong> Both belong to the 2024-01 cohort. <code>substr(order_date,1,7)</code> cuts 'YYYY-MM' from the text date. We reuse this <code>MIN</code> idea in the next problem.</li></ul>
+<p class="problem"><span class="pl">Problem 12.2.2</span> Build the cohort table (months 0 to 3).</p>
+<pre class="code lang-sql"><code>WITH paid AS (
+  SELECT customer_id, substr(order_date,1,7) AS ym
+  FROM orders WHERE status='paid' GROUP BY 1,2),
+first AS (SELECT customer_id, MIN(ym) AS cohort FROM paid GROUP BY customer_id),
+j AS (
+  SELECT f.cohort,
+   (CAST(substr(p.ym,1,4) AS INT)*12 + CAST(substr(p.ym,6,2) AS INT))
+   -(CAST(substr(f.cohort,1,4) AS INT)*12 + CAST(substr(f.cohort,6,2) AS INT)) AS m,
+   p.customer_id
+  FROM paid p JOIN first f USING (customer_id))
+SELECT cohort, COUNT(DISTINCT customer_id) AS size,
+  COUNT(DISTINCT CASE WHEN m=0 THEN customer_id END) AS m0,
+  COUNT(DISTINCT CASE WHEN m=1 THEN customer_id END) AS m1,
+  COUNT(DISTINCT CASE WHEN m=2 THEN customer_id END) AS m2,
+  COUNT(DISTINCT CASE WHEN m=3 THEN customer_id END) AS m3
+FROM j GROUP BY cohort ORDER BY cohort;</code></pre>
+<pre class="code lang-text"><code>cohort   size  m0  m1  m2  m3
+-------  ----  --  --  --  --
+2024-01  2     2   1   2   2 
+2024-02  1     1   0   1   0 
+2024-03  2     2   1   0   0 </code></pre>
+<ul><li><strong>Step 1</strong> Month number = <code>year*12 + month</code> for both dates, then subtract. This avoids a date-difference function that differs by dialect. In PostgreSQL you would use <code>DATE_TRUNC</code> and <code>AGE</code> or the same arithmetic (not run here).</li><li><strong>Check</strong> January cohort is customers 1 and 2. In February only customer 1 bought (m1 = 1). In March both (m2 = 2). In April both (m3 = 2). February cohort is customer 4: bought in February and April (m2 = 1). March cohort is customers 5 and 6: in April only customer 5 (m1 = 1).</li><li><strong>Answer</strong> The January cohort retains 50% in month 1, 100% in months 2 and 3.</li><li><strong>Meaning</strong> Retention does not have to fall every month. Customers skip a month and return.</li></ul>
+<p class="problem"><span class="pl">Problem 12.2.3</span> Turn counts into percent with a window function.</p>
+<pre class="code lang-sql"><code>WITH paid AS (
+  SELECT customer_id, substr(order_date,1,7) AS ym
+  FROM orders WHERE status='paid' GROUP BY 1,2),
+first AS (SELECT customer_id, MIN(ym) AS cohort FROM paid GROUP BY customer_id),
+j AS (
+  SELECT f.cohort,
+   (CAST(substr(p.ym,1,4) AS INT)*12 + CAST(substr(p.ym,6,2) AS INT))
+   -(CAST(substr(f.cohort,1,4) AS INT)*12 + CAST(substr(f.cohort,6,2) AS INT)) AS m,
+   p.customer_id
+  FROM paid p JOIN first f USING (customer_id)),
+c AS (SELECT cohort, m, COUNT(DISTINCT customer_id) n FROM j GROUP BY 1,2)
+SELECT cohort, m AS month_n, n,
+  ROUND(100.0*n/FIRST_VALUE(n) OVER (PARTITION BY cohort ORDER BY m),0) AS retention_pct
+FROM c ORDER BY cohort, m;</code></pre>
+<pre class="code lang-text"><code>cohort   month_n  n  retention_pct
+-------  -------  -  -------------
+2024-01  0        2  100.0        
+2024-01  1        1  50.0         
+2024-01  2        2  100.0        
+2024-01  3        2  100.0        
+2024-02  0        1  100.0        
+2024-02  2        1  100.0        
+2024-03  0        2  100.0        
+2024-03  1        1  50.0         </code></pre>
+<ul><li><strong>Why <code>FIRST_VALUE</code></strong> Month 0 is the first row of each cohort, and it is the cohort size, so every row divides by it.</li><li><strong>Meaning</strong> This long form is what you feed into a heatmap in Power BI or Python.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> cohort    m0    m1    m2    m3
+ 2024-01   100%  50%   100%  100%
+ 2024-02   100%  --    100%   ?
+ 2024-03   100%  50%    ?     ?
+           ('?' = month has not happened yet, we have data to April only)</code></pre>
+<p>Rows are start months, columns are months since start. Reading across shows one cohort ageing. Reading down compares cohorts at the same age.</p>
+<h3>Connection to the real job</h3>
+<p>Retention tables are the main product-health chart in SaaS, apps and e-commerce. Investors ask for them.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> weekly active-user retention, repeat-purchase rate.</li><li><strong>Data Science:</strong> retention curves feed survival models and lifetime-value forecasts.</li><li><strong>Marketing:</strong> compare cohorts from different campaigns.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reading a missing cell as zero retention. In the real output the February cohort has <code>m3 = 0</code>, but month 3 of that cohort is May, and we only have data until April. The 0 means "not observed yet", not "everyone left". Compare the cohort's age with the last date in your data before you draw conclusions.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is a cohort? Answer: customers who started in the same period.</li><li>Why <code>COUNT(DISTINCT customer_id)</code>? Answer: a customer with two orders in a month must count once.</li><li>What would a cohort of size 1 tell you? Answer: very little; its percentages jump between 0 and 100.</li></ol>
+<h2 id="s3-12-3-rfm-segmentation-and-customer-lifetime-value">12.3 RFM Segmentation and Customer Lifetime Value</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A shopkeeper knows three things about regulars: how recently they came, how often they come, and how much they spend. A customer who came yesterday, comes weekly and spends a lot is a champion. One who spent a lot but vanished six months ago needs a phone call. <strong>RFM</strong> = <strong>R</strong>ecency, <strong>F</strong>requency, <strong>M</strong>onetary value.</div></div>
+<h3>How it works</h3>
+<ul><li><strong>Recency</strong> = days since the last paid order, measured against a fixed "as-of" date (never <code>now()</code> when you want a repeatable answer).</li><li><strong>Frequency</strong> = number of paid orders.</li><li><strong>Monetary</strong> = total paid money.</li><li>Give each a score (1 to 3 here) with <code>CASE</code> thresholds, or with <code>NTILE</code> (equal-sized buckets) when you have many customers. Then name segments.</li></ul>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 12.3.1</span> Compute raw R, F, M for each paying customer, as of 2024-04-30.</p>
+<pre class="code lang-sql"><code>WITH rev AS (
+  SELECT o.customer_id, o.order_id, o.order_date, SUM(oi.qty*oi.unit_price) AS amt
+  FROM orders o JOIN order_items oi USING(order_id)
+  WHERE o.status='paid' GROUP BY o.order_id),
+rfm AS (
+  SELECT customer_id,
+    CAST(julianday('2024-04-30') - julianday(MAX(order_date)) AS INT) AS recency_days,
+    COUNT(*) AS frequency, SUM(amt) AS monetary
+  FROM rev GROUP BY customer_id)
+SELECT * FROM rfm ORDER BY customer_id;</code></pre>
+<pre class="code lang-text"><code>customer_id  recency_days  frequency  monetary
+-----------  ------------  ---------  --------
+1            28            4          4560    
+2            10            3          3600    
+4            21            2          3300    
+5            15            2          760     
+6            31            1          440     </code></pre>
+<ul><li><strong>Step 1</strong> The inner query sums line values per order first, so frequency counts orders and not order lines (the duplicate trap of Section 4.4).</li><li><strong>Check</strong> Customer 1's last paid order is 2024-04-02, which is 28 days before April 30. The monetary values add to 12,660, the paid total we know from Chapter 3.</li><li><strong>Answer</strong> Customer 2 is the most recent (10 days); customer 1 spends the most (4,560).</li><li><strong>Meaning</strong> Customers 3, 7 and 8 do not appear: they have no paid orders, so they have no RFM at all. Decide what to do with them separately.</li></ul>
+<p class="problem"><span class="pl">Problem 12.3.2</span> Score and name segments. Thresholds are business choices; here recency &lt;= 20 days scores 3, &lt;= 45 scores 2; frequency &gt;= 4 scores 3, &gt;= 2 scores 2; monetary &gt;= 3000 scores 3, &gt;= 1000 scores 2.</p>
+<pre class="code lang-sql"><code>WITH rev AS (
+  SELECT o.customer_id, o.order_id, o.order_date, SUM(oi.qty*oi.unit_price) AS amt
+  FROM orders o JOIN order_items oi USING(order_id)
+  WHERE o.status='paid' GROUP BY o.order_id),
+rfm AS (
+  SELECT customer_id,
+    CAST(julianday('2024-04-30') - julianday(MAX(order_date)) AS INT) AS recency_days,
+    COUNT(*) AS frequency, SUM(amt) AS monetary
+  FROM rev GROUP BY customer_id),
+sc AS (
+  SELECT *,
+   CASE WHEN recency_days&lt;=20 THEN 3 WHEN recency_days&lt;=45 THEN 2 ELSE 1 END AS r,
+   CASE WHEN frequency&gt;=4 THEN 3 WHEN frequency&gt;=2 THEN 2 ELSE 1 END AS f,
+   CASE WHEN monetary&gt;=3000 THEN 3 WHEN monetary&gt;=1000 THEN 2 ELSE 1 END AS m
+  FROM rfm)
+SELECT customer_id, recency_days, frequency, monetary, r,f,m,
+  CASE WHEN r=3 AND f&gt;=2 AND m&gt;=2 THEN 'Champion'
+       WHEN r=1 THEN 'At risk' WHEN f=1 THEN 'New / one-time' ELSE 'Regular' END AS segment
+FROM sc ORDER BY customer_id;</code></pre>
+<pre class="code lang-text"><code>customer_id  recency_days  frequency  monetary  r  f  m  segment       
+-----------  ------------  ---------  --------  -  -  -  --------------
+1            28            4          4560      2  3  3  Regular       
+2            10            3          3600      3  2  3  Champion      
+4            21            2          3300      2  2  3  Regular       
+5            15            2          760       3  2  1  Regular       
+6            31            1          440       2  1  1  New / one-time</code></pre>
+<ul><li><strong>Answer</strong> Customer 2 is our only Champion. Customer 6 bought once.</li><li><strong>Meaning</strong> The <code>CASE</code> order matters: the first true branch wins (Chapter 6).</li></ul>
+<p class="problem"><span class="pl">Problem 12.3.3</span> (combine) A simple lifetime-value estimate and the median-style split with <code>NTILE</code>.</p>
+<table class="steps"><tr><th>Formula</th><td>Average order value (AOV) = paid revenue / paid orders = 12,660 / 12 = 1,055.</td></tr><tr><th>Formula</th><td>Simple CLV = AOV x orders per customer per year x expected years.</td></tr></table>
+<pre class="code lang-sql"><code>WITH rev AS (SELECT o.customer_id, SUM(oi.qty*oi.unit_price) m
+  FROM orders o JOIN order_items oi USING(order_id)
+  WHERE o.status='paid' GROUP BY o.customer_id)
+SELECT customer_id, m, NTILE(2) OVER (ORDER BY m DESC) AS half FROM rev;</code></pre>
+<pre class="code lang-text"><code>customer_id  m     half
+-----------  ----  ----
+1            4560  1   
+2            3600  1   
+4            3300  1   
+5            760   2   
+6            440   2   </code></pre>
+<ul><li><strong>Check</strong> 5 rows into 2 buckets gives 3 and 2 (the extra row goes to the first bucket).</li><li><strong>Answer</strong> The top half holds three customers who give 11,460 of 12,660: about 90.5% of revenue.</li><li><strong>Meaning</strong> A few customers carry most revenue, the usual "80/20" shape.</li><li><strong>Limit</strong> Real CLV uses retention curves (12.2) and margins, not just revenue. A formula with one AOV hides differences between customers.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Computing recency with <code>now()</code>. Your answer changes every day and nobody can reproduce last month's report. Pass a fixed as-of date.</div></div>
+<h3>Connection to the real job</h3>
+<p>CRM and marketing teams use RFM to choose who gets a discount or a win-back email. It needs no machine learning, which is why it is still popular.</p>
+<h3>Applications</h3>
+<ul><li><strong>Marketing analytics:</strong> target champions with loyalty offers, at-risk customers with win-back.</li><li><strong>Data Science:</strong> R, F, M are strong features for churn models.</li><li><strong>Finance:</strong> concentration risk (how much revenue comes from the top 3 customers).</li></ul>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does high recency days mean? Answer: the customer bought long ago (bad).</li><li>Why aggregate by order before counting frequency? Answer: otherwise each order line counts as an order.</li><li>Difference between <code>CASE</code> scoring and <code>NTILE</code>? Answer: <code>CASE</code> uses thresholds you choose; <code>NTILE</code> forces equal-sized groups.</li></ol>
+<h2 id="s4-12-4-period-over-period-running-totals-mom-and-yoy">12.4 Period-over-Period: Running Totals, MoM and YoY</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">"Revenue is 2,980." Is that good? Only compared with something: last month (MoM, month-over-month), or the same month last year (YoY, year-over-year). YoY removes seasonality: December is always strong, so compare December with December.</div></div>
+<h3>How it works</h3>
+<ul><li><strong>Growth %</strong> = (this period - previous period) / previous period x 100.</li><li><code>LAG(value, 1) OVER (ORDER BY period)</code> brings the previous row's value onto the current row.</li><li>A <strong>running total</strong> is <code>SUM(...) OVER (ORDER BY period)</code>; a <strong>moving average</strong> adds a frame such as <code>ROWS BETWEEN 1 PRECEDING AND CURRENT ROW</code>.</li></ul>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 12.4.1</span> MoM growth, running total and 2-month moving average of paid revenue.</p>
+<pre class="code lang-sql"><code>WITH m AS (
+  SELECT substr(o.order_date,1,7) AS ym, SUM(oi.qty*oi.unit_price) AS rev
+  FROM orders o JOIN order_items oi USING(order_id)
+  WHERE o.status='paid' GROUP BY 1)
+SELECT ym, rev,
+  LAG(rev) OVER (ORDER BY ym) AS prev_rev,
+  ROUND(100.0*(rev-LAG(rev) OVER (ORDER BY ym))/LAG(rev) OVER (ORDER BY ym),1) AS mom_pct,
+  SUM(rev) OVER (ORDER BY ym) AS running,
+  ROUND(AVG(rev) OVER (ORDER BY ym ROWS BETWEEN 1 PRECEDING AND CURRENT ROW),1) AS avg2
+FROM m ORDER BY ym;</code></pre>
+<pre class="code lang-text"><code>ym       rev   prev_rev  mom_pct  running  avg2  
+-------  ----  --------  -------  -------  ------
+2024-01  2260                     2260     2260.0
+2024-02  2520  2260      11.5     4780     2390.0
+2024-03  2980  2520      18.3     7760     2750.0
+2024-04  4900  2980      64.4     12660    3940.0</code></pre>
+<ul><li><strong>Compute</strong> March: (2980 - 2520) / 2520 = 460 / 2520 = 0.1825, so 18.3%. April: (4900 - 2980) / 2980 = 1920 / 2980 = 0.6443, so 64.4%.</li><li><strong>Check</strong> The last running total, 12,660, equals the paid total. January has no previous month, so growth is <code>NULL</code>: correct, not zero.</li><li><strong>Answer</strong> Revenue grew in every month; April grew 64.4%.</li><li><strong>Meaning</strong> The average of the first row uses only one row because the frame cannot reach back.</li></ul>
+<p class="problem"><span class="pl">Problem 12.4.2</span> (YoY, the trap) A table of monthly sales for two years, with 4 months each.</p>
+<pre class="code lang-sql"><code>CREATE TABLE monthly_sales (ym TEXT, rev INTEGER);
+INSERT INTO monthly_sales VALUES
+('2023-01',1000),('2023-02',1100),('2023-03',1200),('2023-04',1500),
+('2024-01',1300),('2024-02',1210),('2024-03',1800),('2024-04',1500);
+SELECT ym, rev, LAG(rev,12) OVER (ORDER BY ym) AS wrong_lag12
+FROM monthly_sales ORDER BY ym;</code></pre>
+<pre class="code lang-text"><code>ym       rev   wrong_lag12
+-------  ----  -----------
+2023-01  1000              
+2023-02  1100              
+2023-03  1200              
+2023-04  1500              
+2024-01  1300              
+2024-02  1210              
+2024-03  1800              
+2024-04  1500              </code></pre>
+<p><code>LAG(rev,12)</code> counts 12 <strong>rows</strong> back, not 12 months. Here only 8 rows exist, so all values are <code>NULL</code>. If a month were missing, it would silently pick the wrong month. The safe method joins on the calendar:</p>
+<pre class="code lang-sql"><code>SELECT c.ym, c.rev, p.rev AS last_year,
+  ROUND(100.0*(c.rev-p.rev)/p.rev,1) AS yoy_pct
+FROM monthly_sales c
+LEFT JOIN monthly_sales p
+  ON p.ym = strftime('%Y-%m', date(c.ym||'-01','-1 year'))
+WHERE c.ym &gt;= '2024-01' ORDER BY c.ym;</code></pre>
+<pre class="code lang-text"><code>ym       rev   last_year  yoy_pct
+-------  ----  ---------  -------
+2024-01  1300  1000       30.0   
+2024-02  1210  1100       10.0   
+2024-03  1800  1200       50.0   
+2024-04  1500  1500       0.0    </code></pre>
+<ul><li><strong>Check</strong> March: (1800 - 1200) / 1200 = 0.5, so 50%. April: 0 change.</li><li><strong>Answer</strong> YoY growth is 30%, 10%, 50% and 0%.</li><li><strong>Meaning</strong> Compared with last year, April stood still, even though April grew strongly against March (MoM).</li><li><strong>Fix for gaps</strong> Build a <strong>date spine</strong> (a table with one row per month, from a recursive CTE, Chapter 5) and LEFT JOIN data onto it, so missing months appear as rows with 0 or <code>NULL</code> (the spine query is standard; PostgreSQL has <code>generate_series</code> instead, not run here).</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> revenue
+ 4900 |                      ##
+ 2980 |              ##      ##
+ 2520 |      ##      ##      ##
+ 2260 | ##   ##      ##      ##
+      +-----------------------------
+        Jan  Feb    Mar     Apr
+ MoM compares each bar with the bar to its left.
+ YoY compares it with the same month a year earlier (different chart row).</code></pre>
+<h3>Connection to the real job</h3>
+<p>Every business dashboard has a "vs last month" and "vs last year" number. Getting them wrong is a classic incident: a <code>LAG</code> over data with missing months.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> weekly, monthly and yearly KPI reports.</li><li><strong>Finance:</strong> budget versus actual, year-to-date running totals.</li><li><strong>Logistics:</strong> compare this month's 95th-percentile delivery time with last month's (the same formula).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Dividing by zero or by <code>NULL</code>. If last year was 0, <code>(c.rev-p.rev)/p.rev</code> fails or gives <code>NULL</code>. Guard with <code>NULLIF(p.rev,0)</code>.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why is growth in the first month <code>NULL</code>? Answer: there is no earlier row to compare with.</li><li>When is <code>LAG(x,12)</code> wrong for YoY? Answer: when months are missing, since it counts rows, not months.</li><li>Why is <code>SUM() OVER (ORDER BY ym)</code> a running total? Answer: the default frame runs from the first row to the current row.</li></ol>
+<h2 id="s5-12-5-sessionization-and-gaps-and-islands">12.5 Sessionization and Gaps and Islands</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You scroll a shopping app for 20 minutes, go for lunch, then return. Is that one visit or two? Analysts say a new <strong>session</strong> starts after a long silence, often 30 minutes. A similar puzzle: a gym app wants "longest streak of consecutive days". Both are "break a sorted list wherever there is a gap". Each unbroken stretch is an <strong>island</strong>; the breaks are <strong>gaps</strong>.</div></div>
+<h3>How it works (sessions)</h3>
+<ol><li>For each click, compute the gap in minutes from the previous click of the same user (<code>LAG</code>).</li><li>Mark <code>1</code> when the gap is missing or longer than 30 minutes (a session start), else <code>0</code>.</li><li>A running <code>SUM</code> of those marks gives the session number.</li></ol>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 12.5.1</span> Compute the gaps.</p>
+<pre class="code lang-sql"><code>CREATE TABLE clicks (user_id INTEGER, ts TEXT);
+INSERT INTO clicks VALUES
+(1,'2024-05-01 09:00:00'),(1,'2024-05-01 09:10:00'),(1,'2024-05-01 09:25:00'),
+(1,'2024-05-01 11:00:00'),(1,'2024-05-01 11:20:00'),
+(1,'2024-05-02 08:00:00'),
+(2,'2024-05-01 09:05:00'),(2,'2024-05-01 09:50:00');
+
+SELECT user_id, ts,
+  (strftime('%s',ts) - strftime('%s', LAG(ts) OVER (PARTITION BY user_id ORDER BY ts)))/60 AS gap_min
+FROM clicks ORDER BY user_id, ts;</code></pre>
+<pre class="code lang-text"><code>user_id  ts                   gap_min
+-------  -------------------  -------
+1        2024-05-01 09:00:00         
+1        2024-05-01 09:10:00  10     
+1        2024-05-01 09:25:00  15     
+1        2024-05-01 11:00:00  95     
+1        2024-05-01 11:20:00  20     
+1        2024-05-02 08:00:00  1240   
+2        2024-05-01 09:05:00         
+2        2024-05-01 09:50:00  45     </code></pre>
+<ul><li><strong>Step 1</strong> <code>strftime('%s', ...)</code> turns text time into seconds, so subtraction is exact (SQLite specific; PostgreSQL uses <code>EXTRACT(EPOCH FROM ...)</code>, not run here).</li><li><strong>Check</strong> 09:25 to 11:00 is 1h35m = 95 minutes.</li><li><strong>Answer</strong> The first click of each user has no gap; big gaps are 95, 1240 and 45.</li></ul>
+<p class="problem"><span class="pl">Problem 12.5.2</span> Assign sessions (30-minute rule) and summarise.</p>
+<pre class="code lang-sql"><code>WITH g AS (
+ SELECT user_id, ts,
+  (strftime('%s',ts) - strftime('%s', LAG(ts) OVER (PARTITION BY user_id ORDER BY ts)))/60 AS gap_min
+ FROM clicks),
+f AS (SELECT *, CASE WHEN gap_min IS NULL OR gap_min &gt; 30 THEN 1 ELSE 0 END AS new_s FROM g),
+s AS (SELECT *, SUM(new_s) OVER (PARTITION BY user_id ORDER BY ts) AS session_no FROM f)
+SELECT user_id, session_no, MIN(ts) AS start_ts, MAX(ts) AS end_ts, COUNT(*) AS clicks,
+  (strftime('%s',MAX(ts)) - strftime('%s',MIN(ts)))/60 AS minutes
+FROM s GROUP BY user_id, session_no ORDER BY user_id, session_no;</code></pre>
+<pre class="code lang-text"><code>user_id  session_no  start_ts             end_ts               clicks  minutes
+-------  ----------  -------------------  -------------------  ------  -------
+1        1           2024-05-01 09:00:00  2024-05-01 09:25:00  3       25     
+1        2           2024-05-01 11:00:00  2024-05-01 11:20:00  2       20     
+1        3           2024-05-02 08:00:00  2024-05-02 08:00:00  1       0      
+2        1           2024-05-01 09:05:00  2024-05-01 09:05:00  1       0      
+2        2           2024-05-01 09:50:00  2024-05-01 09:50:00  1       0      </code></pre>
+<ul><li><strong>Check</strong> User 1's clicks split at the 95 and 1240 minute gaps: 3 + 2 + 1 = 6 clicks. User 2 splits at 45 minutes.</li><li><strong>Answer</strong> 5 sessions in total. A single-click session has duration 0, a known limit: you cannot measure time on the last page.</li></ul>
+<p class="problem"><span class="pl">Problem 12.5.3</span> Gaps and islands: longest login streak. Trick: subtract the row number (in days) from each date. In a run of consecutive days the result is constant.</p>
+<pre class="code lang-sql"><code>CREATE TABLE logins (user_id INTEGER, d TEXT);
+INSERT INTO logins VALUES (1,'2024-05-01'),(1,'2024-05-02'),(1,'2024-05-03'),
+  (1,'2024-05-06'),(1,'2024-05-07'),(1,'2024-05-09');
+WITH r AS (SELECT user_id, d, ROW_NUMBER() OVER (PARTITION BY user_id ORDER BY d) rn FROM logins),
+i AS (SELECT *, date(d, '-'||rn||' days') AS grp FROM r)
+SELECT user_id, MIN(d) AS streak_start, MAX(d) AS streak_end, COUNT(*) AS days
+FROM i GROUP BY user_id, grp ORDER BY streak_start;</code></pre>
+<pre class="code lang-text"><code>user_id  streak_start  streak_end  days
+-------  ------------  ----------  ----
+1        2024-05-01    2024-05-03  3   
+1        2024-05-06    2024-05-07  2   
+1        2024-05-09    2024-05-09  1   </code></pre>
+<ul><li><strong>Why it works</strong> For 05-01, 05-02, 05-03 the row numbers are 1, 2, 3. Subtracting gives 04-30 each time. After the gap (05-06 with row 4) we get 05-02, a new value, so a new island.</li><li><strong>Answer</strong> The longest streak is 3 days (May 1 to 3).</li><li><strong>Limit</strong> The trick needs one row per day (use <code>DISTINCT</code> first). In PostgreSQL write <code>d - rn</code> with a date column (not run here).</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> time --&gt;  9:00  9:10  9:25            11:00  11:20             next day 8:00
+ gap:        -    10    15     95       -&gt; 20          1240
+ new_s:      1     0     0      1          0             1
+ session:    1     1     1      2          2             3</code></pre>
+<p>The gap row above each click is the silence before it. A <code>1</code> starts a new session. The running sum counts how many starts we have seen so far.</p>
+<h3>Connection to the real job</h3>
+<p>Web and app analytics tools compute sessions in this way. A session is like one visit to a shop: a long gap between actions means the visitor left and later came back as a new visit.</p>
+<h3>Applications</h3>
+<ul><li><strong>Product analytics:</strong> sessions per user, pages per session, session length.</li><li><strong>Data Engineering:</strong> building a <code>sessions</code> table from raw click logs.</li><li><strong>Operations:</strong> find outage windows (islands of consecutive error minutes).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting <code>PARTITION BY user_id</code> in <code>LAG</code>. Then the first click of user 2 is compared with the last click of user 1, giving a nonsense gap.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why do we mark a session start when the gap is <code>NULL</code>? Answer: the first click has no previous click, so it must start session 1.</li><li>What is constant inside an island? Answer: date minus row number.</li><li>Why does a one-click session have duration 0? Answer: start and end are the same timestamp.</li></ol>
+<h2 id="s6-12-6-deduplication-late-data-and-data-quality-queries">12.6 Deduplication, Late Data and Data-Quality Queries</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Before you trust a report, you inspect the ingredients, as a cook sniffs the milk. Duplicate rows, missing values, impossible numbers and orphan references are the four common problems. You find each with a short query. Keep these queries and run them after each data load; this is "testing for data".</div></div>
+<h3>How it works</h3>
+<ul><li><strong>Deduplication:</strong> <code>ROW_NUMBER() OVER (PARTITION BY the-real-key ORDER BY the-tie-breaker)</code>, keep <code>rn = 1</code>.</li><li><strong>Late data:</strong> records that arrive after their period closed. Keep an <code>updated_at</code> or <code>loaded_at</code> column and pick the latest version per key.</li><li><strong>Checks:</strong> count NULLs, duplicates, out-of-range values; find orphans with an anti-join.</li></ul>
+<p>Running table:</p>
+<pre class="code lang-sql"><code>CREATE TABLE signups_raw (id INTEGER, email TEXT, plan TEXT, updated_at TEXT, age INTEGER);
+INSERT INTO signups_raw VALUES
+(1,'asha@x.com','free','2024-05-01',29),
+(2,'ravi@x.com','free','2024-05-01',31),
+(3,'ravi@x.com','pro','2024-05-03',31),
+(4,'Meena@x.com','pro','2024-05-02',NULL),
+(5,'meena@x.com ','pro','2024-05-04',27),
+(6,'john@x.com','free','2024-05-02',250),
+(7,NULL,'free','2024-05-02',40);</code></pre>
+<p>Look carefully: Meena appears twice with different case and a trailing space. Ravi appears twice (an upgrade). Row 6 has age 250. Row 7 has no email.</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 12.6.1</span> Keep the newest row per person. Predict: 4 people, so 4 rows.</p>
+<pre class="code lang-sql"><code>WITH r AS (
+  SELECT *, ROW_NUMBER() OVER (PARTITION BY lower(trim(email))
+                               ORDER BY updated_at DESC, id DESC) AS rn
+  FROM signups_raw WHERE email IS NOT NULL)
+SELECT id, lower(trim(email)) AS email, plan, updated_at FROM r WHERE rn=1 ORDER BY id;</code></pre>
+<pre class="code lang-text"><code>id  email        plan  updated_at
+--  -----------  ----  ----------
+1   asha@x.com   free  2024-05-01
+3   ravi@x.com   pro   2024-05-03
+5   meena@x.com  pro   2024-05-04
+6   john@x.com   free  2024-05-02</code></pre>
+<ul><li><strong>Step 1</strong> Normalise before comparing: <code>lower(trim(email))</code> makes 'Meena@x.com' and 'meena@x.com ' the same person.</li><li><strong>Step 2</strong> <code>ORDER BY updated_at DESC, id DESC</code>: newest first; <code>id</code> breaks ties so the result is stable.</li><li><strong>Check</strong> 7 rows, minus 1 null email, minus 2 older duplicates = 4.</li><li><strong>Answer</strong> Ravi is kept as <code>pro</code>, Meena as the May 4 row.</li><li><strong>Meaning</strong> Without the <code>lower(trim())</code>, Meena would survive twice and your user count would be wrong by one.</li></ul>
+<p class="problem"><span class="pl">Problem 12.6.2</span> A data-quality report in one row.</p>
+<pre class="code lang-sql"><code>SELECT COUNT(*) AS total_rows,
+  SUM(email IS NULL) AS null_email,
+  COUNT(email) - COUNT(DISTINCT lower(trim(email))) AS dup_extra_rows,
+  SUM(age IS NULL) AS null_age,
+  SUM(age &lt; 0 OR age &gt; 120) AS bad_age
+FROM signups_raw;</code></pre>
+<pre class="code lang-text"><code>total_rows  null_email  dup_extra_rows  null_age  bad_age
+----------  ----------  --------------  --------  -------
+7           1           2               1         1      </code></pre>
+<ul><li><strong>Check</strong> <code>COUNT(email)</code> ignores NULL: 6. Distinct cleaned emails: 4. So 2 extra rows. <code>age IS NULL</code> is only row 4. <code>age &gt; 120</code> is only row 6. Note <code>age IS NULL</code> rows are not counted in <code>bad_age</code>, since a comparison with NULL is not true (Chapter 2).</li><li><strong>Answer</strong> 1 missing email, 2 extra duplicate rows, 1 missing age, 1 impossible age.</li><li><strong>Meaning</strong> Report these numbers to the data owner before building on the table.</li></ul>
+<p class="problem"><span class="pl">Problem 12.6.3</span> (combine) Orphans and the median. Orphans: orders pointing to a customer that does not exist.</p>
+<pre class="code lang-sql"><code>CREATE TABLE o2 (order_id INTEGER, customer_id INTEGER);
+INSERT INTO o2 VALUES (1,1),(2,2),(3,99);
+CREATE TABLE c2 (customer_id INTEGER PRIMARY KEY);
+INSERT INTO c2 VALUES (1),(2);
+SELECT o.* FROM o2 o LEFT JOIN c2 c USING (customer_id) WHERE c.customer_id IS NULL;</code></pre>
+<pre class="code lang-text"><code>order_id  customer_id
+--------  -----------
+3         99         </code></pre>
+<p>The median (the middle value, robust to outliers) of hospital appointment waiting times 120, 130, 150, 160, 170, 900 minutes:</p>
+<pre class="code lang-sql"><code>CREATE TABLE waits (minutes INTEGER);
+INSERT INTO waits VALUES (120),(130),(150),(160),(900),(170);
+WITH o AS (SELECT minutes, ROW_NUMBER() OVER (ORDER BY minutes) rn, COUNT(*) OVER () n FROM waits)
+SELECT AVG(minutes) AS median_minutes FROM o WHERE rn IN ((n+1)/2, (n+2)/2);
+SELECT AVG(minutes) AS mean_minutes FROM waits;</code></pre>
+<pre class="code lang-text"><code>median_minutes
+--------------
+155.0         
+mean_minutes    
+----------------
+271.666666666667</code></pre>
+<ul><li><strong>Why the formula works</strong> With n = 6, <code>(n+1)/2 = 3</code> and <code>(n+2)/2 = 4</code> (integer division), so we average the 3rd and 4th values: (150 + 160) / 2 = 155. With odd n, both expressions give the same row.</li><li><strong>Answer</strong> Orphan order 3; median 155 minutes against a mean of about 271.7 minutes.</li><li><strong>Meaning</strong> One very long wait (900 minutes) drags the mean far from the typical patient. This is why delivery and waiting-time reports quote percentiles. PostgreSQL has <code>PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY minutes)</code> (not run here).</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> raw table --&gt; [dedupe] --&gt; [checks: nulls, ranges, orphans] --&gt; trusted table
+                  |                    |
+            ROW_NUMBER()          counts that must be 0</code></pre>
+<h3>Connection to the real job</h3>
+<p>Data engineers wrap such queries in tests (dbt tests, Great Expectations) that run after every load. An analyst who runs them first avoids embarrassing corrections.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> dedupe CDC (change data capture) feeds by <code>updated_at</code>.</li><li><strong>Data Science:</strong> clean training data before modelling.</li><li><strong>Compliance:</strong> prove that every order has a customer.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using <code>SELECT DISTINCT *</code> to dedupe. It removes only rows that are identical in every column; the Ravi rows differ in <code>plan</code>, so both stay. Pick the business key and a rule for the winner.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why include a tie-breaker in <code>ORDER BY</code> of <code>ROW_NUMBER</code>? Answer: equal timestamps would give an unpredictable winner.</li><li>How do you find orphans? Answer: LEFT JOIN to the parent and keep rows where the parent key is NULL.</li><li>Why use median instead of mean for waiting times? Answer: outliers do not move the median much.</li></ol>
+<h2 id="s7-chapter-recap">Chapter recap</h2>
+<ul><li>A funnel counts distinct users who did each step in order; divide by the previous step to find the leak.</li><li>A cohort is a group that started together; retention is the share of the cohort active n periods later. Unobserved months are not zeros.</li><li>RFM scores recency, frequency and money; fix an as-of date and aggregate by order first.</li><li>MoM compares with the previous period, YoY with the same period last year; <code>LAG(x,12)</code> counts rows, so use a calendar join when months can be missing.</li><li>Sessions: gap from <code>LAG</code>, flag gap &gt; threshold, running <code>SUM</code> gives the session number.</li><li>Islands: date minus row number is constant inside a consecutive run.</li><li>Dedupe with <code>ROW_NUMBER</code> over a normalised key; never rely on <code>DISTINCT *</code>.</li><li>Data-quality queries count NULLs, duplicates, out-of-range values and orphans; run them after each load.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Core SQL</th></tr></thead><tbody><tr><td>Funnel</td><td><code>MIN(CASE WHEN event=... THEN ts END)</code> per user, compare times</td></tr><tr><td>Retention</td><td>month index = <code>y*12+m</code> minus cohort index, <code>COUNT(DISTINCT)</code></td></tr><tr><td>RFM</td><td><code>MAX(date)</code>, <code>COUNT(*)</code>, <code>SUM(amt)</code> then <code>CASE</code> or <code>NTILE</code></td></tr><tr><td>MoM</td><td><code>LAG(x) OVER (ORDER BY period)</code></td></tr><tr><td>YoY</td><td>self-join on <code>period - 1 year</code></td></tr><tr><td>Session</td><td><code>SUM(gap&gt;30) OVER (PARTITION BY u ORDER BY ts)</code></td></tr><tr><td>Island</td><td><code>date - ROW_NUMBER()</code> as group key</td></tr><tr><td>Dedupe</td><td><code>ROW_NUMBER() ... WHERE rn=1</code></td></tr><tr><td>Orphans</td><td><code>LEFT JOIN ... WHERE parent.id IS NULL</code></td></tr></tbody></table></div>
+<h2 id="s8-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 12.P.1</span> (easy) In the funnel data, how many users have a <code>cart</code> event? <strong>Answer:</strong> 4 (users 1, 2, 3, 5). Each user has one cart row, so <code>COUNT(*)</code> also gives 4, but <code>COUNT(DISTINCT user_id)</code> is the safe habit.</p>
+<p class="problem"><span class="pl">Problem 12.P.2</span> (easy) Overall view-to-pay conversion in the strict funnel. <strong>Answer:</strong> 2 paid of 6 viewers = 33.3%.</p>
+<p class="problem"><span class="pl">Problem 12.P.3</span> (what is the output?) The January cohort has 2 customers; 1 of them buys in February. What is month-1 retention? <strong>Answer:</strong> 1 / 2 = 50%, matching the table in 12.2.</p>
+<p class="problem"><span class="pl">Problem 12.P.4</span> (find the bug) A funnel query uses <code>COUNT(*)</code> on <code>events WHERE event='view'</code> and reports 7 viewers. What is wrong? <strong>Answer:</strong> User 5 viewed twice. Use <code>COUNT(DISTINCT user_id)</code>; the correct number is 6.</p>
+<p class="problem"><span class="pl">Problem 12.P.5</span> (find the bug) YoY with <code>LAG(rev,12)</code> returns NULL for every row of an 8-row table. Why, and what do you do? <strong>Answer:</strong> There are only 8 rows, so no row is 12 rows back; <code>LAG</code> counts rows, not months. Join the table to itself on the month one year earlier (12.4.2).</p>
+<p class="problem"><span class="pl">Problem 12.P.6</span> Using the click data, how many sessions exist if the timeout is 60 minutes instead of 30? <strong>Answer:</strong> 4. With a 60-minute rule the 45-minute gap of user 2 no longer splits, so user 2 has 1 session. User 1 still splits at 95 and 1240 minutes into 3 sessions. Total 3 + 1 = 4 (verified by running the query).</p>
+<p class="problem"><span class="pl">Problem 12.P.7</span> For each product category, which product has the highest paid revenue? <strong>Answer:</strong> Using <code>RANK() OVER (PARTITION BY category ORDER BY rev DESC)</code> and <code>rk = 1</code>: Electronics Keyboard 4500, Home Desk Lamp 3600, Stationery Pen Pack 840 (verified by running).</p>
+<p class="problem"><span class="pl">Problem 12.P.8</span> (scenario) Customer 3 has only a cancelled order. Does customer 3 belong to the January cohort, to churn, or to RFM? <strong>Answer:</strong> To none of them. All three patterns filter <code>status='paid'</code>, so customer 3 has no paid orders. Whether cancelled orders should count as activity is a business definition to agree before reporting.</p>
+<p class="problem"><span class="pl">Problem 12.P.9</span> (interview) Write the pattern to find users who logged in on at least 3 consecutive days. <strong>Answer:</strong> Make one row per user per day (<code>DISTINCT</code>), compute <code>d - ROW_NUMBER()</code> as the island key as in 12.5.3, group by user and key, and keep groups with <code>COUNT(*) &gt;= 3</code>.</p>
+<p class="problem"><span class="pl">Problem 12.P.10</span> (interview) A table has duplicate rows per <code>order_id</code> from a retry bug. Delete-free way to get one row per order, keeping the latest <code>loaded_at</code>? <strong>Answer:</strong> <code>ROW_NUMBER() OVER (PARTITION BY order_id ORDER BY loaded_at DESC)</code> in a CTE, then <code>WHERE rn = 1</code>. Mention a tie-breaker column.</p>
+<p class="problem"><span class="pl">Problem 12.P.11</span> (computation) Revenue was 2,520 in February and 2,980 in March. What is MoM growth, to one decimal? <strong>Answer:</strong> (2980 - 2520) / 2520 = 460 / 2520 = 0.1825 = 18.3%.</p>
+<h2 id="s9-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data analytics and I know basic SQL joins, CTEs and window functions. Teach me funnel analysis in SQL step by step, using a small events table (user_id, event, ts). Show the "one row per user" step, the strict step order rule, and conversion percentages. After each step, ask me one question to check understanding before continuing.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning analytics SQL. Explain cohort retention in SQL with a tiny orders table. Cover cohort month, month index, the retention triangle and why missing cells are not zeros. Then give me 8 graded exercises without solutions, from easy to hard, and wait for my answers.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for data analyst interviews. Quiz me one question at a time on analytics SQL patterns: RFM, MoM and YoY, sessionization, gaps and islands, deduplication. Give a small table with each question, grade my query out of 10, show a model answer and explain one common mistake.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning SQL for data work. Review my analytics query below for correctness: check joins for duplicate rows, window partitions, NULL handling, division by zero and time boundaries. Explain every problem in simple English and give a corrected version. My query and table sample: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me data-quality queries in SQL: finding NULLs, duplicates, impossible values and orphan keys, and deduplicating with ROW_NUMBER. Use a messy 7-row sample table, show every query and its exact output, and then run a mock interview of five questions on data cleaning, grading each answer.</pre></div><div class="readbtn"><button class="btn" data-read="study:sql:ch12">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch11.html">← Chapter 11: Schema Design, Normalization and Data Wa</a><a class="btn" href="ch13.html">Chapter 13: Beyond SQL →</a></div></div><script src="../../assets/study.js"></script></body></html>

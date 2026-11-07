@@ -1,0 +1,285 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 5: Operating Systems for Everyday Debugging</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Linux, Git, Algorithms &amp; CS Foundations</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 5</div><h1>Operating Systems for Everyday Debugging</h1><p>Processes, threads, memory, disks and the tools that tell you why a system is slow.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-5-1-processes-threads-context-switches-and-scheduling">5.1 Processes, Threads, Context Switches and Scheduling</a></li><li><a href="#s2-5-2-concurrency-problems-races-deadlocks-starvation-locks">5.2 Concurrency Problems: Races, Deadlocks, Starvation, Locks</a></li><li><a href="#s3-5-3-memory-stack-heap-virtual-memory-swapping-oom">5.3 Memory: Stack, Heap, Virtual Memory, Swapping, OOM</a></li><li><a href="#s4-5-4-file-systems-and-i-o-models">5.4 File Systems and I/O Models</a></li><li><a href="#s5-5-5-diagnosing-a-slow-system-on-linux">5.5 Diagnosing a Slow System on Linux</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p>Every slow website raises the same question: "the page got slower, why?" The answer is almost always inside the operating system (OS): the CPU was busy, memory ran out, the disk was slow, or threads were waiting on each other. This chapter gives you the mental model and the commands. By the end you will be able to explain why a server is slow in terms of CPU, memory, disk and waiting, run a race condition and a deadlock yourself, and read the output of <code>vmstat</code> and <code>top</code>. We use one running example: a small web service with 4 CPU cores, 16 GB of RAM and a pool of worker threads, the kind that serves an online shop. Examples run on a Mac with Python 3.14. Commands that exist only on Linux are marked <strong>Linux only, not run here</strong>, and their output is labelled illustrative.</p>
+<h2 id="s1-5-1-processes-threads-context-switches-and-scheduling">5.1 Processes, Threads, Context Switches and Scheduling</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of a restaurant kitchen. A <strong>process</strong> is a whole kitchen with its own stove, fridge and cooks. A <strong>thread</strong> is one cook inside that kitchen: cooks share the fridge (memory) but each has their own cutting board (stack). There are only a few stoves (CPU cores) and many cooks. Someone must decide who gets a stove now. That someone is the <strong>scheduler</strong>.</div></div>
+<h3>How it works</h3>
+<ul><li>A <strong>process</strong> is a running program. It has its own private memory, open files and a process ID (PID). One process cannot read another's memory by default.</li><li>A <strong>thread</strong> is a path of execution inside a process. Threads of one process share memory. This makes sharing data cheap, and also dangerous (section 5.2).</li><li>A <strong>CPU core</strong> runs one thread at a time. The OS gives each runnable thread a short <strong>time slice</strong> (often a few milliseconds), then switches to another. This switch is a <strong>context switch</strong>: save the registers of the old thread, load those of the new one. It costs microseconds, and it also makes CPU caches colder.</li><li>A thread is in one of three broad states: <strong>running</strong>, <strong>ready</strong> (waiting for a core) or <strong>blocked</strong> (waiting for I/O or a lock).</li><li>The scheduler policy decides the order. <strong>FCFS</strong> (first come, first served) is simple but a long job blocks short ones. <strong>Round robin</strong> gives each job a fixed slice in turn. Linux uses a more complex fair scheduler, but round robin is the right first picture.</li></ul>
+<figure><img src="images/ch5_scheduler.svg" alt="A ready queue feeds one CPU core; blocked threads return to the queue when I/O finishes." loading="lazy"/><figcaption>A ready queue feeds one CPU core; blocked threads return to the queue when I/O finishes.</figcaption></figure>
+<p>Read it left to right: threads wait in the ready queue, one runs on the core, and when its slice ends it goes to the back. A thread that must wait for the disk or network moves to the blocked box and comes back when the I/O completes.</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 5.1.1</span> Three jobs arrive together: A needs 24 ms of CPU, B needs 3 ms, C needs 3 ms. Compare the average finish time under FCFS and under round robin with a 4 ms slice. Ignore switch cost.</p>
+<table class="steps"><tr><th>Step 1</th><td>FCFS runs A, then B, then C. A finishes at 24, B at 27, C at 30. Average = (24 + 27 + 30) / 3 = 27.0.</td></tr><tr><th>Step 2</th><td>Round robin with slice 4: A runs 0-4, B runs 4-7 (done), C runs 7-10 (done), then A runs alone until 30. Finish times: B = 7, C = 10, A = 30. Average = (7 + 10 + 30) / 3 = 15.67.</td></tr><tr><th>Step 3</th><td>Check with code.</td></tr></table>
+<pre class="code lang-python"><code>from collections import deque
+def fcfs(jobs):
+    t=0; res={}
+    for n,b in jobs:
+        t+=b; res[n]=t
+    return res
+def rr(jobs,q):
+    dq=deque(jobs); t=0; res={}
+    while dq:
+        n,b=dq.popleft()
+        run=min(q,b); t+=run; b-=run
+        if b: dq.append((n,b))
+        else: res[n]=t
+    return res
+jobs=[("A",24),("B",3),("C",3)]
+for name,r in [("FCFS",fcfs(jobs)),("RR q=4",rr(jobs,4))]:
+    print(name,r,"avg finish",round(sum(r.values())/len(r),2))</code></pre>
+<p><strong>Predict first:</strong> before you run this, which policy do you think gives the smaller average finish time, and by roughly how much?</p>
+<pre class="code lang-text"><code>FCFS {'A': 24, 'B': 27, 'C': 30} avg finish 27.0
+RR q=4 {'B': 7, 'C': 10, 'A': 30} avg finish 15.67</code></pre>
+<ul><li><strong>Line by line</strong> <code>deque</code> is a queue; <code>popleft</code> takes the next job. <code>run=min(q,b)</code> runs at most one slice. <code>if b:</code> means work is left, so the job goes to the back of the queue; otherwise we record its finish time <code>t</code>. <code>fcfs</code> just adds burn times in order.</li><li><strong>Wrong version</strong> If you forget <code>popleft()</code> and write <code>dq.pop()</code>, you take the job from the wrong end and the order changes (that is a stack, not a queue).</li><li><strong>Answer</strong> Round robin cuts the average finish time from 27.0 ms to 15.67 ms, because short jobs no longer wait behind the long one. The last job (A) finishes at 30 ms in both cases. This is why a busy server still feels responsive to small requests.</li><li><strong>Check</strong> Total CPU work is 30 ms in both cases, and the last job ends at 30 in both. Only the order changed, so the averages can differ.</li><li><strong>Why it matters</strong> Plain English: under round robin, 2 of your 3 users wait about a third as long, and the long job loses only a few milliseconds.</li></ul>
+<p class="problem"><span class="pl">Problem 5.1.2</span> Python threads versus processes for CPU work. Run a CPU-heavy function four times: serially, in 4 threads, in 4 processes (12-core Mac).</p>
+<table class="steps"><tr><th>Step 1</th><td>The function adds <code>i*i</code> for 3 million numbers.</td></tr><tr><th>Step 2</th><td>Run all three styles and time them.</td></tr></table>
+<pre class="code lang-python"><code>import time, multiprocessing as mp, threading, os
+def burn(n=3_000_000):
+    s=0
+    for i in range(n): s+=i*i
+    return s
+if __name__=="__main__":
+    print("cores:", os.cpu_count())
+    t=time.perf_counter(); [burn() for _ in range(4)]; print(f"serial x4: {time.perf_counter()-t:.2f}s")
+    t=time.perf_counter()
+    ts=[threading.Thread(target=burn) for _ in range(4)]
+    [x.start() for x in ts]; [x.join() for x in ts]
+    print(f"4 threads: {time.perf_counter()-t:.2f}s")
+    t=time.perf_counter()
+    with mp.Pool(4) as p: p.map(burn,[3_000_000]*4)
+    print(f"4 processes: {time.perf_counter()-t:.2f}s")</code></pre>
+<p><strong>Predict first:</strong> will 4 threads take about 1/4 of the serial time? Write your guess, then look.</p>
+<pre class="code lang-text"><code>cores: 12
+serial x4: 0.31s
+4 threads: 0.32s
+4 processes: 0.38s</code></pre>
+<ul><li><strong>Line by line</strong> <code>burn</code> does pure arithmetic (no waiting), so it is CPU-bound. The list comprehension runs it 4 times one after another. The thread version starts 4 threads and <code>join</code> waits for all. <code>mp.Pool(4).map</code> sends the work to 4 separate processes.</li><li><strong>Check</strong> Serial time 0.31 s for 4 calls is about 0.078 s per call. Threads at 0.32 s match serial, as the GIL predicts.</li><li><strong>Answer</strong> Threads gave no speed-up (0.32 s vs 0.31 s), because standard Python has a <strong>GIL</strong> (global interpreter lock): only one thread runs Python bytecode at a time. Processes were not faster here (0.38 s) because the job is so small that starting processes costs as much as the work. With a job 100 times bigger, processes would win on a multi-core machine. Lesson: measure before you parallelise. Threads still help when work is I/O waiting (section 5.4).</li></ul>
+<div class="callout cream"><div class="lab">KEY INSIGHT</div><div class="txt">Threads are cheap to create and share memory, but they share bugs too. Processes are isolated and safer, but sharing data needs copying or special channels. Most servers use both: several processes, each with many threads.</div></div>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Process</td><td>One Gunicorn worker, PID 4021</td><td>Each worker of your web service is a process</td></tr><tr><td>Thread</td><td>8 threads inside one web-server process</td><td>Each visitor request is handled by a thread</td></tr><tr><td>Ready queue length</td><td><code>r = 9</code> on 4 cores</td><td>Why latency rises when CPU is saturated</td></tr><tr><td>Context switch</td><td>About 9,000 per second (<code>cs</code> in <code>vmstat</code>)</td><td>Too many threads wastes CPU</td></tr></tbody></table></div>
+<h3>Connection to the real job</h3>
+<p>When a busy web service shows CPU at 100% and latency climbing, requests are sitting in the ready queue. The CPU is not "doing more work", it is making them wait. Thread-pool sizing in web servers, Spark executors (one process, many threads) and Python's <code>multiprocessing</code> for data preprocessing all rest on this model.</p>
+<h3>Applications</h3>
+<ul><li>Web servers (worker processes plus thread pools)</li><li>Data pipelines (parallel file processing with processes)</li><li>Databases (one process or thread per connection)</li><li>Containers (a container is just isolated processes)</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Assuming more threads means more speed. If threads exceed cores for CPU-bound work, you only add context switches. In Python, CPU-bound threads do not run in parallel at all (standard build). Use processes or vectorised libraries like NumPy.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does a thread share with other threads of the same process, and what is private? Answer: It shares memory (heap, open files); its stack and registers are private.</li><li>Why does round robin reduce average finish time in Problem 5.1.1? Answer: Short jobs finish early instead of waiting for the 24 ms job.</li><li>Why did 4 threads not beat serial in Python? Answer: The GIL lets only one thread run Python bytecode at a time.</li></ol>
+<h2 id="s2-5-2-concurrency-problems-races-deadlocks-starvation-locks">5.2 Concurrency Problems: Races, Deadlocks, Starvation, Locks</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Two people edit the same cell in a shared spreadsheet. Both read "100", both add 1, both write "101". Two additions happened but the cell moved by one. That lost update is a <strong>race condition</strong>. Locks are the "someone is editing, please wait" sign.</div></div>
+<h3>Definitions</h3>
+<ul><li><strong>Race condition:</strong> the result depends on the exact timing of threads. Typical form: read, modify, write, without protection.</li><li><strong>Critical section:</strong> the code that touches shared data and must run by one thread at a time.</li><li><strong>Lock (mutex):</strong> only one thread can hold it. Others wait. Always release it (use <code>with</code>).</li><li><strong>Semaphore:</strong> a counter that allows up to N threads in at once. A semaphore of 5 is a "5 database connections only" gate.</li><li><strong>Deadlock:</strong> thread 1 holds lock A and waits for B; thread 2 holds B and waits for A. Both wait forever. Four conditions must all hold: mutual exclusion, hold-and-wait, no pre-emption, circular wait. Break any one to prevent deadlock.</li><li><strong>Starvation:</strong> a thread is always skipped and never gets the resource (for example, low-priority work under constant high-priority load).</li></ul>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 5.2.1</span> Four threads each add 1 to a shared counter 2000 times. Expected total: 8000. Show the race and fix it with a lock. (We add <code>time.sleep(0)</code> between read and write to force a thread switch. Real races are rarer but just as real.)</p>
+<table class="steps"><tr><th>Step 1</th><td>Unsafe version: <code>tmp = counter</code>, yield, <code>counter = tmp + 1</code>.</td></tr><tr><th>Step 2</th><td>Safe version: wrap the three lines in <code>with lock:</code>.</td></tr></table>
+<pre class="code lang-python"><code>import threading, time
+counter = 0
+def work_unsafe(n):
+    global counter
+    for _ in range(n):
+        tmp = counter
+        time.sleep(0)
+        counter = tmp + 1
+lock = threading.Lock()
+def work_safe(n):
+    global counter
+    for _ in range(n):
+        with lock:
+            tmp = counter
+            time.sleep(0)
+            counter = tmp + 1
+def run(fn, label, threads=4, n=2000):
+    global counter
+    counter = 0
+    ts = [threading.Thread(target=fn, args=(n,)) for _ in range(threads)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    print(f"{label}: expected {threads*n}, got {counter}")
+run(work_unsafe, "no lock  ")
+run(work_safe,   "with lock")</code></pre>
+<p><strong>Predict first:</strong> the right answer is 8000. What do you expect the no-lock line to print: 8000, a bit less, or a lot less?</p>
+<pre class="code lang-text"><code>no lock  : expected 8000, got 2055
+with lock: expected 8000, got 8000</code></pre>
+<ul><li><strong>Line by line</strong> <code>tmp = counter</code> reads. <code>time.sleep(0)</code> politely gives up the CPU, so another thread runs and reads the same old value. <code>counter = tmp + 1</code> then writes a stale result. <code>with lock:</code> makes read, sleep and write one unbreakable block.</li><li><strong>Wrong version</strong> If you write <code>counter = counter + 1</code> in a function without <code>global counter</code>, Python stops you:</li></ul>
+<pre class="code lang-text"><code>UnboundLocalError cannot access local variable 'counter' where it is not associated with a value</code></pre>
+<p>Fix: add <code>global counter</code> as the first line of the function.</p>
+<ul><li><strong>Check</strong> 4 threads x 2000 = 8000. The safe version printed exactly that, so the lock works.</li><li><strong>Answer</strong> Without the lock we lost about 5,900 updates. The exact number changes on every run (that is what makes races hard to debug). With the lock the answer is always 8000. In plain words: about 3 of every 4 updates vanished, and nothing crashed, which is why races are dangerous.</li></ul>
+<p class="problem"><span class="pl">Problem 5.2.2</span> Create a deadlock, then fix it by lock ordering. We use <code>acquire(timeout=1)</code> so the demo ends instead of hanging.</p>
+<table class="steps"><tr><th>Step 1</th><td>Thread 1 takes <code>a</code>, sleeps, then wants <code>b</code>. Thread 2 takes <code>b</code>, sleeps, then wants <code>a</code>.</td></tr><tr><th>Step 2</th><td>Both time out: they were in a circular wait.</td></tr><tr><th>Step 3</th><td>Fix: both threads always take <code>a</code> first, then <code>b</code>.</td></tr></table>
+<pre class="code lang-python"><code>import threading, time
+a, b = threading.Lock(), threading.Lock()
+def t1():
+    with a:
+        time.sleep(0.2)
+        ok = b.acquire(timeout=1)
+        print("t1 got b?", ok)
+        if ok: b.release()
+def t2():
+    with b:
+        time.sleep(0.2)
+        ok = a.acquire(timeout=1)
+        print("t2 got a?", ok)
+        if ok: a.release()
+def t2_fixed():
+    with a:
+        time.sleep(0.2)
+        with b:
+            print("t2 got both")</code></pre>
+<p><strong>Predict first:</strong> neither thread can finish. What will <code>acquire(timeout=1)</code> return for each?</p>
+<pre class="code lang-text"><code>t1 got b? False
+t2 got a? False
+--- fixed: both take locks in the same order (a then b) ---
+t1 got b? True
+t2 got both</code></pre>
+<ul><li><strong>Check</strong> After the fix there is no cycle: t2_fixed waits for <code>a</code>, which t1 releases when done, so progress is guaranteed.</li><li><strong>Answer</strong> Opposite lock order gave a deadlock (both gave up after 1 s). The same order removed the circular wait, and both threads finished.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code>Deadlock:   T1 holds A --wants--&gt; B held by T2 --wants--&gt; A held by T1   (a cycle)
+Fix:        order the locks (A before B) so a cycle cannot form</code></pre>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Race condition</td><td>Two requests update one counter, 2055 of 8000 survive</td><td>Hit counters, inventory stock, caches</td></tr><tr><td>Lock</td><td><code>with lock:</code> around the counter update</td><td>Thread-safe code in services</td></tr><tr><td>Semaphore</td><td>Pool of 20 database connections</td><td>Connection pools; exhausted pool means queueing</td></tr><tr><td>Deadlock</td><td>Two transactions update rows in opposite order</td><td>Random database errors under load</td></tr></tbody></table></div>
+<h3>Connection to the real job</h3>
+<ul><li>Database deadlocks: two transactions update rows in opposite order. The database kills one ("deadlock detected"). Users may see these as random errors when many people act at once, and the fix is the same: consistent ordering.</li><li>Lock contention shows up as low CPU but high latency: threads are blocked, not running. A thread dump (<code>jstack</code> for Java services) shows many threads in state BLOCKED or WAITING.</li><li>Connection pools are semaphores in disguise. When the pool is exhausted, requests queue.</li></ul>
+<h3>Applications</h3>
+<ul><li>Databases and transactions</li><li>Thread-safe caches and counters</li><li>Producer-consumer queues in data pipelines</li><li>Rate limiters and connection pools</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Locking too much. One giant lock makes the program correct but serial, so it is slow. Lock only the smallest critical section. Another mistake: testing a race once, seeing correct output and concluding it is safe. Races are timing luck.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Name the four deadlock conditions. Answer: Mutual exclusion, hold-and-wait, no pre-emption, circular wait.</li><li>What is the difference between a lock and a semaphore? Answer: A lock lets one thread in; a semaphore lets up to N in.</li><li>Why is low CPU with high latency a hint of lock contention? Answer: Threads are blocked waiting, not using the CPU.</li></ol>
+<h2 id="s3-5-3-memory-stack-heap-virtual-memory-swapping-oom">5.3 Memory: Stack, Heap, Virtual Memory, Swapping, OOM</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Memory (RAM) is a desk. Disk is the cupboard across the room. Your program thinks it has a huge private desk, but the OS secretly keeps only the papers you are using on the real desk and puts the rest in the cupboard. That trick is <strong>virtual memory</strong>.</div></div>
+<h3>How it works</h3>
+<ul><li><strong>Stack:</strong> small, fast memory for function calls and local variables. Each call adds a frame; return removes it. Too deep recursion causes <strong>stack overflow</strong>.</li><li><strong>Heap:</strong> large memory for objects that live as long as needed. You (or a garbage collector) must free them.</li><li><strong>Virtual memory:</strong> every process sees its own address space. The OS maps it to real RAM in blocks called <strong>pages</strong> (commonly 4 KB; this Mac uses 16 KB, as <code>vm_stat</code> reports). A page not in RAM causes a <strong>page fault</strong>: the OS loads it from disk.</li><li><strong>Swapping:</strong> when RAM is full, the OS moves cold pages to disk (swap). Disk is thousands of times slower than RAM, so a swapping machine crawls.</li><li><strong>Memory leak:</strong> the program keeps references to objects it no longer needs, so memory only grows.</li><li><strong>OOM (out of memory):</strong> when memory truly runs out, Linux's OOM killer picks a process and kills it. Containers with a memory limit get killed at their limit, often shown as "OOMKilled" or exit code 137.</li><li><strong>CPU caches:</strong> tiny, very fast memory on the chip. Reading data in order is much faster than jumping around (more in chapter 13).</li></ul>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 5.3.1</span> Find a leak. A handler appends 10,000 characters to a global list on every request and never clears it. Measure after 1000 and 2000 requests with <code>tracemalloc</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>Expected by hand: 1000 x 10,000 bytes = 10 MB; 2000 requests = 20 MB.</td></tr><tr><th>Step 2</th><td>Run it.</td></tr></table>
+<pre class="code lang-python"><code>import tracemalloc, sys
+cache = []
+def handle(i):
+    cache.append("x"*10_000)   # leak: never cleared
+tracemalloc.start()
+for i in range(1000): handle(i)
+cur, peak = tracemalloc.get_traced_memory()
+print(f"after 1000 requests: {cur/1e6:.1f} MB held")
+for i in range(1000): handle(i)
+cur, peak = tracemalloc.get_traced_memory()
+print(f"after 2000 requests: {cur/1e6:.1f} MB held")
+print("list of 1000 ints:", sys.getsizeof(list(range(1000))), "bytes (pointers only)")
+def rec(n): return rec(n+1)
+try: rec(0)
+except RecursionError as e: print("stack overflow guard:", type(e).__name__)</code></pre>
+<p><strong>Predict first:</strong> by hand, 1000 strings of 10,000 bytes is how many MB? Then check.</p>
+<pre class="code lang-text"><code>after 1000 requests: 10.0 MB held
+after 2000 requests: 20.1 MB held
+list of 1000 ints: 8056 bytes (pointers only)
+stack overflow guard: RecursionError</code></pre>
+<ul><li><strong>Line by line</strong> <code>cache</code> is a global list, so it lives as long as the program. Each call appends a new 10,000-character string and nothing removes it. <code>tracemalloc.get_traced_memory()</code> returns (current, peak) bytes. <code>rec</code> calls itself with no stopping rule, so frames pile up on the stack until Python raises <code>RecursionError</code>.</li><li><strong>Check</strong> 2000 x 10,000 bytes = 20,000,000 bytes = 20 MB, and the tool says 20.1 MB (small extras from object headers).</li><li><strong>Answer</strong> Memory grows linearly with requests (10.0 MB then 20.1 MB), matching our hand calculation. A steady upward line like this over a long soak test is the signature of a leak. The last two lines show a list stores only pointers (8 bytes each, plus a small header), and that Python stops runaway recursion with <code>RecursionError</code>.</li></ul>
+<p class="problem"><span class="pl">Problem 5.3.2</span> Will it fit? A server has 16 GB RAM, the OS and other services use 3 GB, and each worker process uses 1.8 GB. How many workers fit without swapping, keeping a 10% safety margin of total RAM?</p>
+<table class="steps"><tr><th>Step 1</th><td>Safety margin: 10% of 16 = 1.6 GB.</td></tr><tr><th>Step 2</th><td>Available: 16 - 3 - 1.6 = 11.4 GB.</td></tr><tr><th>Step 3</th><td>Workers: 11.4 / 1.8 = 6.33, round down.</td></tr><tr><th>Check</th><td>6 x 1.8 = 10.8 GB is below 11.4; 7 x 1.8 = 12.6 GB is above it.</td></tr><tr><th>Answer</th><td>6 workers. A 7th would push the machine into swap or the OOM killer.</td></tr></table>
+<h3>Picture</h3>
+<pre class="code lang-text"><code> Fast, small, costly                                  Slow, large, cheap
+ CPU registers -&gt; L1/L2/L3 cache -&gt; RAM -&gt; SSD (swap) -&gt; network disk
+   ~1 ns               ~1-30 ns     ~100 ns   ~100 us         ~ms
+ (typical orders of magnitude; real numbers vary by machine)</code></pre>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Stack</td><td>Frames of nested function calls</td><td><code>RecursionError</code>, Java <code>StackOverflowError</code></td></tr><tr><td>Heap</td><td>10 MB of cached strings</td><td>Java heap settings, pandas DataFrames</td></tr><tr><td>Swap</td><td><code>so</code> above 0 in <code>vmstat</code></td><td>Server suddenly 50 times slower</td></tr><tr><td>OOM kill</td><td>Container exit code 137</td><td>Pods restarting during a soak test</td></tr></tbody></table></div>
+<h3>Connection to the real job</h3>
+<p>In a soak test, plot memory over time. Flat means healthy; a staircase that never drops is a leak; a sudden drop to zero is an OOM kill. In ML work, "CUDA out of memory" and pandas crashing on a large CSV are the same problem: the data does not fit in RAM or VRAM.</p>
+<h3>Applications</h3>
+<ul><li>Capacity planning (workers per machine)</li><li>Setting container memory limits</li><li>Choosing chunked reading for big files</li><li>Debugging slow services that swap</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reading "used memory" as bad. Linux uses spare RAM as file cache, so "free" is often small on a healthy machine. Look at <strong>available</strong> memory and at <strong>swap activity</strong> (<code>si/so</code> in <code>vmstat</code>), not at free.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What lives on the stack, what on the heap? Answer: Stack: call frames and locals. Heap: long-lived objects.</li><li>Why does swapping make a server slow? Answer: Disk is far slower than RAM, so each page fault waits long.</li><li>What does exit code 137 in a container usually mean? Answer: The process was killed with SIGKILL, often by the OOM killer.</li></ol>
+<h2 id="s4-5-4-file-systems-and-i-o-models">5.4 File Systems and I/O Models</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You order food. Option 1: stand at the counter until it is ready (<strong>blocking</strong>). Option 2: keep checking every minute while doing other things (<strong>non-blocking</strong>). Option 3: take a token and be called when ready (<strong>async / event-driven</strong>). The waiting is the same; what you do meanwhile differs.</div></div>
+<h3>How it works</h3>
+<ul><li>A <strong>file system</strong> (ext4, XFS, APFS, NTFS) organises disk blocks into files and folders. A file is stored as an inode (metadata) plus data blocks. Reads and writes go through the OS.</li><li><strong>Page cache:</strong> the OS keeps recently used file data in free RAM. A repeated read of the same file comes from RAM, not disk. Writes are often held in cache and flushed later (<code>fsync</code> forces them to disk).</li><li><strong>Disk types:</strong> an HDD has a moving head, so random access is slow (milliseconds). An SSD has no moving parts, so random access is fast (tens to hundreds of microseconds), but still slower than RAM. Sequential reads are faster than random on both.</li><li><strong>Blocking I/O:</strong> the thread sleeps until data arrives. <strong>Non-blocking:</strong> call returns at once ("not ready yet"). <strong>Async I/O:</strong> one thread manages thousands of waiting operations (<code>asyncio</code>, Node.js, <code>epoll</code> on Linux).</li></ul>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 5.4.1</span> Five calls each wait 0.2 s (like five slow API calls). Compare sequential blocking calls with <code>asyncio.gather</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>Sequential: 5 x 0.2 = 1.0 s expected.</td></tr><tr><th>Step 2</th><td>Together: all five wait at the same time, so about 0.2 s.</td></tr></table>
+<pre class="code lang-python"><code>import asyncio, time
+def blocking():
+    t=time.perf_counter()
+    for _ in range(5): time.sleep(0.2)
+    print(f"blocking sequential: {time.perf_counter()-t:.1f}s")
+async def one(): await asyncio.sleep(0.2)
+async def main():
+    t=time.perf_counter()
+    await asyncio.gather(*[one() for _ in range(5)])
+    print(f"asyncio, 5 waits together: {time.perf_counter()-t:.1f}s")
+blocking(); asyncio.run(main())</code></pre>
+<p><strong>Predict first:</strong> sequential is 1.0 s. How long do you think <code>gather</code> takes?</p>
+<pre class="code lang-text"><code>blocking sequential: 1.0s
+asyncio, 5 waits together: 0.2s</code></pre>
+<ul><li><strong>Line by line</strong> <code>time.sleep</code> blocks the whole thread. <code>await asyncio.sleep</code> hands control back to the event loop (the scheduler of async code) so the other waits can start. <code>gather</code> starts all five and waits for all.</li><li><strong>Wrong version</strong> If you call <code>time.sleep(0.2)</code> inside <code>async def one()</code>, the loop is blocked and the total is back to 1.0 s. Use <code>await asyncio.sleep</code>.</li><li><strong>Answer</strong> Overlapping the waits gave a 5x speed-up (1.0 s to 0.2 s) using one thread. Async helps with waiting, not with computing.</li></ul>
+<p class="problem"><span class="pl">Problem 5.4.2</span> See the page cache. Write a 200 MB random file in <code>/tmp</code>, read it twice, and time both reads. (The script deletes only its own temp file.)</p>
+<table class="steps"><tr><th>Step 1</th><td>Write the file, then read it in 1 MB chunks, twice.</td></tr></table>
+<pre class="code lang-python"><code>import os, time, tempfile
+d=tempfile.mkdtemp(dir="/tmp"); p=os.path.join(d,"f.bin")
+with open(p,"wb") as f: f.write(os.urandom(200_000_000))
+for label in ["first read","second read"]:
+    t=time.perf_counter()
+    with open(p,"rb") as f:
+        while f.read(1&lt;&lt;20): pass
+    print(f"{label}: {time.perf_counter()-t:.3f}s")
+os.remove(p); os.rmdir(d)</code></pre>
+<p><strong>Predict first:</strong> which read is faster, and why might the first one not be slow?</p>
+<pre class="code lang-text"><code>first read: 0.020s
+second read: 0.012s</code></pre>
+<ul><li><strong>Answer</strong> Both reads were fast, and the second was faster. Honest note: we had just written the file, so it was already in the page cache and even the "first" read came from RAM. To see a cold read you must drop caches (needs root on Linux, so not done here). The lesson for any timing measurement: the first run after a restart can be slower than later runs because caches are cold. Always warm up.</li></ul>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Page cache</td><td>Second read of a file is faster</td><td>Cold-start slowness in the first minute of a test</td></tr><tr><td>Blocking I/O</td><td><code>time.sleep(0.2)</code> x 5 = 1.0 s</td><td>Simple scripts calling APIs one by one</td></tr><tr><td>Async I/O</td><td>5 waits in 0.2 s</td><td><code>asyncio</code> ingestion jobs, nginx, Node.js</td></tr><tr><td>SSD vs HDD</td><td>Random reads in microseconds vs milliseconds</td><td>Choosing disks for databases</td></tr></tbody></table></div>
+<h3>Connection to the real job</h3>
+<p>Database performance is mostly about whether the working set sits in cache. A "slow first request" after a restart is often a cold cache. Async I/O is how one Python or Node process serves thousands of connections, and how data ingestion code calls many APIs fast.</p>
+<h3>Applications</h3>
+<ul><li>Web servers (nginx uses event-driven I/O)</li><li>Scraping and API ingestion with <code>asyncio</code></li><li>Database buffer pools and page caches</li><li>Choosing SSD vs HDD for logs and databases</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Benchmarking disk with a tiny file that fits in cache and concluding the disk is fast. Use files larger than RAM, or tools that bypass the cache, and say which you did.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is the page cache? Answer: Free RAM that the OS uses to keep recently used file data.</li><li>Why can async finish five 0.2 s waits in about 0.2 s? Answer: The waits overlap; one thread starts all of them and resumes as each ends.</li><li>Why is a cold-cache first run slower? Answer: Data must be read from disk before it lands in cache.</li></ol>
+<h2 id="s5-5-5-diagnosing-a-slow-system-on-linux">5.5 Diagnosing a Slow System on Linux</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A doctor checks pulse, temperature and blood pressure before guessing. For a server, the four "vital signs" are CPU, memory, disk and network. The <strong>USE method</strong> says: for each resource, check <strong>U</strong>tilisation (how busy), <strong>S</strong>aturation (how much waiting) and <strong>E</strong>rrors.</div></div>
+<h3>The toolbox</h3>
+<p>All commands below are <strong>Linux only, not run here</strong> unless stated. Outputs are illustrative of the shape, not measured.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Question</th><th>Command</th><th>What to look at</th></tr></thead><tbody><tr><td>Who is using CPU/memory?</td><td><code>top</code> or <code>htop</code></td><td><code>%CPU</code>, <code>%MEM</code>, load average, <code>wa</code> (I/O wait)</td></tr><tr><td>Is the box swapping or waiting?</td><td><code>vmstat 1</code></td><td><code>r</code> (runnable), <code>b</code> (blocked), <code>si/so</code> (swap), <code>us/sy/id/wa</code></td></tr><tr><td>Is the disk saturated?</td><td><code>iostat -x 1</code></td><td><code>%util</code>, <code>await</code> (ms per request), queue size</td></tr><tr><td>What system calls is it making?</td><td><code>strace -p PID</code> (or <code>strace -c</code>)</td><td>Slow or failing calls</td></tr><tr><td>Where in code is CPU spent?</td><td><code>perf top</code> / <code>perf record</code></td><td>Hot functions</td></tr><tr><td>Which files/ports are open?</td><td><code>lsof -p PID</code>, <code>lsof -i :8080</code></td><td>Leaked file handles, who owns a port</td></tr><tr><td>Raw kernel info</td><td><code>/proc/PID/status</code>, <code>/proc/meminfo</code>, <code>/proc/loadavg</code></td><td>Files that look like text but are live kernel data</td></tr></tbody></table></div>
+<p>Illustrative <code>vmstat 1</code> output:</p>
+<pre class="code lang-text"><code>procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 9  0      0 812344  91200 3211000    0    0     0    12 4100 9000 88 10  2  0  0</code></pre>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 5.5.1</span> Read the illustrative <code>vmstat</code> line above. The machine has 4 cores. What is the likely problem?</p>
+<table class="steps"><tr><th>Step 1</th><td><code>r = 9</code>: nine threads want a CPU, only 4 cores exist. The ready queue is about 2x the cores.</td></tr><tr><th>Step 2</th><td><code>us + sy = 98</code>, <code>id = 2</code>, <code>wa = 0</code>: the CPU is full and not waiting on disk.</td></tr><tr><th>Step 3</th><td><code>si = so = 0</code>: no swapping. <code>b = 0</code>: nothing is blocked on I/O.</td></tr><tr><th>Check</th><td>9 runnable on 4 cores means 5 threads wait at any moment, which explains slow responses with no disk or swap activity.</td></tr><tr><th>Answer</th><td>The system is CPU-bound and saturated. Plain English: your service is trying to do about twice as much work as the CPUs can handle. Fix by cutting CPU work (profile with <code>perf</code>), adding cores, or limiting concurrency. Adding RAM or faster disk would not help.</td></tr></table>
+<p class="problem"><span class="pl">Problem 5.5.2</span> Load average. A 4-core server shows load average <code>8.2, 7.9, 4.1</code> (1, 5, 15 minutes). Interpret it.</p>
+<table class="steps"><tr><th>Step 1</th><td>Load average roughly counts threads running or waiting. Divide by cores: 8.2 / 4 = 2.05.</td></tr><tr><th>Step 2</th><td>The trend: 4.1 (15 min) rising to 7.9 and 8.2 means the load grew about 10 minutes ago and is still high.</td></tr><tr><th>Check</th><td>8.2 / 4 = 2.05, and 4.1 / 4 is about 1.0, so the load doubled.</td></tr><tr><th>Answer</th><td>Each core has about two threads wanting it, so work queues up, and the problem is recent and ongoing. On Linux, load average also counts threads blocked in disk I/O, so check <code>vmstat</code> (<code>r</code> vs <code>b</code>) to tell CPU from disk.</td></tr></table>
+<p>Now a real command on this Mac, to show process listing (macOS tools differ from Linux, but <code>ps</code> is similar):</p>
+<pre class="code lang-bash"><code>ps -o pid,ppid,stat,%cpu,%mem,comm -p $$</code></pre>
+<pre class="code lang-text"><code>  PID  PPID STAT  %CPU %MEM COMM
+21620 21529 Ss     0.0  0.0 /bin/zsh</code></pre>
+<p>This is the shell itself: PID 21620, started by parent 21529, state <code>Ss</code> (sleeping, session leader). The PPID column shows every process has a parent, which is how the process tree forms. macOS <code>vm_stat</code> (also run here) reported "page size of 16384 bytes" and counts of free, active and inactive pages.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>vmstat 1</code></td><td><code>r=9, wa=0, si=so=0</code></td><td>First look at a slow box</td></tr><tr><td><code>iostat -x</code></td><td><code>%util</code> near 100</td><td>Disk-bound database</td></tr><tr><td>Load average</td><td><code>8.2</code> on 4 cores</td><td>Capacity and queue buildup</td></tr><tr><td><code>lsof -i :8080</code></td><td>PID owning port 8080</td><td>"Address already in use" errors</td></tr></tbody></table></div>
+<h3>Connection to the real job</h3>
+<p>This habit is a superpower in a data job. A slow Spark job, a slow training loop or a slow API all go through the same four resources. Say "GPU utilisation is 30% and the data loader is CPU-bound with <code>wa</code> high" in an interview and you stand out.</p>
+<h3>Applications</h3>
+<ul><li>Root-cause analysis after a slow day on a web service</li><li>Capacity planning</li><li>Tuning data pipelines and training jobs</li><li>On-call incident response</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Looking at only CPU%. A system with 20% CPU can be slow because of lock waits, disk queueing or network delay. Check all four resources and the queues, not just utilisation.</div></div>
+<div class="callout green"><div class="lab">REAL JOB TIP</div><div class="txt">Keep a one-page checklist: <code>uptime</code>, <code>vmstat 1 5</code>, <code>iostat -x 1 5</code>, <code>top</code>, then <code>ss -s</code>. Run it in the first minute of every incident. Related: Little's law, <code>L = λ × W</code> (items in system = arrival rate x time in system), tells you how queue length grows when latency grows.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What do <code>r</code> and <code>b</code> mean in <code>vmstat</code>? Answer: <code>r</code> is runnable threads waiting for CPU; <code>b</code> is threads blocked on I/O.</li><li>Which tool shows slow disk requests? Answer: <code>iostat -x</code> (look at <code>await</code> and <code>%util</code>).</li><li>Which tool finds who holds port 8080? Answer: <code>lsof -i :8080</code> (or <code>ss -ltnp</code>).</li></ol>
+<h2 id="s6-chapter-recap">Chapter recap</h2>
+<ul><li>A process has private memory; threads in one process share memory.</li><li>A core runs one thread at a time; the scheduler switches with context switches.</li><li>Round robin helps short jobs: average finish dropped from 27.0 to 15.67 ms in our example.</li><li>Python threads do not speed up CPU work (GIL); use processes or NumPy. Threads are fine for waiting.</li><li>A race condition loses updates (2055 instead of 8000); a lock fixes it.</li><li>Deadlock needs a circular wait; always take locks in the same order.</li><li>Virtual memory, swapping and OOM kills explain many slow or crashing servers; watch available memory and swap activity.</li><li>The page cache makes repeated reads fast, so warm up before measuring.</li><li>Async I/O overlaps waiting; it does not speed up computing.</li><li>Diagnose with USE: utilisation, saturation, errors for CPU, memory, disk and network.</li></ul>
+<h3>Cheat sheet</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Situation</th><th>Command or pattern</th><th>What to read</th></tr></thead><tbody><tr><td>Process list</td><td><code>ps -o pid,ppid,stat,%cpu,%mem,comm -p PID</code></td><td>State, parent, CPU, memory</td></tr><tr><td>CPU queue and swap</td><td><code>vmstat 1</code> (Linux)</td><td><code>r</code>, <code>b</code>, <code>si</code>, <code>so</code>, <code>wa</code></td></tr><tr><td>Disk busy</td><td><code>iostat -x 1</code> (Linux)</td><td><code>%util</code>, <code>await</code></td></tr><tr><td>Port owner</td><td><code>lsof -i :PORT</code></td><td>PID</td></tr><tr><td>Safe shared update</td><td><code>with lock:</code></td><td>Whole read-modify-write inside</td></tr><tr><td>Avoid deadlock</td><td>Take locks in one global order</td><td>No circular wait</td></tr><tr><td>Overlap waiting</td><td><code>await asyncio.gather(...)</code></td><td>Total time is the longest wait</td></tr><tr><td>Spot a leak</td><td><code>tracemalloc.get_traced_memory()</code></td><td>Steady growth per request</td></tr></tbody></table></div>
+<h2 id="s7-practice-set">Practice set</h2>
+<p><strong>1.</strong> What is a context switch? <strong>Answer:</strong> The OS saves one thread's state and loads another's so a core can run it.</p>
+<p><strong>2.</strong> Three jobs of 5, 5 and 10 ms run FCFS in that order. What is the average finish time? <strong>Answer:</strong> Finish at 5, 10, 20. Average = 35 / 3 = 11.67 ms.</p>
+<p><strong>3.</strong> A container has a 2 GB memory limit and exits with code 137. Name two likely causes. <strong>Answer:</strong> A memory leak, or a workload (big DataFrame, large batch) that needs more than 2 GB. The OOM killer sent SIGKILL.</p>
+<p><strong>4.</strong> Find the bug:</p>
+<pre class="code lang-python"><code>lock.acquire()
+total += compute()
+lock.release()</code></pre>
+<p><strong>Answer:</strong> If <code>compute()</code> raises an exception the lock is never released and others block forever. Use <code>with lock:</code>.</p>
+<p><strong>5.</strong> A 8-core machine has load average 2.0 but requests are slow and CPU is 15% busy. Give two hypotheses. <strong>Answer:</strong> Lock contention in the application, or waiting on a slow downstream service or database. Check thread dumps and downstream latency.</p>
+<p><strong>6.</strong> Scenario: during a 2-hour soak test, memory climbs 50 MB every 10 minutes and CPU stays flat. What do you report? <strong>Answer:</strong> A likely memory leak: about 5 MB per minute, 600 MB over the test. Recommend heap analysis, and estimate when the process will hit its limit (limit minus current, divided by 5 MB per minute).</p>
+<p><strong>7.</strong> Interview: "Explain the difference between a process and a thread and when you would use each." <strong>Answer:</strong> Processes have isolated memory, so they are safer and use multiple cores in Python, but cost more and need IPC to share data. Threads share memory, so they are cheap and good for I/O waiting, but need locks to avoid races. Many servers combine both.</p>
+<p><strong>8.</strong> Interview: "A service is slow but CPU is low. How do you investigate?" <strong>Answer:</strong> Apply USE to every resource: <code>vmstat</code> for blocked threads and swap, <code>iostat</code> for disk, <code>ss</code> for network queues, a thread dump for lock waits, and tracing for slow downstream calls. Low CPU points toward waiting, not computing.</p>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data and ML roles, and English is my second language, so use simple words. Teach me "processes, threads, context switches and CPU scheduling". Explain step by step with a kitchen analogy, then give three small numeric scheduling problems (FCFS vs round robin). After each, wait for my answer, check it, and correct me gently. Finish by asking me to explain the topic back in my own words.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data and ML roles, with English as my second language. Topic: "race conditions, locks, semaphores and deadlocks in Python threading". Give me 8 graded exercises, from a simple unsafe counter to a deadlock with lock ordering, without solutions. Each should have runnable code and a question like "what could the output be?". When I paste my answers, review them and explain every mistake in simple English.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning data and ML engineering, English is my second language. Topic: "virtual memory, stack vs heap, swapping, memory leaks and OOM kills". Quiz me one question at a time, starting easy and getting harder, using real server and container situations. Wait for my answer before giving feedback. Keep a score and tell me which sub-topic I should revise at the end.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving to data and ML roles, with English as my second language. Topic: "diagnosing slow Linux systems with top, vmstat, iostat, strace, perf, lsof and the USE method". Here is output from my machine: [PASTE HERE]. Explain what each column means, say whether the problem is CPU, memory, disk or network, and tell me which command to run next and why.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data and ML roles, English is my second language. Run a mock interview on "operating systems fundamentals for performance and data engineering": processes vs threads, GIL, memory, blocking vs async I/O, and diagnosing slow services. Ask one question at a time, then give a score out of 10 and a model answer in simple English. After 8 questions, summarise my strong and weak areas and suggest a 3-day revision plan.</pre></div><div class="readbtn"><button class="btn" data-read="study:cs:ch05">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch04.html">← Chapter 4: Computer Networks and HTTP</a><a class="btn" href="ch06.html">Chapter 6: Security Basics for Data and ML Engineer →</a></div></div><script src="../../assets/study.js"></script></body></html>

@@ -1,0 +1,316 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 6: Feature Engineering II: Behavioural Features, Selection and Leakage-Safe Pipelines</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Science in Practice</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 6</div><h1>Feature Engineering II: Behavioural Features, Selection and Leakage-Safe Pipelines</h1><p>The features that usually win: how a customer behaved recently, how that is changing, which ones to keep, and how to build them once so training and production agree.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-6-1-rfm-and-rolling-window-features">6.1 RFM and Rolling-Window Features</a></li><li><a href="#s2-6-2-trends-lags-cross-entity-features-and-do-they-help">6.2 Trends, Lags, Cross-Entity Features, and Do They Help?</a></li><li><a href="#s3-6-3-feature-selection-and-stability">6.3 Feature Selection and Stability</a></li><li><a href="#s4-6-4-leakage-safe-pipelines-and-training-serving-skew">6.4 Leakage-Safe Pipelines and Training-Serving Skew</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>In Chapter 5 you prepared single columns. But for churn, fraud, credit and demand, the strongest signals are rarely in one column. They are in <em>behaviour over time</em>: how recently did the customer act, how often, how much, is the pace rising or falling? In this chapter you will build those features from an orders table (recency, frequency, monetary value, rolling windows, trends, gaps, category shares), test whether each helps, choose the ones to keep with several selection methods, check that they are stable over time, and package everything in a pipeline so the feature you test is exactly the feature you serve. You will end with a function <code>build_features(c, o, T)</code> that you can reuse on any event table. A warning you will see proven: more features is not always better, and in our data a handful of simple ones carry nearly all the signal.</p>
+<p><strong>Running example.</strong> The shop data (<code>make_data()</code>), churn at prediction date T. For training we build a <em>snapshot table</em> at several dates (T = 1 May, 1 June, ..., 1 Nov 2024), stack them (16,152 rows), and test on T = 2025-01-01 (2,562 rows). Using several snapshots gives the model more examples, and the time split (train earlier, test later) copies real use. The label window of the last training snapshot (1 Nov plus 60 days = 31 Dec) ends before the test date, so there is no overlap in time.</p>
+<h2 id="s1-6-1-rfm-and-rolling-window-features">6.1 RFM and Rolling-Window Features</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A shopkeeper who knows his regular customers does not need a model to guess who is drifting away. He thinks: "She came yesterday, she comes every week, she spends a lot: safe." "He last came two months ago, and used to come weekly: gone." Those are three numbers: how recently (R), how often (F), how much (M). Rolling windows are the same idea measured over the last 7, 30 and 90 days.</div></div>
+<p><strong>Words you need</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th><th>Example</th></tr></thead><tbody><tr><td>RFM</td><td>Recency, Frequency, Monetary value</td><td>8 days ago, 40 orders, Rs 23,746</td></tr><tr><td>Window</td><td>A time range ending at T</td><td>last 30 days: <code>age_d &lt;= 30</code></td></tr><tr><td><code>age_d</code></td><td>Days between an event and T (1 = yesterday)</td><td>an order 5 days before T has <code>age_d = 5</code></td></tr><tr><td>Rolling aggregate</td><td>Count, sum, mean, std, min, max inside a window</td><td><code>orders_30d</code>, <code>spend_90d</code></td></tr><tr><td>Snapshot</td><td>The feature table as of one date T</td><td>train table at 2024-08-01</td></tr></tbody></table></div>
+<p><strong>The core function.</strong> Everything is computed from rows with <code>order_ts &lt; T</code>; this is the point-in-time rule from Chapter 2. Read it slowly; we use it for the rest of the chapter.</p>
+<pre class="code lang-python"><code>def build_features(c, o, T):
+    """One row per ACTIVE customer at T. Uses only orders with order_ts &lt; T. Label from T..T+60d."""
+    T = pd.Timestamp(T)
+    base = make_label_table(c, o, pred_date=T)               # customers + churn label
+    past = o[o.order_ts &lt; T].copy()                           # &lt;-- the leakage guard
+    past["age_d"] = (T - past.order_ts).dt.days               # 1 = yesterday
+    f = pd.DataFrame(index=base.customer_id)
+    g = past.groupby("customer_id")
+    f["recency_days"] = g.age_d.min()                         # R
+    f["frequency_all"] = g.size()                             # F
+    f["monetary_all"] = g.amount.sum()                        # M
+    for w in (7, 30, 90):                                     # rolling windows
+        s = past[past.age_d &lt;= w].groupby("customer_id")
+        f[f"orders_{w}d"] = s.size(); f[f"spend_{w}d"] = s.amount.sum()
+    s = past[(past.age_d &gt; 30) &amp; (past.age_d &lt;= 60)].groupby("customer_id")     # previous windows
+    f["orders_30_60d"] = s.size(); f["spend_30_60d"] = s.amount.sum()
+    s = past[(past.age_d &gt; 60) &amp; (past.age_d &lt;= 90)].groupby("customer_id")
+    f["orders_60_90d"] = s.size(); f["spend_60_90d"] = s.amount.sum()
+    f = f.reindex(base.customer_id).fillna({k: 0 for k in f.columns if k != "recency_days"})
+    f["avg_order_90d"] = np.where(f.orders_90d &gt; 0, f.spend_90d / f.orders_90d.clip(lower=1), np.nan)
+    f["ratio_7_30"] = f.orders_7d / (f.orders_30d + 1)
+    f["trend_30_vs_prev60"] = (f.orders_30d + 1) / ((f.orders_30_60d + f.orders_60_90d) / 2 + 1)
+    f["velocity_spend"] = f.spend_30d - f.spend_30_60d
+    f["accel_spend"] = (f.spend_30d - f.spend_30_60d) - (f.spend_30_60d - f.spend_60_90d)
+    # gaps between consecutive orders in the last 180 days
+    p2 = past[past.age_d &lt;= 180].sort_values(["customer_id", "order_ts"])
+    p2["gap"] = p2.groupby("customer_id").order_ts.diff().dt.days
+    gg = p2.groupby("customer_id").gap.agg(["mean", "max", "std"]); gg.columns = ["gap_mean", "gap_max", "gap_std"]
+    f = f.join(gg, how="left")
+    f["rec_over_gap"] = f.recency_days / (f.gap_mean.fillna(90) + 1)
+    # customer x category shares in the last 90 days (cross-entity feature)
+    q = past[past.age_d &lt;= 90]
+    cs = pd.crosstab(q.customer_id, q.category, normalize="index"); cs.columns = [f"share_{x}" for x in cs.columns]
+    f = f.join(cs, how="left").fillna({k: 0 for k in cs.columns})
+    out = base.merge(f.reset_index(), on="customer_id", how="left")
+    out["tenure_days"] = (T - out.signup_date).dt.days
+    out["is_pro"] = (out.plan == "pro").astype(int)
+    out["T"] = T
+    return out</code></pre>
+<p><strong>Worked problem.</strong> Before using it on 6,000 customers, we do one customer by hand.</p>
+<p class="problem"><span class="pl">Problem 6.1.1</span> A customer's orders before T were, in days before T: 2, 5, 9, 20 and 45, for Rs 100, 200, 150, 300 and 250. Compute <code>orders_7d</code>, <code>orders_30d</code>, <code>spend_30d</code>, <code>orders_30_60d</code>, <code>spend_30_60d</code>, <code>trend_30_vs_prev60</code>, <code>gap_mean</code>, <code>gap_max</code>, and <code>rec_over_gap</code>.</p>
+<table class="steps"><tr><th>Step 1 (windows)</th><td><code>orders_7d</code> counts <code>age_d &lt;= 7</code>: ages 2 and 5, so 2. <code>orders_30d</code> counts <code>age_d &lt;= 30</code>: ages 2, 5, 9, 20, so 4. <code>spend_30d</code> = 100 + 200 + 150 + 300 = 750. The window 30 to 60 days holds age 45 only, so <code>orders_30_60d</code> = 1 and <code>spend_30_60d</code> = 250. The window 60 to 90 days is empty: <code>orders_60_90d</code> = 0.</td></tr><tr><th>Step 2 (trend)</th><td>Formula <code>(orders_30d + 1) / ((orders_30_60d + orders_60_90d)/2 + 1)</code>. Plug in <code>(4 + 1) / ((1 + 0)/2 + 1) = 5 / 1.5 = 3.33</code>. The "+1" terms are <em>smoothing</em>: they avoid dividing by zero and calm down tiny counts.</td></tr><tr><th>Step 3 (gaps)</th><td>Sort the order times oldest to newest (ages 45, 20, 9, 5, 2). Gaps are 45-20 = 25, 20-9 = 11, 9-5 = 4, 5-2 = 3 days. Mean = (25 + 11 + 4 + 3) / 4 = 10.75; max = 25.</td></tr><tr><th>Step 4 (recency over gap)</th><td><code>recency_days</code> = 2 (the most recent order was 2 days ago). <code>rec_over_gap = 2 / (10.75 + 1) = 0.17</code>.</td></tr><tr><th>Answer</th><td>2, 4, Rs 750, 1, Rs 250, trend 3.33, mean gap 10.75, max gap 25, rec_over_gap 0.17.</td></tr><tr><th>Check</th><td>Total spend over all five orders = 1,000; windows 0-30 and 30-60 give 750 + 250 = 1,000 ✓. Verified in code too.</td></tr><tr><th>Why it matters</th><td>In plain words: this customer is buying about three times faster in the last month than before, and ordered 2 days ago against a usual gap of 11 days, so they look very active. A value of <code>rec_over_gap</code> above 3 would say "three missed cycles": a warning sign.</td></tr></table>
+<p><strong>Run it.</strong> Predict first: how many rows will the training snapshots give, and will churn rates differ much between train and test?</p>
+<pre class="code lang-python"><code>c, o = make_data()
+Ts_train = pd.to_datetime(["2024-05-01", "2024-06-01", "2024-07-01", "2024-08-01",
+                           "2024-09-01", "2024-10-01", "2024-11-01"])
+tr = pd.concat([build_features(c, o, T) for T in Ts_train], ignore_index=True)
+te = build_features(c, o, "2025-01-01")
+print("train rows", len(tr), " test rows", len(te), " churn rates", round(tr.churn.mean(), 3), round(te.churn.mean(), 3))
+print(te[["recency_days", "orders_7d", "orders_30d", "orders_90d", "gap_mean", "trend_30_vs_prev60", "rec_over_gap"]]
+      .describe().round(2).loc[["mean", "50%", "max"]].to_string())</code></pre>
+<pre class="code lang-text"><code>train rows 16152  test rows 2562  churn rates 0.246 0.254
+      recency_days  orders_7d  orders_30d  orders_90d  gap_mean  trend_30_vs_prev60  rec_over_gap
+mean         19.35       0.75        3.12        9.17     11.65                1.28          1.83
+50%           9.00       0.00        2.00        7.00      8.33                1.00          0.84
+max          90.00       8.00       22.00       67.00    153.00               17.00         75.00</code></pre>
+<p>Reading it: the churn rate is steady (24.6% in train, 25.4% in test), as Chapter 3's drift check suggested. A median customer last ordered 9 days ago and has a gap of about 8 days. <code>trend_30_vs_prev60</code> has a median of 1.00 (steady pace) and a maximum of 17 (a customer who suddenly became very active).</p>
+<p><strong>RFM scoring and segments.</strong> Marketers rank each of R, F and M into 5 groups (5 = best) and combine them. <code>pd.qcut</code> cuts into quantile groups. For recency, a small number of days is good, so labels are reversed.</p>
+<pre class="code lang-python"><code>rfm = te[["customer_id", "recency_days", "frequency_all", "monetary_all", "churn"]].copy()
+rfm["R"] = pd.qcut(rfm.recency_days, 5, labels=[5, 4, 3, 2, 1]).astype(int)
+rfm["F"] = pd.qcut(rfm.frequency_all.rank(method="first"), 5, labels=[1, 2, 3, 4, 5]).astype(int)
+rfm["M"] = pd.qcut(rfm.monetary_all.rank(method="first"), 5, labels=[1, 2, 3, 4, 5]).astype(int)
+def seg(r):
+    if r.R &gt;= 4 and r.F &gt;= 4: return "Champions"
+    if r.R &gt;= 4: return "Recent"
+    if r.R &lt;= 2 and r.F &gt;= 4: return "At risk (were frequent)"
+    if r.R &lt;= 2: return "Lapsing"
+    return "Middle"
+rfm["segment"] = rfm.apply(seg, axis=1)
+print(rfm.groupby("segment").churn.agg(["size", "mean"]).round(3).sort_values("mean"))</code></pre>
+<pre class="code lang-text"><code>                         size   mean
+segment                             
+Champions                 608  0.028
+Recent                    510  0.069
+Middle                    423  0.121
+Lapsing                   770  0.536
+At risk (were frequent)   251  0.538</code></pre>
+<p class="problem"><span class="pl">Problem 6.1.2</span> Read the segment table: how much better is the best segment than the worst, and how many customers does the "At risk (were frequent)" group represent as churners?</p>
+<table class="steps"><tr><th>Formula</th><td>ratio = worst rate / best rate; churners = size × rate</td></tr><tr><th>Plug in</th><td>0.538 / 0.028; 251 × 0.538</td></tr><tr><th>Compute</th><td>0.538 / 0.028 = 19.2; 251 × 0.538 = 135</td></tr><tr><th>Answer</th><td>The worst segment churns 19 times as often as the best (53.8% vs 2.8%). The "At risk" group holds about 135 expected churners among its 251 customers.</td></tr><tr><th>Check</th><td>Sizes add up: 608 + 510 + 423 + 770 + 251 = 2,562 ✓. Overall rate: (608×0.028 + 510×0.069 + 423×0.121 + 770×0.536 + 251×0.538) / 2562 = (17.0 + 35.2 + 51.2 + 412.7 + 135.0) / 2562 = 651.1 / 2562 = 0.254 ✓.</td></tr><tr><th>Why it matters</th><td>A rule-based segmentation, with no model at all, separates customers 19 to 1. It is easy to explain to marketing ("call the At-risk segment first"), and a perfect baseline for any model (Chapter 1).</td></tr></table>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>time ----------------------------------------------------------------&gt; T
+ |&lt;----------- 90 days -----------&gt;|
+ |        |&lt;------ 30 days -------&gt;|
+ |        |                |&lt;-7d -&gt;|
+ prev30   last30            last7                 orders in each window: counts, sums, means
+ (60-90)  (30-60) is between; trend = last30 / average of the two earlier windows</code></pre>
+<p><strong>Connection to the real job.</strong> RFM-style features are the first thing built for churn, CLV (Chapter 11), fraud (transactions in the last hour, day, week) and credit (utilisation over the last 3, 6 and 12 months). Windows are almost always 7, 30, 90 days or similar, chosen to match the business rhythm.</p>
+<p><strong>Applications</strong></p>
+<ul><li>E-commerce and retail: churn and next-purchase propensity.</li><li>Fraud: card transactions in the last 1 hour and 24 hours.</li><li>Banking: average balance and credit utilisation over 3, 6, 12 months.</li><li>Operations: failed-payment counts in the last 5, 15, 60 minutes (the same rolling windows).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Computing windows from the <em>whole table</em> and filtering by "last 30 days" relative to today, not to T. A training snapshot at 2024-08-01 must use 2024-08-01 as its "today". Always pass T into the function.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What do R, F and M stand for?</li></ol>
+<p>Answer: recency, frequency, monetary value.</p>
+<ol><li>Why add +1 in a ratio of counts?</li></ol>
+<p>Answer: to avoid division by zero and to calm ratios with tiny counts.</p>
+<ol><li>What is a snapshot table?</li></ol>
+<p>Answer: the feature table as it looked at one prediction date T.</p>
+<h2 id="s2-6-2-trends-lags-cross-entity-features-and-do-they-help">6.2 Trends, Lags, Cross-Entity Features, and Do They Help?</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Two customers both ordered 3 times last month. One used to order 10 times a month (falling), the other used to order once (rising). Same count, opposite story. Trends, gaps and changes carry that story. A car's speed tells you where you are; velocity and acceleration tell you where you are heading.</div></div>
+<p><strong>Types of behavioural features</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Type</th><th>Example in our code</th><th>Meaning</th></tr></thead><tbody><tr><td>Lag</td><td><code>orders_30_60d</code> (the previous window)</td><td>what happened one window ago</td></tr><tr><td>Time since last event</td><td><code>recency_days</code></td><td>silence length</td></tr><tr><td>Gap statistics</td><td><code>gap_mean</code>, <code>gap_max</code>, <code>gap_std</code></td><td>usual rhythm and irregularity</td></tr><tr><td>Ratios between windows</td><td><code>ratio_7_30</code></td><td>is the last week quiet compared to the month?</td></tr><tr><td>Trend</td><td><code>trend_30_vs_prev60</code></td><td>pace now vs before</td></tr><tr><td>Velocity</td><td><code>velocity_spend</code> = spend_30d - spend_30_60d</td><td>change in spend</td></tr><tr><td>Acceleration</td><td><code>accel_spend</code></td><td>change of the change</td></tr><tr><td>Streaks</td><td>consecutive weeks with an order</td><td>habit strength</td></tr><tr><td>Entity aggregates</td><td>per user, merchant, device</td><td>merchant's average ticket size</td></tr><tr><td>Cross-entity</td><td><code>share_fashion</code> = customer x category</td><td>taste profile</td></tr><tr><td>Interactions / ratios</td><td><code>rec_over_gap</code>, debt-to-income, price per unit</td><td>domain ratios</td></tr><tr><td>Graph (awareness)</td><td>number of accounts sharing a device or address</td><td>fraud rings</td></tr></tbody></table></div>
+<p>We have not yet checked whether these help. A strong habit: <strong>add features in groups and measure each group on the later test period.</strong> We train a gradient boosting model (a tree-based model that handles missing values; see <code>study/ml/</code>) on the stacked snapshots and test on January 2025.</p>
+<pre class="code lang-python"><code>from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import roc_auc_score
+def auc(cols, seed=0):
+    m = HistGradientBoostingClassifier(max_iter=150, learning_rate=0.08, random_state=seed).fit(tr[cols], tr.churn)
+    return round(roc_auc_score(te.churn, m.predict_proba(te[cols])[:, 1]), 3)
+static = ["is_pro", "tenure_days"]
+A = ["recency_days", "orders_90d", "is_pro"]
+B = A + ["orders_7d", "orders_30d", "spend_7d", "spend_30d", "spend_90d", "frequency_all", "monetary_all"]
+C = B + ["ratio_7_30", "trend_30_vs_prev60", "velocity_spend", "accel_spend", "gap_mean", "gap_max", "gap_std", "rec_over_gap"]
+D = C + [x for x in te.columns if x.startswith("share_")] + ["tenure_days", "avg_order_90d"]
+print("static only (plan, tenure):", auc(static))
+for name, cols in [("A RFM-ish base", A), ("B + windows", B), ("C + trends/gaps", C), ("D + category shares, tenure", D)]:
+    print(f"{name:32s} n_feat={len(cols):2d}  test AUC={auc(cols)}")</code></pre>
+<pre class="code lang-text"><code>static only (plan, tenure): 0.612
+A RFM-ish base                   n_feat= 3  test AUC=0.891
+B + windows                      n_feat=10  test AUC=0.891
+C + trends/gaps                  n_feat=18  test AUC=0.887
+D + category shares, tenure      n_feat=24  test AUC=0.89</code></pre>
+<p class="problem"><span class="pl">Problem 6.2.1</span> Interpret the table. Which step is the "biggest win", and what does the rest tell you?</p>
+<table class="steps"><tr><th>Step 1</th><td>From static profile columns (plan, tenure) to behavioural features: 0.612 to 0.891, a gain of 0.279 AUC.</td></tr><tr><th>Step 2</th><td>Adding windows, trends, gaps and category shares: 0.891, 0.891, 0.887, 0.890: no real gain. The spread of 0.004 is within noise (with about 650 churners in the test set, the standard error of an AUC around 0.89 is roughly 0.01).</td></tr><tr><th>Answer</th><td>Behavioural features are the big win (+0.28 AUC over a profile-only model). The extra 21 features add nothing measurable in this dataset.</td></tr><tr><th>Check</th><td>Our synthetic customers churn according to their order rate and silence, so recency already captures nearly all of it (a single feature had AUC 0.880 in Chapter 3). Real data is richer, but the lesson holds.</td></tr><tr><th>Why it matters</th><td>In plain words: build behaviour first, then add features only when they earn their place on a <em>later</em> test period. More features mean more code, more monitoring and more ways to break in production. Do not add features to feel busy.</td></tr></table>
+<p><strong>A fair test needs a time split.</strong> We stacked several snapshots, so the same customer appears many times. A <em>random</em> split would put the same customer in train and test. We compare:</p>
+<pre class="code lang-text"><code>random split inside snapshots AUC: 0.887  (customers repeat across snapshots)
+time split (train&lt;=Nov, test Jan) AUC: 0.89
+customers in train &amp; test: 2085 of 2562</code></pre>
+<p>The code for these three lines:</p>
+<pre class="code lang-python"><code>from sklearn.model_selection import train_test_split
+rtr, rte = train_test_split(tr, test_size=0.3, random_state=0)
+m = HistGradientBoostingClassifier(max_iter=150, learning_rate=0.08, random_state=0).fit(rtr[D], rtr.churn)
+print("random split inside snapshots AUC:", round(roc_auc_score(rte.churn, m.predict_proba(rte[D])[:, 1]), 3))
+print("time split AUC:", auc(D))
+print("customers in train &amp; test:", len(set(tr.customer_id) &amp; set(te.customer_id)), "of", te.customer_id.nunique())</code></pre>
+<p>Here both agree, because this synthetic world does not change over time. In real data with trends, promotions or a changing user base, the random split is <em>optimistic</em> and the time split is honest. 2,085 of the 2,562 test customers were also in training: this is normal in churn, but it means customer-level repeats must stay on one side of any random split (use group splits, <code>GroupKFold</code>, in that case).</p>
+<p class="problem"><span class="pl">Problem 6.2.2</span> Design three more features for fraud on card transactions: velocity, entity aggregates and a graph feature. Write them as precise definitions.</p>
+<table class="steps"><tr><th>Step 1 (velocity)</th><td><code>txn_count_1h</code> = number of transactions by this card in the 60 minutes before the current transaction (strictly before).</td></tr><tr><th>Step 2 (entity aggregate)</th><td><code>merchant_avg_ticket_30d</code> = average amount at this merchant over the 30 days before the current transaction; then <code>amount / merchant_avg_ticket_30d</code> as a ratio feature.</td></tr><tr><th>Step 3 (graph, awareness)</th><td><code>cards_on_device_7d</code> = number of distinct cards seen on this device in the last 7 days (a high value suggests a fraud ring).</td></tr><tr><th>Answer</th><td>Each feature has a window, an entity and a rule "strictly before the current event".</td></tr><tr><th>Check</th><td>For the first transaction of a card, <code>txn_count_1h</code> = 0, not missing; for a new merchant, <code>merchant_avg_ticket_30d</code> is missing and the ratio must handle that (fill, flag).</td></tr><tr><th>Why it matters</th><td>At serving time (a payment in 100 ms) these features must be computed from a fast store (a <em>feature store</em>); a feature you cannot compute in time is worthless in production (Chapter 13).</td></tr></table>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>profile only   |######..............|  0.61
++ behaviour    |#########################...|  0.89    &lt;- the big win
++ 21 more      |#########################...|  0.89    &lt;- no more gain here</code></pre>
+<p><strong>Connection to the real job.</strong> In interviews: "what features would you build for X?" A good answer lists RFM-style windows, trends, ratios and entity aggregates, then says "and I will test groups of them on a later period".</p>
+<p><strong>Applications</strong></p>
+<ul><li>Churn and CLV: windows, trends, gaps.</li><li>Fraud: velocity, device and merchant aggregates, graph features.</li><li>Credit: utilisation trends, delinquency counts over windows.</li><li>Demand forecasting: lags and rolling means of sales (Chapter 9).</li><li>AIOps: rolling error rates and latency percentiles.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Adding every possible window and ratio (hundreds of features) with no test, then trusting feature importance. Also: dividing by zero or comparing a new customer's empty history with an old customer's long one without a tenure feature or a "has history" flag.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is velocity? And acceleration?</li></ol>
+<p>Answer: change in a quantity between windows; the change of that change.</p>
+<ol><li>Why use a time split when you stack several snapshots?</li></ol>
+<p>Answer: to avoid the same customer and the same period appearing in both train and test, and to copy real use.</p>
+<ol><li>21 extra features gave AUC +0.000. What do you do?</li></ol>
+<p>Answer: drop most of them; keep the simple model.</p>
+<h2 id="s3-6-3-feature-selection-and-stability">6.3 Feature Selection and Stability</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Packing for a trip: you could take everything, but a heavy bag slows you down, and half of it you never use. Selection removes features that are useless (no information), redundant (same information twice), dangerous (leaky) or unstable (behave differently now than before).</div></div>
+<p><strong>Step 0: hygiene.</strong> Remove (1) leakage features (Chapter 3), (2) constant and near-constant columns (<code>nunique() &lt;= 1</code>), (3) duplicated information (correlation above 0.95).</p>
+<p><strong>Selection methods</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Family</th><th>Idea</th><th>Tools</th></tr></thead><tbody><tr><td>Filter</td><td>Score each feature alone, keep the best</td><td>variance, correlation, mutual information (MI), <code>SelectKBest</code></td></tr><tr><td>Wrapper</td><td>Train repeatedly, remove the weakest</td><td><code>RFE</code> (recursive feature elimination)</td></tr><tr><td>Embedded</td><td>The model itself shrinks useless weights</td><td>L1 (lasso) logistic regression, tree importance</td></tr><tr><td>Permutation importance</td><td>Shuffle one column in the test set and see how much AUC drops</td><td><code>permutation_importance</code></td></tr><tr><td>SHAP / Boruta (awareness)</td><td>Game-theory contributions; compare with random shadow features</td><td><code>shap</code>, <code>boruta</code> (not installed or run here)</td></tr></tbody></table></div>
+<p>Run them all on our 25 candidate features. Predict: which single feature will matter most under permutation importance?</p>
+<pre class="code lang-python"><code>from sklearn.feature_selection import mutual_info_classif, RFE
+from sklearn.linear_model import LogisticRegression
+from sklearn.inspection import permutation_importance
+from sklearn.preprocessing import StandardScaler
+feats = ["recency_days", "frequency_all", "monetary_all", "orders_7d", "orders_30d", "orders_90d",
+         "spend_7d", "spend_30d", "spend_90d", "ratio_7_30", "trend_30_vs_prev60", "velocity_spend",
+         "accel_spend", "gap_mean", "gap_max", "gap_std", "rec_over_gap", "share_grocery", "share_fashion",
+         "share_electronics", "share_home", "tenure_days", "is_pro", "avg_order_90d", "age"]   # 25 columns
+Xtr, Xte = tr[feats], te[feats]
+cm = Xtr.corr(method="spearman").abs()
+print("pairs with |spearman|&gt;0.95:", [(a, b, round(cm.loc[a, b], 3)) for i, a in enumerate(feats) for b in feats[i+1:] if cm.loc[a, b] &gt; 0.95])
+mi = pd.Series(mutual_info_classif(Xtr.fillna(0), tr.churn, random_state=0), index=feats).sort_values(ascending=False)
+print("MI top 6:", mi.head(6).round(3).to_dict())
+Xs = StandardScaler().fit_transform(Xtr.fillna(0))
+l1 = LogisticRegression(penalty="l1", solver="liblinear", C=0.05).fit(Xs, tr.churn)
+kept = [f for f, w in zip(feats, l1.coef_[0]) if abs(w) &gt; 1e-6]
+print("L1 (C=0.05) keeps", len(kept), "of", len(feats), ":", kept)
+m = HistGradientBoostingClassifier(max_iter=150, learning_rate=0.08, random_state=0).fit(Xtr, tr.churn)
+pi = permutation_importance(m, Xte, te.churn, scoring="roc_auc", n_repeats=5, random_state=0)
+print(pd.Series(pi.importances_mean, index=feats).sort_values(ascending=False).head(6).round(3).to_dict())</code></pre>
+<pre class="code lang-text"><code>pairs with |spearman|&gt;0.95: [('frequency_all', 'monetary_all', 0.985), ('orders_7d', 'spend_7d', 0.973), ('orders_30d', 'spend_30d', 0.953), ('orders_90d', 'spend_90d', 0.96)]
+MI top 6: {'recency_days': 0.188, 'spend_30d': 0.177, 'orders_30d': 0.173, 'rec_over_gap': 0.145, 'trend_30_vs_prev60': 0.134, 'monetary_all': 0.125}
+L1 (C=0.05) keeps 13 of 25 : ['recency_days', 'monetary_all', 'orders_7d', 'orders_30d', 'spend_7d', 'trend_30_vs_prev60', 'accel_spend', 'gap_mean', 'gap_std', 'rec_over_gap', 'share_fashion', 'share_home', 'is_pro']
+permutation importance (AUC drop) top 6: {'recency_days': 0.198, 'tenure_days': 0.008, 'rec_over_gap': 0.006, 'is_pro': 0.004, 'gap_mean': 0.003, 'spend_90d': 0.003}
+full model AUC: 0.889
+top-5 by permutation: ['recency_days', 'tenure_days', 'rec_over_gap', 'is_pro', 'gap_mean']  AUC with only these: 0.894
+RFE keeps: ['recency_days', 'orders_7d', 'orders_30d', 'rec_over_gap', 'is_pro']</code></pre>
+<p>The last two output lines come from these extra lines (RFE = recursive feature elimination: train, drop the weakest feature, repeat until 5 remain):</p>
+<pre class="code lang-python"><code>pis = pd.Series(pi.importances_mean, index=feats).sort_values(ascending=False)
+top5 = list(pis.index[:5]); print("top-5 by permutation:", top5, " AUC with only these:", auc(top5))
+rfe = RFE(LogisticRegression(max_iter=2000), n_features_to_select=5).fit(Xs, tr.churn)
+print("RFE keeps:", [f for f, k in zip(feats, rfe.support_) if k])</code></pre>
+<p>(The <code>age</code> column is the customer's age from the customers table.) Line by line: the correlation test finds four pairs that carry nearly the same information (spend and count of orders move together, since order values are similar). Mutual information ranks recency first. L1 shrinks 12 weights to exactly zero and keeps 13. Permutation importance for <code>recency_days</code> is 0.198: shuffling that one column drops the test AUC by 0.198, while every other feature drops it by under 0.01. RFE (keep 5) picks a different set, with recency, two window counts, <code>rec_over_gap</code> and <code>is_pro</code>.</p>
+<p class="problem"><span class="pl">Problem 6.3.1</span> Compare the full model with a 5-feature model chosen by permutation importance.</p>
+<table class="steps"><tr><th>Step 1</th><td>Full model with 25 features: test AUC 0.889.</td></tr><tr><th>Step 2</th><td>Keep the top 5 by permutation importance (recency_days, tenure_days, rec_over_gap, is_pro, gap_mean): test AUC 0.894.</td></tr><tr><th>Answer</th><td>The small model is as good as (even slightly better than) the large one: 0.894 vs 0.889 with one fifth of the features.</td></tr><tr><th>Check</th><td>The difference of 0.005 is within noise, so the honest statement is "equal". Remember we looked at test importances to choose the features, which is a mild form of peeking (Chapter 4); in production you would pick the features on a <em>validation</em> period and keep the January test untouched.</td></tr><tr><th>Why it matters</th><td>A model with 5 features is cheaper to compute, easier to explain, easier to monitor and has fewer ways to break. Also, different methods choose different sets: that is a sign that many features are interchangeable, so prefer the cheapest to compute and the most stable.</td></tr></table>
+<p><strong>Stability: PSI per feature.</strong> A feature can be strong in training and then change meaning or shape in production. The <em>Population Stability Index</em> compares the distribution of a feature in an old period (expected) and a new period (actual) over bins:</p>
+<p><code>PSI = Σ (actual% − expected%) × ln(actual% / expected%)</code> over bins.</p>
+<p>Common reading: below 0.1 stable, 0.1 to 0.25 moderate shift (watch), above 0.25 large shift (investigate or retrain). (These are rules of thumb from credit risk, not laws.)</p>
+<p class="problem"><span class="pl">Problem 6.3.2</span> First by hand: a feature has three bins with expected shares 50%, 30%, 20% and actual shares 40%, 30%, 30%. Compute PSI.</p>
+<table class="steps"><tr><th>Formula</th><td><code>PSI = Σ (a − e) × ln(a / e)</code></td></tr><tr><th>Plug in</th><td>bin 1: (0.4 − 0.5) × ln(0.4/0.5); bin 2: (0.3 − 0.3) × ln(1); bin 3: (0.3 − 0.2) × ln(0.3/0.2)</td></tr><tr><th>Compute</th><td>bin 1: (−0.1) × (−0.2231) = 0.0223; bin 2: 0; bin 3: 0.1 × 0.4055 = 0.0405; total 0.0629</td></tr><tr><th>Answer</th><td>PSI = 0.063: stable (below 0.1).</td></tr><tr><th>Check</th><td>Each term is positive (the product of a difference and the log of the same direction ratio), so PSI can never be negative ✓; the code reproduced 0.0629.</td></tr><tr><th>Why it matters</th><td>In plain words: 10 percentage points moved between bins, and PSI says "small shift".</td></tr></table>
+<p>Now on real data: compare May 2024 customers (old) with January 2025 customers (new), then simulate a shift.</p>
+<pre class="code lang-python"><code>def psi(expected, actual, bins=10):
+    qs = np.unique(np.nanquantile(expected, np.linspace(0, 1, bins + 1)))
+    qs[0], qs[-1] = -np.inf, np.inf
+    e = np.histogram(expected.dropna(), qs)[0] / expected.notna().sum()
+    a = np.histogram(actual.dropna(), qs)[0] / actual.notna().sum()
+    e = np.clip(e, 1e-4, None); a = np.clip(a, 1e-4, None)
+    return float(np.sum((a - e) * np.log(a / e)))
+old = tr[tr["T"] == pd.Timestamp("2024-05-01")]
+print({f: round(psi(old[f], te[f]), 3) for f in ["recency_days", "orders_90d", "spend_90d", "tenure_days", "gap_mean"]})
+for k in (1.0, 1.2, 1.5, 2.0):
+    print("spend x", k, "PSI", round(psi(old.spend_90d, te.spend_90d * k), 3))</code></pre>
+<pre class="code lang-text"><code>{'recency_days': 0.009, 'orders_90d': 0.006, 'spend_90d': 0.02, 'tenure_days': 0.162, 'gap_mean': 0.015}
+spend x 1.0 PSI 0.02
+spend x 1.2 PSI 0.065
+spend x 1.5 PSI 0.191
+spend x 2.0 PSI 0.46</code></pre>
+<ul><li><strong>Answer</strong> Behaviour features are stable (PSI under 0.03). <code>tenure_days</code> shows 0.162, a moderate shift, for an obvious reason: eight months later, the same customers are simply eight months older, and new signups arrive. If spend per order rose by 20%, PSI is 0.065 (stable), by 50% it is 0.191 (watch), and by 100% it is 0.46 (large).</li><li><strong>Check</strong> <code>spend x 1.0</code> is not zero (0.02) because January customers genuinely differ a bit from May ones; compare with the scale of 0.1.</li><li><strong>Why it matters</strong> Features that count "time since something" drift by design. Prefer ratios and rates, or retrain regularly. PSI is the standard monitor in credit risk (Chapter 11) and in MLOps (see <code>study/mlops/</code> if available).</li></ul>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>PSI      0 ------ 0.1 ------- 0.25 --------------&gt; 
+         stable    watch       act: investigate/retrain
+tenure_days 0.162   (moderate: expected, ages grow)
+spend x2    0.46    (large)</code></pre>
+<p><strong>Connection to the real job.</strong> In regulated settings, a model with fewer, explainable and stable features is far easier to approve. Selection is also a cost question: each feature needs a data pipeline, monitoring and an owner.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Credit risk: Information Value and PSI for variable selection and monitoring.</li><li>MLOps: per-feature drift dashboards.</li><li>Healthcare: small interpretable feature sets for clinical use.</li><li>Fraud: low-latency models need cheap features.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Choosing features using the test set (we did it above only as a demonstration, and noted it). Do selection on training or validation data only, and judge on a separate test. Another mistake: believing importance means causation (Chapter 8) or that a low-importance feature is "useless" when it is correlated with a stronger one.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which selection method shuffles one column and measures the score drop?</li></ol>
+<p>Answer: permutation importance.</p>
+<ol><li>PSI is 0.3 for an important feature. What do you do?</li></ol>
+<p>Answer: investigate (pipeline change, real shift), and consider retraining.</p>
+<ol><li>Why did <code>tenure_days</code> drift?</li></ol>
+<p>Answer: it grows with time by definition.</p>
+<h2 id="s4-6-4-leakage-safe-pipelines-and-training-serving-skew">6.4 Leakage-Safe Pipelines and Training-Serving Skew</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A recipe must be the same in the test kitchen and the restaurant. If the test kitchen uses a hand-crafted sauce and the restaurant a factory sauce, the dish tastes different, and nobody knows why customers complain. In ML this is <em>training-serving skew</em>: the features at training time are computed one way, in production another way.</div></div>
+<p><strong>Words you need</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th><th>Example</th></tr></thead><tbody><tr><td>Pipeline</td><td>Ordered steps (impute, scale, encode, model) that are fitted together</td><td><code>Pipeline([...])</code></td></tr><tr><td>ColumnTransformer</td><td>Applies different steps to different columns</td><td>numbers vs categories</td></tr><tr><td>Fit vs transform</td><td><code>fit</code> learns numbers from training rows (median, mean); <code>transform</code> applies them</td><td>median from train used for test</td></tr><tr><td>Training-serving skew</td><td>Features differ between training and production</td><td>days computed in IST in training and UTC in serving</td></tr><tr><td>Feature store</td><td>A system that stores feature definitions and values for training and serving</td><td>Feast, Tecton (awareness)</td></tr></tbody></table></div>
+<p><strong>Why pipelines.</strong> Every learned number (medians, means, category lists, selected columns, encoders) must be learned from training rows only, and then applied unchanged to validation, test and live data. A scikit-learn <code>Pipeline</code> does this for you and also makes cross-validation honest: in each fold it refits all steps using only that fold's training part.</p>
+<p class="problem"><span class="pl">Problem 6.4.1</span> Show the danger. We make 400 rows of <em>pure noise</em> (1,000 random features, random labels). The true AUC of any model is 0.5. Compare selecting the 20 "best" features before cross-validation versus inside a pipeline.</p>
+<pre class="code lang-python"><code>from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.pipeline import Pipeline
+rng = np.random.default_rng(0)
+n, p = 400, 1000
+X = rng.normal(size=(n, p)); y = rng.integers(0, 2, n)
+cv = StratifiedKFold(5, shuffle=True, random_state=0)
+Xk = SelectKBest(f_classif, k=20).fit_transform(X, y)                 # selection uses ALL labels (leak)
+leak = cross_val_score(LogisticRegression(max_iter=1000), Xk, y, cv=cv, scoring="roc_auc").mean()
+pipe = Pipeline([("sel", SelectKBest(f_classif, k=20)), ("clf", LogisticRegression(max_iter=1000))])
+safe = cross_val_score(pipe, X, y, cv=cv, scoring="roc_auc").mean()   # selection refit inside each fold
+print("pure-noise data: selection outside CV AUC", round(leak, 3), " selection inside pipeline AUC", round(safe, 3))</code></pre>
+<pre class="code lang-text"><code>pure-noise data: selection outside CV AUC 0.757  selection inside pipeline AUC 0.517</code></pre>
+<ul><li><strong>Answer</strong> Selecting features on all the data first produced AUC 0.757 on random noise, a fake "skill". Inside the pipeline the AUC is 0.517, correctly near 0.5.</li><li><strong>Check</strong> The labels were random coin flips, so any honest AUC must be near 0.5 ✓.</li><li><strong>Why it matters</strong> With 1,000 features, a few correlate with the labels by chance; picking them with the labels in view and then "testing" on the same labels fools you. This is the same leak as Chapter 4's validation peeking. Rule: <em>every step that looks at the target (selection, target encoding, imputation by group mean, resampling) belongs inside the cross-validation loop.</em></li></ul>
+<p><strong>A full production-style pipeline.</strong> Numeric columns: median imputation (with missing flags), scaling. Categorical: one-hot with unknown categories ignored. Then logistic regression.</p>
+<pre class="code lang-python"><code>from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+num = ["recency_days", "orders_30d", "orders_90d", "spend_90d", "gap_mean", "rec_over_gap", "tenure_days"]
+cat = ["plan", "channel", "city"]
+pre = ColumnTransformer([
+    ("num", Pipeline([("imp", SimpleImputer(strategy="median", add_indicator=True)), ("sc", StandardScaler())]), num),
+    ("cat", OneHotEncoder(handle_unknown="ignore"), cat)])
+pipe = Pipeline([("pre", pre), ("clf", LogisticRegression(max_iter=2000))]).fit(tr[num + cat], tr.churn)
+print("pipeline AUC on Jan-25:", round(roc_auc_score(te.churn, pipe.predict_proba(te[num + cat])[:, 1]), 3))
+new = te[num + cat].head(2).copy()
+new.loc[new.index[0], "city"] = "Jaipur"; new.loc[new.index[1], "gap_mean"] = np.nan
+print("scores for odd rows (unseen city, missing gap):", pipe.predict_proba(new)[:, 1].round(3))
+print("n transformed columns:", pipe.named_steps["pre"].transform(te[num + cat].head(1)).shape[1])</code></pre>
+<pre class="code lang-text"><code>pipeline AUC on Jan-25: 0.893
+scores for odd rows (unseen city, missing gap): [0.102 0.631]
+n transformed columns: 19</code></pre>
+<p>Line by line: <code>add_indicator=True</code> adds a 0/1 column for each numeric feature that had missing values in training (<code>gap_mean</code>), which is why we get 19 columns: 7 numeric + 1 flag + 2 + 3 + 6 one-hot levels = 19. <code>handle_unknown="ignore"</code> means a city never seen in training ("Jaipur") becomes all zeros instead of crashing. The odd rows still get scores. A plain logistic regression pipeline with 7 numeric features and 3 categoricals gives 0.893, equal to the boosted trees with many features. We can save the fitted pipeline as one object (<code>joblib.dump(pipe, "model.joblib")</code>, not run here) and load it in the serving code, which guarantees the same median, same scaling and same categories.</p>
+<p class="problem"><span class="pl">Problem 6.4.2</span> Why is our <code>build_features(c, o, T)</code> also a skew-prevention tool? Explain, and name two ways it could still go wrong in production.</p>
+<table class="steps"><tr><th>Step 1</th><td>The same function creates features for training (T = 1 May to 1 Nov) and for scoring (T = today). One definition, no rewriting in another language.</td></tr><tr><th>Step 2</th><td>Risk one: in production the orders table may be updated late (Chapter 2: today's data is 59% complete), so <code>orders_7d</code> is smaller than in training, where we used final data. Fix: train on data "as of T" or apply the finalisation lag.</td></tr><tr><th>Step 3</th><td>Risk two: time zones or a changed definition of an "order" (cancelled orders now counted). Fix: tests on feature distributions (PSI) and unit tests on <code>build_features</code>.</td></tr><tr><th>Answer</th><td>One shared function removes duplicated logic; the remaining risks are late data and definition changes, caught by monitoring.</td></tr><tr><th>Check</th><td>If you score yesterday's customers with partially loaded data and recency looks 1 day longer than it was, the model will think more of them have churned: monitor the mean of key features daily.</td></tr><tr><th>Why it matters</th><td>Most "the model got worse in production" stories are skew, not algorithms. Production topics continue in Chapter 13 and <code>study/mlops/</code>.</td></tr></table>
+<p><strong>Tools (not installed or run here, so check their documentation):</strong> <code>feature-engine</code> (transformers for scikit-learn), <code>category_encoders</code> (many encoders), <code>featuretools</code> (automatic features from related tables), <code>tsfresh</code> (automatic time-series features), <code>polars</code> and <code>duckdb</code> (fast aggregations on big tables), a feature store such as Feast.</p>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>TRAIN:  raw rows --build_features(T_i)--&gt; features --[impute -&gt; scale -&gt; encode -&gt; model]--&gt; fitted pipeline
+                                                                                         |
+SERVE:  raw rows --build_features(today)-------------------------------------------------&gt; same pipeline.predict
+        ^ same function                                 ^ same learned numbers</code></pre>
+<p><strong>Connection to the real job.</strong> The ML engineer will ask you for exactly this: one function (or SQL view) that creates features at a given time, a fitted pipeline file, and a list of expected ranges. Giving them a messy notebook delays deployment by weeks.</p>
+<p><strong>Applications</strong></p>
+<ul><li>MLOps: shipping one fitted pipeline object; schema checks at the API.</li><li>Fraud and credit: real-time feature computation with strict latency.</li><li>Data Engineering: feature tables that are point-in-time correct.</li><li>Any CV-based model comparison: pipelines inside cross-validation.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Fitting an imputer, scaler or selector on the full dataset "to save time". The effect is sometimes small (scalers) and sometimes huge (target-aware steps, as 0.757 vs 0.517 showed). Use a pipeline always; it costs nothing.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What goes inside the cross-validation loop?</li></ol>
+<p>Answer: every step that learns from the data, especially those using the target (selection, target encoding, imputation, resampling).</p>
+<ol><li>What does <code>handle_unknown="ignore"</code> do?</li></ol>
+<p>Answer: unseen categories become all zeros instead of causing an error.</p>
+<ol><li>What is training-serving skew?</li></ol>
+<p>Answer: features are computed differently in training and in production.</p>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>Behaviour over time (recency, frequency, monetary, windows, trends, gaps) is the strongest feature family: it lifted AUC from 0.612 (profile only) to 0.891.</li><li>Always compute features from rows before T, with <code>age_d</code> relative to T, and pass T into the feature function.</li><li>Do one example by hand before running it on millions of rows.</li><li>RFM segments with no model separated customers 19 to 1 (53.8% vs 2.8% churn).</li><li>Add features in groups and test on a later period: 21 more features added no AUC in our data.</li><li>Time-split your validation; keep customer repeats on one side if you split randomly.</li><li>Selection methods: hygiene, filter (correlation, MI), embedded (L1), wrapper (RFE), permutation importance; five features matched twenty-five.</li><li>PSI per feature (below 0.1 stable, 0.1 to 0.25 watch, above 0.25 act); "time since" features drift by design.</li><li>Put everything that learns from data, especially from the target, inside a pipeline; selection outside CV gave 0.757 on pure noise vs 0.517 inside.</li><li>One feature function and one fitted pipeline for training and serving prevents skew.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Task</th><th>Pattern</th><th>Example</th></tr></thead><tbody><tr><td>Window mask</td><td><code>past.age_d &lt;= w</code> with <code>age_d = (T - ts).dt.days</code></td><td>7, 30, 90 days</td></tr><tr><td>Trend</td><td><code>(a_now + 1) / (a_before + 1)</code></td><td>3.33 in Problem 6.1.1</td></tr><tr><td>Gap stats</td><td><code>groupby.order_ts.diff().dt.days</code> then <code>agg</code></td><td>mean 10.75, max 25</td></tr><tr><td>Recency over gap</td><td><code>recency / (gap_mean + 1)</code></td><td>0.17</td></tr><tr><td>RFM score</td><td><code>pd.qcut(x, 5, labels=...)</code></td><td>R, F, M in 1 to 5</td></tr><tr><td>PSI</td><td><code>Σ (a − e) ln(a/e)</code></td><td>0.0629 by hand</td></tr><tr><td>Permutation importance</td><td><code>permutation_importance(m, X, y, scoring="roc_auc")</code></td><td>recency drop 0.198</td></tr><tr><td>Pipeline</td><td><code>Pipeline([("pre", ColumnTransformer(...)), ("clf", model)])</code></td><td>AUC 0.893</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 6.P.1</span> (easy) An order happened 12 days before T. Which windows (7, 30, 90) contain it? <strong>Answer:</strong> The 30-day and 90-day windows, not the 7-day one.</p>
+<p class="problem"><span class="pl">Problem 6.P.2</span> (easy) Compute the PSI for expected [0.6, 0.4] and actual [0.6, 0.4]. <strong>Answer:</strong> 0, since both differences and both logs are 0.</p>
+<p class="problem"><span class="pl">Problem 6.P.3</span> (easy) <code>orders_30d</code> = 6, <code>orders_30_60d</code> = 2, <code>orders_60_90d</code> = 4. Trend using the chapter formula? <strong>Answer:</strong> (6 + 1) / ((2 + 4)/2 + 1) = 7 / 4 = 1.75.</p>
+<p class="problem"><span class="pl">Problem 6.P.4</span> (medium) Orders at ages 1, 8 and 15 days before T. Gaps, mean gap, and <code>rec_over_gap</code>? <strong>Answer:</strong> Sorted oldest to newest ages 15, 8, 1 give gaps 7 and 7; mean 7. Recency = 1. <code>rec_over_gap</code> = 1 / (7 + 1) = 0.125.</p>
+<p class="problem"><span class="pl">Problem 6.P.5</span> (medium) What is the output? <code>pd.qcut(pd.Series([1,2,3,4]), 2, labels=[0,1]).tolist()</code> <strong>Answer:</strong> <code>[0, 0, 1, 1]</code>.</p>
+<p class="problem"><span class="pl">Problem 6.P.6</span> (medium) Find the bug: <code>df["orders_30d"] = (orders.order_ts &gt;= pd.Timestamp.today() - pd.Timedelta(days=30)).groupby(orders.customer_id).sum()</code> used for a training table at T = 2024-08-01. <strong>Answer:</strong> The window is relative to today, not T, and has no upper bound <code>order_ts &lt; T</code>: it includes future orders. Use <code>T - 30 days &lt;= order_ts &lt; T</code>.</p>
+<p class="problem"><span class="pl">Problem 6.P.7</span> (medium) Expected shares [0.7, 0.2, 0.1], actual [0.5, 0.3, 0.2]. Compute PSI and say which action. <strong>Answer:</strong> (0.5-0.7)ln(0.5/0.7) = (-0.2)(-0.3365) = 0.0673; (0.3-0.2)ln(1.5) = 0.0405; (0.2-0.1)ln(2) = 0.0693; total 0.177. Moderate shift (0.1 to 0.25): watch and investigate.</p>
+<p class="problem"><span class="pl">Problem 6.P.8</span> (hard) A random split on stacked snapshots gives AUC 0.93, a time split gives 0.86. Which do you report, and why do they differ? <strong>Answer:</strong> 0.86. The random split puts the same customers and similar periods in train and test, so it is optimistic; the time split copies real use (predict the future from the past).</p>
+<p class="problem"><span class="pl">Problem 6.P.9</span> (interview) "Your model's AUC in production is 0.08 lower than in testing. How do you investigate?" <strong>Answer:</strong> Check training-serving skew first: compare feature distributions (PSI, means, missing rates) between training data and live data; check late-arriving data, time zones and definition changes; check label delay in monitoring; then check population drift and leakage in the original validation (random split, target encoding outside folds).</p>
+<p class="problem"><span class="pl">Problem 6.P.10</span> (interview) "How would you select features for a model that must run in 50 ms?" <strong>Answer:</strong> Start with permutation importance and a cost column (compute time and data-source latency) per feature; drop leakage, duplicates and unstable features; prefer features from fast stores (precomputed aggregates); keep the smallest set within 1 to 2 AUC points of the full model; test latency end to end.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional at an Indian MNC moving into data science, and English is my second language. Teach me behavioural features: RFM, rolling windows (7/30/90 days), lags, gaps, trends, velocity and acceleration, using a small orders table with 8 rows that we compute by hand together. Check my understanding with one question after each feature type, and show me the pandas code only after I try.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Topic: "point-in-time correct feature building from an event table". Give me 8 graded exercises that start from tiny order lists and a prediction date T (compute windows, gaps, trends by hand), then 2 exercises where I must find a leakage bug in pandas code. Do not give solutions until I answer; then grade me and explain.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional new to data science. Topic: "feature selection (filter, wrapper, embedded, permutation importance) and feature stability with PSI". Quiz me one question at a time, mixing numerical PSI calculations with conceptual questions such as when permutation importance misleads. Wait for my answer, grade it, and explain. Ask 10 questions.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Review my scikit-learn pipeline and feature code below. Check whether any step that learns from data (imputer, scaler, selector, target encoder) is fitted outside the cross-validation loop, whether features use only data before the prediction time, whether unseen categories and missing values are handled, and whether training and serving use the same code. Give concrete fixes in simple English. My code: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for data science interviews in India. Run a mock interview on feature engineering and pipelines: "what features for churn, fraud or credit", "random vs time split", "AUC dropped in production", "training-serving skew". Ask one question at a time, score me out of 10, give a model answer and one follow-up. Do 8 rounds.</pre></div><div class="readbtn"><button class="btn" data-read="study:ds:ch06">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch05.html">← Chapter 5: Feature Engineering I: Transformations, </a><a class="btn" href="ch07.html">Chapter 7: Experimentation: A/B Testing Done Proper →</a></div></div><script src="../../assets/study.js"></script></body></html>

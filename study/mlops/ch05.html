@@ -1,0 +1,182 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 5: Feature Stores and Data Validation for ML</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 5</div><h1>Feature Stores and Data Validation for ML</h1><p>Models are only as good as the numbers you feed them. This chapter is about feeding them the right numbers, at the right time, and catching bad ones before they hurt.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-5-1-feature-store-concepts-offline-online-reuse">5.1 Feature Store Concepts: Offline, Online, Reuse</a></li><li><a href="#s2-5-2-point-in-time-correctness-avoiding-leakage">5.2 Point-in-Time Correctness (Avoiding Leakage)</a></li><li><a href="#s3-5-3-data-validation-for-ml">5.3 Data Validation for ML</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>Suppose your churn model uses "orders in the last 30 days". The data scientist computes it in SQL for training. The engineer re-implements it in Java for the live API. Two months later the numbers disagree by a few percent and nobody knows why (that is training-serving skew from Chapter 1). Worse, the training set accidentally used orders that happened after the prediction date, so the model looked brilliant offline and failed live. A <strong>feature store</strong> and <strong>data validation</strong> are the two tools that prevent these disasters. By the end of this chapter you will be able to explain offline and online stores, do a point-in-time join and show why the naive join leaks the future, write schema checks that catch bad rows, and explain what tools like Feast, Evidently and Great Expectations are for.</p>
+<p>Words you need:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Feature</td><td>One model input, such as <code>orders_30d</code>.</td></tr><tr><td>Entity</td><td>The thing a feature describes, such as a user or a product.</td></tr><tr><td>Offline store</td><td>Large history of feature values, used to build training sets (a warehouse or Parquet files).</td></tr><tr><td>Online store</td><td>Fast key-value lookup of the latest values for live predictions (Redis, DynamoDB).</td></tr><tr><td>Materialization</td><td>Copying the latest feature values from offline to online.</td></tr><tr><td>Leakage</td><td>Using information in training that would not be available at prediction time.</td></tr><tr><td>Schema</td><td>The agreed list of columns, types and allowed values.</td></tr></tbody></table></div>
+<h2 id="s1-5-1-feature-store-concepts-offline-online-reuse">5.1 Feature Store Concepts: Offline, Online, Reuse</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A restaurant keeps a prep station: chopped onions, ready sauces, measured portions, used by every chef and every dish. A feature store is the prep station for ML. Everyone takes the same prepared "onions", so every dish tastes the same, in the kitchen (training) and at the table (serving).</div></div>
+<h3>The problem it solves</h3>
+<p>Without a feature store, each model team recomputes features in its own way: duplicated work, different definitions, skew, and no catalogue ("does anyone already have a customer-lifetime-value feature?"). A feature store gives you:</p>
+<ol><li><strong>One definition</strong> per feature, used for both training and serving (kills skew).</li><li><strong>Offline store</strong> for history: build training sets for any past time.</li><li><strong>Online store</strong> for the latest values: answer a live request in a few milliseconds.</li><li><strong>Discovery and reuse</strong>: a catalogue with owners and descriptions.</li><li><strong>Monitoring</strong>: freshness, null rates and drift per feature.</li></ol>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Entity</td><td><code>user_id = u1</code></td><td>The key you look features up by</td></tr><tr><td>Feature</td><td><code>orders_30d = 9</code></td><td>An input column of the model</td></tr><tr><td>Event timestamp</td><td><code>2026-01-25</code></td><td>When the value became true (needed for point-in-time joins)</td></tr><tr><td>Online lookup</td><td><code>{"orders_30d": 9}</code> in 2 ms</td><td>The live API calls it before predicting</td></tr><tr><td>Backfill</td><td>Recompute last 2 years of a new feature</td><td>Needed when you add a feature to old training data</td></tr></tbody></table></div>
+<h3>Tools</h3>
+<p><strong>Feast</strong> (open source), Tecton, Databricks Feature Store, SageMaker Feature Store, Vertex AI Feature Store and Hopsworks. They differ in hosting and how features are computed, but the concepts are identical. We could not install Feast here, so the Feast code below is <strong>not run here</strong>; the working examples below use pandas and a dictionary to show the same ideas.</p>
+<p>A Feast-style definition (not run here; API names change between versions, so verify with current docs):</p>
+<pre class="code lang-python"><code>from feast import Entity, FeatureView, Field, FileSource
+from feast.types import Int64
+from datetime import timedelta
+user = Entity(name="user", join_keys=["user"])
+src = FileSource(path="data/user_features.parquet", timestamp_field="ts")
+user_stats = FeatureView(name="user_stats", entities=[user], ttl=timedelta(days=30),
+                         schema=[Field(name="orders_30d", dtype=Int64)], source=src)
+# training:  store.get_historical_features(entity_df, ["user_stats:orders_30d"])
+# serving:   store.get_online_features(features=["user_stats:orders_30d"], entity_rows=[{"user": "u1"}])</code></pre>
+<h3>An online store you can run</h3>
+<p>We copy the latest value per user from the offline history into a dictionary (that is <strong>materialization</strong>), then look up values with a <strong>TTL</strong> (time to live: how old a value may be before we call it stale).</p>
+<pre class="code lang-python"><code>import pandas as pd
+offline = pd.DataFrame({
+ "user": ["u1","u1","u1","u2","u2"],
+ "ts": pd.to_datetime(["2026-01-05","2026-01-12","2026-01-25","2026-01-01","2026-01-18"]),
+ "orders_30d": [1,2,9,0,7]})
+latest = offline.sort_values("ts").groupby("user").tail(1)
+online = {r.user: {"orders_30d": int(r.orders_30d), "ts": r.ts} for r in latest.itertuples()}
+now = pd.Timestamp("2026-02-20"); ttl = pd.Timedelta(days=30)
+def get(user):
+    row = online.get(user)
+    if row is None: return "MISSING -&gt; use default"
+    age = now - row["ts"]
+    return f"{row['orders_30d']} (age {age.days} d)" + ("  STALE" if age &gt; ttl else "")
+for u in ["u1","u2","u3"]: print(u, "-&gt;", get(u))</code></pre>
+<p>Before you run it: which user will be flagged stale, given "today" is 20 February 2026 and the TTL is 30 days?</p>
+<p>Real output:</p>
+<pre class="code lang-text"><code>u1 -&gt; 9 (age 26 d)
+u2 -&gt; 7 (age 33 d)  STALE
+u3 -&gt; MISSING -&gt; use default</code></pre>
+<p><strong>Explain.</strong> <code>sort_values("ts")</code> puts the oldest first, <code>groupby("user").tail(1)</code> keeps each user's newest row. u1's newest value is from 25 January: 6 days left in January plus 20 in February is 26 days old, inside the TTL. u2's newest is 18 January: 13 + 20 = 33 days, past 30, so it is stale. u3 has never been seen, so we return a clearly marked default. The production code must decide what to do for stale and missing features (use a default, skip, or fall back to a simple rule) and <strong>count how often it happens</strong>, because a rising "missing" rate is an early warning.</p>
+<p class="problem"><span class="pl">Problem 5.1.1</span> A feature value was written on 10 March. The TTL is 14 days. On which date does it become stale?</p>
+<table class="steps"><tr><th>Formula</th><td>stale when age &gt; TTL, so the first stale date is write date + TTL + 1 day</td></tr><tr><th>Plug in</th><td>10 March + 14 days = 24 March (age exactly 14, not yet stale); 25 March is age 15</td></tr><tr><th>Compute</th><td>10 + 14 = 24, so on 24 March age is 14 and equals the TTL; on 25 March age is 15 &gt; 14</td></tr><tr><th>Answer</th><td>The value becomes stale on 25 March.</td></tr><tr><th>Check</th><td><code>pd.Timestamp("2026-03-25") - pd.Timestamp("2026-03-10")</code> is 15 days, greater than 14.</td></tr><tr><th>Why it matters</th><td>TTL choice is a business decision: a "recent orders" feature may need hours, a "birth year" feature can last years.</td></tr></table>
+<p class="problem"><span class="pl">Problem 5.1.2</span> The online store holds 2 million users, each with 20 features of 8 bytes. About how much memory is the raw data?</p>
+<table class="steps"><tr><th>Formula</th><td>bytes = users × features × bytes per value</td></tr><tr><th>Plug in</th><td>2,000,000 × 20 × 8</td></tr><tr><th>Compute</th><td>2,000,000 × 20 = 40,000,000; × 8 = 320,000,000 bytes</td></tr><tr><th>Answer</th><td>320 MB of raw values. Real stores add overhead (keys, structures), so budget perhaps 2 to 4 times more, which is still small for an in-memory store.</td></tr><tr><th>Check</th><td>320,000,000 ÷ 1,000,000 = 320 MB.</td></tr><tr><th>Why it matters</th><td>You can size an online store with simple arithmetic, the same capacity thinking a shop uses to decide how many shelves it needs.</td></tr></table>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> raw data -&gt; [feature pipeline: batch + streaming] -&gt; OFFLINE store (history, big)
+                                                          |  get_historical_features (point-in-time)  -&gt; training set
+                                                          |  materialize latest
+                                                          v
+                                                    ONLINE store (latest, fast) &lt;- live API: get_online_features</code></pre>
+<p>Read it as: one pipeline writes the features once; history goes to the offline store for training, and the newest values are copied to the online store for serving. Both read the same definitions.</p>
+<h3>Connection to the real job</h3>
+<p>Feature pipelines have two flavours: <strong>batch</strong> (a nightly job computing yesterday's features) and <strong>streaming</strong> (Kafka plus Flink or Spark Streaming computing "clicks in last 10 minutes"). <strong>Backfills</strong> recompute history when a feature definition changes or a new feature is added. In service terms: online lookups have latency promises (for example p99 under 10 ms, like a bank promising that 99 in 100 customers are served within 10 minutes), and you can test them by sending many lookups at once, as with any key-value service.</p>
+<h3>Applications</h3>
+<ul><li><strong>Machine Learning</strong>: reuse a "customer lifetime value" feature across churn, fraud and recommendations.</li><li><strong>MLOps</strong>: monitor freshness and null rate per feature.</li><li><strong>Data Engineering</strong>: build and own the pipelines that fill the stores.</li><li><strong>Fraud / Recommendations</strong>: real-time features such as "transactions in the last hour".</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Building a feature store before you need one. For a single model and one team, a shared <code>features.py</code> and a table in the warehouse is enough. Add a store when many models share features or when you need low-latency online lookups.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is materialization?</li></ol>
+<p>Answer: Copying the latest feature values from the offline store to the online store.</p>
+<ol><li>Why does the online store keep only the latest value?</li></ol>
+<p>Answer: Live prediction needs only the current state, and a small store is fast.</p>
+<ol><li>What does a TTL protect against?</li></ol>
+<p>Answer: Using stale values that are no longer true.</p>
+<h2 id="s2-5-2-point-in-time-correctness-avoiding-leakage">5.2 Point-in-Time Correctness (Avoiding Leakage)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You are asked "would this customer buy on 10 January?" You are only allowed to look at what you knew on 10 January. If you peek at a newspaper from 25 January, you will guess perfectly but you cannot do that in real life. A point-in-time join forces every training row to look only at the past.</div></div>
+<h3>Definition</h3>
+<p><strong>Data leakage</strong> means a training feature contains information from after the prediction moment. <strong>Point-in-time correctness</strong> means each training example uses, for each feature, the latest value whose timestamp is on or before the example's event time. In pandas this is <code>merge_asof</code> with <code>direction="backward"</code>. Offline models that leak look fantastic in testing and collapse in production.</p>
+<h3>Predict, run, explain</h3>
+<p>We have purchase events (label: did the user buy?) and a feature history. First the naive join, which attaches each user's <em>latest ever</em> value. Then the correct join. Before you run it: what <code>orders_30d</code> should user u1 have on 10 January 2026?</p>
+<pre class="code lang-python"><code>import pandas as pd
+events = pd.DataFrame({
+ "user": ["u1","u1","u2"],
+ "ts": pd.to_datetime(["2026-01-10","2026-01-20","2026-01-15"]),
+ "bought": [0,1,1]})
+feat = pd.DataFrame({
+ "user": ["u1","u1","u1","u2","u2"],
+ "ts": pd.to_datetime(["2026-01-05","2026-01-12","2026-01-25","2026-01-01","2026-01-18"]),
+ "orders_30d": [1,2,9,0,7]})
+bad = events.merge(feat.sort_values("ts").groupby("user").tail(1)[["user","orders_30d"]], on="user")
+print("LEAKY join (latest value):"); print(bad.to_string(index=False))
+good = pd.merge_asof(events.sort_values("ts"), feat.sort_values("ts"), on="ts", by="user", direction="backward")
+print("\nPOINT-IN-TIME join:"); print(good.to_string(index=False))</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>LEAKY join (latest value):
+user         ts  bought  orders_30d
+  u1 2026-01-10       0           9
+  u1 2026-01-20       1           9
+  u2 2026-01-15       1           7
+
+POINT-IN-TIME join:
+user         ts  bought  orders_30d
+  u1 2026-01-10       0           1
+  u2 2026-01-15       1           0
+  u1 2026-01-20       1           2</code></pre>
+<p><strong>Explain.</strong> On 10 January, u1's most recent known feature was from 5 January: <code>orders_30d = 1</code>. The leaky join gave 9, a value from 25 January that did not exist yet, so the model learns "9 orders means buy", which is nonsense at the time of prediction. For u2 on 15 January the last known value is from 1 January (0), but the leaky join showed 7 (from 18 January, in the future). The point-in-time join also reorders rows by time because <code>merge_asof</code> requires sorted input; the <code>by="user"</code> option matches within each user. Direction <code>backward</code> means "look back in time only".</p>
+<p class="problem"><span class="pl">Problem 5.2.1</span> For u1's second event on 20 January, which feature row should be used, and what is <code>orders_30d</code>?</p>
+<table class="steps"><tr><th>Formula</th><td>latest feature row with <code>ts ≤ event ts</code></td></tr><tr><th>Plug in</th><td>u1 feature timestamps: 5 Jan, 12 Jan, 25 Jan; event on 20 Jan</td></tr><tr><th>Compute</th><td>5 Jan ≤ 20 Jan yes; 12 Jan ≤ 20 Jan yes; 25 Jan ≤ 20 Jan no. Latest allowed is 12 Jan with <code>orders_30d = 2</code>.</td></tr><tr><th>Answer</th><td>The row from 12 January, value 2 (and the output above shows 2).</td></tr><tr><th>Check</th><td>The leaky table said 9 (from 25 January, five days after the event), clearly the wrong row.</td></tr><tr><th>Why it matters</th><td>Point-in-time joins are the heart of trustworthy training sets.</td></tr></table>
+<p class="problem"><span class="pl">Problem 5.2.2</span> Leakage test: a model gets AUC 0.99 on churn. List the first three checks.</p>
+<table class="steps"><tr><th>Step 1</th><td>Look at feature importance. A single feature with huge weight (like "days since last login" computed after churn happened) is suspicious.</td></tr><tr><th>Step 2</th><td>Ask for each top feature: "would I have this value at prediction time?"</td></tr><tr><th>Step 3</th><td>Rebuild the training set with point-in-time joins and compare the AUC.</td></tr><tr><th>Answer</th><td>Too-good scores almost always mean leakage; check importance, time availability, and rebuild point-in-time.</td></tr><tr><th>Check</th><td>After fixing leakage, AUC typically drops to a believable level (for example 0.80).</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Feast and other stores do this join for you (<code>get_historical_features</code>). The interview question "how do you prevent leakage?" has a three-part answer: point-in-time joins, time-based train/test splits (train on the past, test on the future), and removing features that would not exist at serving time.</p>
+<h3>Applications</h3>
+<ul><li><strong>Machine Learning</strong>: fraud, churn and forecasting all need correct time handling.</li><li><strong>Finance</strong>: backtests that peek into the future give false profits.</li><li><strong>Healthcare</strong>: a feature recorded after diagnosis must not predict the diagnosis.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Random train/test splits on time-ordered data. Rows from the future end up in training, leaking trends. Split by time.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does <code>direction="backward"</code> mean?</li></ol>
+<p>Answer: Use the most recent feature value at or before the event time.</p>
+<ol><li>Why did the leaky join give 9 for u1 on 10 January?</li></ol>
+<p>Answer: It used the latest value ever (25 January), which is in the future for that event.</p>
+<ol><li>What is a symptom of leakage?</li></ol>
+<p>Answer: Suspiciously high offline accuracy that drops sharply in production.</p>
+<h2 id="s3-5-3-data-validation-for-ml">5.3 Data Validation for ML</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A security guard at the gate checks every delivery against the order form: right items, right quantity, nothing broken. Data validation is the guard for your pipeline. Bad rows are stopped at the gate instead of silently poisoning the model.</div></div>
+<h3>Types of checks</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Check</th><th>Example</th><th>Catches</th></tr></thead><tbody><tr><td>Schema</td><td>Column <code>age</code> exists and is numeric</td><td>Renamed or missing columns, type changes</td></tr><tr><td>Null rate</td><td><code>age</code> null share below 1%</td><td>Broken upstream joins</td></tr><tr><td>Range</td><td><code>0 &lt;= age &lt;= 120</code></td><td>Unit errors, sentinels like -999</td></tr><tr><td>Allowed values</td><td><code>country in {IN, US, UK}</code></td><td>New unexpected categories</td></tr><tr><td>Uniqueness</td><td><code>customer_id</code> has no duplicates</td><td>Duplicate loads</td></tr><tr><td>Freshness</td><td>Latest row not older than 24 h</td><td>Stalled pipelines</td></tr><tr><td>Distribution (drift)</td><td>Mean and spread similar to training</td><td>Silent changes (Chapter 10)</td></tr><tr><td>Label quality</td><td>Labels in {0, 1}; label rate near expected</td><td>Bad label joins</td></tr></tbody></table></div>
+<p>Tools: <strong>Great Expectations</strong> (declare "expectations" and get reports), <strong>TensorFlow Data Validation</strong> (computes statistics and infers a schema), <strong>Evidently</strong> (data quality and drift reports), and <strong>pandera</strong> (schemas for pandas). Their code is <strong>not run here</strong>; below we write the checks by hand so you see the logic.</p>
+<h3>Predict, run, explain</h3>
+<p>A batch of five rows arrives. The rule book says: <code>age</code> between 0 and 120, no nulls; <code>country</code> in {IN, US, UK}; <code>label</code> in {0, 1}. Before you run it: how many problems will we find?</p>
+<pre class="code lang-python"><code>import pandas as pd
+df = pd.DataFrame({"age":[25,40,None,200,33],"country":["IN","IN","US","XX","IN"],"label":[0,1,1,0,2]})
+schema = {"age":{"min":0,"max":120,"nullable":False},"country":{"allowed":{"IN","US","UK"}},"label":{"allowed":{0,1}}}
+errs=[]
+for col,r in schema.items():
+    s=df[col]
+    if "nullable" in r and not r["nullable"] and s.isna().any(): errs.append(f"{col}: {int(s.isna().sum())} null(s)")
+    if "min" in r:
+        bad=s[(s&lt;r["min"])|(s&gt;r["max"])]
+        if len(bad): errs.append(f"{col}: out of range {bad.tolist()}")
+    if "allowed" in r:
+        bad=s[~s.isin(r["allowed"])]
+        if len(bad): errs.append(f"{col}: unexpected values {bad.tolist()}")
+print("\n".join(errs))</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>age: 1 null(s)
+age: out of range [200.0]
+country: unexpected values ['XX']
+label: unexpected values [2]</code></pre>
+<p><strong>Explain.</strong> Four problems in five rows. The null age is row 3. The comparison <code>s&lt;0</code> or <code>s&gt;120</code> returns False for a null (NaN), so the null is not double-counted as out of range, and it is reported by the null check. The value 200 is out of range. Country <code>XX</code> is not in the allowed set. Label 2 is not allowed for a binary label. In a real pipeline, you decide on a <strong>policy</strong> for each failure: <strong>block</strong> the whole batch (for schema errors), <strong>quarantine</strong> the bad rows into a separate table for review (for a few bad values), or <strong>warn</strong> (for soft thresholds).</p>
+<p>The Great Expectations style (not run here; the API has changed across versions, so check the docs):</p>
+<pre class="code lang-python"><code># conceptual example
+validator.expect_column_values_to_be_between("age", min_value=0, max_value=120)
+validator.expect_column_values_to_not_be_null("age")
+validator.expect_column_values_to_be_in_set("country", ["IN", "US", "UK"])</code></pre>
+<p class="problem"><span class="pl">Problem 5.3.1</span> A batch of 10,000 rows has 130 nulls in <code>age</code>. The rule says null rate must be below 1%. Pass or fail?</p>
+<table class="steps"><tr><th>Formula</th><td>null rate = nulls ÷ rows</td></tr><tr><th>Plug in</th><td>130 ÷ 10,000</td></tr><tr><th>Compute</th><td>130 ÷ 10,000 = 0.013 = 1.3%</td></tr><tr><th>Answer</th><td>1.3% is above 1%, so the batch fails this check.</td></tr><tr><th>Check</th><td>1% of 10,000 is 100 nulls; we have 130, which is more.</td></tr><tr><th>Why it matters</th><td>Thresholds on rates (not "any null") avoid false alarms while still catching broken joins, which usually cause sudden jumps.</td></tr></table>
+<p class="problem"><span class="pl">Problem 5.3.2</span> Yesterday the null rate of <code>age</code> was 0.2%; today it is 1.3%. Rule: alert if the rate rises more than 3 times. Alert?</p>
+<table class="steps"><tr><th>Formula</th><td>ratio = today ÷ yesterday</td></tr><tr><th>Plug in</th><td>1.3 ÷ 0.2</td></tr><tr><th>Compute</th><td>1.3 ÷ 0.2 = 6.5</td></tr><tr><th>Answer</th><td>6.5 times is more than 3, so alert. A change that big usually means an upstream bug, not real customers.</td></tr><tr><th>Check</th><td>0.2% × 3 = 0.6%, and today's 1.3% exceeds it.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Validation runs at three places: when data enters the pipeline, before training (do not train on garbage), and on live requests (reject or flag malformed inputs, like our API in Chapter 7). Label quality is its own topic: check label rates, duplicates, and annotator disagreement, because noisy labels cap model quality no matter how good the model is.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering</strong>: Great Expectations or dbt tests on every pipeline.</li><li><strong>MLOps</strong>: Evidently reports as a pipeline step with pass/fail gates.</li><li><strong>Data Science</strong>: pandera schemas in notebooks.</li><li><strong>Compliance</strong>: audit logs of validation results.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Writing checks and ignoring failures. A check with no action is decoration. Decide per check: block, quarantine, or alert, and who responds.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Name four kinds of data checks.</li></ol>
+<p>Answer: For example schema, null rate, range, allowed values (also uniqueness, freshness, drift).</p>
+<ol><li>Why use a rate threshold instead of "no nulls at all"?</li></ol>
+<p>Answer: Real data has a few nulls; a rate threshold flags unusual jumps without constant false alarms.</p>
+<ol><li>What are three policies for a failed check?</li></ol>
+<p>Answer: Block, quarantine, warn.</p>
+<h2 id="s4-chapter-recap">Chapter recap</h2>
+<ul><li>A feature store gives one definition for training and serving, an offline store for history and an online store for fast latest values.</li><li>Materialization copies latest values offline to online; TTL guards against staleness.</li><li>Point-in-time joins use only values known at the event time; naive joins leak the future.</li><li>In our example a leaky join gave <code>orders_30d = 9</code> where the truth on that day was 1.</li><li>Too-good offline scores usually mean leakage; split by time.</li><li>Validate schema, nulls, ranges, allowed values, uniqueness, freshness, drift and labels.</li><li>Decide an action per check: block, quarantine or warn.</li><li>Tools: Feast, Tecton, Great Expectations, TFDV, Evidently, pandera; the ideas matter more than the tool.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Meaning</th></tr></thead><tbody><tr><td><code>merge_asof(..., by=k, direction="backward")</code></td><td>Point-in-time join</td></tr><tr><td><code>df.groupby(k).tail(1)</code> after sorting by time</td><td>Latest value per key</td></tr><tr><td><code>null rate = nulls ÷ rows</code></td><td>Basic quality metric</td></tr><tr><td><code>stale if now − ts &gt; ttl</code></td><td>Freshness rule</td></tr><tr><td><code>store.get_historical_features / get_online_features</code></td><td>Feast training / serving calls (not run here)</td></tr></tbody></table></div>
+<h2 id="s5-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 5.1</span> Offline or online store: a 3-year history of daily features for training? <strong>Answer:</strong> Offline.</p>
+<p class="problem"><span class="pl">Problem 5.2</span> What is the output? <code>pd.Timestamp("2026-03-05") - pd.Timestamp("2026-03-01")</code> <strong>Answer:</strong> <code>Timedelta('4 days 00:00:00')</code>.</p>
+<p class="problem"><span class="pl">Problem 5.3</span> 5% of 40,000 rows are null. How many rows? <strong>Answer:</strong> 40,000 × 0.05 = 2,000.</p>
+<p class="problem"><span class="pl">Problem 5.4</span> Feature timestamps: 1 Feb, 8 Feb, 15 Feb. Event on 10 Feb. Which row (point-in-time)? <strong>Answer:</strong> 8 February.</p>
+<p class="problem"><span class="pl">Problem 5.5</span> Find the bug: <code>pd.merge_asof(events, feat, on="ts", by="user")</code> raises an error on unsorted data. <strong>Answer:</strong> <code>merge_asof</code> needs both frames sorted by the <code>on</code> key. Sort first with <code>sort_values("ts")</code>.</p>
+<p class="problem"><span class="pl">Problem 5.6</span> Find the bug: random 80/20 split on 2 years of daily churn data gives 0.95 AUC; production gives 0.78. <strong>Answer:</strong> Time leakage. Use a time-based split (train on the earlier 80%, test on the later 20%).</p>
+<p class="problem"><span class="pl">Problem 5.7</span> The online lookup returns <code>MISSING</code> for 8% of users after a deploy. Possible causes? <strong>Answer:</strong> Materialization job failed or lagged, key format changed (for example upper vs lower case user IDs), TTL too short, or a new user cohort not yet in the store.</p>
+<p class="problem"><span class="pl">Problem 5.8</span> Online store: 5 million entities × 40 features × 8 bytes. Raw size? <strong>Answer:</strong> 5,000,000 × 40 × 8 = 1,600,000,000 bytes = 1.6 GB.</p>
+<p class="problem"><span class="pl">Problem 5.9 (interview)</span> "What is a feature store and when would you not use one?" <strong>Answer:</strong> A system that defines features once and serves them offline for training and online for inference, giving consistency, reuse and point-in-time joins. Do not use one for a single small model; a shared feature module and warehouse table are simpler.</p>
+<p class="problem"><span class="pl">Problem 5.10 (interview)</span> "How do you detect and prevent data leakage?" <strong>Answer:</strong> Point-in-time joins, time-based splits, ask for every feature whether it exists at prediction time, check suspiciously strong features and too-good scores, and test the model on a truly later period.</p>
+<h2 id="s6-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps, and English is my second language. Explain feature stores: offline store, online store, materialization, TTL, point-in-time joins, reuse. Use a restaurant prep-station analogy, then a small pandas example. Ask me one check question after each concept and wait for my answer.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Teach me data leakage and point-in-time correctness with three different examples (churn, fraud, forecasting). For each, show the leaky version and the correct version with small numbers. Then give me 8 graded exercises without solutions and offer to check my answers.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Explain Feast concepts: entities, feature views, data sources, get_historical_features, get_online_features and materialization. Tell me which API details I must verify in the current docs. Then design a small feature repo for a churn model and walk me through it.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Compare Great Expectations, TensorFlow Data Validation, Evidently and pandera for data validation in ML pipelines. Give a table of strengths and when not to use each. Then review my list of data checks for a pipeline and tell me what is missing. My checks: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Run a mock interview about feature stores, training-serving skew, leakage and data validation. Ask one question at a time, grade each answer out of 10, show a model answer, and end with my weakest areas and a one-week plan.</pre></div><div class="readbtn"><button class="btn" data-read="study:mlops:ch05">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch04.html">← Chapter 4: Data and Model Versioning</a><a class="btn" href="ch06.html">Chapter 6: Training Pipelines, Distributed Training →</a></div></div><script src="../../assets/study.js"></script></body></html>

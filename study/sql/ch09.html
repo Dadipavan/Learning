@@ -1,0 +1,284 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 9: DDL, DML, Constraints, Upserts and Transactions</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#357a70"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">SQL &amp; Databases Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 9</div><h1>DDL, DML, Constraints, Upserts and Transactions</h1><p>Creating tables, changing data safely, letting the database enforce your rules, and keeping many users from corrupting each other&#x27;s work.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-9-1-ddl-create-alter-drop-data-types-and-constraints">9.1 DDL: CREATE, ALTER, DROP, Data Types and Constraints</a></li><li><a href="#s2-9-2-dml-insert-update-delete-upserts-views-and-friends">9.2 DML: INSERT, UPDATE, DELETE, Upserts, Views and Friends</a></li><li><a href="#s3-9-3-transactions-and-acid">9.3 Transactions and ACID</a></li><li><a href="#s4-9-4-isolation-levels-mvcc-locks-and-deadlocks">9.4 Isolation Levels, MVCC, Locks and Deadlocks</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>Up to now you only read data. A real job also needs you to create tables, load rows, fix wrong values, and do all of it while other people and programs use the same database. One careless <code>DELETE</code> without a <code>WHERE</code>, or one bank-style transfer that stops half way, can cost a company real money. In this chapter you learn the commands that define and change data, the rules (constraints) that stop bad data from entering, and the transaction system that makes a group of changes all-or-nothing. By the end you can build a safe table, load and correct data, write an upsert, and explain ACID, isolation levels, locks and deadlocks in an interview.</p>
+<p>All examples run in SQLite 3.51 unless I say <strong>not run here</strong>. SQLite is a little different from PostgreSQL in places (I will point these out), but the ideas are identical. We reuse the shop database from Chapter 2, plus a few small tables.</p>
+<h2 id="s1-9-1-ddl-create-alter-drop-data-types-and-constraints">9.1 DDL: CREATE, ALTER, DROP, Data Types and Constraints</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of building a school register. Before any student is written down, you print the form: columns for name, roll number, marks, and rules such as "roll number must be unique" and "marks must be 0 to 100." <strong>DDL</strong> (Data Definition Language) is the set of commands that prints the form. <strong>Constraints</strong> are the rules printed on it. The database then refuses any entry that breaks a rule, even if your Python code has a bug.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>DDL</strong>: commands that define structure (<code>CREATE</code>, <code>ALTER</code>, <code>DROP</code>). <strong>DML</strong>: commands that change rows (<code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>).</li><li><strong>Constraint</strong>: a rule the database checks on every change. <strong>Primary key</strong>: unique, never NULL, identifies a row. <strong>Foreign key</strong>: must match a primary key in another table (Chapter 1).</li></ul>
+<h3>The constraints</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Constraint</th><th>Rule it enforces</th><th>Example</th></tr></thead><tbody><tr><td><code>NOT NULL</code></td><td>value must exist</td><td><code>email TEXT NOT NULL</code></td></tr><tr><td><code>UNIQUE</code></td><td>no two rows share the value</td><td><code>email TEXT UNIQUE</code></td></tr><tr><td><code>PRIMARY KEY</code></td><td>unique + not null, identifies the row</td><td><code>rating_id INTEGER PRIMARY KEY</code></td></tr><tr><td><code>FOREIGN KEY</code></td><td>value must exist in the parent table</td><td><code>REFERENCES customers(customer_id)</code></td></tr><tr><td><code>CHECK</code></td><td>any true/false test on the row</td><td><code>CHECK (score BETWEEN 1 AND 5)</code></td></tr><tr><td><code>DEFAULT</code></td><td>value used when you give none</td><td><code>status TEXT DEFAULT 'new'</code></td></tr></tbody></table></div>
+<p>Data types matter too. Common PostgreSQL types: <code>INTEGER</code>, <code>BIGINT</code>, <code>NUMERIC(10,2)</code> for exact money, <code>TEXT</code>, <code>BOOLEAN</code>, <code>DATE</code>, <code>TIMESTAMPTZ</code> (time with time zone), <code>JSONB</code>. Use <code>NUMERIC</code> for money, never floating point, because <code>0.1 + 0.2</code> is not exactly <code>0.3</code> in floating point. SQLite is loosely typed: it has only a few storage classes (<code>INTEGER</code>, <code>REAL</code>, <code>TEXT</code>, <code>BLOB</code>), and by default it lets you store the wrong type, as you will see below.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>CHECK</code></td><td><code>price &gt;= 0</code></td><td>stopping bad rows from an orders pipeline</td></tr><tr><td><code>UNIQUE</code></td><td><code>(order_id, product_id)</code></td><td>making a nightly load job safe to re-run</td></tr><tr><td><code>FOREIGN KEY</code></td><td><code>orders.customer_id</code></td><td>no order for a missing customer</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 9.1.1</span> Create a <code>ratings</code> table where <code>score</code> must be 1 to 5, <code>email</code> must exist and be unique, and <code>status</code> defaults to <code>'new'</code>. Insert one valid row. Predict first: the <code>SELECT</code> shows the default in <code>status</code>.</p>
+<pre class="code lang-sql"><code>CREATE TABLE ratings (
+  rating_id INTEGER PRIMARY KEY,
+  email     TEXT NOT NULL UNIQUE,
+  score     INTEGER NOT NULL CHECK (score BETWEEN 1 AND 5),
+  status    TEXT NOT NULL DEFAULT 'new'
+);
+INSERT INTO ratings (email, score) VALUES ('a@x.com', 4);
+SELECT * FROM ratings;</code></pre>
+<pre class="code lang-text"><code>rating_id  email    score  status
+---------  -------  -----  ------
+1          a@x.com  4      new   </code></pre>
+<ul><li><strong>Answer</strong> One row. <code>rating_id</code> was auto-filled (SQLite) and <code>status</code> came from the <code>DEFAULT</code>, because we did not name it.</li></ul>
+<p>Now break each rule on purpose. Run these one at a time and read each error.</p>
+<pre class="code lang-sql"><code>INSERT INTO ratings (email, score) VALUES ('a@x.com', 3);   -- same email
+INSERT INTO ratings (email, score) VALUES ('b@x.com', 9);   -- score out of range
+INSERT INTO ratings (email, score) VALUES (NULL, 3);        -- missing email</code></pre>
+<pre class="code lang-text"><code>Error: stepping, UNIQUE constraint failed: ratings.email (19)
+Error: stepping, CHECK constraint failed: score BETWEEN 1 AND 5 (19)
+Error: stepping, NOT NULL constraint failed: ratings.email (19)</code></pre>
+<ul><li><strong>Answer</strong> All three were rejected by the database, not by application code, and the table still has one row.</li></ul>
+<p class="problem"><span class="pl">Problem 9.1.2</span> Change a table later with <code>ALTER TABLE</code>: <code>ALTER TABLE ratings ADD COLUMN note TEXT;</code> adds a column (old rows get NULL), <code>ALTER TABLE ratings RENAME COLUMN note TO comment;</code> renames it, and <code>DROP TABLE IF EXISTS s2;</code> removes a table without an error when it is missing. Run <code>PRAGMA table_info(ratings);</code> to list columns (in PostgreSQL use <code>\d ratings</code> in <code>psql</code>). Plain <code>DROP TABLE s2;</code> on a missing table gives <code>Error: in prepare, no such table: s2</code>.</p>
+<h3>Foreign keys and ON DELETE</h3>
+<p>A foreign key says "this value must exist in the parent." What should happen when the parent row is deleted? You choose.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Option</th><th>Meaning</th></tr></thead><tbody><tr><td><code>ON DELETE RESTRICT</code> (or no action)</td><td>refuse to delete the parent if children exist (the default behaviour)</td></tr><tr><td><code>ON DELETE CASCADE</code></td><td>delete the children too</td></tr><tr><td><code>ON DELETE SET NULL</code></td><td>keep children, set their FK to NULL</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 9.1.3</span> Show the difference between a delete that is refused and one that cascades. First, in the shop database, try to delete customer 1, who has orders:</p>
+<pre class="code lang-sql"><code>PRAGMA foreign_keys = ON;
+DELETE FROM customers WHERE customer_id = 1;</code></pre>
+<pre class="code lang-text"><code>Error: stepping, FOREIGN KEY constraint failed (19)</code></pre>
+<p>Now a cascading design with shopping carts and their items:</p>
+<pre class="code lang-sql"><code>PRAGMA foreign_keys = ON;
+CREATE TABLE carts (cart_id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+CREATE TABLE cart_items (
+  item_id INTEGER PRIMARY KEY,
+  cart_id INTEGER NOT NULL REFERENCES carts(cart_id) ON DELETE CASCADE,
+  price INTEGER CHECK (price &gt;= 0)
+);
+INSERT INTO carts VALUES (1,'birthday'),(2,'groceries');
+INSERT INTO cart_items(cart_id,price) VALUES (1,120),(1,340),(2,95);
+DELETE FROM carts WHERE cart_id = 1;
+SELECT * FROM cart_items;</code></pre>
+<pre class="code lang-text"><code>item_id  cart_id  price
+-------  -------  -----
+3        2        95   </code></pre>
+<ul><li><strong>Step 1</strong> Deleting cart 1 removed its two items automatically.</li><li><strong>Step 2</strong> Cart 2 and its item stayed.</li><li><strong>Answer</strong> The restrict rule protected customer 1; the cascade rule cleaned up cart 1.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">In SQLite, foreign keys are <strong>off by default</strong> for each new connection. I ran the same cascade script in a new session <em>without</em> <code>PRAGMA foreign_keys = ON</code>, but deleted cart 2 (the <code>groceries</code> cart). The check <code>SELECT count(*) FROM cart_items</code> returned <code>3</code>: nothing cascaded, and the item of the deleted cart survived as an orphan row. PostgreSQL, MySQL (InnoDB) and SQL Server enforce foreign keys always. In SQLite, put the <code>PRAGMA</code> at the top of every script.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Trusting SQLite types. In a plain SQLite table <code>CREATE TABLE s(n INTEGER); INSERT INTO s VALUES('abc');</code> succeeds, and <code>typeof(n)</code> says <code>text</code>. SQLite is "flexibly typed." Adding the keyword <code>STRICT</code> at the end of <code>CREATE TABLE</code> makes it refuse: <code>cannot store TEXT value in INTEGER column s2.n</code>. PostgreSQL always refuses. Do not build habits on the lenient behaviour.</div></div>
+<h3>Connection to the real job</h3>
+<p>A data engineer designs tables with constraints so pipelines cannot load garbage. An analyst reads constraint names to learn which columns can be trusted: if <code>email</code> is <code>UNIQUE NOT NULL</code>, you can join on it without fear of duplicates. In ML, a clean constrained feature table saves days of debugging.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> <code>UNIQUE</code> keys make nightly loads safe to repeat; <strong>Analytics:</strong> a <code>NOT NULL UNIQUE</code> column is safe to join on.</li></ul>
+<h3>Check yourself</h3>
+<ol><li>Which constraint stops two customers from having the same email?</li></ol>
+<p>Answer: <code>UNIQUE</code> on the <code>email</code> column.</p>
+<ol><li>What does <code>ON DELETE CASCADE</code> do?</li></ol>
+<p>Answer: When the parent row is deleted, the child rows pointing to it are deleted too.</p>
+<ol><li>Why should money be <code>NUMERIC</code> and not floating point?</li></ol>
+<p>Answer: Floating point cannot store values like 0.1 exactly, so sums drift; <code>NUMERIC</code> is exact.</p>
+<h2 id="s2-9-2-dml-insert-update-delete-upserts-views-and-friends">9.2 DML: INSERT, UPDATE, DELETE, Upserts, Views and Friends</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Imagine a shared Google Sheet used by a team. You add rows, fix wrong cells, delete old rows. The risky moment is when you fix "all rows where..." and the filter is wrong. DML is the same, but the sheet has a million rows and no undo button, except the one you build yourself (transactions, section 9.3).</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Upsert</strong>: "update + insert": update the row if it exists, insert it if not. <strong>Conflict</strong>: an insert that would break a <code>UNIQUE</code> or primary-key rule.</li><li><strong>View</strong>: a saved query used like a table (no data of its own). <strong>Temp table</strong>: disappears when your session ends.</li></ul>
+<h3>INSERT, UPDATE, DELETE</h3>
+<pre class="code lang-text"><code>INSERT INTO table (col1, col2) VALUES (v1, v2), (v3, v4);
+UPDATE table SET col = expression WHERE condition;
+DELETE FROM table WHERE condition;</code></pre>
+<p>Always name the columns in <code>INSERT</code>. If someone later adds a column, an unnamed <code>INSERT</code> breaks or fills the wrong column. And <strong>always write the <code>WHERE</code> first</strong>, then the rest.</p>
+<p class="problem"><span class="pl">Problem 9.2.1</span> The prices of the Home products rise by 50. Update and show the result. Predict: Desk Lamp 900 becomes 950, Mug 250 becomes 300.</p>
+<pre class="code lang-sql"><code>UPDATE products SET price = price + 50 WHERE category = 'Home';
+SELECT product_id, name, price FROM products WHERE category = 'Home';</code></pre>
+<pre class="code lang-text"><code>product_id  name       price
+----------  ---------  -----
+5           Desk Lamp  950  
+6           Mug        300  </code></pre>
+<ul><li><strong>Step 1</strong> <code>WHERE category = 'Home'</code> selects products 5 and 6 only.</li><li><strong>Step 2</strong> <code>price = price + 50</code> reads the old price on the right and writes the new price on the left.</li><li><strong>Check</strong> 900 + 50 = 950 and 250 + 50 = 300.</li><li><strong>Answer</strong> Two rows changed, and no other row was touched.</li></ul>
+<p><code>INSERT ... RETURNING product_id, name;</code> (SQLite 3.35+, PostgreSQL) gives back the new row in one step, avoiding a race with other sessions.</p>
+<div class="callout blue"><div class="lab">PROFESSOR'S NOTE</div><div class="txt">Before any risky <code>UPDATE</code> or <code>DELETE</code>, run the same <code>WHERE</code> as a <code>SELECT COUNT(*)</code> first. If you expect 2 rows and the count says 2,000,000, you just avoided a disaster. Better still, run it inside a transaction (section 9.3) and look before you commit.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><code>DELETE FROM customers;</code> with no <code>WHERE</code> removes every row. <code>UPDATE products SET price = 0;</code> sets every price to zero. The database does not ask "are you sure?". Use a transaction, or a <code>SELECT</code> first.</div></div>
+<h3>TRUNCATE, COPY and bulk loading</h3>
+<p><code>TRUNCATE TABLE t;</code> empties a table fast (PostgreSQL, MySQL, SQL Server; <strong>not run here</strong>; SQLite uses <code>DELETE FROM t;</code>). <code>COPY t FROM 'file.csv' WITH (FORMAT csv, HEADER);</code> bulk-loads a CSV into PostgreSQL (<strong>not run here</strong>; <code>\copy</code> in <code>psql</code>; SQLite: <code>.mode csv</code> then <code>.import</code>). Loading a million rows with one autocommitted <code>INSERT</code> each is slow because every commit waits for the disk: batch them in one transaction or use <code>COPY</code>.</p>
+<h3>Upsert: INSERT ... ON CONFLICT</h3>
+<p><strong>The problem.</strong> A nightly job loads stock counts. Some products are already in the table, some are new. If you just <code>INSERT</code>, existing ones fail with a duplicate-key error. If you check first (<code>SELECT</code>), then insert, two jobs can both see "not there" and both insert. An upsert does the whole thing in one safe statement.</p>
+<pre class="code lang-sql"><code>CREATE TABLE stock (product_id INTEGER PRIMARY KEY, qty INTEGER NOT NULL);
+INSERT INTO stock VALUES (1,10),(2,20);
+
+-- product 1 exists: add to quantity
+INSERT INTO stock VALUES (1,5)
+  ON CONFLICT (product_id) DO UPDATE SET qty = qty + excluded.qty;
+-- product 3 is new: plain insert
+INSERT INTO stock VALUES (3,7)
+  ON CONFLICT (product_id) DO UPDATE SET qty = qty + excluded.qty;
+-- product 2 exists, ignore the new value
+INSERT INTO stock VALUES (2,99)
+  ON CONFLICT (product_id) DO NOTHING;
+SELECT * FROM stock;</code></pre>
+<pre class="code lang-text"><code>product_id  qty
+----------  ---
+1           15 
+2           20 
+3           7  </code></pre>
+<ul><li><strong>Step 1</strong> The first statement conflicts on <code>product_id = 1</code>. <code>DO UPDATE</code> runs. <code>excluded</code> is a special name for "the row I tried to insert," so <code>excluded.qty</code> is 5, and <code>qty</code> is the existing 10. Result 10 + 5 = 15.</li><li><strong>Step 2</strong> Product 3 has no conflict. It is inserted as 7.</li><li><strong>Step 3</strong> Product 2 conflicts, but <code>DO NOTHING</code> skips the new row. Qty stays 20.</li><li><strong>Check</strong> 15, 20, 7 matches the output.</li><li><strong>Answer</strong> One statement handled update, insert and ignore, atomically.</li></ul>
+<p>The same syntax works in PostgreSQL. <code>MERGE</code> is the SQL-standard alternative (PostgreSQL 15+, SQL Server, Oracle). <strong>Not run here.</strong> In MySQL the equivalent is <code>INSERT ... ON DUPLICATE KEY UPDATE</code>.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using <code>INSERT OR REPLACE</code> (SQLite) or <code>REPLACE INTO</code> (MySQL) as an upsert. It <strong>deletes</strong> the old row and inserts a new one, so other columns you did not mention are reset to defaults. I ran <code>INSERT OR REPLACE INTO stock VALUES (1,1);</code> after the script above and product 1 went from 15 to 1: the whole row was replaced. Prefer <code>ON CONFLICT ... DO UPDATE</code>, which changes only the columns you name.</div></div>
+<h3>Views, temp tables and identity columns</h3>
+<p><strong>Views</strong> give a name to a query so everyone uses the same definition of "revenue."</p>
+<pre class="code lang-sql"><code>CREATE VIEW paid_revenue AS
+SELECT o.order_id, SUM(i.qty * i.unit_price) AS total
+FROM orders o JOIN order_items i USING (order_id)
+WHERE o.status = 'paid'
+GROUP BY o.order_id;
+
+SELECT * FROM paid_revenue LIMIT 3;</code></pre>
+<pre class="code lang-text"><code>order_id  total
+--------  -----
+101       1660 
+102       600  
+103       1020 </code></pre>
+<p>Check by hand: order 101 has 1 keyboard at 1500 plus 2 notebooks at 80, so 1500 + 160 = 1660. Order 103: 900 + 120 = 1020.</p>
+<p><strong>Temp tables</strong> (<code>CREATE TEMP TABLE big AS SELECT ...</code>) hold intermediate results for your session only. <strong>Identity:</strong> PostgreSQL uses <code>id BIGINT GENERATED ALWAYS AS IDENTITY</code> (<strong>not run here</strong>); SQLite's <code>INTEGER PRIMARY KEY</code> auto-numbers, and ids are never guaranteed gap-free (I deleted id 2 from a 2-row table and the next insert got id 3 with <code>AUTOINCREMENT</code>). <strong>Awareness, not run here:</strong> <code>CREATE MATERIALIZED VIEW</code> plus <code>REFRESH MATERIALIZED VIEW</code> stores a heavy query's result; triggers and stored procedures hide logic in the database, so use them rarely.</p>
+<h3>Surrogate vs natural keys</h3>
+<p>A <strong>natural key</strong> is real-world data (an email) and can change. A <strong>surrogate key</strong> is a meaningless id the database makes (<code>customer_id</code>). Practice: surrogate primary key, plus <code>UNIQUE</code> on the natural key.</p>
+<h3>Connection to the real job</h3>
+<p>Upserts are in every incremental data pipeline: "load today's changes into the table without duplicating yesterday's." Views are how analytics teams share one definition of a metric. <code>COPY</code> and bulk loads are how data engineers fill warehouses.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> idempotent loads with <code>ON CONFLICT</code>; <strong>Analytics:</strong> shared views so dashboards agree; <strong>ML:</strong> temp tables to build a training set.</li></ul>
+<h3>Check yourself</h3>
+<ol><li>What does <code>excluded.qty</code> mean inside <code>ON CONFLICT DO UPDATE</code>?</li></ol>
+<p>Answer: The value from the row that you tried to insert.</p>
+<ol><li>Why is <code>INSERT OR REPLACE</code> dangerous as an upsert?</li></ol>
+<p>Answer: It deletes the whole old row and inserts a new one, so unmentioned columns are lost.</p>
+<ol><li>What is the first thing to do before a risky <code>DELETE</code>?</li></ol>
+<p>Answer: Run the same <code>WHERE</code> in a <code>SELECT COUNT(*)</code>, and ideally work inside a transaction.</p>
+<h2 id="s3-9-3-transactions-and-acid">9.3 Transactions and ACID</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You move Rs 300 from Asha to Ravi. That is two steps: subtract from Asha, add to Ravi. If the power fails between the steps, Rs 300 vanishes. A <strong>transaction</strong> wraps both steps in one box that either happens fully or not at all. Think of a bank counter: deposit, stamp and receipt are many small actions but one business step with one result.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Transaction</strong>: a group of statements treated as one unit.</li><li><strong>COMMIT</strong>: make all the changes permanent.</li><li><strong>ROLLBACK</strong>: undo all the changes since <code>BEGIN</code>.</li><li><strong>Savepoint</strong>: a bookmark inside a transaction you can roll back to.</li><li><strong>Autocommit</strong>: the default mode in which each single statement is its own transaction.</li></ul>
+<h3>ACID</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Letter</th><th>Name</th><th>Plain meaning</th><th>If it were missing</th></tr></thead><tbody><tr><td>A</td><td>Atomicity</td><td>all steps happen, or none</td><td>half a transfer</td></tr><tr><td>C</td><td>Consistency</td><td>rules (constraints) hold before and after</td><td>negative balances</td></tr><tr><td>I</td><td>Isolation</td><td>concurrent transactions do not see each other's half-done work</td><td>wrong totals in reports</td></tr><tr><td>D</td><td>Durability</td><td>once committed, it survives a crash</td><td>lost orders after power cut</td></tr></tbody></table></div>
+<p>Durability is usually done with a <strong>write-ahead log (WAL)</strong>: the database writes the change to a log file on disk first, and updates the table files later. After a crash it replays the log.</p>
+<p class="problem"><span class="pl">Problem 9.3.1</span> Transfer Rs 300 from Asha (id 1) to Ravi (id 2), first rolled back, then committed.</p>
+<pre class="code lang-sql"><code>CREATE TABLE accounts (
+  id INTEGER PRIMARY KEY, owner TEXT,
+  balance INTEGER NOT NULL CHECK (balance &gt;= 0));
+INSERT INTO accounts VALUES (1,'Asha',1000),(2,'Ravi',500);
+
+BEGIN;
+UPDATE accounts SET balance = balance - 300 WHERE id = 1;
+UPDATE accounts SET balance = balance + 300 WHERE id = 2;
+SELECT * FROM accounts;
+ROLLBACK;
+SELECT * FROM accounts;
+
+BEGIN;
+UPDATE accounts SET balance = balance - 300 WHERE id = 1;
+UPDATE accounts SET balance = balance + 300 WHERE id = 2;
+COMMIT;
+SELECT * FROM accounts;</code></pre>
+<pre class="code lang-text"><code>id  owner  balance
+--  -----  -------
+1   Asha   700    
+2   Ravi   800    
+id  owner  balance
+--  -----  -------
+1   Asha   1000   
+2   Ravi   500    
+id  owner  balance
+--  -----  -------
+1   Asha   700    
+2   Ravi   800    </code></pre>
+<ul><li><strong>Step 1</strong> Inside the first transaction we see the new balances (700 and 800). This is <em>our own</em> view.</li><li><strong>Step 2</strong> <code>ROLLBACK</code> undoes both updates: 1000 and 500 again.</li><li><strong>Step 3</strong> The second run ends in <code>COMMIT</code>, so 700 and 800 become permanent.</li><li><strong>Check</strong> 700 + 800 = 1500 = 1000 + 500. Money is conserved.</li><li><strong>Answer</strong> Both steps happen together or not at all.</li></ul>
+<p class="problem"><span class="pl">Problem 9.3.2 (find the bug)</span> A script runs a transfer that should fail: Asha has only 700 but we try to move 5,000. We add 500 to Ravi first, then subtract 5,000 from Asha. The <code>CHECK (balance &gt;= 0)</code> will reject the second step. Predict the final balances if the script continues after the error.</p>
+<pre class="code lang-sql"><code>BEGIN;
+UPDATE accounts SET balance = balance + 500 WHERE id = 2;
+UPDATE accounts SET balance = balance - 5000 WHERE id = 1;
+COMMIT;
+SELECT * FROM accounts;</code></pre>
+<pre class="code lang-text"><code>Runtime error near line 5: CHECK constraint failed: balance &gt;= 0 (19)
+id  owner  balance
+--  -----  -------
+1   Asha   700    
+2   Ravi   1300   </code></pre>
+<ul><li><strong>Step 1</strong> The first <code>UPDATE</code> worked: Ravi 800 to 1300.</li><li><strong>Step 2</strong> The second <code>UPDATE</code> failed. Only that <strong>one statement</strong> was undone, not the transaction.</li><li><strong>Step 3</strong> The <code>sqlite3</code> shell continued and ran <code>COMMIT</code>, which saved the half-done work.</li><li><strong>Answer</strong> Ravi gained 500 from nowhere. Total money rose from 1500 to 2000.</li><li><strong>Fix</strong> Your program must check for an error and issue <code>ROLLBACK</code> itself. In Python: <code>try: ... conn.commit() except: conn.rollback()</code>. In PostgreSQL an error inside a transaction puts the whole transaction in an "aborted" state, and <code>COMMIT</code> then behaves as a rollback. That is safer, but still handle errors in code.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Assuming "an error cancels the whole transaction." Behaviour depends on the database and the shell. Always handle the error and roll back explicitly.</div></div>
+<p><strong>Savepoints</strong> (<code>SAVEPOINT s1; ... ROLLBACK TO s1;</code>) undo only part of a transaction. I ran a +1 update, a savepoint, a +100 update, <code>ROLLBACK TO s1</code>, then <code>COMMIT</code>: Ravi went from 1300 to 1301 only.</p>
+<h3>Connection to the real job</h3>
+<p>Every payment, order and booking system relies on atomic transactions. In data engineering, a pipeline loads a day of data in one transaction so dashboards never see half a day. Keep transactions <strong>short</strong>: a long open transaction holds locks and blocks others (section 9.4). It is the same as one slow customer at a bank counter holding up the whole queue.</p>
+<h3>Applications</h3>
+<ul><li><strong>Back ends:</strong> checkout, transfers, seat booking. <strong>Data Engineering:</strong> swap a staging table in one transaction.</li></ul>
+<h3>Check yourself</h3>
+<ol><li>What does the A in ACID guarantee?</li></ol>
+<p>Answer: A transaction's steps all happen or none do.</p>
+<ol><li>Which ACID property is delivered by the write-ahead log?</li></ol>
+<p>Answer: Durability.</p>
+<ol><li>Why keep transactions short?</li></ol>
+<p>Answer: Open transactions hold locks and block other users; long ones cause waits and deadlocks.</p>
+<h2 id="s4-9-4-isolation-levels-mvcc-locks-and-deadlocks">9.4 Isolation Levels, MVCC, Locks and Deadlocks</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Two clerks edit the same customer file in a bank at the same moment. Clerk 1 reads "balance 1000" and wants to subtract 100. Clerk 2 also read "1000" and subtracts 200. If both write back, one change is lost. <strong>Isolation</strong> is the set of rules for what each clerk may see and when one must wait. It is the same issue as two people updating one shared tally sheet: without a guard, the final value is wrong.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Concurrent</strong>: happening at the same time.</li><li><strong>Dirty read</strong>: reading another transaction's uncommitted data (which may be rolled back).</li><li><strong>Non-repeatable read</strong>: reading the same row twice in one transaction and getting two different values, because someone committed in between.</li><li><strong>Phantom read</strong>: running the same query twice and getting extra rows, because someone inserted rows in between.</li><li><strong>Lock</strong>: a flag that makes others wait before touching a row or table.</li><li><strong>MVCC</strong> (Multi-Version Concurrency Control): the database keeps old versions of a row, so readers see a stable snapshot and do not block writers.</li><li><strong>Deadlock</strong>: two transactions each wait for a lock the other holds, forever.</li></ul>
+<h3>The four isolation levels (SQL standard)</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Level</th><th>Dirty read</th><th>Non-repeatable read</th><th>Phantom</th></tr></thead><tbody><tr><td>READ UNCOMMITTED</td><td>possible</td><td>possible</td><td>possible</td></tr><tr><td>READ COMMITTED</td><td>no</td><td>possible</td><td>possible</td></tr><tr><td>REPEATABLE READ</td><td>no</td><td>no</td><td>possible (standard), not in PostgreSQL</td></tr><tr><td>SERIALIZABLE</td><td>no</td><td>no</td><td>no</td></tr></tbody></table></div>
+<p>Facts about real databases (check the version docs for details): PostgreSQL's default is <strong>READ COMMITTED</strong>; it treats READ UNCOMMITTED the same as READ COMMITTED, so it never allows dirty reads. Its REPEATABLE READ is a snapshot, and SERIALIZABLE may abort a transaction with a "serialization failure," which your code must <strong>retry</strong>. MySQL InnoDB defaults to REPEATABLE READ. You set the level with <code>BEGIN ISOLATION LEVEL REPEATABLE READ;</code> in PostgreSQL (<strong>not run here</strong>).</p>
+<p>Higher isolation means fewer strange results and more waiting or retries. Most systems use READ COMMITTED and add explicit locks only where needed.</p>
+<h3>SQLite is different (and simpler)</h3>
+<p>SQLite allows <strong>one writer at a time</strong> for the whole database, and its transactions are serializable. That makes it easy to demonstrate. I used Python's <code>sqlite3</code> module with two connections, A and B, to the same file.</p>
+<p class="problem"><span class="pl">Problem 9.4.1</span> A updates a balance but has not committed. What does B see? Can B also write?</p>
+<pre class="code lang-python"><code>a.execute("BEGIN IMMEDIATE")
+a.execute("UPDATE accounts SET balance = 700 WHERE id = 1")
+print("A sees :", a.execute("SELECT balance FROM accounts").fetchone())
+print("B sees :", b.execute("SELECT balance FROM accounts").fetchone())
+b.execute("BEGIN IMMEDIATE")      # B also wants to write</code></pre>
+<pre class="code lang-text"><code>A sees : (700,)
+B sees : (1000,)
+B error: database is locked
+after commit B sees: (700,)</code></pre>
+<ul><li><strong>Step 1</strong> A changed the balance to 700 but has not committed.</li><li><strong>Step 2</strong> A sees its own change, 700. B still sees 1000. <strong>No dirty read.</strong></li><li><strong>Step 3</strong> B tries to start a write and gets <code>database is locked</code>, because A holds the write lock. (I set the wait time to 0 so the error appears at once. Normally you set a timeout and B simply waits.)</li><li><strong>Step 4</strong> After A commits, B sees 700.</li><li><strong>Answer</strong> Readers see committed data only, and a second writer must wait.</li></ul>
+<p class="problem"><span class="pl">Problem 9.4.2 (lost update)</span> Both connections read the balance (1000) into Python, subtract in Python and write back. A subtracts 100, B subtracts 200. The right answer is 700.</p>
+<pre class="code lang-python"><code>bal_a = a.execute("SELECT balance FROM accounts").fetchone()[0]   # 1000
+bal_b = b.execute("SELECT balance FROM accounts").fetchone()[0]   # 1000
+a.execute("UPDATE accounts SET balance = ?", (bal_a - 100,))      # writes 900
+b.execute("UPDATE accounts SET balance = ?", (bal_b - 200,))      # writes 800</code></pre>
+<pre class="code lang-text"><code>expected 700, got: 800</code></pre>
+<ul><li><strong>Step 1</strong> Both read 1000.</li><li><strong>Step 2</strong> A writes 900. Then B writes 800, based on its old read, wiping A's change.</li><li><strong>Answer</strong> One withdrawal of 100 was lost. This is the <strong>lost update</strong> problem.</li></ul>
+<p>The fix is to let the database do the arithmetic in one statement:</p>
+<pre class="code lang-python"><code>a.execute("UPDATE accounts SET balance = balance - 100")
+b.execute("UPDATE accounts SET balance = balance - 200")</code></pre>
+<pre class="code lang-text"><code>expected 700, got: 700</code></pre>
+<p><code>balance = balance - 100</code> reads and writes under one lock, so each change builds on the last. Other fixes: <code>SELECT ... FOR UPDATE</code> (PostgreSQL, <strong>not run here</strong>) locks the row while you read it; or use SERIALIZABLE and retry; or optimistic locking with a <code>version</code> column (<code>UPDATE ... WHERE id = 1 AND version = 7</code>, then check that 1 row changed).</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Read-modify-write in application code (<code>x = SELECT ...; UPDATE ... SET v = x - 100</code>). This is the classic cause of lost updates. Do the maths inside the SQL statement whenever possible.</div></div>
+<h3>Locks and MVCC in PostgreSQL</h3>
+<p>An <code>UPDATE</code> writes a <strong>new version</strong> of the row and keeps the old one for earlier transactions. Readers never block writers; writers block writers only on the <em>same row</em>. Dead versions are cleaned by <code>VACUUM</code> (Chapter 10). <code>ALTER TABLE</code> takes a strong table lock and can stall a busy table.</p>
+<h3>Deadlocks</h3>
+<p>A deadlock needs two transactions and two rows. Think of two cars on a narrow bridge, each waiting for the other to back up.</p>
+<pre class="code lang-text"><code> time   Transaction T1                   Transaction T2
+  1     UPDATE acct SET .. WHERE id=1   (locks row 1)
+  2                                     UPDATE acct SET .. WHERE id=2  (locks row 2)
+  3     UPDATE acct SET .. WHERE id=2   waits for T2
+  4                                     UPDATE acct SET .. WHERE id=1  waits for T1
+        --&gt; each waits for the other: DEADLOCK</code></pre>
+<p>PostgreSQL detects this (after <code>deadlock_timeout</code>, 1 second by default), kills one transaction with <code>ERROR: deadlock detected</code>, and lets the other finish. The killed program must retry. <strong>Not run here</strong> (SQLite avoids it by having one writer).</p>
+<p><strong>How to avoid deadlocks (all databases):</strong></p>
+<ol><li>Touch rows in the <strong>same order</strong> everywhere (always lower id first).</li><li>Keep transactions <strong>short</strong>; no user input or network calls in the middle.</li><li>Take stronger locks early (<code>SELECT ... FOR UPDATE</code>) when you know you will write.</li><li><strong>Retry</strong> on deadlock and serialization errors. Your code should expect them.</li></ol>
+<h3>Connection to the real job</h3>
+<p>A <strong>hot row</strong> (one counter row updated by every request) is a classic performance bottleneck: throughput is capped by how fast one lock can pass from transaction to transaction. Picture one bank counter: more customers join the queue, the number served per hour stays flat, and waiting times climb. The cure is the same as for any queue: shorter hold time, or spread the work across many rows.</p>
+<h3>Applications</h3>
+<ul><li><strong>Back ends:</strong> inventory and wallets (atomic updates, <code>FOR UPDATE</code>). <strong>Operations:</strong> lock waits show as slow pages with low CPU use.</li></ul>
+<h3>Check yourself</h3>
+<ol><li>Which anomaly is "same query, extra rows the second time"?</li></ol>
+<p>Answer: Phantom read.</p>
+<ol><li>What does MVCC let readers do?</li></ol>
+<p>Answer: Read a consistent older version of rows without waiting for writers.</p>
+<ol><li>Name two ways to avoid deadlocks.</li></ol>
+<p>Answer: Lock rows in the same order everywhere; keep transactions short (also: retry on failure).</p>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>DDL defines structure (<code>CREATE</code>, <code>ALTER</code>, <code>DROP</code>). Constraints (<code>NOT NULL</code>, <code>UNIQUE</code>, <code>PRIMARY KEY</code>, <code>FOREIGN KEY</code>, <code>CHECK</code>, <code>DEFAULT</code>) make the database reject bad data.</li><li>SQLite needs <code>PRAGMA foreign_keys = ON</code> each session and is loosely typed unless <code>STRICT</code>; PostgreSQL always enforces both.</li><li>Use <code>NUMERIC</code> for money. Prefer surrogate primary keys plus a <code>UNIQUE</code> natural key.</li><li><code>INSERT</code>, <code>UPDATE</code>, <code>DELETE</code>: write the <code>WHERE</code> first and test it with a <code>SELECT COUNT(*)</code>.</li><li>Upsert is <code>INSERT ... ON CONFLICT DO UPDATE / DO NOTHING</code>; do not use <code>REPLACE</code>, which deletes the whole row.</li><li>A transaction groups statements: <code>BEGIN</code>, then <code>COMMIT</code> or <code>ROLLBACK</code>. Handle errors in code.</li><li>ACID: atomic, consistent, isolated, durable. The write-ahead log gives durability.</li><li>Isolation levels trade safety for speed: READ COMMITTED is the PostgreSQL default; SERIALIZABLE needs retries.</li><li>Never read, then write back a computed value in app code; use <code>SET x = x - 100</code> or <code>FOR UPDATE</code>.</li><li>Deadlocks: lock in a fixed order, keep transactions short, retry.</li></ul>
+<h3>Cheat-sheet</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Task</th><th>Pattern</th></tr></thead><tbody><tr><td>Safe rerunnable create</td><td><code>CREATE TABLE IF NOT EXISTS t (...)</code>, <code>DROP TABLE IF EXISTS t</code></td></tr><tr><td>Add column</td><td><code>ALTER TABLE t ADD COLUMN c TYPE</code></td></tr><tr><td>Upsert</td><td><code>INSERT ... ON CONFLICT (key) DO UPDATE SET c = excluded.c</code></td></tr><tr><td>Insert and get id</td><td><code>INSERT ... RETURNING id</code></td></tr><tr><td>Atomic block</td><td><code>BEGIN; ...; COMMIT;</code> or <code>ROLLBACK;</code></td></tr><tr><td>Partial undo</td><td><code>SAVEPOINT s; ... ROLLBACK TO s;</code></td></tr><tr><td>Row lock (PostgreSQL)</td><td><code>SELECT ... FOR UPDATE</code></td></tr><tr><td>Isolation (PostgreSQL)</td><td><code>BEGIN ISOLATION LEVEL SERIALIZABLE;</code></td></tr><tr><td>Bulk load</td><td><code>COPY</code> (PostgreSQL), <code>.import</code> (SQLite)</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 9.P.1</span> (easy) Which constraint ensures <code>age</code> is between 0 and 120? <strong>Answer:</strong> <code>CHECK (age BETWEEN 0 AND 120)</code>.</p>
+<p class="problem"><span class="pl">Problem 9.P.2</span> (what is the output?) <code>CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT DEFAULT 'x'); INSERT INTO t (a) VALUES (5); SELECT * FROM t;</code> <strong>Answer:</strong> One row: <code>5</code> and <code>x</code>. The default fills <code>b</code>.</p>
+<p class="problem"><span class="pl">Problem 9.P.3</span> (find the bug) <code>DELETE FROM orders WHERE status = 'cancelled' OR 'refunded';</code> What is wrong? <strong>Answer:</strong> <code>OR 'refunded'</code> is not a comparison. Write <code>status IN ('cancelled','refunded')</code>. In SQLite the text <code>'refunded'</code> evaluates as 0 (false), so only cancelled rows would go, a silent bug. Check with a <code>SELECT COUNT(*)</code> first.</p>
+<p class="problem"><span class="pl">Problem 9.P.4</span> (find the bug) A function reads <code>bal = SELECT balance ...</code>, then runs <code>UPDATE accounts SET balance = &lt;bal - 100&gt;</code>. Two users run it at once from balance 1000. What can the final balance be, and what is the fix? <strong>Answer:</strong> 900 instead of 800 (lost update). Fix: <code>UPDATE accounts SET balance = balance - 100 WHERE id = 1 AND balance &gt;= 100</code>, and check that one row changed.</p>
+<p class="problem"><span class="pl">Problem 9.P.5</span> (scenario) A nightly job loads 2 million rows with one <code>INSERT</code> each, autocommit on, and takes 3 hours. Suggest two improvements. <strong>Answer:</strong> Wrap batches (say 10,000 rows) in one transaction, so there are fewer commits and disk waits. Better, use <code>COPY</code> (PostgreSQL) or a multi-row <code>INSERT</code>. Also drop or defer heavy indexes during the load (Chapter 10).</p>
+<p class="problem"><span class="pl">Problem 9.P.6</span> (scenario) Your app logs <code>deadlock detected</code> about 5 times a day. Two functions update <code>accounts</code> row 1 then row 2, and row 2 then row 1. Fix it. <strong>Answer:</strong> Make both lock rows in the same order (lowest id first), keep the transaction short, and retry the transaction when the error occurs.</p>
+<p class="problem"><span class="pl">Problem 9.P.7</span> (interview) Explain the difference between READ COMMITTED and REPEATABLE READ with an example. <strong>Answer:</strong> In READ COMMITTED each statement sees data committed so far, so two identical <code>SELECT</code>s in one transaction can differ if someone commits between them (non-repeatable read). In REPEATABLE READ the transaction sees one snapshot taken at its start, so both <code>SELECT</code>s agree. Cost: REPEATABLE READ may need retries on write conflicts.</p>
+<p class="problem"><span class="pl">Problem 9.P.8</span> (interview) Why does PostgreSQL not block a long report query when an <code>UPDATE</code> hits the same table? <strong>Answer:</strong> MVCC. The report reads a snapshot of old row versions, while the <code>UPDATE</code> writes new versions. Readers and writers do not block each other. The cost is dead rows that <code>VACUUM</code> must clean later.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning SQL for data roles. Teach me DDL and constraints: CREATE, ALTER, DROP, data types, PRIMARY KEY, FOREIGN KEY, UNIQUE, CHECK, NOT NULL, DEFAULT and ON DELETE CASCADE. Use a small orders and customers example. Explain step by step in simple English, show each error message when a rule is broken, and after each idea ask me one question to check my understanding before moving on.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data engineering. Explain INSERT, UPDATE, DELETE and the upsert pattern INSERT ... ON CONFLICT in PostgreSQL, and how it differs from MERGE, REPLACE and INSERT OR REPLACE. Give 8 graded exercises with a small inventory table, no solutions at first. Then wait for my answers and correct them kindly, explaining every mistake.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning SQL. Teach me transactions and ACID with a bank-transfer example: BEGIN, COMMIT, ROLLBACK, savepoints and what happens when a statement fails halfway. Explain each ACID letter with an everyday analogy (a bank queue or a shop counter). Then quiz me one question at a time, with a short scenario each time, and only give the next question after I answer.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional who understands shared counters but is new to databases. Explain isolation levels (READ COMMITTED, REPEATABLE READ, SERIALIZABLE), dirty, non-repeatable and phantom reads, MVCC, row locks, lost updates and deadlocks in PostgreSQL. Use two-session timelines with numbers. Then give me 6 scenarios and ask which anomaly or lock problem occurs and how to fix it.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for data engineer interviews. Run a mock interview on SQL transactions, constraints and concurrency: ask me 8 questions, one at a time, from easy to hard, and wait for my answer each time. After each answer, score it out of 5, point out missing points, and give a model answer in simple English. Here is my last piece of work to review as well: [PASTE HERE]</pre></div><div class="readbtn"><button class="btn" data-read="study:sql:ch09">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch08.html">← Chapter 8: Window Functions in Depth</a><a class="btn" href="ch10.html">Chapter 10: Indexes, EXPLAIN and Query Optimization →</a></div></div><script src="../../assets/study.js"></script></body></html>

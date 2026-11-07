@@ -1,0 +1,343 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 16: Project Lab 2: Detection, Mini-GPT and a Sequence Model</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Deep Learning &amp; Computer Vision</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 16</div><h1>Project Lab 2: Detection, Mini-GPT and a Sequence Model</h1><p>Three more portfolio projects: measure a detector correctly, build a GPT forward pass piece by piece, and train a recurrent network that writes text.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-16-1-project-object-detection-on-a-custom-dataset-learner-project-36">16.1 Project: Object Detection on a Custom Dataset (learner project #36)</a></li><li><a href="#s2-16-2-project-mini-gpt-from-scratch-learner-project-37">16.2 Project: Mini-GPT From Scratch (learner project #37)</a></li><li><a href="#s3-16-3-project-a-sequence-model-for-next-character-prediction-new">16.3 Project: A Sequence Model for Next-Character Prediction (NEW)</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>Chapter 15 gave you the project method and two image projects. If you have not read section 15.1 (planning, repository layout, commit rhythm, definition of done, README template, testing checklist), read it first, because every project below uses it. These three projects go deeper into the topics that interviews love: how to score a detector (IoU and mAP, which most beginners get wrong), how a GPT works inside (attention with a causal mask), and how a recurrent network learns from a sequence (backpropagation through time). As before, all NumPy code was run and the printed output is real. Anything that needs PyTorch, a GPU or downloaded data is labelled "not run here".</p>
+<div class="callout blue"><div class="lab">PROFESSOR'S NOTE</div><div class="txt">The three projects share one theme: <strong>build the measuring stick first</strong>. For detection that is mAP, for the GPT it is the loss at the start and a baseline model, for the RNN it is gradient checking. A project with a trustworthy measuring stick is worth ten with a bigger model and no test.</div></div>
+<h2 id="s1-16-1-project-object-detection-on-a-custom-dataset-learner-project-36">16.1 Project: Object Detection on a Custom Dataset (learner project #36)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of a warehouse inspector with a clipboard. She must write down where each damaged box is (a rectangle on a photo) and what is wrong with it. Marking a rectangle a little to the side is a small error. Marking a second rectangle on the same box is a different error. Missing the box is a third. A detection score has to treat all three fairly, and that is what IoU and mAP do.</div></div>
+<h3>Goal and why employers care</h3>
+<p>Train a detector for one or two object types on a small custom image set (for example parcels on a shelf, or helmets in site photos), and evaluate it with the standard metric. Companies need detectors for inventory, quality checks and safety. The part that separates professionals from beginners is correct evaluation and annotation hygiene, which you can show even without a GPU.</p>
+<h3>Skills used</h3>
+<p>Chapter 9 (Object Detection, Segmentation and OCR: IoU, NMS, AP and mAP, detector families), Chapter 7 (Transfer Learning and Fine-Tuning for Images), Chapter 5 (PyTorch Essentials), Chapter 3 (Training in Practice).</p>
+<h3>Data</h3>
+<p>Free, licensed sources: public sets with boxes such as Pascal VOC or a COCO subset, or your own 100 to 300 photos. Label them with a free annotation tool (for example Label Studio, CVAT or LabelImg) and export in one of three formats. Know all three, because tools and models disagree:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Format</th><th>Box numbers</th><th>Units</th><th>Example for a 100x60 box at (50, 40) in a 640x480 image</th></tr></thead><tbody><tr><td>COCO</td><td><code>[x, y, width, height]</code> (top-left corner)</td><td>pixels</td><td><code>[50, 40, 100, 60]</code></td></tr><tr><td>Pascal VOC / "xyxy"</td><td><code>[x1, y1, x2, y2]</code> (two corners)</td><td>pixels</td><td><code>[50, 40, 150, 100]</code></td></tr><tr><td>YOLO</td><td><code>[cx, cy, w, h]</code> (centre)</td><td>fractions 0 to 1 of image size</td><td><code>[0.1562, 0.1458, 0.1562, 0.125]</code></td></tr></tbody></table></div>
+<p>The code below converts between them and defines IoU, NMS and AP. These were run, together with the demo at the bottom.</p>
+<h3>Architecture and folder structure</h3>
+<pre class="code lang-text"><code>data/raw/images/            photos
+data/raw/labels/            one annotation file per image (or one COCO json)
+data/splits/{train,val,test}.txt    split by IMAGE (or by scene), never by box
+src/formats.py              conversions (below)
+src/metrics.py              IoU, NMS, AP, mAP (below)
+src/train.py                fine-tuning recipe (not run here)
+src/evaluate.py             runs model on test, calls metrics, saves error gallery
+tests/test_metrics.py       known-answer tests (below)</code></pre>
+<h3>Step-by-step build</h3>
+<ol><li><strong>Collect and label.</strong> Aim for at least 100 images per class with varied backgrounds and sizes. Write a labelling guide of 5 lines (what counts as the object, how tight the box is, what about hidden parts). Two people labelling the same 20 images and comparing IoU tells you how noisy your labels are.</li><li><strong>Split by image or scene</strong> (a video's frames must stay together, otherwise near-copies leak into the test set).</li><li><strong>Write and test the metrics first</strong> (code below).</li><li><strong>Train</strong> with the recipe (not run here).</li><li><strong>Evaluate</strong> on the test set at IoU 0.5 and report AP per class, then mAP; add AP at a stricter threshold.</li><li><strong>Look at errors</strong>: false positives, misses, duplicates, boxes that are too loose.</li></ol>
+<pre class="code lang-python"><code>import numpy as np
+
+def coco_to_xyxy(b):  x, y, w, h = b; return [x, y, x + w, y + h]
+def xyxy_to_yolo(b, W, H):
+    x1, y1, x2, y2 = b
+    return [((x1 + x2) / 2) / W, ((y1 + y2) / 2) / H, (x2 - x1) / W, (y2 - y1) / H]
+def yolo_to_xyxy(b, W, H):
+    cx, cy, w, h = b
+    return [(cx - w/2) * W, (cy - h/2) * H, (cx + w/2) * W, (cy + h/2) * H]
+
+def iou(a, b):
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1]); ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    union = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
+    return inter / union if union &gt; 0 else 0.0
+
+def nms(boxes, scores, thr=0.5):
+    order = [int(i) for i in np.argsort(scores)[::-1]]; keep = []
+    while order:
+        i = order.pop(0); keep.append(i)
+        order = [j for j in order if iou(boxes[i], boxes[j]) &lt; thr]
+    return keep
+
+def average_precision(preds, gts, thr=0.5):
+    """preds: list of (image_id, score, box); gts: dict image_id -&gt; list of boxes"""
+    npos = sum(len(v) for v in gts.values()); used = {k: [False]*len(v) for k, v in gts.items()}
+    preds = sorted(preds, key=lambda p: -p[1]); tp = []
+    for img, score, box in preds:
+        best, bj = 0, -1
+        for j, g in enumerate(gts.get(img, [])):
+            o = iou(box, g)
+            if o &gt; best: best, bj = o, j
+        if best &gt;= thr and not used[img][bj]: used[img][bj] = True; tp.append(1)
+        else: tp.append(0)
+    tp = np.array(tp); ctp = np.cumsum(tp); cfp = np.cumsum(1 - tp)
+    rec = ctp / npos; prec = ctp / (ctp + cfp)
+    mrec = np.concatenate([[0], rec, [1]]); mpre = np.concatenate([[0], prec, [0]])
+    for i in range(len(mpre) - 2, -1, -1): mpre[i] = max(mpre[i], mpre[i + 1])
+    idx = np.where(mrec[1:] != mrec[:-1])[0]
+    return float(((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1]).sum()), rec, prec</code></pre>
+<p>Now a known-answer test (<code>tests/test_metrics.py</code> in spirit). Predict first: what is the IoU of <code>[0,0,10,10]</code> and <code>[5,0,15,10]</code>? Intersection is <code>5 × 10 = 50</code>, union is <code>100 + 100 − 50 = 150</code>, so <code>50/150 = 0.3333</code>.</p>
+<pre class="code lang-python"><code>c = [50, 40, 100, 60]; x = coco_to_xyxy(c); print("coco-&gt;xyxy", x)
+y = xyxy_to_yolo(x, 640, 480); print("yolo", [round(v, 4) for v in y])
+print("round trip", yolo_to_xyxy(y, 640, 480))
+print("IoU same", iou(x, x), " IoU shifted", round(iou([0,0,10,10],[5,0,15,10]), 4), " IoU apart", iou([0,0,1,1],[5,5,6,6]))
+boxes = [[10,10,50,50],[12,12,52,52],[100,100,140,140],[11,9,49,51]]; sc = [0.9, 0.8, 0.7, 0.6]
+print("NMS keep", nms(boxes, sc))
+gts = {"a": [[10,10,50,50],[100,100,140,140]], "b": [[20,20,60,60]]}
+preds = [("a",0.95,[11,11,50,50]),("a",0.9,[12,12,51,51]),("b",0.8,[70,70,110,110]),
+         ("a",0.7,[100,100,141,140]),("b",0.6,[21,19,60,61])]
+ap, rec, prec = average_precision(preds, gts)
+print("recall", np.round(rec, 3)); print("precision", np.round(prec, 3)); print("AP@0.5", round(ap, 4))
+print("AP@0.95", round(average_precision(preds, gts, 0.95)[0], 4))</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>coco-&gt;xyxy [50, 40, 150, 100]
+yolo [0.1562, 0.1458, 0.1562, 0.125]
+round trip [50.0, 40.00000000000001, 150.0, 100.0]
+IoU same 1.0  IoU shifted 0.3333  IoU apart 0.0
+NMS keep [0, 2]
+recall [0.333 0.333 0.333 0.667 1.   ]
+precision [1.    0.5   0.333 0.5   0.6  ]
+AP@0.5 0.7333
+AP@0.95 0.5</code></pre>
+<p>Read it line by line. The round trip returns <code>40.00000000000001</code>, a floating-point wobble, so test with <code>np.allclose</code>, never <code>==</code>. NMS (non-maximum suppression, which deletes boxes that overlap a better-scoring box too much) kept box 0 and box 2: boxes 1 and 3 sit almost on top of box 0, so they are duplicates.</p>
+<p>Now check AP@0.5 by hand. Predictions sorted by score: (a, 0.95) matches box 1, true positive (TP). (a, 0.9) matches the same box again, so it is a duplicate, false positive (FP). (b, 0.8) is far from the real box, FP. (a, 0.7) matches box 2, TP. (b, 0.6) matches image b's box, TP. There are 3 real boxes. Cumulative recall: 1/3, 1/3, 1/3, 2/3, 3/3. Precision: 1/1, 1/2, 1/3, 2/4, 3/5. We then make precision "never go up when we move left" (the envelope), giving 1.0 at recall 1/3 and 0.6 at recall 2/3 and 1. AP is the area: <code>0.3333×1 + 0.3333×0.6 + 0.3333×0.6 = 0.7333</code>. It matches the code. At IoU 0.95 only two boxes pass the bar and one match fails, so AP falls to 0.5. That is why papers report mAP at several IoU thresholds: loose boxes look good at 0.5 and bad at 0.95.</p>
+<p><strong>The training recipe (not run here).</strong> Fine-tune a pretrained detector from torchvision. Details change between versions, so check the docs:</p>
+<pre class="code lang-python"><code>import torch, torchvision
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+
+model = torchvision.models.detection.fasterrcnn_resnet50_fpn(weights="DEFAULT")
+in_f = model.roi_heads.box_predictor.cls_score.in_features
+model.roi_heads.box_predictor = FastRCNNPredictor(in_f, num_classes=3)   # background + 2 classes
+params = [p for p in model.parameters() if p.requires_grad]
+opt = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=5e-4)
+# each batch: images = list of 3xHxW float tensors in [0,1]
+#             targets = list of {"boxes": FloatTensor[N,4] (xyxy pixels), "labels": Int64Tensor[N] (1..K)}
+# model.train(); loss_dict = model(images, targets); sum(loss_dict.values()).backward(); opt.step()
+# model.eval(); outputs = model(images)  -&gt; boxes, labels, scores, then NMS is already applied</code></pre>
+<p>Label 0 is reserved for background in this model family. Many single-stage trainers (YOLO style) use different files and settings, so follow their guide and still evaluate with your own <code>metrics.py</code>, so every model is scored the same way.</p>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li><code>tests/test_metrics.py</code> passes: IoU of identical boxes is 1, disjoint boxes 0, the example above gives AP 0.7333 at 0.5.</li><li>mAP at IoU 0.5 reported per class, plus mAP over IoU 0.5 to 0.95 if you want COCO style.</li><li>Baseline stated: a model with no training scores AP near 0, and the pretrained model on out-of-set objects shows how much custom data helped.</li><li>Error gallery with at least 3 false positives, 3 misses and a statement of the likely cause.</li><li>Train, validation and test split by image or scene with no overlap, checked by a script.</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Mixing box formats.</strong> Detect it: boxes drawn on the image look shifted or tiny. Draw 10 ground-truth boxes on their images before any training.</li><li><strong>Boxes in resized-image units but labels in original units.</strong> Detect it: IoU of a perfect prediction is below 1. Scale both together.</li><li><strong>Leakage between frames of one video.</strong> Detect it: validation mAP is much higher than on a fresh photo set. Split by scene.</li><li><strong>Duplicates counted as correct.</strong> Detect it: precision looks great. Our test shows a duplicate becomes a false positive.</li><li><strong>Score threshold applied before computing AP.</strong> Detect it: the precision-recall curve ends early. For AP keep all detections, even those with low scores.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Compare two detector families on the same test set and plot precision-recall curves.</li><li>Study small objects: report AP separately for boxes under 32x32 pixels and above.</li><li>Do active learning: label the 20 images where the model is least sure and measure the gain.</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. What is IoU?</strong> It is the area where two boxes overlap divided by the area they cover together. It runs from 0 (no overlap) to 1 (identical). We use it to decide whether a predicted box is correct, usually at a threshold such as 0.5.</p>
+<p><strong>Q2. How do you compute AP and mAP?</strong> For one class I sort predictions by confidence. Walking down the list I mark each one correct or wrong using IoU and "each real box can only be matched once". I get a precision and recall at every step, and AP is the area under the precision-recall curve. mAP is the average of AP over classes, and sometimes over several IoU thresholds.</p>
+<p><strong>Q3. Why did your model get high mAP at 0.5 but low at 0.9?</strong> It finds the objects but the boxes are loose. A loose box overlaps enough to pass at 0.5 and not at 0.9. I would look at label quality and the box regression loss, and at augmentation that changes object scale.</p>
+<h3>README outline</h3>
+<p>Title and headline mAP with threshold; question and classes; data source, licence, label guide, split rule; annotation format table; metrics explained with the 3-box worked example; training recipe; results per class with PR curves; error gallery; limits; next steps.</p>
+<h2 id="s2-16-2-project-mini-gpt-from-scratch-learner-project-37">16.2 Project: Mini-GPT From Scratch (learner project #37)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A GPT is a very patient autocomplete. Read the text so far, look back at the earlier words that matter, and guess the next piece. The "causal mask" is a rule that says: when guessing word 5 you may look at words 1 to 4, but never at word 6. Without the rule the model would cheat by reading the answer.</div></div>
+<h3>Goal and why employers care</h3>
+<p>Build every part of a small GPT: tokenization, embeddings, causal self-attention, the transformer block, the loss. Run the forward pass in NumPy and check its properties, then write the training loop in PyTorch. GenAI roles ask you to explain these parts. A person who has built one can reason about context limits, cost and failure modes without guessing.</p>
+<h3>Skills used</h3>
+<p>Chapter 11 (Transformers from Scratch: self-attention, causal masking, multi-head attention, positional encodings, the block, mini-GPT), Chapter 10 (Sequence Models: attention and why transformers won), Chapter 5 (PyTorch Essentials), Chapter 3 (Training in Practice).</p>
+<h3>Data</h3>
+<p>A tiny text we write ourselves, repeated four times (this is a toy corpus, so the model will mostly memorise it; real work needs real text with a free licence, for example public-domain books):</p>
+<pre class="code lang-python"><code>text = ("the shop opens at nine. the shop closes at six. the van brings the orders. "
+        "the clerk packs the orders. the van leaves at noon. ") * 4</code></pre>
+<h3>Architecture and folder structure</h3>
+<pre class="code lang-text"><code>src/tokenizer.py    character tokenizer (this section); BPE as an extension
+src/gpt_numpy.py    forward pass (below)
+src/train_gpt.py    PyTorch training loop (not run here)
+tests/test_gpt.py   loss at start, causal check, shape check
+
+ids (T) -&gt; token embedding + position embedding -&gt; d=16
+  repeat 2 times:  x = x + Attention(LayerNorm(x))     (2 heads, causal mask)
+                   x = x + MLP(LayerNorm(x))           (16 -&gt; 64 -&gt; 16, GELU)
+  LayerNorm -&gt; multiply by embedding matrix transposed -&gt; logits (T x V)</code></pre>
+<h3>Step-by-step build</h3>
+<ol><li><strong>Tokenize.</strong> Characters are the simplest tokens. Build <code>stoi</code> and <code>itos</code> dictionaries. A real GPT uses subword tokens (Byte Pair Encoding), which shorten sequences, but the rest of the model is identical.</li><li><strong>Embed.</strong> Each id picks a row from a table. A second table adds position information.</li><li><strong>Attention.</strong> Make queries, keys and values, score <code>q·k / √head_size</code>, mask the future, softmax, mix the values.</li><li><strong>Block.</strong> Add residual connections around attention and the MLP, with layer normalisation before each.</li><li><strong>Output.</strong> Reuse the embedding table transposed as the output layer ("weight tying").</li><li><strong>Check</strong> loss at start, causality and a baseline, then train.</li></ol>
+<pre class="code lang-python"><code>import numpy as np
+
+text = ("the shop opens at nine. the shop closes at six. the van brings the orders. "
+        "the clerk packs the orders. the van leaves at noon. ") * 4
+chars = sorted(set(text)); stoi = {c: i for i, c in enumerate(chars)}; itos = {i: c for c, i in stoi.items()}
+encode = lambda s: [stoi[c] for c in s]; decode = lambda ids: "".join(itos[i] for i in ids)
+V = len(chars); data = np.array(encode(text))
+
+def softmax(z):
+    z = z - z.max(-1, keepdims=True); e = np.exp(z); return e / e.sum(-1, keepdims=True)
+def layernorm(x, eps=1e-5):
+    return (x - x.mean(-1, keepdims=True)) / np.sqrt(x.var(-1, keepdims=True) + eps)
+def gelu(x): return 0.5 * x * (1 + np.tanh(np.sqrt(2/np.pi) * (x + 0.044715 * x**3)))
+
+def init(rng, V, T, d=16, heads=2, layers=2):
+    s = 0.02
+    P = {"tok": rng.normal(0, s, (V, d)), "pos": rng.normal(0, s, (T, d)), "heads": heads, "layers": []}
+    for _ in range(layers):
+        P["layers"].append({"Wqkv": rng.normal(0, s, (d, 3*d)), "Wo": rng.normal(0, s, (d, d)),
+                            "W1": rng.normal(0, s, (d, 4*d)), "W2": rng.normal(0, s, (4*d, d))})
+    return P
+
+def attention(x, L, heads):
+    T, d = x.shape; hd = d // heads
+    q, k, v = np.split(x @ L["Wqkv"], 3, axis=-1)
+    q, k, v = [m.reshape(T, heads, hd).transpose(1, 0, 2) for m in (q, k, v)]
+    scores = q @ k.transpose(0, 2, 1) / np.sqrt(hd)
+    scores = np.where(np.tril(np.ones((T, T), bool)), scores, -1e9)   # causal mask
+    w = softmax(scores)
+    return (w @ v).transpose(1, 0, 2).reshape(T, d) @ L["Wo"], w
+
+def forward(P, ids):
+    T = len(ids); x = P["tok"][ids] + P["pos"][:T]
+    for L in P["layers"]:
+        a, w = attention(layernorm(x), L, P["heads"]); x = x + a
+        x = x + gelu(layernorm(x) @ L["W1"]) @ L["W2"]
+    return layernorm(x) @ P["tok"].T, w          # weight tying
+
+def loss_fn(logits, targets):
+    p = softmax(logits); return -np.log(p[np.arange(len(targets)), targets]).mean()</code></pre>
+<p>The checks (this part is the test file):</p>
+<pre class="code lang-python"><code>print("vocab size V =", V, " chars:", repr("".join(chars)))
+ids = encode("the shop"); print("encode:", ids, "decode:", decode(ids))
+T = 16; P = init(np.random.default_rng(0), V, T)
+n_params = P["tok"].size + P["pos"].size + sum(m.size for L in P["layers"] for m in L.values())
+print("parameters:", n_params)
+x, y = data[:T], data[1:T+1]
+logits, w = forward(P, x)
+print("logits shape:", logits.shape, " loss:", round(loss_fn(logits, y), 4), " ln(V):", round(np.log(V), 4))
+print("attention row sums:", np.round(w[0].sum(-1)[:4], 3), " weights above diagonal max:", w[0][np.triu_indices(T, 1)].max())
+x2 = x.copy(); x2[10] = (x2[10] + 1) % V
+l2, _ = forward(P, x2)
+print("rows 0-9 unchanged after editing token 10:", np.allclose(logits[:10], l2[:10]), "| row 10 changed:", not np.allclose(logits[10], l2[10]))
+counts = np.ones((V, V))
+for a, b in zip(data[:-1], data[1:]): counts[a, b] += 1
+probs = counts / counts.sum(1, keepdims=True)
+nll = -np.mean([np.log(probs[a, b]) for a, b in zip(data[:-1], data[1:])])
+print("bigram baseline loss:", round(nll, 4), " perplexity:", round(np.exp(nll), 2))</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>vocab size V = 20  chars: ' .abcdeghiklnoprstvx'
+encode: [17, 8, 6, 0, 16, 8, 13, 14] decode: the shop
+parameters: 6720
+logits shape: (16, 20)  loss: 2.9754  ln(V): 2.9957
+attention row sums: [1. 1. 1. 1.]  weights above diagonal max: 0.0
+rows 0-9 unchanged after editing token 10: True | row 10 changed: True
+bigram baseline loss: 1.6495  perplexity: 5.2</code></pre>
+<p>Interpret every line. With <code>V = 20</code> characters, a model that knows nothing should have loss <code>ln(20) = 2.9957</code>, and ours starts at 2.9754, so the start is healthy. The parameter count checks by hand: embeddings <code>20×16 = 320</code>, positions <code>16×16 = 256</code>, and per layer <code>16×48 + 16×16 + 16×64 + 64×16 = 768 + 256 + 1024 + 1024 = 3072</code>, times 2 layers is 6144, giving <code>320 + 256 + 6144 = 6720</code>. Each attention row sums to 1 and nothing sits above the diagonal. The key causality test: changing token 10 leaves outputs 0 to 9 identical but changes output 10, so the future cannot leak into the past. The <strong>bigram baseline</strong> (guess the next character from only the current one, using counts) gets loss 1.6495, perplexity 5.2 (perplexity is <code>e^loss</code>, "as unsure as picking among 5.2 equally likely characters"). Your trained model must beat 1.6495 on held-out text, otherwise attention is adding nothing.</p>
+<p>An untrained model that always picks its top guess produces a sample such as <code>'the pppppppppppp'</code>: it repeats one character. That is normal before training, and a trained model should not do it.</p>
+<p><strong>The training loop (not run here).</strong> Use PyTorch so autograd does the backward pass:</p>
+<pre class="code lang-python"><code># model = MiniGPT(vocab_size, block_size=64, d=64, heads=4, layers=4)   # same structure as above
+# opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+# for step in range(5000):
+#     ix = torch.randint(len(train_ids) - block_size - 1, (batch,))
+#     x = torch.stack([train_ids[i:i+block_size] for i in ix])
+#     y = torch.stack([train_ids[i+1:i+block_size+1] for i in ix])      # shifted by one
+#     logits = model(x); loss = F.cross_entropy(logits.view(-1, V), y.view(-1))
+#     opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0); opt.step()
+#     # every 200 steps: evaluate loss on held-out val_ids; generate a sample</code></pre>
+<p>Chapter 11 section 11.5 has a fuller PyTorch version.</p>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li>Loss at step 0 within 0.1 of <code>ln(V)</code> (we got 2.9754 vs 2.9957).</li><li>Causality test passes (rows before the edited position unchanged).</li><li>Validation loss below the bigram baseline on text not used for training, and you write down both numbers.</li><li>Overfit one batch to near-zero loss as a sanity check.</li><li>Generated samples at two temperatures, with an honest comment on quality.</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Forgetting the mask.</strong> Detect it: training loss becomes absurdly low and samples are garbage. Run the causality test above.</li><li><strong>Targets not shifted by one.</strong> Detect it: the loss drops to near 0 quickly, since the model just copies its input.</li><li><strong>Validation text overlaps training text.</strong> Detect it: val loss equals train loss on a tiny repeated corpus. Hold out a different passage.</li><li><strong>Mask value too weak or wrong dtype.</strong> Detect it: attention weights above the diagonal are not exactly 0. Print the max, as above.</li><li><strong>Learning rate too high.</strong> Detect it: loss spikes or becomes <code>nan</code>. Lower it, and clip gradients.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Replace the character tokenizer with a simple BPE tokenizer and compare sequence length and loss.</li><li>Add a KV cache to generation and measure that cached and uncached outputs match.</li><li>Train on a larger free text and plot validation loss against model size for three sizes.</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. Why does a GPT need a causal mask?</strong> It is trained to predict the next token for every position at once. If position 5 could read token 6, it would just copy the answer. The mask sets the scores for future positions to a huge negative number before softmax, so their weights become 0.</p>
+<p><strong>Q2. What do you expect the loss to be before training?</strong> About <code>ln(V)</code>, where V is the vocabulary size, because the model starts out spreading probability evenly. If it is much higher, I look for a bug in the loss or the scale of the initial weights.</p>
+<p><strong>Q3. How would you know your model is learning something beyond memorising?</strong> I compare validation loss on held-out text with a simple baseline like a bigram model, and I check that validation loss goes down, not only training loss.</p>
+<h3>README outline</h3>
+<p>Title and headline (val loss vs bigram baseline); diagram of the block; tokenizer choice; the three tests (start loss, causality, parameters by hand); training settings and curves (from your PyTorch run); sample generations; limits (toy data); extensions.</p>
+<h2 id="s3-16-3-project-a-sequence-model-for-next-character-prediction-new">16.3 Project: A Sequence Model for Next-Character Prediction (NEW)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A recurrent network (RNN) is a person reading a sentence one word at a time while keeping a short note in their head. After each word they rewrite the note using the new word and the old note, then guess the next word from the note. "Backpropagation through time" is going back over the whole reading, from the last word to the first, to see which rewrite of the note caused the mistake.</div></div>
+<h3>Goal and why employers care</h3>
+<p>Build a character-level RNN with the forward and backward passes in NumPy, verify the backward pass by gradient checking, train it, and generate text. Sequences are everywhere: logs, sensor readings, prices, text. Being able to explain hidden state, unrolling and exploding gradients is expected in deep learning interviews, and the same loop explains why transformers replaced RNNs.</p>
+<h3>Skills used</h3>
+<p>Chapter 10 (Sequence Models: RNN, LSTM, GRU, Seq2Seq and Attention), Chapter 2 (gradient checking), Chapter 3 (Training in Practice: optimizers and clipping), Chapter 4 (Debugging Training).</p>
+<h3>Data</h3>
+<p>The same shop text as section 16.2 (stdlib only, so nothing to download). For a sentiment variant, a small free labelled review set works: run the RNN over a review and classify from the last hidden state.</p>
+<h3>Architecture and folder structure</h3>
+<pre class="code lang-text"><code>src/rnn.py        model, loss, backward through time, gradient check, training, sampling
+tests/test_rnn.py gradient check &lt; 1e-5, loss at start near ln(V)
+
+at each time t:  h_t = tanh( Wxh[x_t] + h_(t-1) · Whh + bh )     (note, 32 numbers)
+                 p_t = softmax( h_t · Why + by )                  (guess over V characters)
+Using a one-hot input means "Wxh[x_t]" is simply a row lookup.</code></pre>
+<h3>Step-by-step build</h3>
+<ol><li><strong>Prepare data</strong>: map characters to ids. Input at time t is <code>x_t</code>, target is the next character.</li><li><strong>Forward through time</strong> for a window of 20 characters, storing every <code>h_t</code> and <code>p_t</code>.</li><li><strong>Backward through time</strong>: go from the last step to the first, and carry <code>dh_next</code> (the blame passed from the future note to the present one). Add up gradients because the same weights are used at every step.</li><li><strong>Gradient check</strong> every parameter (before clipping is applied to training).</li><li><strong>Train</strong> with Adagrad and gradient clipping, carrying the hidden state across windows.</li><li><strong>Sample</strong> text, at normal and low temperature.</li></ol>
+<pre class="code lang-python"><code>import numpy as np
+
+text = ("the shop opens at nine. the shop closes at six. the van brings the orders. "
+        "the clerk packs the orders. the van leaves at noon. ") * 4
+chars = sorted(set(text)); stoi = {c: i for i, c in enumerate(chars)}; itos = {i: c for c, i in stoi.items()}
+V = len(chars); data = np.array([stoi[c] for c in text])
+
+def init(rng, V, H):
+    return {"Wxh": rng.normal(0, 0.1, (V, H)), "Whh": rng.normal(0, 0.1, (H, H)), "bh": np.zeros(H),
+            "Why": rng.normal(0, 0.1, (H, V)), "by": np.zeros(V)}
+
+def softmax(z): e = np.exp(z - z.max()); return e / e.sum()
+
+def loss_and_grads(P, xs, ys, h0):
+    hs = {-1: h0}; ps = {}; loss = 0
+    for t, (x, y) in enumerate(zip(xs, ys)):                  # forward through time
+        hs[t] = np.tanh(P["Wxh"][x] + hs[t-1] @ P["Whh"] + P["bh"])
+        ps[t] = softmax(hs[t] @ P["Why"] + P["by"]); loss -= np.log(ps[t][y])
+    loss /= len(xs)
+    g = {k: np.zeros_like(v) for k, v in P.items()}; dh_next = np.zeros_like(h0)
+    for t in reversed(range(len(xs))):                        # backprop through time
+        dy = ps[t].copy(); dy[ys[t]] -= 1; dy /= len(xs)
+        g["Why"] += np.outer(hs[t], dy); g["by"] += dy
+        dh = dy @ P["Why"].T + dh_next; dz = dh * (1 - hs[t]**2)
+        g["Wxh"][xs[t]] += dz; g["Whh"] += np.outer(hs[t-1], dz); g["bh"] += dz
+        dh_next = dz @ P["Whh"].T
+    for k in g: np.clip(g[k], -5, 5, out=g[k])               # gradient clipping
+    return loss, g, hs[len(xs)-1]
+
+def sample(P, seed_char, n, H, rng, temp=1.0):
+    h = np.zeros(H); x = stoi[seed_char]; out = [seed_char]
+    for _ in range(n):
+        h = np.tanh(P["Wxh"][x] + h @ P["Whh"] + P["bh"])
+        p = softmax((h @ P["Why"] + P["by"]) / temp); x = rng.choice(V, p=p); out.append(itos[x])
+    return "".join(out)</code></pre>
+<p>Notice that clipping is inside <code>loss_and_grads</code>. In this run every gradient at initialisation is small enough that clipping does nothing, so the gradient check is valid. If a check ever fails with a huge gradient, switch clipping off first, because clipping changes the gradient on purpose.</p>
+<p>The run script:</p>
+<pre class="code lang-python"><code>H, T = 32, 20; rng = np.random.default_rng(0); P = init(rng, V, H)
+xs, ys = data[:T], data[1:T+1]
+loss, g, _ = loss_and_grads(P, xs, ys, np.zeros(H))
+worst = 0
+for name in P:
+    flat = P[name].ravel()
+    for i in np.random.default_rng(1).choice(flat.size, 5, replace=False):
+        old = flat[i]; eps = 1e-5
+        flat[i] = old + eps; lp = loss_and_grads(P, xs, ys, np.zeros(H))[0]
+        flat[i] = old - eps; lm = loss_and_grads(P, xs, ys, np.zeros(H))[0]; flat[i] = old
+        num = (lp - lm) / (2*eps); ana = g[name].ravel()[i]
+        worst = max(worst, abs(num - ana) / max(1e-12, abs(num) + abs(ana)))
+print(f"V={V}  initial loss {loss:.4f}  ln(V)={np.log(V):.4f}  gradcheck worst rel error {worst:.2e}")
+mem = {k: np.zeros_like(v) for k, v in P.items()}; lr = 0.1; pos = 0; h = np.zeros(H)
+for it in range(1, 3001):
+    if pos + T + 1 &gt;= len(data): pos = 0; h = np.zeros(H)
+    xs, ys = data[pos:pos+T], data[pos+1:pos+T+1]; pos += T
+    loss, g, h = loss_and_grads(P, xs, ys, h)
+    for k in P: mem[k] += g[k]**2; P[k] -= lr * g[k] / np.sqrt(mem[k] + 1e-8)   # Adagrad
+    if it in (1, 100, 500, 1000, 3000): print(f"iter {it:4d} loss {loss:.4f}")
+print("sample:", repr(sample(P, "t", 80, H, np.random.default_rng(3))))
+print("temp 0.3:", repr(sample(P, "t", 80, H, np.random.default_rng(3), 0.3)))</code></pre>
+<p>Real output (about one second):</p>
+<pre class="code lang-text"><code>V=20  initial loss 3.0075  ln(V)=2.9957  gradcheck worst rel error 1.31e-08
+iter    1 loss 3.0075
+iter  100 loss 0.4822
+iter  500 loss 0.0665
+iter 1000 loss 0.0537
+iter 3000 loss 0.0472
+sample: 'the shop opens at nine. the shop closes at six. the van brings the orders. the cl'
+temp 0.3: 'the shop opens at nine. the shop closes at six. the van brings the orders. the cl'</code></pre>
+<p>Read it honestly. The initial loss 3.0075 is next to <code>ln(20) = 2.9957</code>, and the gradient check error of <code>1.3e-8</code> proves backpropagation through time is correct. The loss falls to 0.047, far below the bigram baseline of 1.65 from section 16.2. But look at the samples: the model reproduces the paragraph word for word. That is <strong>memorisation</strong>, not understanding. The text is one 120-character paragraph repeated, so every training window is also a test window, and a loss of 0.047 says only that the model can recite. To make this a real project you need text with variety and a held-out part, and you must compare held-out loss with the bigram baseline. Writing this limit in your README is a strength, not a weakness.</p>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li>Gradient check worst relative error below <code>1e-5</code> (we got <code>1.3e-8</code>).</li><li>Loss at start within 0.1 of <code>ln(V)</code>.</li><li>Held-out loss (on a different passage) below the bigram baseline, reported with both numbers.</li><li>Samples shown at two temperatures with a one-line comment.</li><li>For a sentiment variant: accuracy on a held-out set above the majority-class baseline.</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Memorising a tiny, repeated corpus.</strong> Detect it: samples copy the corpus and train loss is tiny. Use a held-out passage.</li><li><strong>Exploding gradients.</strong> Detect it: loss jumps to <code>nan</code> or huge values. Print the largest gradient norm and clip.</li><li><strong>Forgetting to carry or reset the hidden state.</strong> Detect it: loss at each window start is higher than the rest. Carry it between windows, reset at the end of the data.</li><li><strong>Using <code>=</code> instead of <code>+=</code> for shared weights.</strong> Detect it: the gradient check fails and only the recurrent weight is off.</li><li><strong>Gradient check with clipping on.</strong> Detect it: errors appear only when gradients are large. Turn clipping off while checking.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Replace the plain RNN cell with an LSTM or GRU (Chapter 10) and compare held-out loss on real text.</li><li>Turn it into a sentiment classifier: read a short review and classify from the final hidden state.</li><li>Plot the gradient norm at each time step to see vanishing gradients for long windows.</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. What is backpropagation through time?</strong> I unroll the network over the time steps so it looks like a very deep network that shares the same weights at each step. Then I run ordinary backpropagation. The gradients for the shared weights are the sum over all time steps.</p>
+<p><strong>Q2. Why do RNNs have vanishing and exploding gradients?</strong> The blame is multiplied by the recurrent weights and by the slope of tanh at every step. If these factors are below 1, the signal shrinks to nothing over many steps. If they are above 1, it blows up. We clip gradients for explosions, and use LSTM or GRU gates for vanishing.</p>
+<p><strong>Q3. Why did transformers replace RNNs?</strong> An RNN must read in order, so it cannot use a whole sequence in parallel, and information from far back has to survive many steps. Attention lets every position look directly at every earlier position and trains in parallel.</p>
+<h3>README outline</h3>
+<p>Title and headline numbers (gradient check, held-out loss vs baseline); the RNN equations with a diagram; how BPTT was verified; training curve; samples at two temperatures; the memorisation limit and how you fixed it; extensions.</p>
+<h2 id="s4-chapter-recap">Chapter recap</h2>
+<ul><li>Build the measuring stick first: mAP for detection, start loss and a baseline for a GPT, a gradient check for a hand-written backward pass.</li><li>Know the three box formats (COCO <code>[x, y, w, h]</code>, xyxy corners, YOLO normalised centres) and convert with round-trip tests, using <code>np.allclose</code>.</li><li>IoU is overlap divided by combined area. AP is the area under the precision-recall curve after sorting by confidence and allowing each real box to match once. Duplicates are false positives.</li><li>In our hand-made example AP at IoU 0.5 was 0.7333 and at 0.95 it was 0.5, so report several thresholds.</li><li>A GPT forward pass is embeddings, then blocks of masked attention and an MLP with residuals and layer norm, then logits. Start loss should be <code>ln(V)</code>.</li><li>A causal test (edit token t and check earlier outputs do not change) is the quickest proof that the mask works.</li><li>BPTT sums gradients over time for shared weights. Verify it with gradient checking, clip for stability.</li><li>A tiny repeated corpus makes any model look brilliant. Always hold out text and beat a simple baseline.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Pattern</th></tr></thead><tbody><tr><td>IoU</td><td><code>intersection / (area_a + area_b − intersection)</code></td></tr><tr><td>YOLO box</td><td><code>[cx/W, cy/H, w/W, h/H]</code></td></tr><tr><td>AP</td><td>area under the precision envelope across recall</td></tr><tr><td>Start loss</td><td><code>ln(V)</code> for V classes or characters</td></tr><tr><td>Attention</td><td><code>softmax(q·kᵀ / √d) · v</code>, future masked to <code>−1e9</code></td></tr><tr><td>Perplexity</td><td><code>exp(loss)</code></td></tr><tr><td>BPTT</td><td><code>dh_prev = (dh · (1 − h²)) · Whhᵀ</code>, sum weight gradients over t</td></tr></tbody></table></div>
+<h2 id="s5-practice-set">Practice set</h2>
+<p><strong>Task 1 (easy).</strong> Convert the COCO box <code>[10, 20, 30, 40]</code> to xyxy. <strong>Answer:</strong> <code>[10, 20, 40, 60]</code>.</p>
+<p><strong>Task 2.</strong> Boxes <code>[0,0,4,4]</code> and <code>[2,2,6,6]</code>: what is the IoU? <strong>Answer:</strong> intersection <code>2×2 = 4</code>, areas 16 and 16, union <code>16 + 16 − 4 = 28</code>, IoU <code>4/28 = 0.1429</code>.</p>
+<p><strong>Task 3.</strong> A 20-character vocabulary model starts with loss 3.0. Is it healthy? <strong>Answer:</strong> yes, <code>ln(20) = 2.9957</code>, so 3.0 is almost exactly "no knowledge".</p>
+<p><strong>Task 4.</strong> Convert the xyxy box <code>[100, 50, 300, 250]</code> in a 400x500 image to YOLO format. <strong>Answer:</strong> <code>cx = 200/400 = 0.5</code>, <code>cy = 150/500 = 0.3</code>, <code>w = 200/400 = 0.5</code>, <code>h = 200/500 = 0.4</code>, so <code>[0.5, 0.3, 0.5, 0.4]</code>.</p>
+<p><strong>Task 5 (what is the output).</strong> Predictions for one class, sorted by score, are TP, FP, TP, and there are 2 real boxes. What are the precisions and recalls? <strong>Answer:</strong> precision <code>1/1, 1/2, 2/3</code>, recall <code>1/2, 1/2, 2/2</code>. After the envelope, AP = <code>0.5×1 + 0.5×0.6667 = 0.8333</code>.</p>
+<p><strong>Task 6 (find the bug).</strong> Your GPT train loss reaches 0.01 within 50 steps on real text. Name the most likely bug. <strong>Answer:</strong> the mask is missing or the targets are not shifted by one, so the model can see the answer.</p>
+<p><strong>Task 7 (interview).</strong> Explain mAP to a manager in three sentences. <strong>Answer:</strong> for each type of object we check how well the detector's boxes match the real boxes while ranking its guesses by confidence. We score how many it gets right without too many false alarms. mAP is the average of that score over object types, and a higher number is better.</p>
+<p><strong>Task 8 (scenario).</strong> Your RNN gradient check passes but training loss jumps to <code>nan</code> at iteration 700. List the first two actions. <strong>Answer:</strong> print the maximum gradient norm and clip at a fixed value (such as 5), then lower the learning rate and check for <code>log(0)</code> in the loss by adding a small constant or using a stable softmax.</p>
+<h2 id="s6-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Help me plan an object detection portfolio project on a custom dataset: my idea is [PASTE HERE]. Ask me one question at a time about classes, number of images, labelling guide, annotation format, split rule (by image or scene), the metric (IoU threshold and mAP) and a stop rule. Finish with a repository tree, a testing checklist and a one-week plan with small commits.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Review my detection evaluation code for IoU, NMS and AP: duplicates, matching each real box only once, box format mix-ups, and threshold choices. Create 5 tiny known-answer tests with hand-computed answers, then check my code against them and explain any mismatch simply. My code: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me how to build a small GPT step by step: character tokenizer, embeddings, causal self-attention, the block, loss and training loop. After each step ask me to predict a shape or a number, then correct me kindly. Include the start loss ln(V), the causality test and a baseline model. End with 5 questions graded one at a time.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. My language model or RNN training is not working. Give me a debugging order: shapes, start loss versus ln(V), overfit one batch, gradient check, exploding gradients and clipping, leakage between train and validation text, and learning rate. Ask me for each measurement before concluding. My code and the numbers I see: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles and am preparing for deep learning interviews, and English is my second language. Run a mock interview based on my three projects: object detection with mAP, a mini-GPT, and a character RNN. Ask one question at a time, score me out of 10, give the ideal short answer in simple English, and ask a harder follow-up. Do 8 questions and finish with a list of my weak spots and what to rebuild.</pre></div><div class="readbtn"><button class="btn" data-read="study:dl:ch16">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch15.html">← Chapter 15: Project Lab 1: Image Classifiers, From S</a><a class="btn" href="appendix.html">Appendix: Cheat Sheet →</a></div></div><script src="../../assets/study.js"></script></body></html>

@@ -1,0 +1,296 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 16: Project Lab 2: Quality, Streaming, Star Schemas and Storage</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Engineering &amp; Big Data</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 16</div><h1>Project Lab 2: Quality, Streaming, Star Schemas and Storage</h1><p>Four more portfolio projects: a data-quality framework, windowed streaming, a star schema with history, and a storage benchmark.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-16-1-project-data-quality-framework-with-alerts">16.1 Project: Data-Quality Framework with Alerts</a></li><li><a href="#s2-16-2-project-streaming-windowed-aggregation-with-late-events">16.2 Project: Streaming Windowed Aggregation with Late Events</a></li><li><a href="#s3-16-3-project-warehouse-star-schema-with-scd2-for-an-online-shop">16.3 Project: Warehouse Star Schema with SCD2 for an Online Shop</a></li><li><a href="#s4-16-4-project-parquet-versus-csv-partitioning-and-compression-benchmark">16.4 Project: Parquet versus CSV, Partitioning and Compression Benchmark</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>The first lab chapter built pipelines that move data. This one builds projects that prove the data is trustworthy, that handle data arriving out of order, that keep history correct when customers change, and that measure how storage choices change size and speed. These are the projects that separate "I can copy a tutorial" from "I understand why". Follow the method in Chapter 15, section 15.1 (plan, layout, commits, definition of done, README, post, debugging checklist) for every project here. As before, all code was run with Python 3 standard library and sqlite3, using neutral datasets (hospital appointments, shop orders, customers). Real tools (Spark Structured Streaming, pyarrow) are shown as short snippets labelled "not run here".</p>
+<h2 id="s1-16-1-project-data-quality-framework-with-alerts">16.1 Project: Data-Quality Framework with Alerts</h2>
+<h3>Goal and why employers care</h3>
+<p>Write a small framework where each check is declared as data (a name, a SQL query, a severity and a threshold), run all checks, send alerts, and make a <strong>stop or publish</strong> decision. Employers care because bad data that reaches a dashboard destroys trust, and teams want engineers who build the safety net, not only the pipeline.</p>
+<h3>Skills used</h3>
+<p>Data Quality and Testing (Chapter 5: dimensions, severity, checks), Ingestion Patterns (Chapter 4: where to put checks), Orchestration with Airflow (Chapter 6: a failed check should fail the task).</p>
+<h3>Data</h3>
+<p>An <code>appointments</code> table with 6 hospital appointment rows and planted problems: a duplicate id (<code>A3</code> twice), a missing patient id, a negative wait time (-3) and an extreme wait time (500 minutes).</p>
+<h3>Architecture</h3>
+<pre class="code lang-text"><code> checks (declared) --&gt; runner --&gt; results list --&gt; alert function (print / email stub)
+                                      |
+                                      +--&gt; JSON report --&gt; decision: STOP if any error-severity failure</code></pre>
+<h3>Step-by-step build</h3>
+<ol><li>Define a <code>Check</code> dataclass: <code>name</code>, <code>sql</code> (returns a number of bad rows or a bad fraction), <code>severity</code> (<code>error</code> or <code>warn</code>), <code>threshold</code> (the allowed value).</li><li>Write <code>run_checks(db, checks, alert)</code> that runs each query, compares to the threshold, records the result and calls <code>alert</code> on failure.</li><li>Add checks across the quality dimensions: uniqueness, completeness, validity, allowed values, volume, null rate.</li><li>Decide: any failed <code>error</code> check means STOP.</li><li>Save a JSON report for the run history.</li></ol>
+<p>Predict: which of the six checks fail, and does the pipeline stop?</p>
+<pre class="code lang-python"><code>import sqlite3, json
+from dataclasses import dataclass
+
+@dataclass
+class Check:
+    name: str; sql: str; severity: str
+    threshold: float = 0
+
+def run_checks(db, checks, alert):
+    results = []
+    for c in checks:
+        bad = db.execute(c.sql).fetchone()[0]
+        ok = bad &lt;= c.threshold
+        results.append({"check": c.name, "bad": bad, "ok": ok, "severity": c.severity})
+        if not ok: alert(c, bad)
+    return results
+
+alerts = []
+def alert(c, bad): alerts.append(f"[{c.severity.upper()}] {c.name}: {bad} bad (allowed {c.threshold})")
+
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE appointments(appt_id TEXT, patient_id TEXT, wait_min REAL, dept TEXT, booked_at TEXT);
+INSERT INTO appointments VALUES
+('A1','P1',15,'ENT','2024-06-01T09:00:00'),('A2','P2',40,'ENT','2024-06-01T09:30:00'),
+('A3','P3',-3,'CARDIO','2024-06-01T10:00:00'),('A3','P3',25,'CARDIO','2024-06-01T10:00:00'),
+('A4',NULL,500,'XRAY','2024-06-01T10:30:00'),('A5','P5',30,'ENT','2024-06-01T11:00:00');""")
+checks = [
+ Check("appt_id unique", "SELECT COUNT(*)-COUNT(DISTINCT appt_id) FROM appointments", "error"),
+ Check("patient_id not null", "SELECT COUNT(*) FROM appointments WHERE patient_id IS NULL", "error"),
+ Check("wait_min in 0..240", "SELECT COUNT(*) FROM appointments WHERE wait_min&lt;0 OR wait_min&gt;240", "warn"),
+ Check("dept in known list", "SELECT COUNT(*) FROM appointments WHERE dept NOT IN ('ENT','CARDIO','XRAY')", "error"),
+ Check("row count &gt;= 5", "SELECT CASE WHEN COUNT(*)&gt;=5 THEN 0 ELSE 1 END FROM appointments", "error"),
+ Check("null rate patient_id &lt;= 20%", "SELECT AVG(patient_id IS NULL) FROM appointments", "warn", threshold=0.20),
+]
+res = run_checks(db, checks, alert)
+for r in res: print(("PASS" if r["ok"] else "FAIL"), r["check"], r["bad"])
+print("\nALERTS:"); print("\n".join(alerts))
+errors = [r for r in res if not r["ok"] and r["severity"] == "error"]
+print("\npipeline decision:", "STOP (publish blocked)" if errors else "PUBLISH")
+json.dump(res, open("dq_report.json", "w"), indent=1)</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>FAIL appt_id unique 1
+FAIL patient_id not null 1
+FAIL wait_min in 0..240 2
+PASS dept in known list 0
+PASS row count &gt;= 5 0
+PASS null rate patient_id &lt;= 20% 0.16666666666666666
+
+ALERTS:
+[ERROR] appt_id unique: 1 bad (allowed 0)
+[ERROR] patient_id not null: 1 bad (allowed 0)
+[WARN] wait_min in 0..240: 2 bad (allowed 0)
+
+pipeline decision: STOP (publish blocked)</code></pre>
+<p><strong>Explain:</strong> three checks fail. Two are errors, so the pipeline stops. The wait-time check is only a warning, so by itself it would alert and continue. The null-rate check passes because 1 of 6 rows is 16.7%, under the 20% allowance, even though the hard "not null" check fails: the two checks express two different policies (a strict rule and a tolerated rate). The wait-time check found 2 bad rows: the -3 and the 500.</p>
+<p>Real orchestration wiring, <strong>not run here</strong>: in Airflow, raise an exception in the check task when <code>errors</code> is non-empty so the downstream publish task does not run.</p>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li>At least 8 checks across at least 5 quality dimensions.</li><li>Each planted problem is found by at least one check (4 of 4).</li><li>A clean table gives <code>PUBLISH</code> and zero alerts (add a test with good data).</li><li>Severity logic is tested: warn-only failures do not stop the run.</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Everything is an error.</strong> Teams then ignore alerts. Detect: alerts per week; if people mute the channel, severity is wrong.</li><li><strong>Checks that never fail.</strong> Detect: break the data on purpose and see if it fires.</li><li><strong>Averages hiding bad rows.</strong> Detect: count bad rows, not just a mean.</li><li><strong>Threshold copied without evidence.</strong> Detect: base it on history (for example the last 30 row counts).</li><li><strong>Alert without detail.</strong> Detect: can the person on call find the bad rows from the message? Include the query or sample ids.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Add a freshness check (newest <code>booked_at</code> within 24 hours).</li><li>Store each run in a <code>dq_runs</code> table and alert when the row count falls 30% below the 7-day average.</li><li>Write bad rows to a <code>quarantine</code> table with the check name.</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. Error versus warn?</strong> An error means the data is unsafe to publish, so stop. A warn means look at it soon but continue.</p>
+<p><strong>Q2. Where do you put checks?</strong> At the edges: after ingestion (is the source sane?) and before publishing (is the output sane?).</p>
+<p><strong>Q3. How do you stop alert fatigue?</strong> Few, meaningful alerts; clear severity; each alert says what broke and who owns it.</p>
+<h3>README outline</h3>
+<p>Problem, check table (name, dimension, severity), runner diagram, the sample output, how to add a check, limits, extensions.</p>
+<h2 id="s2-16-2-project-streaming-windowed-aggregation-with-late-events">16.2 Project: Streaming Windowed Aggregation with Late Events</h2>
+<h3>Goal and why employers care</h3>
+<p>Sum order amounts per one-minute window from events that arrive <strong>out of order</strong>, and decide what to do with events that arrive too late. Streaming roles ask about event time, windows and watermarks in almost every interview, and few candidates have built one.</p>
+<h3>Skills used</h3>
+<p>Streaming and Kafka (Chapter 11: event time, windows, watermarks, late data), Data Quality and Testing (Chapter 5: counting dropped rows).</p>
+<h3>Data</h3>
+<p>Nine events as <code>(event_time_in_seconds, amount)</code> in <strong>arrival order</strong>. Event time is when the order happened; arrival order is when we received it. They differ.</p>
+<h3>Architecture</h3>
+<pre class="code lang-text"><code> events (arrive in order of delivery) --&gt; assign window = event_time // 60 * 60
+                                      --&gt; watermark = max event_time seen - 30 s
+                                      --&gt; if window end &lt;= watermark: DROP (late)
+                                          else: add amount to that window</code></pre>
+<p>Words you need: a <strong>tumbling window</strong> is a fixed block of time that never overlaps the next (0 to 60 s, 60 to 120 s). The <strong>watermark</strong> is the stream's estimate of "we have probably seen everything up to this time"; here it is the newest event time minus an allowed lateness of 30 seconds. A window whose end is at or before the watermark is closed.</p>
+<h3>Step-by-step build</h3>
+<ol><li>Set <code>WINDOW = 60</code>, <code>LATENESS = 30</code>.</li><li>For each event update the watermark, compute its window start.</li><li>If the window is already closed, record it as dropped; otherwise add the amount.</li><li>Print the watermark at each step so you can see why decisions happen.</li></ol>
+<p>Predict: the event <code>(10, 999)</code> arrives near the end. Will it be counted?</p>
+<pre class="code lang-python"><code>from collections import defaultdict
+WINDOW, LATENESS = 60, 30
+events = [(5,100),(20,50),(65,200),(50,70),(70,30),(125,10),(62,40),(10,999),(130,60)]
+windows = defaultdict(float); dropped = []; watermark = 0
+for et, amt in events:
+    watermark = max(watermark, et - LATENESS)
+    w_start = et // WINDOW * WINDOW
+    if w_start + WINDOW &lt;= watermark:
+        dropped.append((et, amt))
+        print(f"event t={et:3d} amt={amt:3d}  watermark={watermark:3d}  DROPPED (window closed)")
+        continue
+    windows[w_start] += amt
+    print(f"event t={et:3d} amt={amt:3d}  watermark={watermark:3d}  -&gt; window [{w_start},{w_start+WINDOW})")
+print("\nresult:", dict(sorted(windows.items())))
+print("dropped:", dropped)</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>event t=  5 amt=100  watermark=  0  -&gt; window [0,60)
+event t= 20 amt= 50  watermark=  0  -&gt; window [0,60)
+event t= 65 amt=200  watermark= 35  -&gt; window [60,120)
+event t= 50 amt= 70  watermark= 35  -&gt; window [0,60)
+event t= 70 amt= 30  watermark= 40  -&gt; window [60,120)
+event t=125 amt= 10  watermark= 95  -&gt; window [120,180)
+event t= 62 amt= 40  watermark= 95  -&gt; window [60,120)
+event t= 10 amt=999  watermark= 95  DROPPED (window closed)
+event t=130 amt= 60  watermark=100  -&gt; window [120,180)
+
+result: {0: 220.0, 60: 270.0, 120: 70.0}
+dropped: [(10, 999)]</code></pre>
+<p><strong>Explain line by line.</strong> The event at t=50 arrives after t=65 but is still accepted: the watermark is 35, and window [0,60) ends at 60, which is above 35, so it is still open. Window [0,60) therefore holds 100 + 50 + 70 = 220. The event at t=62 arrives when the watermark is 95: its window [60,120) ends at 120, above 95, so it is open: window [60,120) holds 200 + 30 + 40 = 270. The event t=10 arrives when the watermark is 95: window [0,60) ended at 60, which is at or below 95, so that window is closed and the event is dropped. Window [120,180) holds 10 + 60 = 70.</p>
+<p><strong>Hand check:</strong> total of all amounts = 100+50+200+70+30+10+40+999+60 = 1559; minus the dropped 999 = 560 = 220 + 270 + 70.</p>
+<p>Spark Structured Streaming equivalent, <strong>not run here</strong>:</p>
+<pre class="code lang-python"><code>from pyspark.sql import functions as F
+agg = (events.withWatermark("event_time", "30 seconds")
+       .groupBy(F.window("event_time", "1 minute")).agg(F.sum("amount")))</code></pre>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li>Result windows sum to the accepted events (check by hand: 560).</li><li>The dropped list contains exactly the events whose windows were closed.</li><li>Changing <code>LATENESS</code> to 100 makes the 999 event count (test it, expected: dropped list empty, window 0 equals 1219).</li><li>Dropped count and amount are reported, never hidden.</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Using arrival time instead of event time.</strong> Detect: windows change when delivery order changes.</li><li><strong>Lateness too small</strong> (loses real data) or <strong>too large</strong> (windows stay open and results arrive late). Detect: dropped count versus delay of output.</li><li><strong>Silent drops.</strong> Detect: always log dropped count and value.</li><li><strong>Watermark that moves backwards.</strong> Detect: use <code>max</code>, as the code does.</li><li><strong>Confusing event-time seconds with clock time.</strong> Detect: print both.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Add sliding windows (60 s windows every 30 s).</li><li>Send dropped events to a "late" side output and report them separately.</li><li>Emit a window result only when the watermark passes its end (finalised output).</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. Event time versus processing time?</strong> Event time is when it happened; processing time is when we saw it. Networks reorder events, so correct results use event time.</p>
+<p><strong>Q2. What is a watermark?</strong> A moving line that says "events older than this are unlikely to arrive". It lets the system close windows and free memory.</p>
+<p><strong>Q3. What do you do with very late data?</strong> Drop it and count it, send it to a correction process, or update an already published result if the business needs exact numbers.</p>
+<h3>README outline</h3>
+<p>Problem, diagram, trace table (as above), parameter choices, hand-checked totals, limits (single process, no state store), extensions.</p>
+<h2 id="s3-16-3-project-warehouse-star-schema-with-scd2-for-an-online-shop">16.3 Project: Warehouse Star Schema with SCD2 for an Online Shop</h2>
+<h3>Goal and why employers care</h3>
+<p>Model sales as a <strong>star schema</strong> (a central fact table of events, surrounded by dimension tables describing who, what and when), and keep customer history correct with a <strong>slowly changing dimension type 2</strong> (SCD2): when a customer changes city, keep the old row and add a new one, with valid dates. Employers care because "revenue by city" must use the city the customer lived in <strong>at the time of the order</strong>, and many reports quietly get this wrong.</p>
+<h3>Skills used</h3>
+<p>Data Modeling (Chapter 2: facts, dimensions, grain, SCD types), Warehouses and Cloud (Chapter 8: marts), Data Quality and Testing (Chapter 5: orphan and uniqueness checks).</p>
+<h3>Data</h3>
+<p>One customer <code>C1</code> who lives in Pune from 2024-01-01 and moves to Delhi on 2024-03-01. Two products. Three orders: O1 (Feb, in Pune), O2 and O3 (March, in Delhi).</p>
+<h3>Architecture</h3>
+<pre class="code lang-text"><code>              dim_product
+                  |
+ dim_customer -- fact_sales (order_id, cust_key, prod_key, order_date, qty, amount)
+ (cust_key, cust_id, city, valid_from, valid_to, is_current)</code></pre>
+<p>The <strong>grain</strong> (what one fact row means) is one order line. The dimension has a <strong>surrogate key</strong> (<code>cust_key</code>, a number we generate) separate from the <strong>business key</strong> (<code>cust_id</code>, the id from the source). One customer can have several surrogate keys over time.</p>
+<h3>Step-by-step build</h3>
+<ol><li>Create <code>dim_customer</code> with <code>valid_from</code>, <code>valid_to</code>, <code>is_current</code>; <code>dim_product</code>; <code>fact_sales</code>.</li><li>Write <code>scd2_upsert(cust_id, city, as_of)</code>: if no current row, insert; if the city is unchanged, do nothing; if changed, close the old row (<code>valid_to = as_of</code>, <code>is_current = 0</code>) and insert a new current row.</li><li>Write <code>key_for(cust_id, order_date)</code>: pick the row where <code>valid_from &lt;= date &lt; valid_to</code>. This is the <strong>point-in-time lookup</strong>.</li><li>Load facts using that lookup.</li><li>Query revenue by city and by category; run orphan and current-row checks.</li></ol>
+<p>Predict: with the city change on March 1, how much revenue will each city show? (Hint: which orders happened in March?)</p>
+<pre class="code lang-python"><code>import sqlite3
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE dim_customer(cust_key INTEGER PRIMARY KEY AUTOINCREMENT, cust_id TEXT, city TEXT,
+   valid_from TEXT, valid_to TEXT, is_current INT);
+CREATE TABLE dim_product(prod_key INTEGER PRIMARY KEY, name TEXT, category TEXT);
+CREATE TABLE fact_sales(order_id TEXT, cust_key INT, prod_key INT, order_date TEXT, qty INT, amount REAL);
+INSERT INTO dim_product VALUES(1,'Kettle','Home'),(2,'Notebook','Stationery');""")
+
+def scd2_upsert(cust_id, city, as_of):
+    cur = db.execute("SELECT cust_key, city FROM dim_customer WHERE cust_id=? AND is_current=1", (cust_id,)).fetchone()
+    if cur and cur[1] == city: return "unchanged"
+    if cur: db.execute("UPDATE dim_customer SET valid_to=?, is_current=0 WHERE cust_key=?", (as_of, cur[0]))
+    db.execute("INSERT INTO dim_customer(cust_id,city,valid_from,valid_to,is_current) VALUES(?,?,?,'9999-12-31',1)", (cust_id, city, as_of))
+    return "changed" if cur else "new"
+
+def key_for(cust_id, order_date):
+    return db.execute("SELECT cust_key FROM dim_customer WHERE cust_id=? AND valid_from&lt;=? AND ?&lt;valid_to",
+                      (cust_id, order_date, order_date)).fetchone()[0]
+
+print(scd2_upsert("C1", "Pune", "2024-01-01"), scd2_upsert("C1", "Pune", "2024-02-01"), scd2_upsert("C1", "Delhi", "2024-03-01"))
+for oid, d, p, q, a in [("O1","2024-02-10",1,1,800.0),("O2","2024-03-15",2,3,150.0),("O3","2024-03-20",1,2,1600.0)]:
+    db.execute("INSERT INTO fact_sales VALUES(?,?,?,?,?,?)", (oid, key_for("C1", d), p, d, q, a))
+print(db.execute("SELECT * FROM dim_customer").fetchall())
+print(db.execute("""SELECT c.city, SUM(f.amount) FROM fact_sales f JOIN dim_customer c USING(cust_key)
+                    GROUP BY c.city ORDER BY c.city""").fetchall())
+print(db.execute("""SELECT p.category, c.city, SUM(f.amount), SUM(f.qty) FROM fact_sales f
+   JOIN dim_customer c USING(cust_key) JOIN dim_product p USING(prod_key) GROUP BY 1,2 ORDER BY 1,2""").fetchall())
+print("orphans:", db.execute("SELECT COUNT(*) FROM fact_sales f LEFT JOIN dim_customer c USING(cust_key) WHERE c.cust_key IS NULL").fetchone()[0])
+print("current rows per customer:", db.execute("SELECT cust_id, SUM(is_current) FROM dim_customer GROUP BY cust_id").fetchall())</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>new unchanged changed
+[(1, 'C1', 'Pune', '2024-01-01', '2024-03-01', 0), (2, 'C1', 'Delhi', '2024-03-01', '9999-12-31', 1)]
+[('Delhi', 1750.0), ('Pune', 800.0)]
+[('Home', 'Delhi', 1600.0, 2), ('Home', 'Pune', 800.0, 1), ('Stationery', 'Delhi', 150.0, 3)]
+orphans: 0
+current rows per customer: [('C1', 1)]</code></pre>
+<p><strong>Explain:</strong> the first call creates the customer (<code>new</code>), the second finds the same city (<code>unchanged</code>, no new row), the third closes the Pune row at 2024-03-01 and opens a Delhi row. Order O1 (February) got key 1 and is counted in Pune: 800. Orders O2 and O3 (March) got key 2: 150 + 1600 = 1750 in Delhi. If we had simply overwritten the city (SCD type 1), all 2,550 would show as Delhi and Pune's history would vanish. Total check: 800 + 1750 = 2550 = 800 + 150 + 1600.</p>
+<p>Real warehouse DDL would use the warehouse's own types and, in dbt, a snapshot (<code>dbt snapshot</code>), <strong>not run here</strong>.</p>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li>Exactly one <code>is_current = 1</code> row per customer.</li><li>No overlapping validity ranges for one customer (query: self-join where ranges intersect returns 0 rows).</li><li>Zero orphan facts.</li><li>Revenue by city for February equals 800 in Pune only.</li><li>Total revenue in the star equals total revenue in the source orders (2550).</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Joining facts to the current dimension row.</strong> Detect: past revenue moves to the new city; the point-in-time test fails.</li><li><strong>Overlapping or gapped validity dates.</strong> Detect: the overlap query; use <code>valid_to</code> exclusive and equal to the next <code>valid_from</code>.</li><li><strong>Treating the business key as unique in the dimension.</strong> Detect: <code>COUNT(*)</code> versus <code>COUNT(DISTINCT cust_id)</code>.</li><li><strong>Wrong grain</strong> (mixing order and order-line rows). Detect: write the grain sentence in the README and test uniqueness on it.</li><li><strong>Late-arriving facts</strong> (order arrives after the customer changed again). Detect: lookup by order date, not load date.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Add a <code>dim_date</code> table and join facts on a date key.</li><li>Add a type 1 attribute (email) beside the type 2 attribute (city).</li><li>Add a "unknown customer" row with key -1 for facts with no match.</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. What is SCD2 and why use it?</strong> It keeps every version of a dimension row with dates. Reports then show facts with the attribute value that was true at the time.</p>
+<p><strong>Q2. Surrogate versus business key?</strong> The business key comes from the source and repeats across versions; the surrogate key is unique per version and is what facts point to.</p>
+<p><strong>Q3. What is the grain and why does it matter?</strong> It is what one fact row means (one order line). If you do not fix it, totals double count.</p>
+<h3>README outline</h3>
+<p>Problem, star diagram, SCD2 example table, point-in-time query, checks, limits, extensions.</p>
+<h2 id="s4-16-4-project-parquet-versus-csv-partitioning-and-compression-benchmark">16.4 Project: Parquet versus CSV, Partitioning and Compression Benchmark</h2>
+<h3>Goal and why employers care</h3>
+<p>Measure how data layout changes file size and read cost: row-wise text (CSV) versus column-wise storage, compressed versus not, partitioned versus not. Employers care because storage choices decide cloud bills and query speed, and a candidate who can show numbers, not slogans, stands out.</p>
+<h3>Skills used</h3>
+<p>File Formats and Storage (Chapter 3: row versus columnar, compression, partitioning), Spark Performance (Chapter 10: scanning less data), Warehouses and Cloud (Chapter 8: pay-per-scan).</p>
+<h3>Data</h3>
+<p>200,000 orders <code>(order_id, city, minutes, amount)</code> made with a seeded generator. Honest scope: real Parquet needs pyarrow or Spark, which are <strong>not run here</strong>. We <strong>simulate</strong> a columnar layout by storing each column's values together in binary and compressing each column with <code>zlib</code>. This shows the principle (similar values together compress better, and reading one column touches one block) but it is not Parquet and the numbers are not Parquet numbers.</p>
+<h3>Architecture</h3>
+<pre class="code lang-text"><code> rows --&gt; A: CSV text, whole file compressed
+      --&gt; B: split into 4 columns, each stored together, each compressed
+      --&gt; C: partition rows by city (folders), read only one city
+ measure: bytes before/after compression, time to read one column, rows scanned</code></pre>
+<h3>Step-by-step build</h3>
+<ol><li>Generate 200,000 rows.</li><li>Layout A: join rows into CSV bytes. Compress with <code>zlib</code> at level 6.</li><li>Layout B: pack each column (<code>struct</code> for numbers, newline-joined text for city) and compress each separately.</li><li>Report sizes per layout and per column.</li><li>Read one column (average of <code>minutes</code>) from each layout and time it.</li><li>Count rows scanned for <code>city = 'Pune'</code> with and without partitioning.</li></ol>
+<p>Predict: which compresses better, the CSV or the columns? Which column compresses most?</p>
+<pre class="code lang-python"><code>import random, zlib, time, struct
+N = 200_000
+rnd = random.Random(3); cities = ["Pune","Delhi","Chennai","Mumbai","Kolkata"]
+rows = [(i, rnd.choice(cities), rnd.randint(20,120), round(rnd.uniform(50,2000),2)) for i in range(N)]
+csv_bytes = "\n".join(",".join(map(str, r)) for r in rows).encode()
+cols = list(zip(*rows))
+col_bytes = [struct.pack(f"{N}q", *cols[0]), "\n".join(cols[1]).encode(),
+             struct.pack(f"{N}H", *cols[2]), struct.pack(f"{N}d", *cols[3])]
+names = ["order_id","city","minutes","amount"]
+z = lambda b: len(zlib.compress(b, 6))
+print(f"{'layout':28s}{'raw KB':&gt;10s}{'zlib KB':&gt;10s}")
+print(f"{'row-wise CSV':28s}{len(csv_bytes)/1024:10.0f}{z(csv_bytes)/1024:10.0f}")
+print(f"{'column-wise (binary)':28s}{sum(map(len,col_bytes))/1024:10.0f}{sum(map(z,col_bytes))/1024:10.0f}")
+for n, b in zip(names, col_bytes): print(f"   column {n:10s}{len(b)/1024:10.0f}{z(b)/1024:10.0f}")
+t=time.perf_counter(); parts=[l.split(",")[2] for l in csv_bytes.decode().split("\n")]
+avg_csv=sum(map(int,parts))/N; t_csv=time.perf_counter()-t
+t=time.perf_counter(); arr=struct.unpack(f"{N}H", zlib.decompress(zlib.compress(col_bytes[2])))
+avg_col=sum(arr)/N; t_col=time.perf_counter()-t
+print(f"avg minutes csv={avg_csv:.3f} ({t_csv:.3f}s)  columnar={avg_col:.3f} ({t_col:.3f}s)")
+by_city = {c: [r for r in rows if r[1]==c] for c in cities}
+print("rows scanned for city=Pune: unpartitioned", N, "| partitioned", len(by_city["Pune"]))</code></pre>
+<p>Real output (timings vary per machine; the column timing includes a compress and decompress step in the same call, so it is a rough comparison):</p>
+<pre class="code lang-text"><code>layout                          raw KB   zlib KB
+row-wise CSV                      4657      1584
+column-wise (binary)              4844      1230
+   column order_id                1562       296
+   column city                    1329       106
+   column minutes                  391       206
+   column amount                  1562       623
+avg minutes csv=70.029 (0.035s)  columnar=70.029 (0.022s)
+rows scanned for city=Pune: unpartitioned 200000 | partitioned 39743</code></pre>
+<p><strong>Explain.</strong> (1) Raw, the binary columns (4844 KB) are slightly <strong>bigger</strong> than CSV text (4657 KB): small numbers take few characters in text, but fixed 8-byte slots in binary. (2) After compression the columns win: 1230 KB versus 1584 KB, about 22% smaller (1 - 1230/1584 = 0.224), because values of the same kind sit together and repeat. (3) <code>city</code> compresses from 1329 KB to 106 KB (about 12.5 times) because it has only 5 distinct values. <code>amount</code> (random decimals) barely compresses: 1562 to 623. (4) Both layouts gave the same average (70.029), which is our correctness check. (5) Reading one column touches 206 KB of compressed bytes instead of the whole 1584 KB file. (6) Partitioning by city reads 39,743 rows instead of 200,000, about 20% of the data.</p>
+<p>pyarrow equivalent, <strong>not run here</strong>:</p>
+<pre class="code lang-python"><code>import pyarrow as pa, pyarrow.parquet as pq, pyarrow.csv as pc
+t = pc.read_csv("orders.csv")
+pq.write_table(t, "orders_snappy.parquet", compression="snappy")
+pq.write_to_dataset(t, root_path="orders_by_city", partition_cols=["city"])
+avg = pq.read_table("orders_snappy.parquet", columns=["minutes"])</code></pre>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li>Table of sizes for at least 3 layouts, with the compression ratio computed correctly.</li><li>Same answer (70.029) from every layout.</li><li>Partition scan shows rows read / total rows (here 39,743 / 200,000 = 19.9%).</li><li>A written paragraph on when the result would flip (for example very small data, or high-cardinality partition keys).</li><li>Real Parquet numbers added when you run pyarrow yourself (clearly labelled).</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Comparing different data.</strong> Detect: assert the same average or row count.</li><li><strong>Partitioning by a high-cardinality key</strong> (such as <code>order_id</code>) makes millions of tiny files. Detect: count the partitions.</li><li><strong>Timing once.</strong> Detect: repeat 5 times and report the median.</li><li><strong>Claiming Parquet results from a simulation.</strong> Detect: label every number with how it was produced.</li><li><strong>Forgetting that compression costs CPU.</strong> Detect: time compress and decompress separately.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Try compression levels 1, 6 and 9 and chart size versus time.</li><li>Sort rows by city before compressing and measure the change in <code>minutes</code> and <code>amount</code>.</li><li>Run the pyarrow version for real and compare with the simulation.</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. Why is columnar storage good for analytics?</strong> Reports usually read a few columns of many rows. Columnar storage reads only those columns, and similar values together compress well.</p>
+<p><strong>Q2. When is CSV fine?</strong> Small data, human inspection, exchange between simple tools. Not for large analytic tables.</p>
+<p><strong>Q3. What is partition pruning?</strong> Skipping whole folders that cannot match the filter. Filtering for one city then reads about a fifth of the data here.</p>
+<h3>README outline</h3>
+<p>Problem, layout diagram, size table, timing method, simulation-versus-real note, when results flip, extensions.</p>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>A quality framework treats checks as data: name, query, severity, threshold, then runs, alerts and decides.</li><li>Error stops the pipeline; warn tells people. Too many errors cause alert fatigue.</li><li>In streaming, use event time; the watermark is the newest event time minus allowed lateness.</li><li>Always count and report dropped late events.</li><li>A star schema has a fact table at a clear grain and dimension tables around it.</li><li>SCD2 keeps history with valid dates; facts must use a point-in-time lookup.</li><li>Surrogate keys identify a version; business keys identify the real-world thing.</li><li>Columnar layout compresses better after compression; low-cardinality columns compress hugely.</li><li>Partitioning lets a query scan only the matching slice; a bad partition key creates many tiny files.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Cheat-sheet line</th></tr></thead><tbody><tr><td>Check</td><td><code>bad = query(); ok = bad &lt;= threshold</code></td></tr><tr><td>Stop rule</td><td>any failed check with severity <code>error</code></td></tr><tr><td>Window</td><td><code>start = t // W * W</code></td></tr><tr><td>Watermark</td><td><code>max(event_time) - lateness</code></td></tr><tr><td>SCD2 change</td><td>close old row, insert new with <code>valid_from = as_of</code></td></tr><tr><td>Point-in-time</td><td><code>valid_from &lt;= d AND d &lt; valid_to</code></td></tr><tr><td>Compression ratio</td><td><code>raw / compressed</code></td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p><strong>1.</strong> (Easy) A check returns 3 bad rows, threshold 0, severity warn. Does the pipeline stop? <strong>Answer:</strong> No. A warn alerts but continues; only error severity stops it.</p>
+<p><strong>2.</strong> (Easy) With 60-second tumbling windows, which window does an event at t=125 belong to? <strong>Answer:</strong> 125 // 60 * 60 = 120, so window [120,180).</p>
+<p><strong>3.</strong> (Easy) Total orders amount 1559, one dropped event of 999. What must the windows add up to? <strong>Answer:</strong> 560.</p>
+<p><strong>4.</strong> (Medium) Watermark is 95, lateness 30. What is the newest event time seen? <strong>Answer:</strong> 125, because watermark = newest - 30.</p>
+<p><strong>5.</strong> (Medium) A customer moves city on 2024-03-01. An order on 2024-03-01 exactly: old or new row? <strong>Answer:</strong> The new row, because validity is <code>valid_from &lt;= date &lt; valid_to</code> and the old row's <code>valid_to</code> is 2024-03-01 (exclusive).</p>
+<p><strong>6.</strong> (Medium, compute) CSV compressed to 1584 KB and columnar to 1230 KB. How much smaller is columnar, in percent? <strong>Answer:</strong> (1584 - 1230) / 1584 = 354 / 1584 = 0.2235, so about 22%.</p>
+<p><strong>7.</strong> (Interview) Your dashboard shows last year's revenue for a customer under the new city after a move. What went wrong and how do you fix it? <strong>Answer (acceptance):</strong> Facts were joined to the current dimension row (type 1 behaviour or no point-in-time lookup). Use SCD2 with valid dates and look up the surrogate key by order date; test with an order before the move.</p>
+<p><strong>8.</strong> (Interview) Why can a streaming job drop correct data, and how do you decide the lateness? <strong>Answer (acceptance):</strong> Events arrive out of order; once the watermark passes a window, later events are dropped. Choose lateness from measured delay (for example the 99th percentile of arrival delay), count drops, and trade accuracy against delay of results.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Help me plan a data-quality framework project (Chapter 16, Project Lab 2). Ask me one question at a time about my dataset and who consumes it. Then propose 10 checks across the quality dimensions, give each a severity and a threshold with a reason, and describe how I would prove each check can fail. Keep the English simple and tell me what to leave out of version one.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me event time, tumbling windows, watermarks and late events using a shop-orders example with 9 events (Chapter 16, streaming project). Trace each event in a table with the watermark value, then give me 6 graded exercises with different lateness settings, without solutions. When I send my answers, check every line and explain mistakes.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Review my star schema with SCD2 for an online shop. Here are my tables and queries: [PASTE HERE]. Check the grain, surrogate versus business keys, validity date logic, overlap and orphan rows, and the point-in-time lookup. List problems in order of severity, show a SQL query that proves each one, and suggest the smallest fix.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. I benchmarked storage layouts (row versus columnar, compression, partitioning) and got these numbers: [PASTE HERE]. Help me judge them honestly. Ask how I measured, check for unfair comparisons, explain why each number came out as it did, and tell me which claims I can safely make in a README and which I cannot make without running real Parquet.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Help me write a LinkedIn or blog post about one of my Chapter 16 projects: [NAME THE PROJECT AND PASTE MY RESULTS]. Use the shape: problem in one sentence, what I built, one measured number, one surprising bug, link. Write it in simple English under 250 words, avoid hype, and then list 3 questions a recruiter might ask me about it with short model answers.</pre></div><div class="readbtn"><button class="btn" data-read="study:de:ch16">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch15.html">← Chapter 15: Project Lab 1: Pipelines, Lakes, Batches</a><a class="btn" href="appendix.html">Appendix: Cheat Sheet →</a></div></div><script src="../../assets/study.js"></script></body></html>

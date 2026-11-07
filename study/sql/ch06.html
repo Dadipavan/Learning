@@ -1,0 +1,451 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 6: CASE, Strings, Dates and Times, JSON and Arrays</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">SQL &amp; Databases Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 6</div><h1>CASE, Strings, Dates and Times, JSON and Arrays</h1><p>The everyday tools for cleaning and reshaping values: if-then logic, text surgery, calendar maths, and semi-structured data.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-6-1-case-when-if-then-else-inside-a-query">6.1 CASE WHEN: If-Then-Else Inside a Query</a></li><li><a href="#s2-6-2-string-functions">6.2 String Functions</a></li><li><a href="#s3-6-3-dates-and-times">6.3 Dates and Times</a></li><li><a href="#s4-6-4-json-and-array-values">6.4 JSON and Array Values</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>Real data is messy. Names have extra spaces, emails come in capital letters, dates arrive as text, and half the interesting fields hide inside a JSON blob. Before you can count or join anything, you must clean and reshape the values. This chapter gives you the four toolboxes that do it: <code>CASE</code> (if-then-else inside SQL), text functions, date functions, and JSON/array functions. SQLite runs most of our examples. When PostgreSQL has a better or different tool (<code>DATE_TRUNC</code>, <code>SPLIT_PART</code>, <code>jsonb</code>, <code>UNNEST</code>), we show it and label it "PostgreSQL syntax, not run here".</p>
+<h2 id="s1-6-1-case-when-if-then-else-inside-a-query">6.1 CASE WHEN: If-Then-Else Inside a Query</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A traffic officer looks at a vehicle and decides: if it is a truck, send it left; if a bus, send it right; otherwise straight. <code>CASE WHEN</code> does the same for each row: it tests conditions in order and returns the value of the first one that is true.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Bucketing</strong> (also <em>binning</em>): turning a number into a label such as small, medium, large.</li><li><strong>Conditional aggregation</strong>: using <code>CASE</code> inside <code>SUM</code> or <code>COUNT</code> (Chapter 3).</li><li><strong>Manual pivot</strong>: turning row values into columns using conditional aggregation.</li></ul>
+<h3>Syntax</h3>
+<pre class="code lang-text"><code>CASE WHEN condition1 THEN value1
+     WHEN condition2 THEN value2
+     ELSE default_value        -- if omitted, the default is NULL
+END</code></pre>
+<p>Conditions are checked top to bottom; the first TRUE wins. All <code>THEN</code> values should have the same type. There is also the "simple" form <code>CASE column WHEN 'a' THEN ...</code>, which only tests equality.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Use of CASE</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Bucketing</td><td>order size small / medium / large</td><td>customer segments, delivery-time bands</td></tr><tr><td>Recoding</td><td><code>status</code> codes to labels</td><td>cleaning source-system codes</td></tr><tr><td>Conditional sum</td><td><code>SUM(CASE WHEN ... )</code></td><td>funnels, KPIs by segment</td></tr><tr><td>Manual pivot</td><td>one column per status</td><td>report layouts</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 6.1.1</span> (trivial) Label each product as <code>cheap</code> (under 200), <code>mid</code> (200 to 999) or <code>premium</code> (1000 or more).</p>
+<table class="steps"><tr><th>Step 1</th><td>Write the conditions from lowest to highest.</td></tr><tr><th>Step 2</th><td>Because the first TRUE wins, the second test can just say <code>price &lt; 1000</code>.</td></tr></table>
+<pre class="code lang-sql"><code>SELECT name, price,
+       CASE WHEN price &lt; 200  THEN 'cheap'
+            WHEN price &lt; 1000 THEN 'mid'
+            ELSE 'premium' END AS band
+FROM products
+ORDER BY price;</code></pre>
+<pre class="code lang-text"><code>name       price  band   
+---------  -----  -------
+Notebook   80     cheap  
+Pen Pack   120    cheap  
+Mug        250    mid    
+Mouse      600    mid    
+Desk Lamp  900    mid    
+Keyboard   1500   premium</code></pre>
+<ul><li><strong>Check</strong> 80 and 120 are below 200 (cheap). 250, 600, 900 are below 1000 (mid). 1500 is premium.</li><li><strong>Answer</strong> Notebook and Pen Pack cheap; Mug, Mouse and Desk Lamp mid; Keyboard premium.</li><li><strong>Meaning</strong> One column of numbers became three labels that a manager can read.</li></ul>
+<p class="problem"><span class="pl">Problem 6.1.2</span> Bucket orders by total value: small below 500, medium 500 to 1499, large 1500 or more. How many orders and how much revenue are in each bucket?</p>
+<table class="steps"><tr><th>Step 1</th><td>Compute each order's total in a CTE.</td></tr><tr><th>Step 2</th><td>Apply <code>CASE</code>, then <code>GROUP BY</code> the bucket.</td></tr></table>
+<pre class="code lang-sql"><code>WITH order_totals AS (
+  SELECT order_id, SUM(qty * unit_price) AS total
+  FROM order_items GROUP BY order_id
+)
+SELECT CASE WHEN total &lt; 500  THEN '1 small'
+            WHEN total &lt; 1500 THEN '2 medium'
+            ELSE '3 large' END AS bucket,
+       COUNT(*) AS n_orders,
+       SUM(total) AS revenue
+FROM order_totals
+GROUP BY bucket
+ORDER BY bucket;</code></pre>
+<pre class="code lang-text"><code>bucket    n_orders  revenue
+--------  --------  -------
+1 small   4         1600   
+2 medium  5         4400   
+3 large   5         8560</code></pre>
+<ul><li><strong>Compute</strong> Order totals: 101:1660, 102:600, 103:1020, 104:400, 105:1500, 106:1280, 107:360, 108:900, 109:1500, 110:440, 111:600, 112:1800, 113:400, 114:2100. Small (under 500): 104, 107, 110, 113 give <code>400 + 360 + 440 + 400 = 1600</code>. Medium: 102, 103, 106, 108, 111 give <code>600 + 1020 + 1280 + 900 + 600 = 4400</code>. Large: 101, 105, 109, 112, 114 give <code>1660 + 1500 + 1500 + 1800 + 2100 = 8560</code>.</li><li><strong>Check</strong> <code>4 + 5 + 5 = 14</code> orders and <code>1600 + 4400 + 8560 = 14560</code>, the full revenue.</li><li><strong>Answer</strong> Small 4 orders / 1600, medium 5 / 4400, large 5 / 8560.</li><li><strong>Meaning</strong> Five large orders (36 percent of orders) bring 59 percent of revenue (<code>8560 / 14560</code>). The number prefix in the label (<code>1 small</code>) is a trick to sort buckets in the right order.</li></ul>
+<p class="problem"><span class="pl">Problem 6.1.3</span> A manual pivot: one row per month, one column per order status.</p>
+<pre class="code lang-sql"><code>SELECT substr(order_date,1,7) AS month,
+       SUM(CASE WHEN status = 'paid'      THEN 1 ELSE 0 END) AS paid,
+       SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
+       SUM(CASE WHEN status = 'refunded'  THEN 1 ELSE 0 END) AS refunded
+FROM orders
+GROUP BY month
+ORDER BY month;</code></pre>
+<pre class="code lang-text"><code>month    paid  cancelled  refunded
+-------  ----  ---------  --------
+2024-01  2     0          0       
+2024-02  2     1          0       
+2024-03  4     0          1       
+2024-04  4     0          0</code></pre>
+<ul><li><strong>Check</strong> Matches Chapter 3: Jan 2 paid; Feb 2 paid and 1 cancelled; Mar 4 paid and 1 refunded; Apr 4 paid. Column sums: <code>12 + 1 + 1 = 14</code>.</li><li><strong>Answer</strong> One compact table, months down, statuses across.</li><li><strong>Meaning</strong> This is the portable way to pivot. Chapter 7 returns to it.</li></ul>
+<p class="problem"><span class="pl">Problem 6.1.4</span> The wrong version: no <code>ELSE</code>, and overlapping conditions. What does this return for the Mouse (600)?</p>
+<pre class="code lang-sql"><code>SELECT name, price,
+       CASE WHEN price &gt;= 100 THEN 'A'
+            WHEN price &gt;= 500 THEN 'B' END AS grade
+FROM products WHERE name IN ('Mouse', 'Notebook');</code></pre>
+<pre class="code lang-text"><code>name      price  grade
+--------  -----  -----
+Mouse     600    A    
+Notebook  80     NULL</code></pre>
+<ul><li><strong>Answer</strong> Mouse gets <code>A</code>, not <code>B</code>: the first TRUE wins, and <code>600 &gt;= 100</code> is true. Notebook (80) matches nothing and gets NULL because there is no <code>ELSE</code>.</li><li><strong>Fix</strong> Order the tests from the most specific (<code>&gt;= 500</code>) to the least, and add an <code>ELSE</code>.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code>  value 600 --&gt; [price &lt; 200?] no --&gt; [price &lt; 1000?] YES --&gt; 'mid'  (stop)
+  value 80  --&gt; [price &lt; 200?] YES --&gt; 'cheap'                (stop)
+  value 1500 -&gt; [price &lt; 200?] no --&gt; [price &lt; 1000?] no --&gt; ELSE 'premium'</code></pre>
+<h3>Connection to the real job</h3>
+<p>Segmentation (new / returning, small / large, fast / slow) is the first step of most analyses. A courier company buckets delivery times (under 1 day, 1 to 3 days, over 3 days) to show promise compliance, exactly the same <code>CASE</code> pattern.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> customer segments, revenue bands, SLA bands.</li><li><strong>Data Science and ML:</strong> creating categorical features, flag columns (<code>is_high_value</code>).</li><li><strong>Data Engineering:</strong> mapping source codes to clean values.</li><li><strong>Logistics:</strong> delivery-time bands (under 1 day, 1 to 3 days, over 3 days).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Wrong order of conditions, and forgetting <code>ELSE</code> so unmatched rows silently become NULL. Also mixing types: <code>THEN 1 ... ELSE 'none'</code> fails in PostgreSQL.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does CASE return if no condition is true and there is no ELSE?</li></ol>
+<p>Answer: NULL.</p>
+<ol><li>If two conditions are both true, which one wins?</li></ol>
+<p>Answer: The first one, from the top.</p>
+<ol><li>How do you count rows meeting a condition inside one aggregate?</li></ol>
+<p>Answer: <code>SUM(CASE WHEN cond THEN 1 ELSE 0 END)</code> or <code>COUNT(*) FILTER (WHERE cond)</code>.</p>
+<h2 id="s2-6-2-string-functions">6.2 String Functions</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Text from forms, files and logs is like a hand-written note: extra spaces, wrong capitals, joined fields. String functions are scissors, glue and an eraser.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>String</strong> (also <em>text</em>): a sequence of characters. <strong>Literal</strong>: <code>'abc'</code>.</li><li><strong>Substring</strong>: a piece of a string. <strong>Position</strong>: where a piece starts (counting from 1 in SQL, not 0).</li><li><strong>Regular expression</strong> (regex): a pattern language for text, for example <code>[0-9]+</code> means "one or more digits".</li></ul>
+<h3>Function table</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Task</th><th>PostgreSQL</th><th>SQLite</th></tr></thead><tbody><tr><td>Join</td><td><code>CONCAT(a,b)</code>, or the double-pipe operator</td><td>the double-pipe operator (see the text below the table)</td></tr><tr><td>Length</td><td><code>LENGTH(s)</code></td><td><code>LENGTH(s)</code></td></tr><tr><td>Upper / lower</td><td><code>UPPER</code>, <code>LOWER</code></td><td>same</td></tr><tr><td>Cut a piece</td><td><code>SUBSTRING(s FROM 2 FOR 3)</code> or <code>SUBSTR(s,2,3)</code></td><td><code>SUBSTR(s,2,3)</code></td></tr><tr><td>Find position</td><td><code>POSITION('@' IN s)</code></td><td><code>INSTR(s,'@')</code></td></tr><tr><td>Trim spaces</td><td><code>TRIM(s)</code>, <code>LTRIM</code>, <code>RTRIM</code></td><td>same</td></tr><tr><td>Replace</td><td><code>REPLACE(s,'a','b')</code></td><td>same</td></tr><tr><td>Pad left</td><td><code>LPAD(s,5,'0')</code></td><td><code>printf('%05d', n)</code></td></tr><tr><td>Split</td><td><code>SPLIT_PART(s,'-',2)</code></td><td>no built-in; use <code>SUBSTR</code> and <code>INSTR</code></td></tr><tr><td>Regex</td><td><code>s ~ 'pattern'</code>, <code>REGEXP_REPLACE</code>, <code>REGEXP_MATCHES</code></td><td><code>REGEXP</code> needs an extension; use <code>LIKE</code> / <code>GLOB</code></td></tr></tbody></table></div>
+<p>The text-join operator is two vertical bars written together, as in <code>'a' || 'b'</code>. It is the standard SQL way to join text and works in PostgreSQL and SQLite.</p>
+<h3>Worked examples (messy contacts)</h3>
+<pre class="code lang-sql"><code>CREATE TABLE contacts (id INTEGER PRIMARY KEY, raw_name TEXT, email TEXT, phone TEXT);
+INSERT INTO contacts VALUES
+ (1,'  Asha  Rao ','ASHA.RAO@Example.COM','+91-98765-43210'),
+ (2,'ravi kumar','ravi.k@example.com','+91-91234-56789'),
+ (3,'MEENA IYER','meena@work.in','98765 00000');</code></pre>
+<p class="problem"><span class="pl">Problem 6.2.1</span> (trivial) How long is each raw name, and how long after trimming? Predict: <code>'  Asha  Rao '</code> has 2 leading, 1 trailing spaces and a double space inside.</p>
+<pre class="code lang-sql"><code>SELECT id, raw_name, LENGTH(raw_name) AS len_raw,
+       TRIM(raw_name) AS trimmed, LENGTH(TRIM(raw_name)) AS len_trim
+FROM contacts;</code></pre>
+<pre class="code lang-text"><code>id  raw_name      len_raw  trimmed     len_trim
+--  ------------  -------  ----------  --------
+1     Asha  Rao   12       Asha  Rao   9       
+2   ravi kumar    10       ravi kumar  10      
+3   MEENA IYER    10       MEENA IYER  10</code></pre>
+<ul><li><strong>Compute</strong> <code>'  Asha  Rao '</code>: 2 spaces + <code>Asha</code> (4) + 2 spaces + <code>Rao</code> (3) + 1 space = 12 characters. After <code>TRIM</code> (ends only): <code>Asha  Rao</code> = 4 + 2 + 3 = 9.</li><li><strong>Check</strong> The output shows 12 and 9 for row 1. <code>ravi kumar</code> has 10 characters, <code>MEENA IYER</code> has 10, and trimming changes nothing.</li><li><strong>Answer</strong> <code>TRIM</code> removes spaces at both ends but not the double space in the middle.</li><li><strong>Meaning</strong> Extra spaces make <code>'Asha'</code> and <code>'Asha '</code> look equal to humans but different to <code>=</code> and <code>GROUP BY</code>, so trimming comes first in every cleaning job.</li></ul>
+<p class="problem"><span class="pl">Problem 6.2.2</span> Clean the email domain: lowercase the email and take the part after <code>@</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>LOWER(email)</code> for case.</td></tr><tr><th>Step 2</th><td><code>INSTR(email, '@')</code> gives the position of <code>@</code>.</td></tr><tr><th>Step 3</th><td><code>SUBSTR(text, position + 1)</code> returns everything after it.</td></tr></table>
+<pre class="code lang-sql"><code>SELECT id,
+       LOWER(email) AS email_clean,
+       SUBSTR(LOWER(email), INSTR(email, '@') + 1) AS domain
+FROM contacts;</code></pre>
+<pre class="code lang-text"><code>id  email_clean           domain     
+--  --------------------  -----------
+1   asha.rao@example.com  example.com
+2   ravi.k@example.com    example.com
+3   meena@work.in         work.in</code></pre>
+<ul><li><strong>Check</strong> <code>ASHA.RAO@Example.COM</code>: <code>@</code> is at position 9, so the domain starts at 10: <code>Example.COM</code> in lowercase is <code>example.com</code>.</li><li><strong>Answer</strong> Domains: <code>example.com</code>, <code>example.com</code>, <code>work.in</code>.</li><li><strong>Meaning</strong> Grouping by domain tells you which companies your users come from.</li></ul>
+<p class="problem"><span class="pl">Problem 6.2.3</span> Clean phone numbers to digits only, and pad an id to five digits with leading zeros.</p>
+<pre class="code lang-sql"><code>SELECT id,
+       REPLACE(REPLACE(REPLACE(phone, '+', ''), '-', ''), ' ', '') AS digits,
+       printf('%05d', id) AS padded_id
+FROM contacts;</code></pre>
+<pre class="code lang-text"><code>id  digits        padded_id
+--  ------------  ---------
+1   919876543210  00001    
+2   919123456789  00002    
+3   9876500000    00003</code></pre>
+<ul><li><strong>Check</strong> <code>+91-98765-43210</code> becomes <code>919876543210</code> (12 digits). <code>98765 00000</code> becomes <code>9876500000</code> (10 digits). The id <code>1</code> padded to 5 digits is <code>00001</code>.</li><li><strong>Answer</strong> Nested <code>REPLACE</code> calls remove each unwanted character.</li><li><strong>Meaning</strong> The two phones now differ in length (12 and 10): one has the country code and one does not. A length check like <code>LENGTH(digits)</code> is a quick data-quality test (Chapter 12).</li></ul>
+<p class="problem"><span class="pl">Problem 6.2.4</span> Split a value: take the middle block of <code>+91-98765-43210</code>. In PostgreSQL <code>SPLIT_PART('+91-98765-43210', '-', 2)</code> returns <code>98765</code>. SQLite has no <code>SPLIT_PART</code>, so use <code>INSTR</code> and <code>SUBSTR</code>.</p>
+<pre class="code lang-sql"><code>SELECT phone,
+       SUBSTR(phone, INSTR(phone, '-') + 1,
+              INSTR(SUBSTR(phone, INSTR(phone, '-') + 1), '-') - 1) AS middle_block
+FROM contacts
+WHERE phone LIKE '%-%-%';</code></pre>
+<pre class="code lang-text"><code>phone            middle_block
+---------------  ------------
++91-98765-43210  98765       
++91-91234-56789  91234</code></pre>
+<ul><li><strong>Check</strong> In <code>+91-98765-43210</code>, the first <code>-</code> is at position 4; after it the text is <code>98765-43210</code>; the next <code>-</code> is at position 6 of that text, so the length is 5, and the result is <code>98765</code>.</li><li><strong>Answer</strong> <code>98765</code> and <code>91234</code>.</li><li><strong>Meaning</strong> This is ugly. When you can choose, use <code>SPLIT_PART</code> or a regex in PostgreSQL.</li></ul>
+<pre class="code lang-sql"><code>-- PostgreSQL syntax, not run here
+SELECT SPLIT_PART(phone, '-', 2)                AS middle_block,
+       REGEXP_REPLACE(phone, '[^0-9]', '', 'g') AS digits_only,
+       LPAD(id::text, 5, '0')                   AS padded_id
+FROM contacts
+WHERE email ~* '^[a-z.]+@example\.com$';   -- ~* means regex match, case-insensitive</code></pre>
+<p class="problem"><span class="pl">Problem 6.2.5</span> Pattern search with <code>LIKE</code>: contacts whose email ends with <code>.com</code> (any case).</p>
+<pre class="code lang-sql"><code>SELECT id, email FROM contacts WHERE LOWER(email) LIKE '%.com';</code></pre>
+<pre class="code lang-text"><code>id  email               
+--  --------------------
+1   ASHA.RAO@Example.COM
+2   ravi.k@example.com</code></pre>
+<ul><li><strong>Answer</strong> Contacts 1 and 2; contact 3 ends in <code>.in</code>.</li><li><strong>Check</strong> <code>ASHA.RAO@Example.COM</code> lowercased ends with <code>.com</code>. <code>meena@work.in</code> does not.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> 'ASHA.RAO@Example.COM'
+  1234567890123...        INSTR(...,'@') = 9
+  ASHA.RAO | @ | Example.COM
+  SUBSTR(s, 1, 8)  = 'ASHA.RAO'   (the part before @: length = position - 1)
+  SUBSTR(s, 10)    = 'Example.COM' (the part after @)</code></pre>
+<p>Positions count from 1. Characters before <code>@</code> are <code>9 - 1 = 8</code>.</p>
+<h3>Connection to the real job</h3>
+<p>Cleaning text is half of data work: standardise names, extract domains and area codes, build keys, search logs. A web analyst often parses URLs and log lines the same way (for example, take the path before <code>?</code>).</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> grouping by cleaned categories; email domains.</li><li><strong>Data Engineering:</strong> standardising keys before joins; parsing log fields.</li><li><strong>Data Science and NLP:</strong> text pre-cleaning before features.</li><li><strong>Web analytics:</strong> extracting page names from URLs.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Joining on dirty text (<code>'Pune'</code> vs <code>'pune '</code>) so rows silently fail to match. Clean with <code>TRIM</code> and <code>LOWER</code> on both sides, or better, fix the data once at load time. Also: <code>NULL || 'x'</code> is NULL, so use <code>COALESCE</code> before joining text; PostgreSQL's <code>CONCAT</code> ignores NULLs.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>In SQL, does the first character have position 0 or 1?</li></ol>
+<p>Answer: 1.</p>
+<ol><li>What does <code>TRIM('  a b ')</code> return?</li></ol>
+<p>Answer: <code>a b</code> (inner space kept).</p>
+<ol><li>What is <code>NULL || 'x'</code>?</li></ol>
+<p>Answer: NULL.</p>
+<h2 id="s3-6-3-dates-and-times">6.3 Dates and Times</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Dates are the hardest "simple" data type: months have different lengths, leap years exist, and a timestamp means different clock times in Mumbai and London. A good analyst always asks: "which time zone, and what is the cut-off?"</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Date</strong>: a calendar day. <strong>Timestamp</strong>: date plus time. <strong><code>timestamptz</code></strong> (PostgreSQL): timestamp stored in UTC and shown in your session time zone.</li><li><strong>UTC</strong>: the world reference time. India Standard Time is UTC + 5:30.</li><li><strong>Interval</strong>: a length of time (<code>7 days</code>, <code>1 month</code>).</li><li><strong>Truncate</strong>: cut a date down to the start of its period (month start, week start).</li><li><strong>ISO format</strong>: <code>YYYY-MM-DD</code>, which sorts correctly as text.</li></ul>
+<p>SQLite has no real date type. It stores dates as text (<code>'2024-03-05'</code>), numbers, or Julian days, and uses functions <code>date()</code>, <code>datetime()</code>, <code>strftime()</code> and <code>julianday()</code>. PostgreSQL has true <code>DATE</code>, <code>TIMESTAMP</code>, <code>TIMESTAMPTZ</code> and <code>INTERVAL</code>.</p>
+<h3>Function table</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Task</th><th>PostgreSQL</th><th>SQLite</th></tr></thead><tbody><tr><td>Today</td><td><code>CURRENT_DATE</code></td><td><code>date('now')</code></td></tr><tr><td>Add days</td><td><code>d + INTERVAL '7 days'</code> or <code>d + 7</code></td><td><code>date(d, '+7 days')</code></td></tr><tr><td>Difference in days</td><td><code>d2 - d1</code></td><td><code>julianday(d2) - julianday(d1)</code></td></tr><tr><td>Part of date</td><td><code>EXTRACT(MONTH FROM d)</code></td><td><code>strftime('%m', d)</code></td></tr><tr><td>Month start</td><td><code>DATE_TRUNC('month', d)</code></td><td><code>date(d, 'start of month')</code></td></tr><tr><td>Month end</td><td><code>DATE_TRUNC('month', d) + INTERVAL '1 month - 1 day'</code></td><td><code>date(d, 'start of month', '+1 month', '-1 day')</code></td></tr><tr><td>Weekday</td><td><code>EXTRACT(DOW FROM d)</code> (0 = Sunday)</td><td><code>strftime('%w', d)</code> (0 = Sunday)</td></tr><tr><td>Format</td><td><code>TO_CHAR(d, 'YYYY-MM')</code></td><td><code>strftime('%Y-%m', d)</code></td></tr><tr><td>Series</td><td><code>generate_series(a, b, interval)</code></td><td>recursive CTE (Chapter 5)</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 6.3.1</span> (trivial) For each order, show its month start and the date a 30-day return window closes. Show the first 4 orders.</p>
+<pre class="code lang-sql"><code>SELECT order_id, order_date,
+       date(order_date, 'start of month') AS month_start,
+       date(order_date, '+30 days')       AS return_by
+FROM orders ORDER BY order_id LIMIT 4;</code></pre>
+<pre class="code lang-text"><code>order_id  order_date  month_start  return_by 
+--------  ----------  -----------  ----------
+101       2024-01-10  2024-01-01   2024-02-09
+102       2024-01-15  2024-01-01   2024-02-14
+103       2024-02-03  2024-02-01   2024-03-04
+104       2024-02-10  2024-02-01   2024-03-11</code></pre>
+<ul><li><strong>Check</strong> Order 101 is on 2024-01-10. January has 31 days, so <code>+30 days</code> is 2024-02-09. Order 103 on 2024-02-03 plus 30 days: February 2024 has 29 days (a leap year), so 26 days take us to 2024-02-29, and 4 more to 2024-03-04.</li><li><strong>Answer</strong> The printed <code>return_by</code> values match: 2024-02-09 for order 101 and 2024-03-04 for order 103.</li><li><strong>Meaning</strong> The database knows month lengths and leap years, so you should never add days with your own arithmetic.</li></ul>
+<p class="problem"><span class="pl">Problem 6.3.2</span> How many days passed from each customer's signup to their first order?</p>
+<table class="steps"><tr><th>Step 1</th><td>In a CTE find the first order date per customer.</td></tr><tr><th>Step 2</th><td>Subtract the Julian day numbers (days since a fixed past date).</td></tr></table>
+<pre class="code lang-sql"><code>WITH first_orders AS (
+  SELECT customer_id, MIN(order_date) AS first_order FROM orders GROUP BY customer_id
+)
+SELECT c.name, c.signup_date, f.first_order,
+       CAST(julianday(f.first_order) - julianday(c.signup_date) AS INTEGER) AS days_to_first_order
+FROM customers c JOIN first_orders f ON f.customer_id = c.customer_id
+ORDER BY c.customer_id;</code></pre>
+<pre class="code lang-text"><code>name   signup_date  first_order  days_to_first_order
+-----  -----------  -----------  -------------------
+Asha   2024-01-05   2024-01-10   5                  
+Ravi   2024-01-12   2024-01-15   3                  
+Meena  2024-01-20   2024-02-10   21                 
+John   2024-02-02   2024-02-20   18                 
+Priya  2024-02-14   2024-03-07   22                 
+Kabir  2024-03-01   2024-03-30   29</code></pre>
+<ul><li><strong>Compute</strong> Asha: Jan 5 to Jan 10 is 5 days. Ravi: Jan 12 to Jan 15 is 3. Meena: Jan 20 to Feb 10 is <code>11 + 10 = 21</code>. John: Feb 2 to Feb 20 is 18. Priya: Feb 14 to Mar 7 is <code>15 + 7 = 22</code> (February has 29 days: 15 days to Feb 29, then 7 more). Kabir: Mar 1 to Mar 30 is 29.</li><li><strong>Check</strong> These six numbers match the printed column.</li><li><strong>Answer</strong> 5, 3, 21, 18, 22, 29 days.</li><li><strong>Meaning</strong> On average <code>(5+3+21+18+22+29)/6 = 16.3</code> days. "Time to first purchase" is a standard activation metric.</li></ul>
+<p class="problem"><span class="pl">Problem 6.3.3</span> Orders per weekday. In SQLite, <code>%w</code> gives 0 for Sunday to 6 for Saturday.</p>
+<pre class="code lang-sql"><code>SELECT strftime('%w', order_date) AS dow,
+       CASE strftime('%w', order_date)
+            WHEN '0' THEN 'Sun' WHEN '1' THEN 'Mon' WHEN '2' THEN 'Tue'
+            WHEN '3' THEN 'Wed' WHEN '4' THEN 'Thu' WHEN '5' THEN 'Fri'
+            ELSE 'Sat' END AS day_name,
+       COUNT(*) AS n_orders
+FROM orders
+GROUP BY dow ORDER BY dow;</code></pre>
+<pre class="code lang-text"><code>dow  day_name  n_orders
+---  --------  --------
+1    Mon       4       
+2    Tue       4       
+3    Wed       1       
+4    Thu       1       
+6    Sat       4</code></pre>
+<ul><li><strong>Check</strong> 2024-01-01 was a Monday, so 2024-01-10 is a Wednesday (1 order), as printed. Counts add to 14.</li><li><strong>Answer</strong> Mon 4, Tue 4, Wed 1, Thu 1, Sat 4; no orders on Fri or Sun.</li><li><strong>Meaning</strong> Day-of-week patterns drive staffing and campaign timing. Note that no row is shown for days with zero orders; use a date spine (Chapter 5) if you need them.</li></ul>
+<p class="problem"><span class="pl">Problem 6.3.4</span> The classic trap: filtering a whole month. Show that <code>BETWEEN '2024-03-01' AND '2024-03-31'</code> is fine for dates but loses rows for timestamps. We simulate a timestamp column.</p>
+<pre class="code lang-sql"><code>CREATE TABLE log (ts TEXT);
+INSERT INTO log VALUES ('2024-03-31 09:15:00'), ('2024-03-31 23:59:59'), ('2024-04-01 00:00:00');
+
+SELECT COUNT(*) AS between_version FROM log
+WHERE ts BETWEEN '2024-03-01' AND '2024-03-31';
+
+SELECT COUNT(*) AS half_open_version FROM log
+WHERE ts &gt;= '2024-03-01' AND ts &lt; '2024-04-01';</code></pre>
+<pre class="code lang-text"><code>between_version
+---------------
+0              
+half_open_version
+-----------------
+2</code></pre>
+<ul><li><strong>Compute</strong> The text <code>'2024-03-31 09:15:00'</code> is greater than <code>'2024-03-31'</code> (longer, same start), so <code>BETWEEN</code> loses both March 31 rows. The half-open test keeps rows from the first moment of March up to, but not including, April 1.</li><li><strong>Check</strong> The half-open version returns 2 (the two March 31 rows); <code>BETWEEN</code> returns 0.</li><li><strong>Answer</strong> Use <code>&gt;= start AND &lt; next_start</code>.</li><li><strong>Meaning</strong> Half-open ranges work for dates, timestamps and any precision.</li></ul>
+<p>PostgreSQL versions of the same ideas, not run here:</p>
+<pre class="code lang-sql"><code>-- PostgreSQL syntax, not run here
+SELECT DATE_TRUNC('month', order_date)                       AS month_start,
+       EXTRACT(DOW FROM order_date)                           AS weekday,
+       order_date + INTERVAL '30 days'                        AS return_by,
+       order_date - signup_date                               AS days_since_signup
+FROM orders JOIN customers USING (customer_id);
+
+-- time zones: store timestamptz, display in India time
+SELECT created_at AT TIME ZONE 'Asia/Kolkata' FROM events;</code></pre>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> time line (UTC)      00:00     05:30 IST          12:00
+ server timestamp  --&gt;  |---------|-----------------|
+ same instant shown in Mumbai: 05:30 on the same day
+ A "day" in Mumbai starts at 18:30 UTC of the previous day.</code></pre>
+<p>If your server stores UTC but the business day is Indian, grouping by UTC date puts late-evening orders on the wrong day. Convert first, then truncate.</p>
+<h3>Connection to the real job</h3>
+<p>Month-over-month growth, retention by week and "orders in the last 7 days" are all date logic. Time-zone errors are among the most common causes of dashboards that "do not match finance". Many systems (mobile apps, sensors, payment logs) store timestamps as milliseconds since 1970 (epoch time); converting them to dates is a typical first query.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> monthly and weekly trends, age of customer, SLA days.</li><li><strong>Data Engineering:</strong> partitioning tables by date; incremental loads by <code>updated_at</code>.</li><li><strong>Data Science and ML:</strong> time-based features (day of week, days since last order).</li><li><strong>Healthcare:</strong> grouping hospital appointments by hour of the day.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using <code>BETWEEN</code> with an end date on timestamp columns (loses the last day), mixing time zones, and storing dates as text in free formats (<code>03/04/24</code> is March 4 or April 3?). Use ISO <code>YYYY-MM-DD</code>.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which is safer for a month filter, <code>BETWEEN</code> or half-open?</li></ol>
+<p>Answer: Half-open (<code>&gt;= start AND &lt; next start</code>).</p>
+<ol><li>India Standard Time is how far from UTC?</li></ol>
+<p>Answer: UTC + 5:30.</p>
+<ol><li>How do you get the first day of the month in PostgreSQL?</li></ol>
+<p>Answer: <code>DATE_TRUNC('month', d)</code>.</p>
+<h2 id="s4-6-4-json-and-array-values">6.4 JSON and Array Values</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A relational table is a spreadsheet with fixed columns. But app events, API responses and logs arrive as <strong>JSON</strong>, a flexible text format with nested fields: <code>{"user":"asha","device":{"os":"android"}}</code>. You can store the whole blob in one column and still pull fields out with SQL.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>JSON</strong> (JavaScript Object Notation): text made of objects <code>{"key": value}</code>, arrays <code>[1, 2, 3]</code>, strings, numbers, booleans and null.</li><li><strong>Semi-structured data</strong>: data whose fields vary per record.</li><li><strong>Path</strong>: an address inside JSON, like <code>$.device.os</code> (<code>$</code> is the root).</li><li><strong>Array column</strong>: PostgreSQL can store a list in one cell (<code>ARRAY['a','b']</code>).</li><li><strong>Unnest / explode</strong>: turning one row with a list into many rows, one per element.</li></ul>
+<h3>Function table</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Task</th><th>PostgreSQL (<code>jsonb</code>)</th><th>SQLite</th></tr></thead><tbody><tr><td>Get field as JSON</td><td><code>payload -&gt; 'device'</code></td><td><code>payload -&gt; '$.device'</code></td></tr><tr><td>Get field as text</td><td><code>payload -&gt;&gt; 'user'</code></td><td><code>payload -&gt;&gt; '$.user'</code></td></tr><tr><td>Nested</td><td><code>payload -&gt; 'device' -&gt;&gt; 'os'</code></td><td><code>payload -&gt;&gt; '$.device.os'</code></td></tr><tr><td>Array to rows</td><td><code>jsonb_array_elements_text(payload -&gt; 'tags')</code></td><td><code>json_each(payload, '$.tags')</code></td></tr><tr><td>Contains</td><td><code>payload @&gt; '{"user":"asha"}'</code></td><td>no direct operator</td></tr><tr><td>Build array</td><td><code>ARRAY_AGG(x)</code> / <code>jsonb_agg(x)</code></td><td><code>json_group_array(x)</code></td></tr><tr><td>Join text</td><td><code>STRING_AGG(x, ', ')</code></td><td><code>GROUP_CONCAT(x, ', ')</code></td></tr><tr><td>Array to rows</td><td><code>UNNEST(arr)</code></td><td><code>json_each</code></td></tr><tr><td>Index</td><td><code>CREATE INDEX ... USING GIN (payload)</code></td><td>expression index</td></tr></tbody></table></div>
+<p>PostgreSQL's <code>jsonb</code> stores JSON in a parsed binary form that supports indexes; <code>json</code> keeps the raw text. Prefer <code>jsonb</code>.</p>
+<h3>Worked examples</h3>
+<pre class="code lang-sql"><code>CREATE TABLE events (id INTEGER PRIMARY KEY, payload TEXT);
+INSERT INTO events VALUES
+ (1,'{"user":"asha","device":{"os":"android","ver":14},"tags":["promo","new"],"amount":250}'),
+ (2,'{"user":"ravi","device":{"os":"ios","ver":17},"tags":[],"amount":600}'),
+ (3,'{"user":"meena","device":{"os":"android","ver":13},"tags":["promo"]}');</code></pre>
+<p class="problem"><span class="pl">Problem 6.4.1</span> (trivial) Pull the user, the operating system and the amount out of each event. Predict: event 3 has no <code>amount</code> field. What will that cell show?</p>
+<pre class="code lang-sql"><code>SELECT id,
+       payload -&gt;&gt; '$.user'         AS user,
+       payload -&gt;&gt; '$.device.os'    AS os,
+       payload -&gt;&gt; '$.amount'       AS amount
+FROM events;</code></pre>
+<pre class="code lang-text"><code>id  user   os       amount
+--  -----  -------  ------
+1   asha   android  250   
+2   ravi   ios      600   
+3   meena  android  NULL</code></pre>
+<ul><li><strong>Answer</strong> Event 3's amount is NULL (a missing key gives NULL, not an error).</li><li><strong>Check</strong> Event 1: asha, android, 250; event 2: ravi, ios, 600; event 3: meena, android, NULL.</li><li><strong>Meaning</strong> You can query flexible data without a fixed schema, but missing keys become NULL, so count them.</li></ul>
+<p class="problem"><span class="pl">Problem 6.4.2</span> Total <code>amount</code> and counts, by operating system.</p>
+<pre class="code lang-sql"><code>SELECT payload -&gt;&gt; '$.device.os' AS os,
+       COUNT(*) AS events,
+       COUNT(payload -&gt;&gt; '$.amount') AS with_amount,
+       SUM(payload -&gt;&gt; '$.amount') AS total_amount
+FROM events
+GROUP BY os
+ORDER BY os;</code></pre>
+<pre class="code lang-text"><code>os       events  with_amount  total_amount
+-------  ------  -----------  ------------
+android  2       1            250         
+ios      1       1            600</code></pre>
+<ul><li><strong>Compute</strong> Android has events 1 and 3: amounts 250 and NULL, so <code>COUNT(amount) = 1</code> and <code>SUM = 250</code>. iOS has event 2: 600.</li><li><strong>Check</strong> <code>250 + 600 = 850</code> total across both groups.</li><li><strong>Answer</strong> Android: 2 events, 1 with amount, 250. iOS: 1 event, 1 with amount, 600.</li><li><strong>Meaning</strong> <code>SUM</code> ignores NULL. If event 3's missing amount really means zero, add <code>COALESCE</code>.</li></ul>
+<p class="problem"><span class="pl">Problem 6.4.3</span> Explode the <code>tags</code> array: one row per (event, tag). Also count events per tag.</p>
+<pre class="code lang-sql"><code>SELECT e.id, t.value AS tag
+FROM events e, json_each(e.payload, '$.tags') AS t
+ORDER BY e.id;</code></pre>
+<pre class="code lang-text"><code>id  tag  
+--  -----
+1   promo
+1   new  
+3   promo</code></pre>
+<pre class="code lang-sql"><code>SELECT t.value AS tag, COUNT(*) AS n_events
+FROM events e, json_each(e.payload, '$.tags') AS t
+GROUP BY t.value ORDER BY n_events DESC;</code></pre>
+<pre class="code lang-text"><code>tag    n_events
+-----  --------
+promo  2       
+new    1</code></pre>
+<ul><li><strong>Check</strong> Event 1 has two tags, event 2 has none (an empty array gives no rows), event 3 has one. Total 3 rows. <code>promo</code> appears in events 1 and 3 (2), <code>new</code> in event 1 (1).</li><li><strong>Answer</strong> Three (event, tag) rows; <code>promo</code> 2, <code>new</code> 1.</li><li><strong>Meaning</strong> Event 2 vanished because an empty array gives zero rows. To keep such rows use a <code>LEFT JOIN</code> form. This "one row per element" shape is what you need to count or join tags.</li></ul>
+<p class="problem"><span class="pl">Problem 6.4.4</span> The reverse: collapse rows into lists. For each product category, list its product names.</p>
+<pre class="code lang-sql"><code>SELECT category, GROUP_CONCAT(name, ', ') AS products, COUNT(*) AS n
+FROM (SELECT category, name FROM products ORDER BY name)
+GROUP BY category
+ORDER BY category;</code></pre>
+<pre class="code lang-text"><code>category     products            n
+-----------  ------------------  -
+Electronics  Keyboard, Mouse     2
+Home         Desk Lamp, Mug      2
+Stationery   Notebook, Pen Pack  2</code></pre>
+<ul><li><strong>Check</strong> Electronics holds Keyboard and Mouse; Home holds Desk Lamp and Mug; Stationery holds Notebook and Pen Pack. Alphabetical inside each group because we sorted before grouping.</li><li><strong>Answer</strong> One row per category with a comma list.</li><li><strong>Meaning</strong> SQLite does not guarantee the order of <code>GROUP_CONCAT</code>; sorting in a subquery works in practice. In PostgreSQL write <code>STRING_AGG(name, ', ' ORDER BY name)</code>.</li></ul>
+<pre class="code lang-sql"><code>-- PostgreSQL syntax, not run here
+-- jsonb and arrays in PostgreSQL
+SELECT payload -&gt;&gt; 'user'                      AS user_name,
+       payload -&gt; 'device' -&gt;&gt; 'os'            AS os,
+       (payload -&gt;&gt; 'amount')::numeric         AS amount
+FROM events
+WHERE payload @&gt; '{"tags": ["promo"]}';        -- contains this fragment (GIN index can help)
+
+SELECT category, ARRAY_AGG(name ORDER BY name) AS names,
+       STRING_AGG(name, ', ' ORDER BY name)    AS names_text
+FROM products GROUP BY category;
+
+SELECT e.id, tag
+FROM events e, LATERAL jsonb_array_elements_text(e.payload -&gt; 'tags') AS tag;
+
+SELECT UNNEST(ARRAY[10, 20, 30]) AS n;         -- one row per element</code></pre>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> one row, nested                 json_each / UNNEST             rows
+ {"tags":["promo","new"]}  ----------------------&gt;  (event 1, promo)
+                                                      (event 1, new)
+ rows to list: GROUP_CONCAT / STRING_AGG / ARRAY_AGG works in the opposite direction.</code></pre>
+<h3>Connection to the real job</h3>
+<p>Event data (clickstream, API logs, mobile telemetry) arrives as JSON. A data engineer lands the raw JSON in one column, then flattens it with these functions into proper tables (a common step in ELT). Many apps already store order details or settings as JSON; the same functions let you query them.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> product events with flexible properties.</li><li><strong>Data Engineering:</strong> flattening raw JSON into columns during ELT.</li><li><strong>Data Science and ML:</strong> extracting features from event payloads.</li><li><strong>GenAI:</strong> storing LLM request and response metadata as JSON for analysis.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Putting everything into one JSON column "for flexibility". You lose type checks, constraints and good indexing. Use JSON for truly variable fields; keep core fields as real columns. Another trap: <code>-&gt;</code> returns JSON (with quotes), <code>-&gt;&gt;</code> returns plain text; comparing <code>payload -&gt; 'user' = 'asha'</code> fails because the left side is <code>"asha"</code> with quotes.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does <code>-&gt;&gt;</code> return compared to <code>-&gt;</code>?</li></ol>
+<p>Answer: <code>-&gt;&gt;</code> returns plain text; <code>-&gt;</code> returns JSON.</p>
+<ol><li>What does an empty array produce when you unnest it?</li></ol>
+<p>Answer: Zero rows.</p>
+<ol><li>Which function joins rows into one comma string in PostgreSQL?</li></ol>
+<p>Answer: <code>STRING_AGG</code>.</p>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li><code>CASE WHEN</code> tests conditions top to bottom and returns the first match; add <code>ELSE</code>.</li><li><code>CASE</code> inside <code>SUM</code> or <code>COUNT</code> builds conditional metrics and manual pivots.</li><li><code>TRIM</code>, <code>LOWER</code>, <code>REPLACE</code>, <code>SUBSTR</code> and <code>INSTR</code> clean text; positions start at 1.</li><li><code>NULL || text</code> is NULL; clean text on both sides before joining.</li><li>Use ISO dates, half-open ranges (<code>&gt;= start AND &lt; next</code>) and never hand-count days.</li><li>Know your time zone; convert before truncating to a day.</li><li>JSON fields are read with <code>-&gt;</code> (JSON) and <code>-&gt;&gt;</code> (text); missing keys give NULL.</li><li>Unnest arrays to rows to count or join them; aggregate rows back to lists with <code>STRING_AGG</code> / <code>ARRAY_AGG</code>.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Task</th><th>PostgreSQL</th><th>SQLite</th></tr></thead><tbody><tr><td>Bucket</td><td><code>CASE WHEN ... END</code></td><td>same</td></tr><tr><td>Month start</td><td><code>DATE_TRUNC('month', d)</code></td><td><code>date(d,'start of month')</code></td></tr><tr><td>Days between</td><td><code>d2 - d1</code></td><td><code>julianday(d2)-julianday(d1)</code></td></tr><tr><td>JSON text</td><td><code>col -&gt;&gt; 'k'</code></td><td><code>col -&gt;&gt; '$.k'</code></td></tr><tr><td>Explode array</td><td><code>UNNEST</code>, <code>jsonb_array_elements_text</code></td><td><code>json_each</code></td></tr><tr><td>Rows to text</td><td><code>STRING_AGG(x, ', ')</code></td><td><code>GROUP_CONCAT(x, ', ')</code></td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 6.P.1</span> (easy) Show each customer name in upper case and its length.</p>
+<pre class="code lang-sql"><code>SELECT UPPER(name) AS name_upper, LENGTH(name) AS len FROM customers ORDER BY customer_id;</code></pre>
+<pre class="code lang-text"><code>name_upper  len
+----------  ---
+ASHA        4  
+RAVI        4  
+MEENA       5  
+JOHN        4  
+PRIYA       5  
+KABIR       5  
+SANA        4  
+TOM         3</code></pre>
+<p><strong>Answer:</strong> ASHA 4, RAVI 4, MEENA 5, JOHN 4, PRIYA 5, KABIR 5, SANA 4, TOM 3.</p>
+<p class="problem"><span class="pl">Problem 6.P.2</span> (easy) Classify each order's status as <code>ok</code> (paid) or <code>problem</code> (anything else) and count each.</p>
+<pre class="code lang-sql"><code>SELECT CASE WHEN status = 'paid' THEN 'ok' ELSE 'problem' END AS kind, COUNT(*) AS n
+FROM orders GROUP BY kind ORDER BY kind;</code></pre>
+<pre class="code lang-text"><code>kind     n 
+-------  --
+ok       12
+problem  2</code></pre>
+<p><strong>Answer:</strong> ok 12, problem 2.</p>
+<p class="problem"><span class="pl">Problem 6.P.3</span> (what is the output?) What does this print?</p>
+<pre class="code lang-sql"><code>SELECT date('2024-01-31', '+1 month') AS a, date('2024-02-29', '+1 year') AS b;</code></pre>
+<pre class="code lang-text"><code>a           b         
+----------  ----------
+2024-03-02  2025-03-01</code></pre>
+<p><strong>Answer:</strong> <code>a = 2024-03-02</code> in SQLite (31 January plus one month is "31 February", which rolls over to 2 March) and <code>b = 2025-03-01</code> (29 February 2025 does not exist, so it rolls to 1 March). PostgreSQL clamps to month end instead: <code>DATE '2024-01-31' + INTERVAL '1 month'</code> is <code>2024-02-29</code>. Month arithmetic differs by database; test it.</p>
+<p class="problem"><span class="pl">Problem 6.P.4</span> (find the bug) A teammate filters March data with <code>WHERE ts BETWEEN '2024-03-01' AND '2024-03-31'</code> on a timestamp column and the last day is missing. Fix it. <strong>Answer:</strong> <code>WHERE ts &gt;= '2024-03-01' AND ts &lt; '2024-04-01'</code>.</p>
+<p class="problem"><span class="pl">Problem 6.P.5</span> Show orders from the second half of each month (day 16 or later) with the day number.</p>
+<pre class="code lang-sql"><code>SELECT order_id, order_date, CAST(strftime('%d', order_date) AS INTEGER) AS day_no
+FROM orders
+WHERE CAST(strftime('%d', order_date) AS INTEGER) &gt;= 16
+ORDER BY order_id;</code></pre>
+<pre class="code lang-text"><code>order_id  order_date  day_no
+--------  ----------  ------
+105       2024-02-20  20    
+108       2024-03-18  18    
+109       2024-03-25  25    
+110       2024-03-30  30    
+114       2024-04-20  20</code></pre>
+<p><strong>Answer:</strong> Orders 105 (day 20), 108 (18), 109 (25), 110 (30) and 114 (20). Order 113 is on day 15, so it is excluded.</p>
+<p class="problem"><span class="pl">Problem 6.P.6</span> Extract the first name and last name from <code>'ravi kumar'</code> using <code>INSTR</code> and <code>SUBSTR</code>.</p>
+<pre class="code lang-sql"><code>SELECT SUBSTR(raw_name, 1, INSTR(raw_name, ' ') - 1) AS first_name,
+       SUBSTR(raw_name, INSTR(raw_name, ' ') + 1)    AS last_name
+FROM contacts WHERE id = 2;</code></pre>
+<pre class="code lang-text"><code>first_name  last_name
+----------  ---------
+ravi        kumar</code></pre>
+<p><strong>Answer:</strong> <code>ravi</code> and <code>kumar</code>. The space is at position 5, so the first name has <code>5 - 1 = 4</code> characters.</p>
+<p class="problem"><span class="pl">Problem 6.P.7</span> Using the <code>events</code> table, find events from Android devices with version 13 or higher.</p>
+<pre class="code lang-sql"><code>SELECT id, payload -&gt;&gt; '$.user' AS user, payload -&gt;&gt; '$.device.ver' AS ver
+FROM events
+WHERE payload -&gt;&gt; '$.device.os' = 'android'
+  AND (payload -&gt;&gt; '$.device.ver') &gt;= 13;</code></pre>
+<pre class="code lang-text"><code>id  user   ver
+--  -----  ---
+1   asha   14 
+3   meena  13</code></pre>
+<p><strong>Answer:</strong> Events 1 (ver 14) and 3 (ver 13), as printed.</p>
+<p class="problem"><span class="pl">Problem 6.P.8</span> (scenario) A column <code>created_at</code> holds UTC timestamps. The business wants daily orders in India time. What do you do? <strong>Answer:</strong> Convert to <code>Asia/Kolkata</code> first (<code>created_at AT TIME ZONE 'Asia/Kolkata'</code> in PostgreSQL), then truncate to date and group. An order at 20:00 UTC on 31 March is 01:30 IST on 1 April, so it belongs to April in India.</p>
+<p class="problem"><span class="pl">Problem 6.P.9</span> (interview) What is the difference between <code>COALESCE</code> and <code>CASE WHEN x IS NULL</code>? <strong>Answer:</strong> <code>COALESCE(a, b, c)</code> is a short form that returns the first non-NULL argument. <code>CASE WHEN a IS NULL THEN b ELSE a END</code> does the same for two values but is longer, and it allows any conditions, not only NULL tests.</p>
+<p class="problem"><span class="pl">Problem 6.P.10</span> (interview) How would you find all users who have a particular tag in a JSON array column in PostgreSQL, and how would you make it fast? <strong>Answer:</strong> With <code>jsonb</code>: <code>WHERE payload @&gt; '{"tags":["promo"]}'</code>, and create a GIN index on the column: <code>CREATE INDEX ON events USING GIN (payload)</code>. Without the index the database scans every row.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional in India moving into data roles, and English is my second language. Teach me Chapter 6 topic: "CASE WHEN, bucketing and manual pivot in SQL". Use a small orders table and show bucketing by value, conditional counts per month, and the order-of-conditions trap. After each example ask me to predict the output and check my answer.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: cleaning text with string functions (TRIM, LOWER, SUBSTR, INSTR, REPLACE, SPLIT_PART, REGEXP_REPLACE) in PostgreSQL. Give me 8 graded cleaning exercises on messy names, emails and phone numbers, with no solutions at first. Review my answers when I paste them and explain mistakes in simple English.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. Teach me date and time handling in SQL for a beginner: DATE_TRUNC, EXTRACT, intervals, half-open ranges, month arithmetic, and time zones (UTC and Asia/Kolkata). Use small numeric examples I can verify by hand, and ask one check question after each step. Finish with 5 quiz questions.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. Teach me JSON and array columns in PostgreSQL: jsonb, -&gt;, -&gt;&gt;, @&gt;, jsonb_array_elements, UNNEST, ARRAY_AGG, STRING_AGG, and GIN indexes. Use an events table with user, device and tags fields. I am a beginner. Give me small exercises, wait for my answers, and explain when NOT to use JSON columns.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. Run a mock SQL interview for a data-analyst role focused on CASE, string, date and JSON functions. Ask one practical question at a time (for example: month-over-month filter, cleaning emails, extracting JSON fields, last day of month), grade my answer out of 10, show the model solution in PostgreSQL, and mention one common mistake.</pre></div><div class="readbtn"><button class="btn" data-read="study:sql:ch06">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch05.html">← Chapter 5: Subqueries and CTEs (Including Recursive</a><a class="btn" href="ch07.html">Chapter 7: Set Operations, Pivot and Unpivot, GROUP →</a></div></div><script src="../../assets/study.js"></script></body></html>

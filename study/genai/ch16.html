@@ -1,0 +1,195 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 16: Project Lab 2: Hybrid Search, LoRA Fine-Tuning, Document Extraction</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">NLP, LLMs, RAG &amp; Agents</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 16</div><h1>Project Lab 2: Hybrid Search, LoRA Fine-Tuning, Document Extraction</h1><p>Three more complete build guides: a search engine you can measure, a fine-tuning plan you can defend, and an extraction pipeline that validates its own output.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-16-1-project-a-hybrid-semantic-search-engine-with-recall-k">16.1 Project: A Hybrid Semantic Search Engine With Recall@k</a></li><li><a href="#s2-16-2-project-fine-tune-a-small-model-with-lora-on-a-narrow-task">16.2 Project: Fine-Tune a Small Model With LoRA on a Narrow Task</a></li><li><a href="#s3-16-3-project-a-document-extraction-pipeline-ocr-text-in-validated-json-out">16.3 Project: A Document Extraction Pipeline (OCR Text In, Validated JSON Out)</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>Chapter 15 covered three projects built around a model answering from documents, tools and a database. This chapter covers the other three: a search engine that mixes keyword and meaning-based ranking (Project 33), a small-model fine-tune with LoRA (Project 34), and a pipeline that turns messy scanned text into clean JSON (Project 35). The theme is the same: decide the numbers first, run a harness, and report failures honestly. The code is runnable Python with a mock model. The one exception is LoRA training itself, which needs a GPU and a model download, so that code is clearly labelled "not run here"; everything around it (data preparation, memory maths, evaluation design) was run. Use the repo layout, README template and testing checklist from section 15.1 for all three projects.</p>
+<p><strong>Words you need first</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Hybrid search</td><td>Combine keyword scores (BM25) and meaning scores (vectors)</td></tr><tr><td>RRF</td><td>Reciprocal Rank Fusion: merge rankings using only rank positions</td></tr><tr><td>Reranker</td><td>A slower, more careful scorer applied to a short candidate list</td></tr><tr><td>LoRA</td><td>Train two small matrices next to a frozen weight instead of changing the weight</td></tr><tr><td>Adapter</td><td>The small file of LoRA weights, loaded on top of the base model</td></tr><tr><td>OCR</td><td>Optical character recognition: turning a picture of text into text</td></tr><tr><td>Schema validation</td><td>Checking that output has the right fields, types and formats</td></tr></tbody></table></div>
+<h2 id="s1-16-1-project-a-hybrid-semantic-search-engine-with-recall-k">16.1 Project: A Hybrid Semantic Search Engine With Recall@k</h2>
+<p><strong>Goal and why employers care.</strong> Build a search engine over 12 short product and help documents that combines BM25 (keywords), vector similarity (meaning) and a reranker, then measure which combination finds the right document. Search is behind shop catalogs, help centres and RAG. Showing recall@k for four methods on queries that break each method is the exact evidence an interviewer wants.</p>
+<p><strong>Skills used.</strong> Chapter 1 (NLP Foundations): BM25. Chapter 2 (Embeddings and Semantic Search): vectors and cosine similarity. Chapter 6 (Vector Databases and Retrieval): hybrid search, RRF, rerankers. Chapter 8 (Evaluating LLM Systems): recall@k.</p>
+<p><strong>Data.</strong> Twelve one-line documents written by you: a kettle (model X200), a card reader error E-4021, an error E-4022 as a distractor, a kettle X300, the refund policy ("send the item within 30 days and we refund the original payment"), a backpack, boots, a lamp, a bottle, delivery times, password reset, gift cards. Eight queries with known relevant documents, chosen so that each method fails somewhere: exact codes ("E-4021", "X200"), and paraphrases that share no words with the document ("get reimbursed", "rucksack for a trek", "lantern for camping", "cannot log in, lost my passcode", "flask to keep tea hot or cold").</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Writing queries that are easy. If every method scores 8/8, you have learned nothing. Our first draft of the queries gave 8/8 for every method, so we rewrote them to include distractors (E-4022, X300) and real paraphrases.</div></div>
+<p><strong>Architecture.</strong></p>
+<pre class="code lang-text"><code>hybrid-search/
+  data/docs.json         12 documents
+  evals/queries.json     8 queries + relevant ids
+  src/bm25.py            keyword scores
+  src/embed.py           toy concept embedding (swap for a real model)
+  src/fuse.py            weighted min-max fusion and RRF
+  src/rerank.py          mock cross-scorer on the top candidates
+  evals/run_eval.py      recall@1, recall@3, per-query rank table</code></pre>
+<pre class="code lang-text"><code>query -&gt; BM25 scores ----\
+                          +-&gt; fuse (weighted or RRF) -&gt; top 5 -&gt; rerank -&gt; final order
+query -&gt; vector scores --/</code></pre>
+<p><strong>Step-by-step build.</strong></p>
+<ol><li><strong>BM25 scores</strong> as in Chapter 1 (k1 = 1.5, b = 0.75). It returns one score per document. A code like <code>E-4021</code> is kept whole because the tokeniser keeps hyphens: <code>re.findall(r"[a-z0-9\-]+", s.lower())</code>.</li><li><strong>A toy embedding.</strong> A real project uses a sentence-embedding model (not run here). To keep this runnable, each word maps to a concept ("refund", "reimbursed", "money", "back" are all the concept <code>money</code>), and a text becomes a vector of concept counts, scaled to length 1. Unknown words, such as codes, get no vector at all. That is a fair picture of how a real model handles codes: blurry.</li></ol>
+<pre class="code lang-python"><code>CONCEPTS = {"money": {"refund","reimbursed","money","back","payment","returns"},
+            "bag": {"backpack","rucksack","bag","pack"}, "hike": {"hiking","hike","trek","trail","boots"},
+            "light": {"lamp","lantern","light","tent","tents","camping","camp"}, ...}   # 9 concepts in all
+CIDS = sorted(CONCEPTS)
+def embed(text):
+    v = np.zeros(len(CIDS))
+    for w in tok(text):
+        for i, c in enumerate(CIDS):
+            if w in CONCEPTS[c]: v[i] += 1
+    n = np.linalg.norm(v); return v / n if n else v
+M = np.array([embed(t) for t in texts])
+def vector_scores(q): return M @ embed(q)          # cosine, because vectors have length 1</code></pre>
+<ol><li><strong>Two ways to fuse.</strong> Scores from BM25 and cosine live on different scales, so first rescale each to 0..1 (min-max), then mix. RRF ignores scores and uses ranks: each ranking gives a document <code>1 / (k + rank)</code>, with k = 60.</li></ol>
+<pre class="code lang-python"><code>def minmax(x): return (x - x.min()) / (x.max() - x.min()) if x.max() &gt; x.min() else np.zeros_like(x)
+def fuse_weighted(q, alpha=0.5): return alpha * minmax(bm.scores(q)) + (1 - alpha) * minmax(vector_scores(q))
+def fuse_rrf(q, k=60):
+    out = np.zeros(len(ids))
+    for sc in (bm.scores(q), vector_scores(q)):
+        for r, j in enumerate(rank(sc)): out[j] += 1 / (k + r + 1)
+    return out</code></pre>
+<ol><li><strong>Rerank the top 5.</strong> A real cross-encoder reads the query and each document together. The mock scores the share of query words (3 letters or more) that prefix-match a word in the document.</li><li><strong>Measure.</strong> For each query, find the rank of the first relevant document under each method, then compute recall@1 and recall@3. Real output:</li></ol>
+<pre class="code lang-text"><code>query                                  BM25   vector weighted      RRF   rerank
+E-4021                                    1        5        1        3        1
+X200                                      1        1        1        1        1
+get reimbursed                            1        1        1        1        1
+rucksack for a trek                       2        1        2        1        1
+when will my parcel arrive                1        1        1        1        1
+lantern for camping                       4        1        1        2        1
+cannot log in, lost my passcode           8        1        2        5        2
+flask to keep tea hot or cold             1        1        1        1        1
+recall@1: BM25=5/8, vector=7/8, weighted=6/8, RRF=5/8, rerank=7/8
+recall@3: BM25=6/8, vector=7/8, weighted=8/8, RRF=7/8, rerank=8/8</code></pre>
+<ol><li><strong>Read the table like a detective.</strong> The number in each cell is the rank of the right document (1 is best). BM25 puts the code <code>E-4021</code> first but pushes "cannot log in, lost my passcode" to rank 8 (no shared words). The vector method does the opposite: rank 1 for the paraphrase, rank 5 for the code. Weighted fusion is rank 1 or 2 on both. The reranker lifts recall@1 from 6/8 to 7/8 and keeps recall@3 at 8/8.</li></ol>
+<div class="callout cream"><div class="lab">KEY INSIGHT</div><div class="txt">The vector column shows rank 1 for <code>X200</code>. That is luck, not skill: the toy embedding has no vector for <code>X200</code>, so every document ties at zero, and the sort order happens to put the kettle first. Always check ties. A method that "wins" through ties will fail on the next query.</div></div>
+<p><strong>Evaluation and acceptance criteria.</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Metric</th><th>Target</th><th>Result</th></tr></thead><tbody><tr><td>recall@3 of hybrid (weighted)</td><td>beats both single methods</td><td>8/8 against 6/8 (BM25) and 7/8 (vector)</td></tr><tr><td>recall@1 after rerank</td><td>at least hybrid</td><td>7/8 against 6/8</td></tr><tr><td>Exact-code queries</td><td>rank 1</td><td>yes for BM25 and weighted</td></tr><tr><td>Paraphrase queries</td><td>in top 3</td><td>yes for weighted</td></tr></tbody></table></div>
+<p>Be honest in your README: 8 queries is far too few to claim "better", and RRF here scored below weighted. With 12 documents, RRF's advantage (no scale tuning) does not show. Use 50 or more queries and report which wins by how much.</p>
+<p><strong>Common pitfalls.</strong></p>
+<ol><li><strong>Ties in vector scores</strong> hide failures (above). Detect: print the scores, not only the ranks.</li><li><strong>Mixing raw scores</strong> without scaling lets BM25 (values like 5) swamp cosine (0 to 1). Detect: print both score ranges for a query.</li><li><strong>A tokeniser that breaks codes</strong> ("E-4021" into "e" and "4021") makes exact lookups fail. Detect: a test query that is only a code.</li><li><strong>Tuning alpha on the test queries.</strong> Detect: split queries into tune and test sets.</li><li><strong>Reranking too few candidates.</strong> If the right document is not in the top 5, no reranker can find it. Detect: report recall@5 of the first stage separately.</li></ol>
+<p><strong>Three extensions.</strong></p>
+<ol><li>Replace the toy embedding with a real embedding model and compare (not run here; use the library's quick start).</li><li>Add metadata filters (price, category) before ranking.</li><li>Add MRR (mean reciprocal rank) and a latency budget per stage, measured neutrally with a timer.</li></ol>
+<p><strong>Interview talking points.</strong></p>
+<ul><li><em>Why hybrid?</em> "Keywords are exact but blind to meaning; vectors understand meaning but blur codes and names. Mixing them covers both kinds of queries."</li><li><em>Why RRF instead of adding scores?</em> "Scores from different systems are not on the same scale. RRF uses only ranks, so there is nothing to calibrate."</li><li><em>Where does the reranker go?</em> "After the cheap first stage. It reads the query with each of the top 20 to 50 candidates, which is accurate but too slow for the whole corpus."</li></ul>
+<p><strong>README outline.</strong> Problem; the 8-query table above; why each method fails somewhere; the tie lesson; fusion formulas; limits (toy embedding, tiny corpus); next steps.</p>
+<h2 id="s2-16-2-project-fine-tune-a-small-model-with-lora-on-a-narrow-task">16.2 Project: Fine-Tune a Small Model With LoRA on a Narrow Task</h2>
+<p><strong>Goal and why employers care.</strong> Prepare data, plan memory, and design the evaluation for fine-tuning a small open model with LoRA to label support tickets (delivery, refund, product_defect, account). The training run itself needs a GPU, so it is "not run here". Most of the value, and most of the failures, are in the parts around training: bad data, leakage, and a weak evaluation. Employers want people who know when fine-tuning is the right tool and can budget its cost.</p>
+<p><strong>Skills used.</strong> Chapter 10 (Fine-Tuning LLMs): LoRA and QLoRA, data formats. Chapter 8 (Evaluating LLM Systems): test sets and confidence. Chapter 3 (How LLMs Work): parameters and memory. Chapter 4 (Prompt and Context Engineering): try a good prompt first.</p>
+<div class="callout blue"><div class="lab">WHY IT MATTERS</div><div class="txt">Fine-tuning is the last step, not the first. If a clear prompt with a few examples already reaches your target, fine-tuning adds cost for no gain. Fine-tune for a narrow, repeated task with stable labels and at least a few hundred good examples.</div></div>
+<p><strong>Data.</strong> A generator writes 200 tickets (50 per label) from 12 templates with random numbers filled in. Real data would be your own tickets with personal details removed. Run it and look at the results first.</p>
+<pre class="code lang-python"><code>def to_chat(r):
+    return {"messages": [
+        {"role": "system", "content": "Classify the ticket. Reply with exactly one of: " + ", ".join(LABELS)},
+        {"role": "user", "content": r["text"]}, {"role": "assistant", "content": r["label"]}]}</code></pre>
+<p><strong>Architecture.</strong></p>
+<pre class="code lang-text"><code>lora-tickets/
+  data/make_tickets.py     seeded generator (or your cleaned real tickets)
+  data/train.jsonl  val.jsonl  test.jsonl
+  src/prep.py              chat format, dedupe, leakage check, split
+  src/memory_math.py       budget calculator
+  src/train_lora.py        training script (NOT RUN HERE)
+  evals/run_eval.py        accuracy, per-label recall, confusion counts, baseline vs tuned</code></pre>
+<p><strong>Step-by-step build.</strong></p>
+<ol><li><strong>Generate and split.</strong> 140 train, 30 validation, 30 test. Real output:</li></ol>
+<pre class="code lang-text"><code>200 Counter({'account': 50, 'delivery': 50, 'refund': 50, 'product_defect': 50})
+sizes 140 30 30
+exact text overlap train/test: 9
+unique templates-with-numbers-masked: 12 dropped 188</code></pre>
+<ol><li><strong>Read the warning in that output.</strong> Nine test texts also appear exactly in the training set. After masking the digits, only 12 distinct sentences exist across all 200 rows. A model that has memorised 12 sentences would score about 100 percent on this test, and the number would mean nothing. This is leakage. The cure with real data is to deduplicate before splitting, and to split by customer or by date. With generated data, write many more paraphrases, or admit in the README that the data is too narrow for a real score.</li></ol>
+<pre class="code lang-python"><code>def dedupe(rows):
+    seen, uniq = set(), []
+    for r in rows:
+        key = "".join(c for c in r["text"] if not c.isdigit())   # ignore the numbers
+        if key not in seen: seen.add(key); uniq.append(r)
+    return uniq, len(rows) - len(uniq)</code></pre>
+<ol><li><strong>Do the memory maths before renting a GPU.</strong> For a 7-billion-parameter model (P = 7 × 10⁹):</li></ol>
+<pre class="code lang-text"><code>fp16 weights GB: 14.0 | 4-bit weights GB: 3.5
+full fine-tune (fp16 w + fp16 g + fp32 Adam m,v + fp32 master) bytes/param = 16 -&gt; GB 112.0
+one 4096x4096 matrix: 16777216 params; LoRA r=8 adds 65536 (0.39%)
+q,v adapters across 32 layers: 4194304 = 0.060% of 7B; adapter file ~8 MB (fp16)
+optimizer state for adapters only (fp32 m+v+w): 50 MB</code></pre>
+<ul><li><strong>Worked reading.</strong> Weights at 2 bytes each: 7 × 10⁹ × 2 = 14 GB. At 4 bits (0.5 byte): 3.5 GB. Full fine-tuning keeps weights (2), gradients (2), a master copy (4) and Adam's two moments (4 + 4): 16 bytes per parameter, so 112 GB, before activations. LoRA freezes the base, so only the adapters carry gradients and optimiser state: a matrix W of size 4096 × 4096 gets two thin matrices, A (r × 4096) and B (4096 × r). With r = 8 that is 8 × (4096 + 4096) = 65,536 numbers, 0.39 percent of the 16.8 million in W. For the query and value matrices in 32 layers: 65,536 × 2 × 32 = 4,194,304 parameters, 0.06 percent of the model. The adapter file is about 8 MB. This is why LoRA fits on one modest GPU, and why QLoRA (4-bit base plus LoRA) fits on even less.</li><li><strong>Check.</strong> The formula is <code>r × (d_in + d_out)</code>; for r = 16 the same matrix needs 16 × 8192 = 131,072.</li></ul>
+<ol><li><strong>The training script, not run here.</strong> Standard shape using the Hugging Face <code>transformers</code>, <code>peft</code> and <code>trl</code> libraries (names and arguments change between versions, so follow the current quick start):</li></ol>
+<pre class="code lang-python"><code># NOT RUN HERE: needs a GPU, a model download and installed libraries.
+from peft import LoraConfig, get_peft_model
+cfg = LoraConfig(r=8, lora_alpha=16, lora_dropout=0.05,
+                 target_modules=["q_proj", "v_proj"], task_type="CAUSAL_LM")
+model = get_peft_model(base_model, cfg)      # base_model loaded from a small open model
+model.print_trainable_parameters()           # should show well under 1 percent
+# then: a trainer on train.jsonl, watch validation loss, save only the adapter</code></pre>
+<ol><li><strong>Design the evaluation before training.</strong> Report these, on a test set the model never saw: accuracy; recall per label (a model can score 80 percent by always guessing the biggest class); a confusion table; and the <strong>baseline</strong> (the same task with a good prompt and no tuning, plus a majority-class guess). With pretend predictions we computed:</li></ol>
+<pre class="code lang-text"><code>baseline accuracy 0.8 n = 30
+tuned accuracy 0.967 n = 30</code></pre>
+<ol><li><strong>Do not over-read it.</strong> With n = 30, each question is worth 3.3 points. A 95 percent range for 29/30 is about 0.967 ± 0.064 (0.90 to 1.00) and for 24/30 it is 0.80 ± 0.143 (0.66 to 0.94). The ranges overlap. To claim "tuning helps", you need a larger test set (200 or more) or a paired test on the same questions. These two accuracies came from invented predictions, to show the harness; they are not a real model result.</li></ol>
+<p><strong>Evaluation and acceptance criteria.</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Criterion</th><th>Target</th></tr></thead><tbody><tr><td>Train/test exact overlap</td><td>0 after dedupe</td></tr><tr><td>Memory plan</td><td>written, with GPU size and adapter size</td></tr><tr><td>Test set</td><td>at least 200 rows, 30 percent hidden until the end</td></tr><tr><td>Tuned beats the prompt-only baseline</td><td>by more than the 95 percent range</td></tr><tr><td>Per-label recall</td><td>no label below 0.7</td></tr></tbody></table></div>
+<p><strong>Common pitfalls.</strong></p>
+<ol><li><strong>Leakage</strong> (9 of 30 test rows seen in training). Detect: an exact-match and a near-duplicate check between splits.</li><li><strong>Templated data</strong> teaches memorisation. Detect: count distinct sentences after masking numbers.</li><li><strong>No baseline.</strong> A tuned 0.97 means little if a prompt gets 0.95. Detect: always run the prompt-only model first.</li><li><strong>Forgetting other skills</strong> after tuning. Detect: a small general check (a few ordinary questions) before and after.</li><li><strong>Wrong format at inference</strong> (different system prompt than in training). Detect: build both from one function, <code>to_chat</code>.</li></ol>
+<p><strong>Three extensions.</strong></p>
+<ol><li>Compare r = 4, 8 and 16 and plot accuracy against adapter size (not run here).</li><li>Try QLoRA to cut memory further (not run here).</li><li>Add a refusal label ("other") and test on out-of-scope tickets.</li></ol>
+<p><strong>Interview talking points.</strong></p>
+<ul><li><em>When would you fine-tune rather than prompt?</em> "When the task is narrow and repeated, I have hundreds of good labelled examples, prompting plateaus below my target, or I need lower cost and delay per call. Otherwise I improve the prompt or retrieval first."</li><li><em>Explain LoRA simply.</em> "Instead of changing a huge weight matrix, I freeze it and learn two thin matrices whose product is the change. They have about half a percent of the parameters, so training needs far less memory, and I can swap adapters for different tasks."</li><li><em>How do you know it worked?</em> "A hidden test set with no overlap, per-label recall, a prompt-only baseline, and a range around the score, because 30 test rows can swing by 6 points."</li></ul>
+<p><strong>README outline.</strong> Problem and why not just prompt; data (generated, with the leakage finding); memory table; evaluation design with the baseline; "not run here" label on training; limits.</p>
+<h2 id="s3-16-3-project-a-document-extraction-pipeline-ocr-text-in-validated-json-out">16.3 Project: A Document Extraction Pipeline (OCR Text In, Validated JSON Out)</h2>
+<p><strong>Goal and why employers care.</strong> Take OCR text from shop invoices, get a model to return JSON with four fields (vendor, invoice number, date, total), validate it against a schema, repair known problems with code, and measure field-level accuracy. Companies have mountains of invoices, forms and letters. The skill that earns trust is validation and measurement, not a clever prompt.</p>
+<p><strong>Skills used.</strong> Chapter 12 (Multimodal, Document AI and Text-to-SQL): OCR and extraction. Chapter 5 (LLM APIs and Reliability): structured output and retries. Chapter 9 (Guardrails, Safety and Responsible AI): validation before use. Chapter 8 (Evaluating LLM Systems): field accuracy.</p>
+<p><strong>Data.</strong> A seeded generator makes 12 invoices as OCR-style text and a gold JSON for each. It adds typical OCR noise: capital I read as lowercase l ("lnvoice No"), a different label ("Amount Due" instead of "Total"), and every sixth document with zero read as the letter O.</p>
+<pre class="code lang-python"><code>text = f"{shop}\nInvoice No: {inv}\nDate: {day:02d}/10/2026\nTotal: ${amt:,.2f}"
+gold = {"vendor": shop, "invoice_no": inv, "date": f"2026-10-{day:02d}", "total": amt}
+if i % 3 == 1: text = text.replace("Invoice No", "lnvoice No")   # OCR reads capital I as lowercase l
+if i % 3 == 2: text = text.replace("Total", "Amount Due")        # different label wording
+if i % 6 == 5: text = text.replace("0", "O")                     # OCR reads zero as letter O</code></pre>
+<p><strong>Architecture.</strong></p>
+<pre class="code lang-text"><code>doc-extract/
+  data/make_invoices.py    text + gold JSON
+  src/mock_model.py        returns JSON text, with chatter, sometimes wrong types
+  src/parse.py             find the JSON inside the reply
+  src/validate.py          schema, types, formats
+  src/repair.py            deterministic fixes
+  evals/run_eval.py        schema-valid rate, per-field accuracy</code></pre>
+<pre class="code lang-text"><code>OCR text -&gt; model -&gt; raw reply -&gt; parse JSON -&gt; validate -&gt; (repair -&gt; validate) -&gt; accept / send to human</code></pre>
+<p><strong>Step-by-step build.</strong></p>
+<ol><li><strong>The mock model</strong> uses regular expressions that allow <code>I</code>, <code>i</code>, <code>1</code> or <code>l</code> at the start of "nvoice", reads either label, and (on purpose) returns the total as a string, a typical model slip. It also wraps the JSON in a polite sentence.</li><li><strong>Parse robustly.</strong> Take the first <code>{</code> to the last <code>}</code> of the reply, then <code>json.loads</code>. If none is found, raise an error and log it.</li><li><strong>Validate</strong> with explicit rules: required fields, types, and formats.</li></ol>
+<pre class="code lang-python"><code>SCHEMA = {"vendor": str, "invoice_no": str, "date": str, "total": float}
+def validate(obj):
+    errs = []
+    for k, t in SCHEMA.items():
+        if k not in obj or obj[k] is None: errs.append(f"{k}: missing")
+        elif not isinstance(obj[k], t): errs.append(f"{k}: expected {t.__name__}, got {type(obj[k]).__name__}")
+    if not errs and not re.fullmatch(r"INV-\d{4}", obj["invoice_no"]): errs.append("invoice_no: bad format")
+    if not errs and not re.fullmatch(r"\d{4}-\d\d-\d\d", obj["date"]): errs.append("date: bad format")
+    return errs</code></pre>
+<ol><li><strong>Repair deterministically</strong> before asking the model again: if <code>total</code> is a string, remove commas and convert it. Cheaper and safer than a second model call.</li></ol>
+<pre class="code lang-python"><code>def repair(obj):
+    if isinstance(obj.get("total"), str): obj["total"] = float(obj["total"].replace(",", ""))
+    return obj</code></pre>
+<ol><li><strong>Run without repair on one document</strong>, then the whole set with repair. Real output:</li></ol>
+<pre class="code lang-text"><code>Green Mart | lnvoice No: INV-8402 | Date: 17/10/2026 | Total: $772.44
+({'vendor': 'City Books', 'invoice_no': 'INV-8411', 'date': '2026-10-28', 'total': '512.60'}, ['total: expected float, got str'])
+  invalid: ['date: missing'] | City Books | Invoice No: INV-1686 | Date: 2O/1O/2O26 | Amount Due: $884.33
+  invalid: ['date: missing'] | Green Mart | Invoice No: INV-5557 | Date: 14/1O/2O26 | Amount Due: $897.94
+schema-valid: 10/12
+{'vendor': '12/12', 'invoice_no': '12/12', 'date': '10/12', 'total': '12/12'}
+field accuracy: 0.958</code></pre>
+<ol><li><strong>Read it.</strong> Without repair, the validator catches the string total (the second line). With repair, 10 of 12 documents are valid. The two failures are documents where OCR turned the zeros in the date into the letter O, so the date pattern does not match and the field is missing. Field accuracy: 4 fields × 12 documents = 48 values; 46 are right, 46 / 48 = 0.958. Notice that both failures were caught by validation (<code>date: missing</code>), not silently accepted. These go to a human review queue. A simple fix is a pre-cleaning step that turns O into 0 inside digit-and-slash patterns, and you then re-run the same eval to confirm it.</li></ol>
+<div class="callout cream"><div class="lab">KEY INSIGHT</div><div class="txt">A pipeline is judged by two numbers: how many outputs are right, and how many wrong outputs get caught. A system that is 96 percent right and flags the other 4 percent is useful. One that is 96 percent right and silent about the rest is dangerous.</div></div>
+<p><strong>Evaluation and acceptance criteria.</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Metric</th><th>Target</th><th>Result</th></tr></thead><tbody><tr><td>Schema-valid rate</td><td>at least 90 percent</td><td>10/12 = 83 percent (fails target; fix and re-run)</td></tr><tr><td>Field accuracy</td><td>at least 95 percent</td><td>46/48 = 95.8 percent</td></tr><tr><td>Wrong values that pass validation</td><td>0</td><td>0 in this set</td></tr><tr><td>Failures routed to review</td><td>100 percent</td><td>2/2</td></tr></tbody></table></div>
+<p>A real eval needs 100 or more documents with a mix of layouts, plus hand-checked gold values.</p>
+<p><strong>Common pitfalls.</strong></p>
+<ol><li><strong>Counting only schema validity.</strong> A valid JSON can hold a wrong total. Detect: compare against gold values, not only formats.</li><li><strong>OCR errors</strong> (O versus 0, l versus 1). Detect: a table of the confusions in failing documents; add targeted cleaning.</li><li><strong>Model chatter</strong> around the JSON. Detect: a test with extra words before and after.</li><li><strong>Currency and date formats</strong> (10/11 means different things in different countries). Detect: say the expected format in the prompt and validate it.</li><li><strong>Silent defaults</strong>, such as filling a missing total with 0. Detect: a validator that treats null as an error.</li></ol>
+<p><strong>Three extensions.</strong></p>
+<ol><li>Add line items (a list of objects) and validate that the sum of line totals equals the invoice total.</li><li>Add confidence per field and a human-review threshold.</li><li>Run a real OCR engine over scanned images (not run here) and compare error types with the simulated ones.</li></ol>
+<p><strong>Interview talking points.</strong></p>
+<ul><li><em>How do you make LLM output reliable?</em> "I ask for JSON against a schema, parse defensively, validate types and formats, repair known slips with code, retry at most once, and route failures to a human."</li><li><em>How do you measure accuracy?</em> "Field by field against hand-checked gold values, plus the share of documents fully correct. I also measure how many errors the validator catches."</li><li><em>What is the biggest risk?</em> "Confident wrong values that pass validation, such as a swapped date. Cross-checks help, for example line items summing to the total."</li></ul>
+<p><strong>README outline.</strong> Problem; pipeline diagram; the noise types; results (schema-valid, field accuracy, caught failures); the O versus 0 story; limits (simulated OCR, 12 documents, mock model).</p>
+<h2 id="s4-chapter-recap">Chapter recap</h2>
+<ul><li>Hybrid search covers both exact lookups (BM25) and paraphrases (vectors); weighted fusion beat both alone on recall@3 in our small test (8/8 against 6/8 and 7/8).</li><li>Always rescale scores before mixing them, or use RRF, which uses ranks only.</li><li>Ties in scores can fake a win; print the scores, not only ranks.</li><li>LoRA trains two thin matrices per target weight: r × (d_in + d_out) parameters, here 0.06 percent of a 7B model.</li><li>Do the memory maths first: 14 GB for fp16 weights, 112 GB for full fine-tuning with Adam at 16 bytes per parameter.</li><li>Leakage and templated data make a fine-tuning test meaningless; check overlap before you train.</li><li>A small test set gives wide ranges: 29/30 is 0.967 ± 0.064.</li><li>Extraction pipelines need parse, validate, repair and a human queue, and are judged on accuracy and on how many errors they catch.</li><li>Be honest in every README about what is simulated, what was not run, and where it fails.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Formula or command</th></tr></thead><tbody><tr><td>RRF</td><td>score = Σ 1 / (60 + rank) over each ranking</td></tr><tr><td>Min-max</td><td>(x − min) / (max − min)</td></tr><tr><td>LoRA params per matrix</td><td>r × (d_in + d_out)</td></tr><tr><td>Weight memory</td><td>parameters × bytes per parameter</td></tr><tr><td>Adam full fine-tune, mixed precision</td><td>about 16 bytes per parameter</td></tr><tr><td>Range for accuracy p on n</td><td>p ± 1.96 × √(p(1 − p) / n)</td></tr><tr><td>Field accuracy</td><td>correct values / (documents × fields)</td></tr></tbody></table></div>
+<h2 id="s5-practice-set">Practice set</h2>
+<p><strong>Task 1 (easy).</strong> A document is rank 1 in both BM25 and vector rankings. What is its RRF score with k = 60? <strong>Answer:</strong> 1/61 + 1/61 = 2/61 = 0.0328.</p>
+<p><strong>Task 2.</strong> Document A is rank 1 in BM25 and rank 3 in vectors. Document B is rank 2 in both. Which has the higher RRF score (k = 60)? <strong>Answer:</strong> A: 1/61 + 1/63 = 0.016393 + 0.015873 = 0.032266. B: 2/62 = 0.032258. A is higher, by a very small margin.</p>
+<p><strong>Task 3.</strong> How many parameters does LoRA add to a 2048 × 2048 matrix with r = 4? <strong>Answer:</strong> r × (d_in + d_out) = 4 × 4096 = 16,384, which is 0.39 percent of 4,194,304.</p>
+<p><strong>Task 4.</strong> How much memory do the weights of a 13-billion-parameter model need in 16-bit, and in 4-bit? <strong>Answer:</strong> 13 × 10⁹ × 2 bytes = 26 GB; 13 × 10⁹ × 0.5 bytes = 6.5 GB (weights only; training and activations need more).</p>
+<p><strong>Task 5.</strong> A tuned model gets 58 of 60 test rows right. What is accuracy and the 95 percent range? <strong>Answer:</strong> p = 58/60 = 0.967. 1.96 × √(0.967 × 0.033 / 60) = 1.96 × 0.0231 = 0.045. Range 0.92 to 1.01, so say "about 92 to 100 percent".</p>
+<p><strong>Task 6 (what is the output?).</strong> In the extraction run, 12 invoices, 4 fields, 2 invoices have a missing date. What is field accuracy? <strong>Answer:</strong> 46/48 = 0.958.</p>
+<p><strong>Task 7 (interview).</strong> Your fine-tuned classifier scores 98 percent on the test set. A teammate asks if you checked for leakage. What do you check? <strong>Answer:</strong> Exact and near-duplicate text between train and test; the same customers, orders or dates on both sides; and whether the test rows came from the same templates. Then re-split by customer or date and re-score. If the score falls a lot, the first number came from memorising.</p>
+<p><strong>Task 8 (scenario, interview).</strong> Your search returns the wrong kettle (X300) when users type "X200". Which stage is most likely at fault, and what do you do? <strong>Answer:</strong> The vector side blurs codes; if only vectors or a tokeniser that splits "X200" are used, similar models look alike. Check BM25 gets the exact token, ensure the tokeniser keeps codes whole, raise the keyword weight (or add an exact-match boost), and add code queries to the eval set.</p>
+<h2 id="s6-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles; I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is planning a hybrid search portfolio project (BM25, vector scores, fusion, reranking, recall@k). Help me design 30 test queries that deliberately break each method (exact codes, paraphrases, typos, ties), choose acceptance criteria, and write a repo layout. Ask one question at a time and check my answers. End with a one-page plan I can paste into a README.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles; I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is reviewing the evaluation of my hybrid search engine. I will paste my queries, scores and recall@k table below. Check for easy queries, ties, scale mismatch between BM25 and cosine, tuning on the test queries, and too few queries for a fair claim. Explain each problem simply, show how to fix it, and give me one follow-up exercise. [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles; I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is planning a LoRA fine-tuning project on a narrow classification task. Walk me through deciding whether to fine-tune at all, preparing data, checking leakage, doing the memory maths for a model size I choose, and designing the evaluation with a baseline and confidence ranges. Quiz me one question at a time and correct my mistakes. Mark clearly anything that needs a GPU.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles; I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is debugging a document extraction pipeline (OCR text to validated JSON). I will paste three failing documents, the model replies and the validator output below. For each, tell me whether the fault is OCR noise, a prompt problem, a parsing problem, a schema problem or a wrong value that passed validation. Suggest a fix and a test for each, and tell me which fixes should be code and which should be a human review.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles; I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is presenting three GenAI projects (hybrid search, LoRA fine-tuning, document extraction) honestly in interviews and blog posts. Run a mock interview: one question at a time about design choices, numbers, leakage, failures and limits. After each answer give feedback in simple English and a model answer. At the end, help me write a README results section that states clearly what was simulated and what was not run.</pre></div><div class="readbtn"><button class="btn" data-read="study:genai:ch16">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch15.html">← Chapter 15: Project Lab 1: RAG Assistant, Reporting </a><a class="btn" href="appendix.html">Appendix: Cheat Sheet →</a></div></div><script src="../../assets/study.js"></script></body></html>

@@ -1,0 +1,176 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 5: Using LLM APIs Safely and Reliably</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">NLP, LLMs, RAG &amp; Agents</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 5</div><h1>Using LLM APIs Safely and Reliably</h1><p>A provider-agnostic pattern for calling models: messages, retries, streaming, token and cost math, caching, and keeping secrets secret.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-5-1-the-generic-request-pattern">5.1 The Generic Request Pattern</a></li><li><a href="#s2-5-2-retries-timeouts-backoff-and-streaming">5.2 Retries, Timeouts, Backoff and Streaming</a></li><li><a href="#s3-5-3-token-and-cost-math-concurrency-and-rate-limits">5.3 Token and Cost Math, Concurrency and Rate Limits</a></li><li><a href="#s4-5-4-caching-and-secrets-handling">5.4 Caching and Secrets Handling</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>Calling a model API looks like the easiest thing in the world: send text, get text. Then production arrives. The provider returns "429 too many requests" at peak hour, one slow call hangs your web page, your monthly bill is ten times what you guessed, and someone commits an API key to GitHub. This is an old story: it is the same story as any busy shop or bank counter serving more customers than it can handle at peak hour. By the end of this chapter you will wrap a model call with timeouts, retries and backoff, stream responses, compute cost from tokens, cache repeated work, and handle secrets correctly. You cannot call a paid API in this document, so we use a fake client that behaves like a real one, including failing on purpose. Every output below is real.</p>
+<p>Important: <strong>we never state prices, model names or limits as facts here</strong>, because they change. Always check your provider's current documentation and pricing page. Our price numbers are made up round numbers for arithmetic practice.</p>
+<p><strong>Words you need first</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>API</td><td>A way for your code to call someone else's service over the network</td></tr><tr><td>SDK</td><td>A provider's ready-made library for calling its API</td></tr><tr><td>Rate limit</td><td>A cap on requests or tokens per minute; exceed it and you get an error (often HTTP 429)</td></tr><tr><td>Timeout</td><td>The longest you will wait before giving up</td></tr><tr><td>Backoff</td><td>Waiting longer after each failed try</td></tr><tr><td>Idempotent</td><td>Safe to repeat; repeating gives the same result</td></tr><tr><td>TTFT</td><td>Time to first token: how long until the first word appears</td></tr></tbody></table></div>
+<h2 id="s1-5-1-the-generic-request-pattern">5.1 The Generic Request Pattern</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">An LLM API is a very slow, very expensive, occasionally unreliable remote function. You would never call such a function without a timeout and a retry policy, and you would not hard-code the password inside it. The same discipline applies.</div></div>
+<p><strong>What every provider's chat API has in common</strong> (names differ, so read the docs):</p>
+<ul><li>A <strong>model</strong> name.</li><li>A list of <strong>messages</strong>, each with a <strong>role</strong> (system, user, assistant, sometimes tool) and <strong>content</strong>.</li><li><strong>Parameters</strong>: maximum output tokens, temperature, sometimes top-p, stop sequences, and options for tools and structured output.</li><li>A <strong>response</strong> with the generated text (or tool-call request), a <strong>stop reason</strong> (finished, hit max tokens, wanted a tool), and <strong>usage</strong> (input tokens and output tokens).</li></ul>
+<p>Provider-specific code (shown only as a shape; <strong>not run here</strong>, since it needs a key and network):</p>
+<pre class="code lang-python"><code># not run here: shape only. The real function and field names differ per provider.
+client = SomeProviderClient(api_key=os.environ["MY_LLM_API_KEY"], timeout=30)
+resp = client.chat(
+    model="MODEL_NAME_FROM_DOCS",
+    messages=[{"role": "system", "content": "You are a triage bot."},
+              {"role": "user",   "content": "Summarise: ..."}],
+    max_tokens=300, temperature=0)
+text  = resp.text
+usage = resp.usage      # input_tokens, output_tokens</code></pre>
+<p><strong>Stateless means you resend history.</strong> The API remembers nothing between calls. To continue a conversation you send the earlier messages again, which is why long chats get more expensive each turn.</p>
+<p class="problem"><span class="pl">Problem 5.1.1</span> A chat has 10 turns. Each user message is 50 tokens and each assistant reply is 150 tokens. The system prompt is 200 tokens. How many input tokens does the 10th call send, and how many input tokens in total were sent across all 10 calls?</p>
+<table class="steps"><tr><th>Formula</th><td>input at call k = system + (k−1) × (user + reply) + current user message</td></tr><tr><th>Plug in</th><td>system 200; each earlier pair 200 tokens; current user 50</td></tr><tr><th>Compute</th><td>call 10: 200 + 9 × 200 + 50 = 2,050. Call k: 250 + 200(k−1). Sum for k = 1..10 = 10 × 250 + 200 × (0 + 1 + ... + 9) = 2,500 + 200 × 45 = 11,500.</td></tr><tr><th>Answer</th><td>The 10th call sends 2,050 input tokens, and all 10 calls together send 11,500 input tokens.</td></tr><tr><th>Check</th><td>Total of the 10 calls: average of first (250) and last (2,050) = 1,150; × 10 = 11,500. Matches.</td></tr><tr><th>Why it matters</th><td>Input cost grows with the square of conversation length (roughly), so trimming or summarising history saves a lot.</td></tr></table>
+<p class="problem"><span class="pl">Problem 5.1.2</span> The response arrives with stop reason "max tokens". What does it mean and what do you do?</p>
+<table class="steps"><tr><th>Step 1</th><td>The model was cut off at your <code>max_tokens</code> limit, so the answer is incomplete (a JSON answer could be broken).</td></tr><tr><th>Step 2</th><td>Increase the limit if the task needs it, or shorten the requested output; treat a cut-off answer as a failure for structured output.</td></tr><tr><th>Answer</th><td>The output is truncated; never parse it as final without checking the stop reason.</td></tr><tr><th>Check</th><td>Log the stop reason on every call and alert if the share of "max tokens" endings rises.</td></tr></table>
+<p><strong>Real-world mapping</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>API element</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>messages</code> list</td><td>system + user + history</td><td>Every chat feature</td></tr><tr><td><code>usage</code></td><td>1,200 in, 300 out</td><td>Cost tracking per request</td></tr><tr><td>Stop reason</td><td>"max tokens"</td><td>Detecting truncated answers</td></tr><tr><td>Timeout</td><td>30 s</td><td>Keeping web pages responsive</td></tr></tbody></table></div>
+<p><strong>Applications</strong></p>
+<ul><li><em>GenAI engineering:</em> every LLM feature.</li><li><em>Data Engineering:</em> batch enrichment jobs that call a model per row.</li><li><em>MLOps:</em> gateways that standardise calls across providers.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Sending the entire chat history forever. Trim or summarise, otherwise cost and latency grow every turn, and eventually you exceed the context window.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Is a chat API stateful?</li></ol>
+<p>Answer: No; you resend the history each time.</p>
+<ol><li>What does a "max tokens" stop reason indicate?</li></ol>
+<p>Answer: The output was truncated at your limit.</p>
+<ol><li>Which part of the response do you log for cost tracking?</li></ol>
+<p>Answer: The usage (input and output tokens).</p>
+<h2 id="s2-5-2-retries-timeouts-backoff-and-streaming">5.2 Retries, Timeouts, Backoff and Streaming</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">If a shop is crowded and you get turned away, you do not stand at the door shouting every millisecond. You wait a moment, try again, then wait longer. If everyone retries instantly, the crowd gets worse: that is a <em>retry storm</em>. Add randomness (<em>jitter</em>) so all clients do not return at the same instant. Think of a bank opening its doors: if everyone arrives at 9:00 sharp the queue explodes, while staggered arrivals keep it short.</div></div>
+<p><strong>Rules.</strong></p>
+<ul><li><strong>Retry only transient errors:</strong> rate limits (429), server errors (5xx), timeouts, dropped connections. <strong>Never retry</strong> bad requests (400), authentication errors (401, 403) or "context too long": they will fail again.</li><li><strong>Exponential backoff with jitter:</strong> wait <code>min(base × 2^attempt, cap) × random(0.5 to 1)</code>.</li><li><strong>Set timeouts</strong> on connection and on the whole call. Without a timeout, one hung call can block a worker forever.</li><li><strong>Honour Retry-After headers</strong> when the provider sends them.</li><li><strong>Make retries safe:</strong> a model call is usually safe to repeat (idempotent in effect), but a tool that sends an email or charges a card is not; protect those with idempotency keys (Chapter 11).</li><li><strong>Set a total retry budget</strong> (for example 4 retries) and then fail clearly.</li></ul>
+<p><strong>Predict, run, explain.</strong> The fake client fails twice with a 429 for each new prompt, then succeeds. Before running: how many attempts are needed for the first prompt?</p>
+<pre class="code lang-python"><code>import time, random, hashlib, os
+class TransientError(Exception): pass
+class FakeLLM:
+    """Pretends to be a provider SDK. Fails the first 2 calls of each prompt."""
+    def __init__(self): self.calls={}
+    def complete(self, prompt, max_tokens=50):
+        n=self.calls.get(prompt,0)+1; self.calls[prompt]=n
+        if n&lt;=2: raise TransientError("429 rate limited")
+        return {"text":"OK: "+prompt[:20],
+                "usage":{"input_tokens":len(prompt.split())*13//10,"output_tokens":12}}
+    def stream(self, prompt):
+        for w in ("The","answer","is","42."): yield w
+def call_with_retry(fn, *a, retries=4, base=0.01, sleep=time.sleep, **kw):
+    for attempt in range(retries+1):
+        try: return fn(*a, **kw)
+        except TransientError as e:
+            if attempt==retries: raise
+            delay=min(base*2**attempt,1.0)*random.uniform(0.5,1.0)
+            print(f"  attempt {attempt+1} failed ({e}); wait {delay*1000:.1f} ms"); sleep(delay)
+random.seed(1)
+llm=FakeLLM()
+r=call_with_retry(llm.complete,"Summarise the weekly sales report for the shop")
+print(r)</code></pre>
+<pre class="code lang-text"><code>  attempt 1 failed (429 rate limited); wait 5.7 ms
+  attempt 2 failed (429 rate limited); wait 18.5 ms
+{'text': 'OK: Summarise the load t', 'usage': {'input_tokens': 9, 'output_tokens': 12}}</code></pre>
+<p>Line by line. The <code>for attempt in range(retries+1)</code> loop tries once and then up to 4 more times. On a <code>TransientError</code> it computes the delay: <code>base × 2^attempt</code> is 0.01 s then 0.02 s, multiplied by a random factor between 0.5 and 1, so 5.7 ms (0.01 × 0.57) and 18.5 ms (0.02 × 0.93). The third attempt succeeds. We used tiny delays so the demo runs fast; real values start at about 0.5 to 1 second. The wrong version, a bare <code>while True: try/except: pass</code> with no sleep, hammers the provider and gets you blocked.</p>
+<p class="problem"><span class="pl">Problem 5.2.1</span> Backoff schedule with base 1 s, doubling, cap 30 s, no jitter. What are the waits for attempts 1 to 7, and the total?</p>
+<table class="steps"><tr><th>Formula</th><td>wait = min(1 × 2^(attempt−1), 30)</td></tr><tr><th>Compute</th><td>1, 2, 4, 8, 16, 32 → capped to 30, 30</td></tr><tr><th>Answer</th><td>1, 2, 4, 8, 16, 30, 30 seconds. Total = 1 + 2 + 4 + 8 + 16 + 30 + 30 = 91 seconds.</td></tr><tr><th>Check</th><td>Without the cap, attempt 6 would wait 32 s and attempt 7 would wait 64 s (total 127 s), so the cap saves 36 s.</td></tr><tr><th>Why it matters</th><td>Decide your retry budget in seconds, because the user is waiting.</td></tr></table>
+<p><strong>Streaming.</strong> Instead of waiting for the full answer, the API sends tokens as they are generated. TTFT is what the user feels. Streaming improves <em>perceived</em> latency, not total time. The fake client's <code>stream</code> yields words one by one:</p>
+<pre class="code lang-python"><code>print("".join(w+" " for w in llm.stream("x")))</code></pre>
+<pre class="code lang-text"><code>The answer is 42. </code></pre>
+<p class="problem"><span class="pl">Problem 5.2.2</span> TTFT is 0.8 s and the model generates 50 tokens per second. The answer is 300 tokens. What are the total time and the time the user waits before they start reading, with and without streaming?</p>
+<table class="steps"><tr><th>Formula</th><td>total = TTFT + tokens / rate</td></tr><tr><th>Plug in</th><td>0.8 + 300 / 50</td></tr><tr><th>Compute</th><td>300 / 50 = 6 s; total = 6.8 s</td></tr><tr><th>Answer</th><td>Total time is 6.8 s either way. Without streaming the user stares at a blank screen for 6.8 s; with streaming they start reading after 0.8 s.</td></tr><tr><th>Check</th><td>0.8 + 6 = 6.8 s. If the answer were 3 times longer (900 tokens), the total would be 18.8 s: output length dominates latency.</td></tr><tr><th>Why it matters</th><td>To cut latency, shorten the output first; reduce the input second.</td></tr></table>
+<p><strong>Streaming caveat.</strong> You cannot validate JSON until it is complete. For structured output, stream only to a progress indicator, or validate at the end.</p>
+<p><strong>Real-world mapping</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Technique</th><th>Example value</th><th>Where it appears</th></tr></thead><tbody><tr><td>Backoff with jitter</td><td>0.5 to 30 s</td><td>Any rate-limited API</td></tr><tr><td>Timeout</td><td>30 s per call</td><td>Web request handlers</td></tr><tr><td>Streaming</td><td>first token in 0.8 s</td><td>Chat UIs</td></tr><tr><td>Retry budget</td><td>4 retries</td><td>Fail clearly after that</td></tr></tbody></table></div>
+<p><strong>Applications</strong></p>
+<ul><li><em>GenAI:</em> chat UIs and batch pipelines.</li><li><em>Operations and serving:</em> stress-checking your own LLM gateway with simulated traffic: measure TTFT, tokens per second, 429 rates and retry amplification.</li><li><em>Data Engineering:</em> resilient enrichment jobs that resume after failure.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Retrying everything. A 400 error (bad request) or "context too long" will fail every time, and you waste time and money. Retry only transient errors.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why add jitter to backoff?</li></ol>
+<p>Answer: To stop many clients from retrying at the same instant.</p>
+<ol><li>Which of 429, 401 and 503 should you retry?</li></ol>
+<p>Answer: 429 and 503 (transient). Not 401.</p>
+<ol><li>Does streaming reduce total generation time?</li></ol>
+<p>Answer: No; it reduces the wait for the first output.</p>
+<h2 id="s3-5-3-token-and-cost-math-concurrency-and-rate-limits">5.3 Token and Cost Math, Concurrency and Rate Limits</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">An LLM bill is a taxi meter running on tokens: you pay for tokens sent in and, at a different rate, for tokens that come out. Output tokens usually cost more per token than input tokens, and they are also slower. Capacity planning uses your old friend Little's Law.</div></div>
+<p><strong>Formulas.</strong></p>
+<pre class="code lang-text"><code>cost per request = (input_tokens × price_in + output_tokens × price_out) / 1,000,000     (prices per million tokens)
+monthly cost     = requests × cost per request
+Little's Law:    requests in flight (concurrency) = arrival rate × average latency</code></pre>
+<p>We use <strong>made-up</strong> prices: 1.00 per million input tokens and 4.00 per million output tokens (currency units). Look up the real current prices before any real estimate.</p>
+<p class="problem"><span class="pl">Problem 5.3.1</span> A feature handles 50,000 requests a month, each with 1,500 input tokens and 300 output tokens. What is the monthly cost at the made-up prices? What if 80% of the input tokens can be served from a prompt cache at 10% of the input price?</p>
+<table class="steps"><tr><th>Formula</th><td>cost = requests × (tin × p_in + tout × p_out) / 10⁶</td></tr><tr><th>Plug in</th><td>50,000 × (1,500 × 1.00 + 300 × 4.00) / 10⁶</td></tr><tr><th>Compute</th><td>1,500 + 1,200 = 2,700; 50,000 × 2,700 = 135,000,000; / 10⁶ = 135. With caching: cached input = 1,200 tokens at 0.10, uncached input = 300 tokens at 1.00; input cost = 120 + 300 = 420 (per request, in units of price × tokens); plus output 1,200 gives 1,620; 50,000 × 1,620 / 10⁶ = 81.</td></tr><tr><th>Answer</th><td>135 units a month without caching and 81 units with it, a 40% saving.</td></tr><tr><th>Check</th><td>The code below reproduces both numbers: 135.0 and 81.0; and (135 − 81)/135 = 0.40.</td></tr><tr><th>Why it matters</th><td>Output tokens were 1,200 of the 2,700 (44%) of the per-request cost even though there are far fewer of them.</td></tr></table>
+<pre class="code lang-python"><code>price_in, price_out = 1.00, 4.00   # made-up, per 1M tokens
+reqs=50_000; tin, tout = 1500, 300
+print("monthly cost:", reqs*(tin*price_in+tout*price_out)/1e6)
+print("with 80% of input cached at 10% price:",
+      reqs*(tin*0.2*price_in+tin*0.8*price_in*0.1+tout*price_out)/1e6)
+lat=6.0; rps=20; print("concurrent requests in flight:", lat*rps)</code></pre>
+<pre class="code lang-text"><code>monthly cost: 135.0
+with 80% of input cached at 10% price: 81.0
+concurrent requests in flight: 120.0</code></pre>
+<p class="problem"><span class="pl">Problem 5.3.2</span> At peak you get 20 requests per second and the average latency is 6 s. How many requests are in flight? If the provider limits you to 100 concurrent requests, what happens?</p>
+<table class="steps"><tr><th>Formula</th><td>concurrency = arrival rate × latency (Little's Law)</td></tr><tr><th>Plug in</th><td>20 × 6</td></tr><tr><th>Compute</th><td>120</td></tr><tr><th>Answer</th><td>120 requests are in flight, above the 100 limit, so about 20 will queue or get rate-limit errors; you need a queue, a higher limit, or lower latency.</td></tr><tr><th>Check</th><td>If you cut latency to 4 s (shorter outputs), concurrency becomes 20 × 4 = 80, under the limit.</td></tr><tr><th>Why it matters</th><td>This is the same arithmetic as deciding how many tellers a bank needs; shortening output is a capacity lever as well as a cost lever.</td></tr></table>
+<p><strong>Rate limits</strong> are usually counted in requests per minute and tokens per minute. Plan for both. Use a client-side limiter (token bucket) so your own code stays under the limit instead of discovering it through 429 errors. For offline bulk jobs, look for the provider's <em>batch</em> interface: it is often cheaper and slower; check the docs for terms.</p>
+<p><strong>Applications</strong></p>
+<ul><li><em>FinOps for AI:</em> forecasting and budgeting.</li><li><em>GenAI engineering:</em> choosing prompt length, number of chunks, and model tier from cost per request.</li><li><em>Operations and serving:</em> capacity planning for the gateway.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting that you pay for retries and for failed or truncated answers. Track cost per <em>successful</em> task, not per call.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which usually costs more per token, input or output?</li></ol>
+<p>Answer: Output.</p>
+<ol><li>Little's Law: 10 requests per second, 3 seconds average latency. Concurrency?</li></ol>
+<p>Answer: 30.</p>
+<ol><li>What does caching 80% of the input tokens at 10% price do to input cost?</li></ol>
+<p>Answer: It becomes 0.2 + 0.8 × 0.1 = 0.28 of the original, a 72% reduction in input cost.</p>
+<h2 id="s4-5-4-caching-and-secrets-handling">5.4 Caching and Secrets Handling</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Two ideas that protect your wallet and your reputation. Caching is "do not pay twice for the same question". Secrets handling is "never leave the house key under the doormat, or in a public GitHub repo".</div></div>
+<p><strong>Caching, three kinds.</strong></p>
+<ol><li><strong>Response (exact) cache:</strong> key = hash of model, prompt and parameters; value = the answer. Perfect for repeated identical requests and for deterministic settings.</li><li><strong>Semantic cache:</strong> key = embedding of the question; reuse an answer if a past question is very close. Saves money but risks serving a wrong answer for a question that is <em>almost</em> the same; use a strict threshold and only for low-risk uses.</li><li><strong>Provider prompt (prefix) caching:</strong> the provider stores the processing of a repeated prompt prefix and bills the repeated part at a discount with lower latency. It needs a byte-identical stable prefix, so put system prompt, tools and examples first (Chapter 4). Rules, minimum lengths and discounts vary: check the provider's docs.</li></ol>
+<pre class="code lang-python"><code>import hashlib
+cache={}
+def cached(prompt):
+    k=hashlib.sha256(prompt.encode()).hexdigest()[:12]
+    if k in cache: print("  cache hit",k); return cache[k]
+    cache[k]=call_with_retry(llm.complete,prompt); return cache[k]
+cached("hello world again"); cached("hello world again")</code></pre>
+<pre class="code lang-text"><code>  attempt 1 failed (429 rate limited); wait 8.8 ms
+  attempt 2 failed (429 rate limited); wait 12.6 ms
+  cache hit cbb2d50bd9c8</code></pre>
+<p>(This snippet continues the script from Section 5.2, so <code>llm</code>, <code>call_with_retry</code> and the random seed are shared, which is why the delays differ from before.) Explain: the first call missed the cache and went through the retry wrapper (two fake 429 errors, then success). The second call had the same hash and returned instantly with no network call, and no cost.</p>
+<p class="problem"><span class="pl">Problem 5.4.1</span> 30% of your requests are exact repeats. You make 100,000 requests a month at 0.5 cost units each. What does an exact cache save?</p>
+<table class="steps"><tr><th>Compute</th><td>repeats = 0.30 × 100,000 = 30,000; saving = 30,000 × 0.5 = 15,000 units of 50,000.</td></tr><tr><th>Answer</th><td>It saves 15,000 units, 30% of the bill.</td></tr><tr><th>Check</th><td>100,000 × 0.5 = 50,000 total; 15,000 / 50,000 = 0.30.</td></tr><tr><th>Why it matters</th><td>Measure your repeat rate in logs before building a cache; if it is 2%, skip it.</td></tr></table>
+<p><strong>Secrets handling.</strong> An API key is a password that spends your money. Rules:</p>
+<ul><li>Never write keys in code, notebooks, prompts, chat messages or screenshots. Never commit them.</li><li>Read keys from environment variables or a secret manager: <code>os.environ.get("MY_LLM_API_KEY")</code>.</li><li>Use <code>.gitignore</code> for <code>.env</code> files and run a secret scanner in CI.</li><li>Use separate keys per environment and per app, with spend limits and the least access possible.</li><li>Rotate (replace) a key at once if it leaks; assume anything pushed to a public repo is already stolen.</li><li>Do not log full prompts that contain personal data, and never log keys.</li></ul>
+<pre class="code lang-python"><code>import os
+key=os.environ.get("MY_LLM_API_KEY")
+print("key present?", key is not None)</code></pre>
+<pre class="code lang-text"><code>key present? False</code></pre>
+<p>That is the expected output on this machine: no key is set, and the code checks safely instead of crashing with a <code>KeyError</code> or, worse, using a hard-coded default. In real code, if the key is missing, fail at start-up with a clear message.</p>
+<p class="problem"><span class="pl">Problem 5.4.2</span> A teammate pastes <code>API_KEY = "sk-..."</code> into a notebook and pushes it to a public repo. List the steps.</p>
+<table class="steps"><tr><th>Step 1</th><td>Revoke or rotate the key in the provider console immediately.</td></tr><tr><th>Step 2</th><td>Check usage logs for unknown calls and set a spend limit.</td></tr><tr><th>Step 3</th><td>Remove the key from the code and Git history, but do not rely on that (the key is already exposed).</td></tr><tr><th>Step 4</th><td>Move to environment variables or a secret manager; add a secret scanner to CI.</td></tr><tr><th>Answer</th><td>Rotate first, clean up second, prevent third.</td></tr><tr><th>Check</th><td>Confirm the old key now returns an authentication error.</td></tr></table>
+<p><strong>Applications</strong></p>
+<ul><li><em>GenAI engineering:</em> gateways with caching and per-team keys.</li><li><em>Security:</em> secret scanning, least-privilege keys, audit logs.</li><li><em>Data Science:</em> notebooks are the commonest place keys leak; use environment variables.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Caching answers that depend on the user or on time. A cache key that ignores user identity can leak one customer's data to another. Include everything that affects the answer in the key, and skip caching for personalised or fast-changing answers.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What must be identical for provider prefix caching to work?</li></ol>
+<p>Answer: The leading part of the prompt, byte for byte.</p>
+<ol><li>First action when a key leaks?</li></ol>
+<p>Answer: Rotate or revoke it.</p>
+<ol><li>Why is a semantic cache risky?</li></ol>
+<p>Answer: A "close" question may need a different answer.</p>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>Treat a model API like any remote service: timeouts, retries, limits, logs.</li><li>Messages are stateless; history is resent and costs grow each turn.</li><li>Retry only transient errors, with exponential backoff and jitter and a budget.</li><li>Streaming cuts perceived latency; shorter output cuts real latency.</li><li>Cost = tokens in × price in + tokens out × price out; track cost per successful task.</li><li>Little's Law (concurrency = rate × latency) sizes limits and queues.</li><li>Use exact caches, careful semantic caches, and provider prefix caching.</li><li>Keep secrets in environment variables or a secret manager; rotate at once after any leak.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Formula or code</th></tr></thead><tbody><tr><td>Backoff</td><td><code>min(base × 2^n, cap) × random(0.5, 1)</code></td></tr><tr><td>Cost</td><td><code>(tin × p_in + tout × p_out) / 1e6</code></td></tr><tr><td>Little's Law</td><td><code>concurrency = rate × latency</code></td></tr><tr><td>Cache key</td><td><code>sha256(model + params + prompt)</code></td></tr><tr><td>Secret</td><td><code>os.environ.get("NAME")</code></td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 5.P.1</span> (easy) Which errors do you retry: 400, 429, 500, 403? <strong>Answer:</strong> 429 and 500 only.</p>
+<p class="problem"><span class="pl">Problem 5.P.2</span> (easy) Where do you store an API key? <strong>Answer:</strong> In an environment variable or secret manager, never in code or Git.</p>
+<p class="problem"><span class="pl">Problem 5.P.3</span> (computation) 2,000 input and 500 output tokens per call at 1.00 / 4.00 per million. Cost per call? <strong>Answer:</strong> (2,000 × 1 + 500 × 4) / 10⁶ = 4,000 / 10⁶ = 0.004 units.</p>
+<p class="problem"><span class="pl">Problem 5.P.4</span> (computation) 40 requests per second, 2.5 s average latency. Concurrency? <strong>Answer:</strong> 40 × 2.5 = 100.</p>
+<p class="problem"><span class="pl">Problem 5.P.5</span> (what is the output?) With the retry wrapper above and <code>retries=1</code>, what happens on a prompt that fails twice? <strong>Answer:</strong> Attempt 1 fails and waits; attempt 2 (<code>attempt == retries</code>) fails and re-raises <code>TransientError</code>.</p>
+<p class="problem"><span class="pl">Problem 5.P.6</span> (find the bug) <code>cache_key = prompt</code> where the prompt does not include the user ID but the answer depends on the user's account. What is the risk? <strong>Answer:</strong> User A's answer can be served to user B (data leak). Include user or tenant ID in the key or do not cache.</p>
+<p class="problem"><span class="pl">Problem 5.P.7</span> (computation) Backoff base 0.5 s, doubling, no cap. Wait before attempt 5 (the 5th retry)? <strong>Answer:</strong> 0.5 × 2⁴ = 8 s.</p>
+<p class="problem"><span class="pl">Problem 5.P.8</span> (scenario) Bills doubled after launching a "chat with history" feature. Explain. <strong>Answer:</strong> History is resent every turn, so input tokens grow with conversation length; trim or summarise history, cache the prefix and cap turns.</p>
+<p class="problem"><span class="pl">Problem 5.P.9</span> (interview) How would you check an LLM-backed endpoint under heavy traffic with simulated users? <strong>Answer:</strong> Use a mock or stub model first to test your own stack, then realistic prompts at target concurrency; measure TTFT, total latency percentiles, tokens per second, error and 429 rates and cost per request; respect provider terms and rate limits.</p>
+<p class="problem"><span class="pl">Problem 5.P.10</span> (interview) Streaming is on but the p95 latency did not change. Is this expected? <strong>Answer:</strong> Yes. Streaming improves time to first token, not total completion time. To reduce total time, shorten outputs or use a faster model.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: Using LLM APIs safely and reliably: messages, retries with backoff, streaming, token and cost math, caching and secrets handling. Explain this topic step by step from first principles using an everyday analogy, then a worked example with real numbers. After each step, ask me one question to check I understood before continuing.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: Using LLM APIs safely and reliably: messages, retries with backoff, streaming, token and cost math, caching and secrets handling. Give me 8 graded exercises on this topic, from easy to hard, with small numbers and a few code-reading questions. Do NOT give solutions until I reply with my answers; then mark them and explain my mistakes.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: Using LLM APIs safely and reliably: messages, retries with backoff, streaming, token and cost math, caching and secrets handling. Quiz me one question at a time on this topic, about 12 questions in total. Wait for my answer, say whether it is right, explain briefly, and adapt the difficulty to my answers. At the end summarise my weak points.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: Using LLM APIs safely and reliably: messages, retries with backoff, streaming, token and cost math, caching and secrets handling. Review my work on this topic. I will paste my code, my calculation or my explanation below. Check it for errors, explain each error in simple words, and show a corrected version. Then give me one follow-up exercise.
+
+[PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: Using LLM APIs safely and reliably: messages, retries with backoff, streaming, token and cost math, caching and secrets handling. Run a mock interview on this topic for a GenAI or data role in India. Ask 6 questions of rising difficulty, one at a time, including one scenario question and one 'find the bug' question. After each answer give a score out of 10 and a model answer. Focus especially on retry backoff schedules, cost per request, Little's Law concurrency and cache savings.</pre></div><div class="readbtn"><button class="btn" data-read="study:genai:ch05">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch04.html">← Chapter 4: Prompt Engineering and Context Engineeri</a><a class="btn" href="ch06.html">Chapter 6: Vector Databases and Retrieval →</a></div></div><script src="../../assets/study.js"></script></body></html>

@@ -1,0 +1,334 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 11: Applied Domains: Churn, Credit Risk, Fraud, Marketing, Demand, Healthcare and Operations</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Science in Practice</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 11</div><h1>Applied Domains: Churn, Credit Risk, Fraud, Marketing, Demand, Healthcare and Operations</h1><p>The same model skills, six different businesses: what each domain asks, what its special metrics mean, and how to start in each.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-11-1-churn-and-customer-lifetime-value">11.1 Churn and Customer Lifetime Value</a></li><li><a href="#s2-11-2-credit-risk-and-scorecards">11.2 Credit Risk and Scorecards</a></li><li><a href="#s3-11-3-fraud-detection">11.3 Fraud Detection</a></li><li><a href="#s4-11-4-marketing-mix-and-pricing">11.4 Marketing Mix and Pricing</a></li><li><a href="#s5-11-5-demand-supply-chain-healthcare-and-other-domains">11.5 Demand, Supply Chain, Healthcare and Other Domains</a></li><li><a href="#s6-11-6-operations-analytics-queues-delivery-times-and-capacity">11.6 Operations Analytics: Queues, Delivery Times and Capacity</a></li><li><a href="#s7-chapter-recap">Chapter recap</a></li><li><a href="#s8-practice-set">Practice set</a></li><li><a href="#s9-prompt-pack">Prompt pack</a></li></ol></details><p>Two candidates with equal skill are not equal in an interview. The one who says "for credit risk we check KS, Gini and PSI, and the label arrives 12 months late" sounds like a colleague. The one who says "I would train XGBoost" sounds like a student. This chapter gives you the vocabulary, the special metrics and one runnable example for each major domain: customer churn and lifetime value, credit scorecards, fraud, marketing mix and pricing, demand and supply chain, healthcare, and operations analytics (queues, delivery times, capacity). By the end you will be able to build a small scorecard by hand, set a fraud threshold from costs, fit an adstock curve, and predict when a warehouse hits its capacity limit. Pick one or two domains to go deep. Skim the rest.</p>
+<p>Code uses the shop dataset from Chapter 1 (<code>from ds_common import *</code>, seed 42) for churn, and small synthetic generators (fixed seeds) for the other domains. All outputs below were produced by running the code with numpy, pandas, scikit-learn and scipy. Where I name a library we did not run (BG/NBD, PyMC-Marketing, OR-Tools), I say "not run here".</p>
+<h2 id="s1-11-1-churn-and-customer-lifetime-value">11.1 Churn and Customer Lifetime Value</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A gym knows exactly when you leave, because you cancel. A supermarket never knows: you just stop coming. Churn work starts with that one question: <em>can I see the exit?</em> If yes it is "contractual" churn. If no, you must invent a rule for "gone" (for example, no order for 90 days), and that rule is a business decision, not a maths result.</div></div>
+<p><strong>Words you need.</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th><th>Example in the shop data</th></tr></thead><tbody><tr><td>Contractual churn</td><td>Customer must cancel; you see it</td><td>A pro plan cancelled</td></tr><tr><td>Non-contractual churn</td><td>Customer just goes silent</td><td>No order for 90 days</td></tr><tr><td>Censored</td><td>Still active when data ends, so end time unknown</td><td>Customer still ordering on 30 Apr 2025</td></tr><tr><td>Survival curve S(t)</td><td>Share still active after t days</td><td>S(180) = 0.47</td></tr><tr><td>CLV</td><td>Customer lifetime value: total future profit from one customer</td><td>12-month profit per customer</td></tr><tr><td>RFM</td><td>Recency, Frequency, Monetary: simple behaviour scores</td><td>Days since last order, order count</td></tr></tbody></table></div>
+<p><strong>Survival analysis</strong> answers "how long until churn?" instead of "will churn happen in 60 days?". Its key tool is the <strong>Kaplan-Meier estimator</strong>. At each day t where someone churned, multiply the running survival by <code>(1 - d/n)</code>, where <code>d</code> is churners that day and <code>n</code> is customers still at risk. Censored customers leave the "at risk" count but never count as churners. This uses customers who are still active, which a plain "churned or not" table wastes.</p>
+<p class="problem"><span class="pl">Problem 11.1.1</span> Five customers have tenure (days) 2, 3, 3, 5, 8. Events: churned, churned, censored, churned, censored. Compute the Kaplan-Meier survival.</p>
+<table class="steps"><tr><th>Formula</th><td>S(t) = S(previous) × (1 − d/n)</td></tr><tr><th>Step 1</th><td>Day 2: n = 5 at risk, d = 1 churn. S = 1 × (1 − 1/5) = 0.80.</td></tr><tr><th>Step 2</th><td>Day 3: one churner and one censored. Everyone with tenure ≥ 3 is at risk: n = 4. d = 1. S = 0.80 × (1 − 1/4) = 0.60.</td></tr><tr><th>Step 3</th><td>Day 5: at risk are tenure 5 and 8, so n = 2, d = 1. S = 0.60 × (1 − 1/2) = 0.30.</td></tr><tr><th>Step 4</th><td>Day 8 is censored, no churn, S stays 0.30.</td></tr><tr><th>Answer</th><td>S = 0.80, 0.60, 0.30, 0.30 at days 2, 3, 5, 8.</td></tr><tr><th>Check</th><td>The code below prints the same four numbers.</td></tr></table>
+<p class="problem"><span class="pl">Problem 11.1.2</span> On the shop data define churn as "last order more than 90 days before 30 April 2025". Compute S(90), S(180), S(365) by plan.</p>
+<pre class="code lang-python"><code>from ds_common import *
+customers, orders = make_data()
+last = orders.groupby("customer_id").order_ts.max()
+c = customers.set_index("customer_id").join(last.rename("last")).dropna(subset=["last"])
+c["event"] = ((END_DATE - c["last"]).dt.days &gt; 90).astype(int)
+c["tenure"] = np.where(c.event == 1, (c["last"] - c.signup_date).dt.days,
+                       (END_DATE - c.signup_date).dt.days)
+
+def km(t, e, points):
+    surv, s = {}, 1.0
+    for u in np.sort(np.unique(t[e == 1])):
+        at = (t &gt;= u).sum(); d = ((t == u) &amp; (e == 1)).sum()
+        s *= 1 - d / at; surv[u] = s
+    surv = pd.Series(surv)
+    return {p: round(float(surv[surv.index &lt;= p].iloc[-1]), 3) for p in points}
+
+print(km(np.array([2,3,3,5,8]), np.array([1,1,0,1,0]), [2,3,5,8]))
+for pl in ["free", "pro"]:
+    m = c[c.plan == pl]
+    print(pl, len(m), km(m.tenure.values, m.event.values, [90, 180, 365]))</code></pre>
+<pre class="code lang-text"><code>{2: 0.8, 3: 0.6, 5: 0.3, 8: 0.3}
+free 3808 {90: 0.662, 180: 0.467, 365: 0.262}
+pro 1688 {90: 0.852, 180: 0.734, 365: 0.57}</code></pre>
+<ul><li><strong>Answer</strong> After one year only 26.2% of free customers are still active, against 57.0% of pro customers.</li><li><strong>Check</strong> Pro should survive longer because we built a lower churn hazard into pro (Chapter 1). It does.</li><li><strong>Why it matters</strong> "Pro customers are worth more" is now a number you can put in a retention budget.</li></ul>
+<p><strong>CLV, the practical way.</strong> The fancy models (BG/NBD for how often a customer buys while alive, Gamma-Gamma for how much they spend, not run here) are useful, but start with a cohort table: for customers who signed up long enough ago to be fully observed, add up revenue by month since signup and multiply by margin. Restrict to customers with a full window, otherwise recent customers drag the average down (a censoring error).</p>
+<pre class="code lang-python"><code>o = orders.merge(customers[["customer_id", "signup_date", "plan"]], on="customer_id")
+o["month"] = (o.order_ts - o.signup_date).dt.days // 30
+old = customers[customers.signup_date &lt; "2024-04-01"]       # 12 full months observed
+for pl in ["free", "pro"]:
+    ids = old[old.plan == pl].customer_id
+    x = o[o.customer_id.isin(ids) &amp; (o.month &lt; 12)]
+    rev = x.groupby("month").amount.sum() / len(ids)
+    print(pl, len(ids), rev.round(0).astype(int).tolist(), round(rev.sum()), round(rev.sum() * 0.20))</code></pre>
+<pre class="code lang-text"><code>free 2676 [1085, 969, 866, 793, 670, 617, 549, 518, 417, 392, 386, 347] 7610 1522
+pro 1109 [2495, 2388, 2301, 2305, 2111, 2123, 2004, 1906, 1873, 1772, 1718, 1707] 24702 4940</code></pre>
+<p>The last two numbers on each line are 12-month revenue and 12-month profit (revenue × 0.20). Notice the monthly revenue per customer falls from 1,085 to 347 for free customers: that fall is churn at work.</p>
+<ul><li><strong>Answer</strong> First-year revenue per customer is about 7,610 rupees (free) and 24,702 rupees (pro). With a 20% margin, 12-month CLV is 1,522 and 4,940 rupees.</li><li><strong>Check</strong> 24,702 × 0.20 = 4,940.4 and 7,610 × 0.20 = 1,522.</li><li><strong>Why it matters</strong> CLV caps what you may spend to win a customer. Paying 2,000 rupees to acquire a free customer loses money in year one.</li></ul>
+<p><strong>RFM segmentation</strong> gives action groups without any model. We cut recency and frequency into thirds among active customers at T and check the churn label of Chapter 1.</p>
+<pre class="code lang-python"><code>d = make_label_table(customers, orders)
+past = orders[orders.order_ts &lt; PRED_DATE]
+g = past.groupby("customer_id").agg(last=("order_ts", "max"), f=("order_id", "count"))
+d = d.merge(g, left_on="customer_id", right_index=True)
+d["rec"] = (PRED_DATE - d["last"]).dt.days
+d["R"] = pd.qcut(d.rec, 3, labels=[3, 2, 1]).astype(int)          # 3 = most recent
+d["F"] = pd.qcut(d.f.rank(method="first"), 3, labels=[1, 2, 3]).astype(int)
+d["seg"] = np.select([(d.R == 3) &amp; (d.F == 3), (d.R == 1) &amp; (d.F == 1)],
+                     ["champions", "slipping"], "middle")
+print(d.groupby("seg").churn.agg(n="size", churn_rate="mean").round(3))</code></pre>
+<pre class="code lang-text"><code>              n  churn_rate
+seg                        
+champions   447       0.027
+middle     1719       0.235
+slipping    396       0.593</code></pre>
+<p>The "slipping" group churns 22 times more often than "champions" (0.593 / 0.027 = 22). That is a free, explainable model.</p>
+<p><strong>The picture.</strong> Survival curve: x axis is days since signup, y axis is the share still active, starting at 1.0 and stepping down at each churn day. The pro curve sits above the free curve. The gap at day 365 (0.57 vs 0.26) is the area where retention offers pay.</p>
+<p><strong>Churn is not the end: uplift.</strong> Predicting who will leave does not tell you who will <em>respond to an offer</em>. Some "likely churners" leave no matter what; some would have stayed anyway. Uplift modelling (Chapter 8) estimates the <em>change</em> in churn caused by the offer. Target by uplift times value, not by churn score alone.</p>
+<p><strong>Connection to the job.</strong> Telecom, SaaS, banks and e-commerce all run churn teams. Next-best-action systems combine churn score, CLV and offer cost (Chapter 12).</p>
+<p><strong>Applications</strong></p>
+<ul><li>Data Analytics: retention cohorts and RFM dashboards.</li><li>Data Science: survival models, uplift targeting.</li><li>ML Engineering: nightly scoring of "slipping" customers to the CRM.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Computing average lifetime as <code>1 / churn rate</code> or averaging tenure of churned customers only. Active customers are censored, and dropping them makes lifetimes look shorter than they are. Use survival curves.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>In Kaplan-Meier, does a censored customer count as a churner? Answer: No. They leave the at-risk count but are never counted as a churn event.</li><li>Why restrict the CLV cohort to old signups? Answer: Recent signups have not had 12 months, so their revenue is cut short and CLV looks falsely low.</li><li>A churn model ranks the top 10% by risk. Why might an offer to them still waste money? Answer: Risk is not responsiveness; many will leave anyway. You need uplift.</li></ol>
+<h2 id="s2-11-2-credit-risk-and-scorecards">11.2 Credit Risk and Scorecards</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A bank clerk used to ask: "Do you have a salary slip? Any past defaults?" and add points in her head. A scorecard is that clerk written down: each answer earns points, the total is the score, and a regulator can read every line. That is why banks still love logistic regression over black boxes.</div></div>
+<p><strong>Words you need.</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th></tr></thead><tbody><tr><td>PD</td><td>Probability of default: chance the borrower fails to pay in a fixed window</td></tr><tr><td>LGD</td><td>Loss given default: share of the loan not recovered</td></tr><tr><td>EAD</td><td>Exposure at default: amount owed when default happens</td></tr><tr><td>Expected loss</td><td><code>PD × LGD × EAD</code></td></tr><tr><td>WoE</td><td>Weight of evidence of a bin: <code>ln(share of goods / share of bads)</code></td></tr><tr><td>IV</td><td>Information value: how well a variable separates good from bad; <code>Σ (pg − pb) × WoE</code></td></tr><tr><td>KS</td><td>Largest gap between cumulative bad rate and cumulative good rate across the score</td></tr><tr><td>Gini</td><td><code>2 × AUC − 1</code></td></tr><tr><td>PSI</td><td>Population stability index: how much a distribution moved</td></tr><tr><td>Good/bad</td><td>Bad = defaulted; good = paid</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 11.2.1</span> A bank has 1,000 good and 100 bad customers. In the bin "utilisation above 60%" there are 100 goods and 20 bads. Find WoE and the IV contribution.</p>
+<table class="steps"><tr><th>Formula</th><td>pg = goods in bin / all goods; pb = bads in bin / all bads; WoE = ln(pg / pb); IV part = (pg − pb) × WoE</td></tr><tr><th>Plug in</th><td>pg = 100 / 1,000 = 0.10; pb = 20 / 100 = 0.20</td></tr><tr><th>Compute</th><td>WoE = ln(0.10 / 0.20) = ln(0.5) = −0.693. IV part = (0.10 − 0.20) × (−0.693) = 0.0693</td></tr><tr><th>Answer</th><td>WoE is −0.693 (negative: this bin has more bads than its share of goods). It adds 0.069 to the IV.</td></tr><tr><th>Check</th><td>A bin with pg = pb has WoE = ln(1) = 0 and contributes nothing. Correct, since it separates nothing.</td></tr><tr><th>Why it matters</th><td>WoE puts every bin on one log-odds scale, so any variable (even a category) becomes a clean numeric input.</td></tr></table>
+<p><strong>Rule of thumb for total IV:</strong> below 0.02 useless, 0.02 to 0.1 weak, 0.1 to 0.3 medium, above 0.3 strong, above 0.5 suspicious (check leakage). These are conventions, not laws.</p>
+<p><strong>Build a scorecard.</strong> We simulate 20,000 applicants with utilisation, debt-to-income (dti), age and past delinquencies, and a 5.45% default rate. We bin on the first 14,000 (train), compute WoE and IV, fit logistic regression on WoE, and test on the last 6,000.</p>
+<pre class="code lang-python"><code>import numpy as np, pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+rng = np.random.default_rng(7); n = 20000
+util = np.clip(rng.beta(2, 3, n), 0, 1); dti = np.clip(rng.normal(0.35, 0.12, n), 0.02, 0.9)
+age = np.clip(rng.normal(36, 9, n), 21, 65).round(); delinq = rng.poisson(0.4, n)
+z = -3.2 + 2.2*(util-0.4) + 3.0*(dti-0.35) - 0.02*(age-36) + 0.45*delinq
+y = (rng.random(n) &lt; 1/(1+np.exp(-z))).astype(int)
+df = pd.DataFrame(dict(util=util, dti=dti, age=age, delinq=delinq, y=y))
+tr, te = df.iloc[:14000], df.iloc[14000:]
+
+def woe_table(x, y, bins):
+    t = pd.DataFrame({"b": pd.cut(x, bins, include_lowest=True), "y": y}).groupby("b", observed=True).y.agg(["size", "sum"])
+    t.columns = ["n", "bad"]; t["good"] = t.n - t.bad
+    t["pg"] = t.good / t.good.sum(); t["pb"] = t.bad / t.bad.sum()
+    t["woe"] = np.log(t.pg / t.pb); t["iv"] = (t.pg - t.pb) * t.woe
+    return t
+specs = {"util": [0, .2, .4, .6, 1.0], "dti": [0, .25, .35, .45, 1.0],
+         "age": [20, 30, 40, 50, 70], "delinq": [-1, 0, 1, 2, 20]}
+tabs = {k: woe_table(tr[k], tr.y, b) for k, b in specs.items()}
+print(tabs["util"].round(3))
+print({k: round(float(t.iv.sum()), 3) for k, t in tabs.items()})</code></pre>
+<pre class="code lang-text"><code>                  n  bad  good     pg     pb    woe     iv
+b                                                         
+(-0.001, 0.2]  2527   70  2457  0.186  0.087  0.765  0.076
+(0.2, 0.4]     4800  223  4577  0.347  0.276  0.229  0.016
+(0.4, 0.6]     4159  274  3885  0.294  0.339 -0.141  0.006
+(0.6, 1.0]     2514  241  2273  0.172  0.298 -0.549  0.069
+{'util': 0.168, 'dti': 0.115, 'age': 0.03, 'delinq': 0.117}</code></pre>
+<p>Read the table: low utilisation (below 20%) has WoE +0.765, so these customers are safer. High utilisation has WoE −0.549. WoE falls steadily as utilisation rises, which is a <em>monotonic</em> pattern, exactly what regulators like to see. Utilisation (IV 0.168) and delinquency and dti (about 0.115) are medium; age (0.03) is weak.</p>
+<p>Next, fit the logistic model on WoE values and measure ranking power.</p>
+<pre class="code lang-python"><code>def apply_woe(d):
+    X = pd.DataFrame(index=d.index)
+    for k, b in specs.items():
+        X[k] = pd.cut(d[k], b, include_lowest=True).map(tabs[k].woe.to_dict()).astype(float)
+    return X
+Xtr, Xte = apply_woe(tr), apply_woe(te)
+lr = LogisticRegression(C=1e6, max_iter=1000).fit(Xtr, tr.y)
+print(dict(zip(Xtr.columns, lr.coef_[0].round(3))), lr.intercept_.round(3))
+
+def ks(y, s):
+    d = pd.DataFrame({"y": y, "s": s}).sort_values("s", ascending=False)
+    return ((d.y.cumsum()/d.y.sum()) - ((1-d.y).cumsum()/(1-d.y).sum())).abs().max()
+for nm, X, d in [("train", Xtr, tr), ("test", Xte, te)]:
+    pr = lr.predict_proba(X)[:, 1]; a = roc_auc_score(d.y, pr)
+    print(nm, "AUC", round(a, 4), "Gini", round(2*a-1, 4), "KS", round(ks(d.y.values, pr), 4))</code></pre>
+<pre class="code lang-text"><code>{'util': -1.022, 'dti': -1.01, 'age': -1.05, 'delinq': -1.045} [-2.793]
+train AUC 0.6785 Gini 0.3571 KS 0.2591
+test AUC 0.6853 Gini 0.3706 KS 0.2949</code></pre>
+<p>All four coefficients are close to −1. That is a good sign: WoE is already "log-odds of good", and we model "bad", so the sign is negative and the size is near one when WoE is a faithful summary. Coefficients far from −1, or with a positive sign, signal correlated variables or bad bins.</p>
+<p class="problem"><span class="pl">Problem 11.2.2</span> Compute the Gini and read the result. Test AUC is 0.6853.</p>
+<table class="steps"><tr><th>Formula</th><td>Gini = 2 × AUC − 1</td></tr><tr><th>Compute</th><td>2 × 0.6853 − 1 = 0.3706</td></tr><tr><th>Answer</th><td>Gini is 0.37 and KS is 0.29 on the test set.</td></tr><tr><th>Check</th><td>Train and test are close (0.357 vs 0.371), so the model is not overfitted. A coin flip has AUC 0.5 and Gini 0.</td></tr><tr><th>Why it matters</th><td>A very high Gini on loan data (say 0.9) would make a risk head suspect leakage before celebrating. (Our data is synthetic with only four weak inputs; do not compare it to a real bank, and real ranges depend on the product and the data.)</td></tr></table>
+<p><strong>Points per bin.</strong> A scorecard converts log-odds to points. Choose a base score (600 points at odds 50 good per bad) and "points to double the odds" (PDO = 20). Then <code>factor = PDO / ln 2 = 28.854</code> and <code>offset = 600 − factor × ln 50 = 487.123</code>. Each bin's points are <code>−(WoE × coefficient + intercept/4) × factor + offset/4</code>, rounded.</p>
+<pre class="code lang-text"><code>util bin          points
+(-0.001, 0.2]      164
+(0.2, 0.4]         149
+(0.4, 0.6]         138
+(0.6, 1.0]         126</code></pre>
+<p>An applicant with utilisation 0.55, dti 0.30, age 45, one delinquency scores <strong>566</strong> (sum of four bin points, from the run). Any underwriter can recompute that by hand, which is the point.</p>
+<p><strong>PSI, the monitoring metric.</strong> <code>PSI = Σ (actual% − expected%) × ln(actual% / expected%)</code> over score bins. Conventions: below 0.1 stable, 0.1 to 0.25 watch, above 0.25 significant shift.</p>
+<p class="problem"><span class="pl">Problem 11.2.3</span> Expected shares in two bins are 50% and 50%. This month they are 40% and 60%. Find PSI.</p>
+<table class="steps"><tr><th>Plug in</th><td>(0.40 − 0.50) × ln(0.40/0.50) + (0.60 − 0.50) × ln(0.60/0.50)</td></tr><tr><th>Compute</th><td>(−0.10)(−0.2231) + (0.10)(0.1823) = 0.02231 + 0.01823 = 0.0405</td></tr><tr><th>Answer</th><td>PSI = 0.04, stable.</td></tr></table>
+<p>On the scorecard: PSI of test scores against train scores (same population) was <strong>0.0006</strong>. We then simulated a recession: utilisation up by 0.15 and dti up by 0.05. PSI became <strong>0.4559</strong>, far above 0.25. The score distribution moved, so we investigate before trusting decisions.</p>
+<p><strong>Other credit ideas.</strong> Expected loss <code>= PD × LGD × EAD</code>. For example PD 3%, LGD 45%, EAD 200,000 rupees gives <code>0.03 × 0.45 × 200000 = 2,700</code> rupees. <strong>Reject inference</strong>: you only see repayment for loans you approved, so training only on approved customers is a selection bias (Chapter 4, and Chapter 2 on selective labels). Methods such as parcelling and augmentation guess outcomes for rejects; they need strong assumptions and are not run here. <strong>Explainability and regulation</strong>: Indian lenders follow RBI guidance on model risk and fair practice codes; the exact circulars change, so read the current ones. In practice you need reason codes (the points that pulled a score down) for each rejected applicant.</p>
+<p><strong>Connection to the job.</strong> BFSI is the largest hiring domain for data scientists in India. Scorecards, collections models and early-warning systems all use these metrics.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Banks: application scorecards, behaviour scorecards, limit assignment.</li><li>Fintech and UPI lenders: thin-file scoring with alternative data (with consent).</li><li>Insurance: frequency times severity models for premiums (awareness).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Quoting AUC, KS and Gini on the <em>training</em> data, or choosing bins by looking at test data. Bin and fit on train, report on out-of-time test, and monitor PSI after launch.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>WoE of a bin is 0. What does it say? Answer: Goods and bads are in the bin in the same proportion as overall; it separates nothing.</li><li>AUC 0.80. Gini? Answer: 2 × 0.80 − 1 = 0.60.</li><li>PSI = 0.46 on the score. First action? Answer: Investigate which inputs shifted (PSI per variable), then decide whether to recalibrate or rebuild.</li></ol>
+<h2 id="s3-11-3-fraud-detection">11.3 Fraud Detection</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Fraud is the needle in the haystack with a fire alarm attached. Fraud is rare, every alert costs an analyst's time, and fraudsters change tactics when you catch them. So accuracy is useless, and the real question becomes "with 500 reviews a day, how many frauds can I catch?"</div></div>
+<p><strong>What makes fraud special.</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Feature</th><th>Consequence</th></tr></thead><tbody><tr><td>Extreme imbalance (about 0.4% fraud here)</td><td>Accuracy is meaningless; use precision, recall, PR-AUC</td></tr><tr><td>Fixed review capacity</td><td>Judge <em>precision at K</em> (best K cases)</td></tr><tr><td>Unequal costs</td><td>Choose the threshold from money, not 0.5</td></tr><tr><td>Adversaries adapt</td><td>Concept drift; retrain, monitor, add rules</td></tr><tr><td>Real-time scoring</td><td>Latency budget (tens of milliseconds); simple features at serving time</td></tr><tr><td>Network structure</td><td>Shared devices or addresses link fraud rings (graph features, awareness)</td></tr></tbody></table></div>
+<p>We simulate 200,000 transactions with 0.416% fraud (831 cases), train gradient boosting on the first 140,000, and test on the last 60,000 (253 frauds).</p>
+<pre class="code lang-python"><code>from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import roc_auc_score, average_precision_score
+rng = np.random.default_rng(11); n = 200000
+amt = rng.lognormal(6, 1, n); night = (rng.random(n) &lt; 0.2).astype(int)
+newdev = (rng.random(n) &lt; 0.1).astype(int); vel = rng.poisson(1, n)
+z = -12.8 + 0.8*np.log(amt) + 1.5*night + 2.5*newdev + 0.7*vel
+y = (rng.random(n) &lt; 1/(1+np.exp(-z))).astype(int)
+X = np.c_[np.log(amt), night, newdev, vel]
+m = HistGradientBoostingClassifier(random_state=0).fit(X[:140000], y[:140000])
+p = m.predict_proba(X[140000:])[:, 1]; yt = y[140000:]
+print("test frauds", yt.sum(), "AUC", round(roc_auc_score(yt, p), 3),
+      "AP", round(average_precision_score(yt, p), 3), "base AP", yt.mean().round(5))
+print("accuracy of always-no", round(1 - yt.mean(), 5))
+top = yt[np.argsort(-p)[:500]]
+print("caught in top 500:", top.sum(), "precision@500", round(top.mean(), 3), "recall", round(top.sum()/yt.sum(), 3))</code></pre>
+<pre class="code lang-text"><code>fraud rate 0.00416 831
+test frauds 253 AUC 0.865 AP 0.061 base AP 0.00422
+accuracy of always-no 0.99578
+review cap 500 caught 45 precision@cap 0.09 recall 0.178</code></pre>
+<p>Read it: "always say no fraud" is 99.58% accurate and catches nothing. AUC 0.865 looks good, but the average precision (area under the precision-recall curve) is only 0.061, about 14 times the random baseline of 0.0042, yet still low. With 500 reviews we catch 45 of 253 frauds (recall 17.8%), precision 9%.</p>
+<p class="problem"><span class="pl">Problem 11.3.1</span> A missed fraud loses 5,000 rupees on average. Reviewing an alert costs 100 rupees. At what fraud probability is it worth reviewing?</p>
+<table class="steps"><tr><th>Formula</th><td>Compare two costs for one transaction with fraud probability p. If we ignore it we expect to lose <code>p × c_miss</code>. If we review it we pay <code>c_review</code> on the innocent ones, an expected <code>(1 − p) × c_review</code>. Setting them equal gives <code>p* = c_review / (c_review + c_miss)</code> (we assume a reviewed fraud is caught for sure).</td></tr><tr><th>Plug in</th><td>p* = 100 / (100 + 5,000)</td></tr><tr><th>Compute</th><td>100 / 5,100 = 0.0196</td></tr><tr><th>Answer</th><td>Review any transaction with a fraud probability above about 2%, not above 50%.</td></tr><tr><th>Check</th><td>At p = 0.0196, expected cost of ignoring is 0.0196 × 5,000 = 98; expected cost of reviewing is 0.9804 × 100 = 98. Equal, so that is the break-even.</td></tr></table>
+<p>The same logic on the test set (cost of FP = 100, cost of FN = 5,000):</p>
+<pre class="code lang-text"><code>threshold  flagged  TP    FP    FN   total cost
+0.5            26      4    22   249   1,247,200
+0.1           334     43   291   210   1,079,100
+0.0196       1803     97  1706   156     950,600
+0.005        7738    176  7562    77   1,141,200</code></pre>
+<ul><li><strong>Answer</strong> The cost-based threshold (0.0196) has the lowest cost, 950,600 rupees. Doing nothing costs 253 × 5,000 = 1,265,000. Saving = 314,400, or 24.9%.</li><li><strong>Check</strong> 950,600 = 1,706 × 100 + 156 × 5,000 = 170,600 + 780,000. Correct.</li><li><strong>Why it matters</strong> This is a model that "only" has precision 5% (97 of 1,803) yet saves a quarter of fraud cost. Judge by money, with capacity as a constraint. If you can only review 500, take the top 500.</li></ul>
+<p>(These probabilities assume reasonable calibration. Boosted models can be miscalibrated; check calibration before using cost-based thresholds, see 11.5.)</p>
+<p><strong>Connection to the job.</strong> UPI and card fraud teams run rules plus models in under 100 ms. Features like "transactions from this device in the last 10 minutes" must be computed identically in training and serving (Chapter 13).</p>
+<p><strong>Applications</strong></p>
+<ul><li>Payments: card, UPI, wallet fraud.</li><li>E-commerce: fake returns, promo abuse, fake reviews.</li><li>Insurance: claim fraud (graph features).</li><li>AML (awareness): unusual transaction patterns sent to human investigators.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Random splits on fraud data. Fraudsters reuse patterns, so a random split leaks. Split by time, and also hold out whole merchants or devices when you can.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why is PR-AUC better than ROC-AUC for 0.4% fraud? Answer: ROC-AUC counts the huge number of true negatives and looks good; PR-AUC focuses on the rare positives.</li><li>Review cost 50, missed-fraud loss 2,500. Break-even probability? Answer: 50 / 2,550 = 0.0196.</li><li>Fraud pattern changes next month. What do you watch? Answer: Score PSI, recall on confirmed frauds, and the share of alerts that are false.</li></ol>
+<h2 id="s4-11-4-marketing-mix-and-pricing">11.4 Marketing Mix and Pricing</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You spent money on TV, search ads and discounts. Sales went up. Which one worked? A marketing mix model (MMM) is a regression that adds two realistic twists: an ad keeps working for days after it airs (carry-over), and each extra rupee works a bit less than the one before (saturation).</div></div>
+<p><strong>Words you need.</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th><th>Example</th></tr></thead><tbody><tr><td>Attribution</td><td>Giving credit for a sale to touchpoints</td><td>Last-touch: all credit to the last click</td></tr><tr><td>Incrementality</td><td>Sales <em>caused</em> by the campaign, beyond what would happen anyway</td><td>Geo experiment: ads in some cities only</td></tr><tr><td>Adstock</td><td>Carry-over: <code>adstock_t = spend_t + a × adstock_{t-1}</code></td><td>a = 0.5 halves the effect each period</td></tr><tr><td>Saturation</td><td>Diminishing returns: <code>x / (x + k)</code></td><td>k = half-saturation point</td></tr><tr><td>Price elasticity</td><td>% change in demand for 1% change in price</td><td>−1.8 means a 1% price rise loses 1.8% of units</td></tr></tbody></table></div>
+<p>Attribution rules (last-touch, multi-touch, data-driven) are fast but only <em>correlational</em>; they love channels that sit at the end of the journey (brand search). Incrementality tests (holdout groups, geo experiments, see Chapters 7 and 8) are the truth check. MMM uses aggregate weekly data, needs no user tracking, and fits well under privacy rules.</p>
+<p class="problem"><span class="pl">Problem 11.4.1</span> Spend is 100 in week 1 and 0 afterwards. With a = 0.5, find adstock for weeks 1 to 3. Then find the saturation <code>x/(x+150)</code> for x = 50, 150, 450.</p>
+<table class="steps"><tr><th>Formula</th><td>adstock_t = spend_t + 0.5 × adstock_{t−1}; saturation = x / (x + k)</td></tr><tr><th>Compute</th><td>Week 1: 100. Week 2: 0 + 0.5 × 100 = 50. Week 3: 0 + 0.5 × 50 = 25. Saturation: 50/200 = 0.25; 150/300 = 0.50; 450/600 = 0.75.</td></tr><tr><th>Answer</th><td>Adstock is 100, 50, 25. Saturation is 0.25, 0.50, 0.75: tripling x from 150 to 450 raises response only from 0.50 to 0.75.</td></tr><tr><th>Check</th><td>The code prints <code>[100.0, 50.0, 25.0]</code> and <code>[0.25, 0.5, 0.75]</code>.</td></tr><tr><th>Why it matters</th><td>Saturation is why you cannot just "double the budget"; the second rupee buys less than the first.</td></tr></table>
+<p><strong>Fit an MMM.</strong> We simulate 104 weeks with true adstock a = 0.6, half-saturation k = 150 and effect b = 200 on top of a base of 500 plus yearly seasonality, plus noise. Then we fit by least squares.</p>
+<pre class="code lang-python"><code>from scipy.optimize import least_squares
+rng = np.random.default_rng(5); T = 104
+spend = np.abs(rng.normal(100, 40, T)) * (1 + 0.5*(np.arange(T) % 13 == 0))
+def adstock(x, a):
+    out = np.zeros_like(x); c = 0
+    for i, v in enumerate(x):
+        c = v + a*c; out[i] = c
+    return out
+sat = lambda x, k: x / (x + k)
+t = np.arange(T)
+sales = 500 + 10*np.sin(2*np.pi*t/52) + 200*sat(adstock(spend, 0.6), 150) + rng.normal(0, 5, T)
+def resid(p):
+    a, k, b, base, s1, s2 = p
+    return (base + s1*np.sin(2*np.pi*t/52) + s2*np.cos(2*np.pi*t/52)
+            + b*sat(adstock(spend, a), k) - sales)
+f = least_squares(resid, [0.3, 100, 100, 400, 0, 0],
+                  bounds=([0, 10, 0, 0, -50, -50], [0.95, 1000, 1000, 1000, 50, 50]))
+print("fit a,k,b,base:", f.x[:4].round(2))</code></pre>
+<pre class="code lang-text"><code>fit a,k,b,base: [  0.58 326.19 198.68 541.63]</code></pre>
+<ul><li><strong>Answer</strong> The carry-over is recovered well (0.58 vs 0.6) and the effect size 198.7 (true 200). But k = 326 (true 150) and base = 542 (true 500) are off.</li><li><strong>Check</strong> Base, k and b trade against each other: a larger k with a larger base can mimic a smaller k with a smaller base over the observed spend range.</li><li><strong>Why it matters</strong> This is the honest limit of MMM. Parameters are weakly identified when spend varies little. Bayesian MMM (PyMC-Marketing, Robyn; not run here) adds priors from earlier experiments, and you should calibrate the model with incrementality tests.</li></ul>
+<p><strong>Pricing.</strong> Fit <code>ln(units) = c + e × ln(price)</code>; the slope <code>e</code> is the elasticity. We continue the same random generator and simulate 300 prices between 80 and 120 with true elasticity −1.8.</p>
+<pre class="code lang-python"><code>p = rng.uniform(80, 120, 300)
+q = np.exp(8 - 1.8*np.log(p) + rng.normal(0, 0.1, 300))
+e = np.polyfit(np.log(p), np.log(q), 1)[0]
+print("elasticity", round(e, 3))</code></pre>
+<pre class="code lang-text"><code>elasticity -1.778</code></pre>
+<p class="problem"><span class="pl">Problem 11.4.2</span> Using e = −1.778, what happens to units and revenue if price rises 10%? What price maximises profit if unit cost is 60?</p>
+<table class="steps"><tr><th>Plug in</th><td>units factor = 1.1^(−1.778); revenue factor = 1.1^(1 − 1.778)</td></tr><tr><th>Compute</th><td>1.1^(−1.778) = 0.844, so units fall 15.6%. Revenue factor = 1.1^(−0.778) = 0.9285, so revenue falls 7.15%. Profit-maximising price for constant elasticity: <code>p* = c × e / (1 + e)</code> = 60 × (−1.778) / (−0.778) = 137.1</td></tr><tr><th>Answer</th><td>A 10% rise loses 15.6% of units and 7.15% of revenue. The formula says 137.</td></tr><tr><th>Check</th><td>If |e| &gt; 1, raising price lowers revenue. That matches. But our data only has prices from 80 to 120. A price of 137 is <em>extrapolation</em>, outside what we have seen, so do not trust it; test 110 to 125 in a real experiment first.</td></tr><tr><th>Why it matters</th><td>Elasticity from observational data is biased when prices were set in response to demand (confounding, Chapter 4). Randomised price tests are safer.</td></tr></table>
+<p>Other pricing words: dynamic pricing (change price by time and stock), promotions (they steal sales from the future; model the dip after), markdown optimisation (clearing stock before it expires).</p>
+<p><strong>Applications</strong></p>
+<ul><li>FMCG and retail: media budget split, promo planning.</li><li>Quick commerce and e-commerce: price tests, delivery-fee experiments.</li><li>Telecom: plan pricing and bundle design.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Treating MMM coefficients as causal truth. Spend is often higher when sales are already expected to be high (festival season). Include seasonality and events, calibrate with experiments, and give ranges.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Adstock a = 0.8: what share of this week's effect remains next week? Answer: 80%.</li><li>Elasticity −0.6 (inelastic). Price up 5%: revenue? Answer: Up. Units fall about 3% and price rises 5%, so revenue rises (1.05^0.4 ≈ +2%).</li><li>Why prefer a geo experiment over last-touch for a TV campaign? Answer: It measures the extra sales caused by the campaign; last-touch only counts who clicked last.</li></ol>
+<h2 id="s5-11-5-demand-supply-chain-healthcare-and-other-domains">11.5 Demand, Supply Chain, Healthcare and Other Domains</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A kirana owner stocks rice for the week. Too little and customers leave. Too much and the money is stuck on the shelf. Forecasting gives a number, but <em>stock</em> is a decision about the risk around that number. Healthcare has the same shape: a prediction is only useful if it leads to the right treatment decision.</div></div>
+<p><strong>Demand and inventory (builds on forecasting, Chapter 6).</strong> Two simple formulas carry most practical work.</p>
+<ul><li><strong>Safety stock</strong> covers demand uncertainty during the lead time <code>L</code> (days between ordering and delivery): <code>SS = z × σ_daily × √L</code>, where <code>z</code> is the normal quantile for your service level (1.645 for 95%).</li><li><strong>Newsvendor</strong>: for one-shot stock, order the quantity at the <em>critical ratio</em> <code>CR = c_under / (c_under + c_over)</code>, where <code>c_under</code> is the profit lost per unit short and <code>c_over</code> the loss per unit left over.</li></ul>
+<p class="problem"><span class="pl">Problem 11.5.1</span> Daily demand has mean 100 and standard deviation 30. Lead time is 4 days. Target service 95%. Find safety stock and reorder point.</p>
+<table class="steps"><tr><th>Formula</th><td>SS = z × σ × √L; ROP = mean × L + SS</td></tr><tr><th>Plug in</th><td>z = 1.645; √4 = 2</td></tr><tr><th>Compute</th><td>SS = 1.645 × 30 × 2 = 98.7. ROP = 100 × 4 + 98.7 = 498.7</td></tr><tr><th>Answer</th><td>Keep about 99 units of safety stock and reorder when stock falls to about 499.</td></tr><tr><th>Check</th><td>The code printed <code>z95 1.645 safety stock 98.7 ROP 498.7</code>.</td></tr><tr><th>Why it matters</th><td>Doubling lead time raises safety stock by only √2, not 2, because random errors partly cancel.</td></tr></table>
+<p class="problem"><span class="pl">Problem 11.5.2</span> Festival item. Each unit short loses 40 rupees profit; each unit left over costs 10. Demand is Normal(mean 500, sd 100). How much to stock?</p>
+<table class="steps"><tr><th>Compute</th><td>CR = 40 / (40 + 10) = 0.80. Normal quantile at 0.80 is +0.8416. Q* = 500 + 0.8416 × 100 = 584.2</td></tr><tr><th>Answer</th><td>Stock about 584 units, well above the mean, because shortages cost four times more than leftovers.</td></tr><tr><th>Check</th><td>Code printed <code>critical ratio 0.8 Q* 584.2</code>.</td></tr></table>
+<p>Other supply-chain tools (OR-Tools for routing and scheduling is covered in Chapter 12; not run here): ETA prediction for logistics is a regression with heavy tails (report quantiles, not just the mean), and intermittent demand uses Croston-type methods.</p>
+<p><strong>Healthcare.</strong> Health data has rare outcomes, strict privacy (identifiers, consent, India's DPDP Act), long label delays and high costs for errors. Two ideas matter most. <strong>Calibration</strong>: when the model says 20% risk, about 20 of 100 such patients should have the event. <strong>Clinical utility</strong> (net benefit): at a threshold probability <code>p_t</code>, <code>net benefit = TP/N − FP/N × p_t/(1 − p_t)</code>. It compares a model with "treat everyone" and "treat nobody" (net benefit 0). Survival analysis (11.1) is also standard.</p>
+<p>We simulated 20,000 patients (8.9% event rate overall, 8.76% in the test part), trained on 12,000, and compared logistic regression with a random forest on the other 8,000 by quintiles of predicted risk.</p>
+<pre class="code lang-text"><code>rf                       pred    obs     n
+(-0.001, 0.005]         0.002  0.019  1862
+(0.005, 0.025]          0.016  0.038  1642
+(0.025, 0.06]           0.043  0.052  1353
+(0.06, 0.15]            0.101  0.111  1583
+(0.15, 0.915]           0.313  0.229  1560
+lr                       pred    obs     n
+(-0.00084, 0.016]       0.009  0.008  1600
+(0.016, 0.0352]         0.025  0.022  1600
+(0.0352, 0.0683]        0.050  0.056  1600
+(0.0683, 0.141]         0.098  0.094  1600
+(0.141, 0.923]          0.271  0.258  1600</code></pre>
+<ul><li><strong>Read it</strong> Logistic regression's predictions match the observed rates in every bin (0.271 predicted vs 0.258 observed at the top). The random forest says 0.2% for patients whose real rate is 1.9%, and 31% for patients whose real rate is 23%. Ranking may be fine, but the numbers are not probabilities. Recalibrate (isotonic or Platt, Chapter on ML evaluation) before using thresholds.</li></ul>
+<pre class="code lang-text"><code>p_t   model NB   treat-all NB   treat-none
+0.05  0.0547     0.0396         0
+0.10  0.0354    -0.0138         0
+0.20  0.0201    -0.1405         0
+0.30  0.0113    -0.3034         0</code></pre>
+<p class="problem"><span class="pl">Problem 11.5.3</span> Compute the net benefit of "treat all" at threshold 0.10. The test-set event rate is 0.0876.</p>
+<table class="steps"><tr><th>Plug in</th><td>prevalence − (1 − prevalence) × 0.10/0.90</td></tr><tr><th>Compute</th><td>0.0876 − 0.9124 × 0.1111 = 0.0876 − 0.1014 = −0.0138, which matches the table</td></tr><tr><th>Answer</th><td>Treating everybody at a 10% threshold does harm (negative net benefit), while the model has +0.035.</td></tr><tr><th>Check</th><td>At threshold 0.05, treat-all (0.0396) is positive but the model (0.0547) is still better.</td></tr><tr><th>Why it matters</th><td>A doctor who treats at a 10% risk accepts nine false alarms per true case. Net benefit uses exactly that trade-off.</td></tr></table>
+<p><strong>Other domains at a glance.</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Domain</th><th>Typical problems</th><th>Special care</th></tr></thead><tbody><tr><td>Telecom</td><td>Churn, ARPU, network anomalies, usage forecasts</td><td>Huge data, billing definitions</td></tr><tr><td>Retail / e-commerce</td><td>Assortment, search, recommendations, returns</td><td>Seasonality, cold-start</td></tr><tr><td>SaaS</td><td>MRR/ARR, activation, retention funnels</td><td>Cohorts, product events</td></tr><tr><td>Manufacturing</td><td>Predictive maintenance, quality, time-to-failure</td><td>Few failures, sensor drift</td></tr><tr><td>Logistics</td><td>ETA, routing, hub capacity</td><td>Heavy-tailed delays</td></tr><tr><td>Geospatial</td><td>Distance features, delivery zones, spatial joins</td><td>Use <code>geopandas</code>, <code>shapely</code>, <code>h3</code> (not run here)</td></tr><tr><td>NLP and vision in business</td><td>Ticket routing, document extraction, review mining</td><td>Details in the deep learning and GenAI material</td></tr></tbody></table></div>
+<p><strong>Learning a domain fast.</strong> Read one annual report and one earnings call, write a glossary of 50 terms, ask an expert for 30 minutes, join a business meeting, and build one small domain project. India-specific strengths worth knowing: UPI-scale payments, quick commerce, ONDC (open commerce networks), agritech, Indian-language NLP, global capability centres (GCC), and DPDP and data localisation rules.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reporting "95% service level" without saying how demand uncertainty was measured. If the forecast errors are skewed or intermittent, the normal formula under-covers; use empirical quantiles of past errors instead.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Lead time goes from 4 to 16 days. Safety stock changes by what factor? Answer: √(16/4) = 2.</li><li>What is the critical ratio if shortage costs 20 and surplus costs 30? Answer: 20/50 = 0.40.</li><li>Why does a model with good AUC still need calibration for clinical use? Answer: Doctors act on the probability value, and AUC only tests ranking.</li></ol>
+<h2 id="s6-11-6-operations-analytics-queues-delivery-times-and-capacity">11.6 Operations Analytics: Queues, Delivery Times and Capacity</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of a bank with one counter. When few customers arrive, nobody waits. When the counter is busy 95% of the time, the line grows and grows, even though the counter is "only" 5% idle. Operations analytics (warehouses, hospitals, call centres, delivery fleets) is about reading such waiting and flow numbers, spotting when something goes wrong, and predicting when capacity runs out.</div></div>
+<p><strong>Two laws that explain most waiting problems.</strong></p>
+<ul><li><strong>Little's law</strong>: <code>L = λ × W</code>. The average number of items in a system (L) equals the arrival rate (λ) times the average time each item spends in the system (W). Patients in a clinic, orders in a warehouse and customers in a bank all obey it.</li><li><strong>M/M/1 queue</strong> (one server, random arrivals and random service times): <code>R = S / (1 − ρ)</code>, where <code>R</code> is the average time in the system, <code>S</code> is the average service time and <code>ρ</code> (rho) is utilisation, the share of time the server is busy.</li></ul>
+<p class="problem"><span class="pl">Problem 11.6.1</span> A clinic admits 50 patients per hour and each stays 0.4 hours on average. How many patients are in the clinic? Then a bank counter serves a customer in S = 0.1 hour (6 minutes) on average. What is the average time in the bank at utilisation 50% to 95%?</p>
+<table class="steps"><tr><th>Formula</th><td>L = λ × W; R = S / (1 − ρ)</td></tr><tr><th>Compute</th><td>L = 50 × 0.4 = 20 patients. R: ρ = 0.5 gives 0.1/0.5 = 0.200 h; 0.7 gives 0.333 h; 0.8 gives 0.500 h; 0.9 gives 1.000 h; 0.95 gives 2.000 h</td></tr><tr><th>Answer</th><td>About 20 patients are in the clinic at any time. Going from 50% to 95% utilisation makes the time in the bank 10 times longer (0.2 h to 2.0 h, that is 12 minutes to 2 hours).</td></tr><tr><th>Check</th><td>At ρ = 0 the formula gives R = S = 0.1 h, a customer who never waits. Correct.</td></tr><tr><th>Why it matters</th><td>"The counter is busy only 70% of the time, so it is fine" is not a safe sentence. The last 20% of utilisation costs more waiting than the first 70%.</td></tr></table>
+<p><strong>Anomaly detection on delivery times.</strong> A warehouse records the average order-to-dispatch time (in seconds) every minute. Orders arrive in a daily cycle, so the busy hour is slower, and that is normal. A global rule (flag if more than 3 standard deviations from the overall mean) mixes up "busy" and "broken". Compare each minute with its own recent past instead: use a rolling median and a rolling MAD (median absolute deviation, a robust spread), and a robust z-score <code>0.6745 × (x − median) / MAD</code>.</p>
+<p>We simulate 7 days of per-minute readings with a daily order cycle, plus one incident (minutes 5000 to 5029, +150 seconds).</p>
+<pre class="code lang-python"><code>rng = np.random.default_rng(3); T = 7*24*60; t = np.arange(T)
+orders_per_hr = 100 + 40*np.sin(2*np.pi*t/1440 - 1.5) + 0.001*t + rng.normal(0, 5, T)
+dispatch = 80 + 0.8*np.maximum(orders_per_hr - 100, 0)**1.2 + rng.normal(0, 6, T)
+dispatch[5000:5030] += 150
+s = pd.Series(dispatch)
+med = s.rolling(60, min_periods=30).median()
+mad = (s - med).abs().rolling(60, min_periods=30).median()
+flag = (0.6745*(s - med)/mad) &gt; 6
+idx = np.where(flag)[0]
+print("flagged", len(idx), "first", idx.min(), "last", idx.max(),
+      "inside incident", int(((idx &gt;= 5000) &amp; (idx &lt; 5030)).sum()))
+print("global z&gt;3 count", int(((s - s.mean())/s.std() &gt; 3).sum()))</code></pre>
+<pre class="code lang-text"><code>flagged minutes 24 first 5000 last 5023
+flagged inside 5000-5029: 24
+global z&gt;3 count 30</code></pre>
+<ul><li><strong>Answer</strong> The rolling rule flagged 24 minutes, all inside the incident, starting at the first bad minute (5000). It missed the last 6, because the rolling median began to adapt to the new level. The global rule caught all 30 (we checked), with no false alarms.</li><li><strong>Check</strong> So on a big incident (+150 seconds) the simple global rule wins. Do not assume the fancy method is better.</li><li><strong>Why it matters</strong> The rolling rule earns its place on <em>small</em> incidents in <em>quiet</em> hours. We repeat the test with a +40 second incident of 30 minutes at the low-order time of day:</li></ul>
+<pre class="code lang-text"><code>incident 7169 7198 rolling flagged 5 inside 5 | global flagged 1 inside 0</code></pre>
+<p>At the quiet hour the global threshold (set by busy-hour variation) never fires inside the incident, and its single flag is a false alarm. The rolling rule catches 5 of 30 minutes, which is still a late and partial warning. A rolling window adapts, which is both strength (it follows the daily cycle) and weakness (a long incident becomes "normal"). Pair it with a fixed service rule such as "average dispatch time above 300 seconds for 5 minutes in a row".</p>
+<p><strong>Capacity forecast.</strong> The warehouse's daily peak load rose from about 200 orders with a slope of 0.8 per day plus noise. The packing limit is 300 orders. Fit a line, find when it crosses, and bootstrap the date.</p>
+<pre class="code lang-python"><code>days = 90
+peak = 200 + 0.8*np.arange(days) + rng.normal(0, 6, days)
+b = np.polyfit(np.arange(days), peak, 1)
+d = (300 - b[1]) / b[0]
+print("slope", b.round(3), "day hits limit", round(d, 1), "from day 90 =", round(d - 90, 1))</code></pre>
+<pre class="code lang-text"><code>slope [  0.814 200.115]
+day hits limit 122.7 from day 90 = 32.7
+90% interval [119.3 126.3]</code></pre>
+<p>(The 90% interval came from 1,000 bootstrap refits of the line on resampled days.)</p>
+<ul><li><strong>Answer</strong> The fitted slope is 0.814 orders per day, so the limit of 300 is hit on about day 123, roughly 33 days from now, with a 90% interval of day 119 to 126.</li><li><strong>Check</strong> (300 − 200.115) / 0.814 = 122.7. Correct.</li><li><strong>Why it matters</strong> Say "between 29 and 36 days from now", not "day 123". Hiring staff or leasing space takes lead time; plan with the early end of the interval. And remember that load rarely stays linear (sales campaigns, festivals).</li></ul>
+<p><strong>Your portfolio piece.</strong> Take any public operations dataset (taxi trips, hospital appointments, delivery logs, bike-share) and produce: percentiles of waiting time by hour (p50, p90, p99), a Little's law consistency check, the utilisation level where waiting explodes, anomaly flags checked against known events, and a capacity date with an interval.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Logistics and e-commerce: delivery-time anomaly detection, hub capacity planning.</li><li>Healthcare operations: appointment waiting times, bed occupancy forecasts.</li><li>Banks and call centres: staffing to a waiting-time target.</li><li>Technology operations: the same laws apply to servers handling requests.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Averaging waiting times. Averages hide the tail: a few customers who wait two hours matter more than a mean of 12 minutes. Report p50, p90, p99, and when you combine groups, combine the raw records, not the percentiles of percentiles.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>200 patients are in a hospital and each stays 0.5 hours on average. What is the admission rate? Answer: λ = L / W = 200 / 0.5 = 400 patients per hour.</li><li>Why does a rolling median beat a global threshold for a daily-cycle metric? Answer: It compares each point to its own recent level, so the daily peak is not flagged.</li><li>Why give a date interval for the capacity limit? Answer: The trend line has uncertainty; the bootstrap shows a range so planning can use the early end.</li></ol>
+<h2 id="s7-chapter-recap">Chapter recap</h2>
+<ul><li>Churn needs a definition first (contractual vs silent). Kaplan-Meier survival uses censored customers properly: 26% of free vs 57% of pro customers survive a year.</li><li>CLV from cohort revenue times margin: 1,522 (free) vs 4,940 (pro) rupees in year one; RFM gave churn rates from 2.7% to 59.3%.</li><li>Scorecards: WoE bins, IV to select, logistic regression on WoE, points from PDO. Test AUC 0.685, Gini 0.371, KS 0.295.</li><li>PSI under 0.1 is stable. A simulated shift gave PSI 0.456.</li><li>Fraud: accuracy is useless at 0.4% fraud; use precision at capacity and the cost threshold <code>c_review / (c_review + c_miss)</code> = 2%, which saved 24.9%.</li><li>MMM uses adstock and saturation, but parameters can be weakly identified. Pricing elasticity from observation is not causal and should not be extrapolated.</li><li>Safety stock <code>z × σ × √L</code> and newsvendor critical ratio turn forecasts into stock.</li><li>Healthcare needs calibration and net benefit. Operations data uses Little's law, the M/M/1 knee, rolling robust anomaly detection and capacity dates with intervals.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Formula</th><th>Example</th></tr></thead><tbody><tr><td>Kaplan-Meier</td><td><code>S × (1 − d/n)</code></td><td>0.8 → 0.6 → 0.3</td></tr><tr><td>WoE</td><td><code>ln(pg / pb)</code></td><td>ln(0.5) = −0.693</td></tr><tr><td>IV</td><td><code>Σ (pg − pb) × WoE</code></td><td>0.168 for utilisation</td></tr><tr><td>Gini</td><td><code>2 × AUC − 1</code></td><td>0.3706</td></tr><tr><td>PSI</td><td><code>Σ (a − e) × ln(a / e)</code></td><td>0.0405</td></tr><tr><td>Expected loss</td><td><code>PD × LGD × EAD</code></td><td>0.03 × 0.45 × 200,000 = 2,700</td></tr><tr><td>Cost threshold</td><td><code>c_fp / (c_fp + c_fn)</code></td><td>100 / 5,100 = 0.0196</td></tr><tr><td>Adstock, saturation</td><td><code>a × prev + x</code>, <code>x / (x + k)</code></td><td>100, 50, 25</td></tr><tr><td>Safety stock</td><td><code>z × σ × √L</code></td><td>98.7</td></tr><tr><td>Newsvendor</td><td><code>c_u / (c_u + c_o)</code></td><td>0.80 → Q = 584</td></tr><tr><td>Little's law, M/M/1</td><td><code>L = λW</code>, <code>R = S/(1−ρ)</code></td><td>20 patients, 2.0 h at 95%</td></tr></tbody></table></div>
+<h2 id="s8-practice-set">Practice set</h2>
+<p><strong>1.</strong> (Easy) Bin A has 40% of goods and 10% of bads. Find its WoE. <strong>Answer:</strong> ln(0.40/0.10) = ln 4 = 1.386. Very safe bin.</p>
+<p><strong>2.</strong> (Easy) PD 2%, LGD 50%, EAD 100,000 rupees. Expected loss? <strong>Answer:</strong> 0.02 × 0.5 × 100,000 = 1,000 rupees.</p>
+<p><strong>3.</strong> (Easy) A shop serves 120 customers per hour and each spends 0.25 hours inside. How many are inside on average? <strong>Answer:</strong> 120 × 0.25 = 30.</p>
+<p><strong>4.</strong> (Medium) PSI for three bins, expected (0.5, 0.3, 0.2), actual (0.4, 0.3, 0.3). Is it stable? <strong>Answer:</strong> (−0.1)ln(0.8) + 0 + (0.1)ln(1.5) = 0.0223 + 0.0405 = 0.0629. Below 0.1, stable.</p>
+<p><strong>5.</strong> (Medium) Find the bug: "Churn rate = 65% so average customer lifetime is 1/0.65 = 1.5 periods." The 65% came from all customers including still-active ones, treated as non-churned. <strong>Answer:</strong> Mixing a share of customers (who churned by a date) with a per-period hazard. The 65% depends on observation length, and active customers are censored. Use a survival curve or a per-period hazard.</p>
+<p><strong>6.</strong> (Medium) What is printed? <code>adstock(np.array([200, 0, 0.]), 0.5)</code> <strong>Answer:</strong> <code>[200., 100., 50.]</code>, since each week keeps half of the previous adstock.</p>
+<p><strong>7.</strong> (Medium) Missed fraud costs 3,000, review costs 60. Capacity allows 200 reviews. Threshold from cost is about 2%, but 2% flags 900 cases a day. What do you do? <strong>Answer:</strong> Capacity is a constraint: review the top 200 by score (precision at K), then argue for more reviewers or a cheap automated step if the expected savings of the next 700 reviews exceed their cost.</p>
+<p><strong>8.</strong> (Hard) Elasticity −2.5, unit cost 40. Optimal price and warning? <strong>Answer:</strong> p* = 40 × (−2.5) / (−1.5) = 66.7. Warn that this assumes constant elasticity and must be tested inside the observed price range.</p>
+<p><strong>9.</strong> (Interview) "Your credit model has Gini 0.85 on test. Is that great?" <strong>Answer:</strong> Suspicious. Check for leakage (variables created after the decision, such as collection status), a time-ordered split, IV above 0.5 for any variable, and that the label window is respected. Real application scorecards are usually far below such a number.</p>
+<p><strong>10.</strong> (Interview) "How would you detect a slow capacity problem versus a sudden breakdown in delivery-time data?" <strong>Answer:</strong> Sudden: rolling robust z-score plus a fixed service rule. Slow: weekly peaks regressed on time (trend with interval), plus a look at where waiting time explodes as utilisation rises. Report the date range at which a limit is hit.</p>
+<p><strong>11.</strong> (Hard) A random forest has AUC 0.87 and its 5% to 10% predicted-risk bin has an observed rate of 3%. A doctor will treat at 10%. Problem? <strong>Answer:</strong> Poor calibration. The probabilities are not real, so the threshold means something different. Calibrate on a held-out set, then re-check net benefit.</p>
+<h2 id="s9-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me credit-risk scorecards step by step: PD, LGD, EAD, WoE binning, Information Value, logistic regression on WoE, converting to points (base score and PDO), KS, Gini and PSI. Use a tiny made-up table of 10 loans with real numbers I can compute by hand. After each step, ask me to compute the next number and check my answer before moving on.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: churn and customer lifetime value, covering contractual vs non-contractual churn, censoring, Kaplan-Meier survival, cohort CLV, RFM segments and why uplift beats churn scores for retention offers. Give me 8 graded exercises with small numbers and no solutions. When I send my answers, grade them, show every calculation step, and explain the business decision that each answer changes.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: fraud detection with extreme class imbalance: why accuracy fails, precision at fixed review capacity, PR-AUC, cost-based thresholds and concept drift. Quiz me one question at a time (10 questions, easy to hard), using numbers like 0.4% fraud rate and costs in rupees. Wait for my answer each time, then correct me and explain the intuition.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: marketing mix modelling (adstock, saturation, identifiability limits, incrementality tests) and price elasticity (log-log regression, optimal price formula, extrapolation danger). Review my work below: [PASTE HERE MY CODE OR MY EXPLANATION]. Point out statistical mistakes, causal mistakes and unclear wording, then rewrite my explanation in simple English for a marketing manager.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles and English is my second language. Topic: operations analytics: Little's law, the M/M/1 utilisation curve, robust rolling anomaly detection on delivery times, and capacity forecasting with uncertainty intervals. Run a mock interview for a Data Scientist role at a logistics or healthcare-operations company: ask 8 questions, one at a time, with follow-ups. Score each answer out of 5 and show a model answer.</pre></div><div class="readbtn"><button class="btn" data-read="study:ds:ch11">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch10.html">← Chapter 10: Recommendation, Ranking and Search</a><a class="btn" href="ch12.html">Chapter 12: From Prediction to Decision: Cost Matric →</a></div></div><script src="../../assets/study.js"></script></body></html>

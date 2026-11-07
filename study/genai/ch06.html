@@ -1,0 +1,169 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 6: Vector Databases and Retrieval</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">NLP, LLMs, RAG &amp; Agents</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 6</div><h1>Vector Databases and Retrieval</h1><p>How to find the right few chunks among millions: exact search, approximate indexes, metadata filters, hybrid search and reranking.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-6-1-a-tiny-retriever-you-can-run-exact-search-and-metadata-filters">6.1 A Tiny Retriever You Can Run (Exact Search and Metadata Filters)</a></li><li><a href="#s2-6-2-approximate-nearest-neighbour-indexes-flat-ivf-hnsw-pq">6.2 Approximate Nearest Neighbour Indexes: Flat, IVF, HNSW, PQ</a></li><li><a href="#s3-6-3-hybrid-search-and-reranking">6.3 Hybrid Search and Reranking</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>In Chapter 2 you searched ten sentences by comparing the query with every one of them. That works for ten, for ten thousand, and even for a million on a decent machine. But when a company has fifty million chunks and wants an answer in under 100 milliseconds for thousands of users, you cannot compare with everything. You also need to filter ("only documents this user may see", "only 2025"), combine meaning search with keyword search, and re-order the top results with a sharper tool. This chapter shows how all of this works, and you will build and run a tiny retriever and measure the speed-versus-accuracy trade-off of an approximate index with real numbers.</p>
+<p><strong>Words you need first</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Index</td><td>A data structure that makes search faster than checking everything</td></tr><tr><td>Exact (flat) search</td><td>Compare the query with every vector; always correct, slower</td></tr><tr><td>ANN</td><td>Approximate Nearest Neighbour: very fast search that may miss a few true neighbours</td></tr><tr><td>Recall@k</td><td>Of the true top k neighbours, the fraction your fast search found</td></tr><tr><td>Metadata</td><td>Extra fields stored with each chunk: source, date, department, permissions</td></tr><tr><td>Reranker</td><td>A second, more careful model that re-orders the top results</td></tr></tbody></table></div>
+<p>Running example: a small customer-help knowledge base with a billing, account and plans section.</p>
+<h2 id="s1-6-1-a-tiny-retriever-you-can-run-exact-search-and-metadata-filters">6.1 A Tiny Retriever You Can Run (Exact Search and Metadata Filters)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A library with a card catalogue. Exact search is reading every card. A metadata filter is first walking to the right shelf ("billing") and only then reading the cards on it. Always cheaper and often more correct.</div></div>
+<p><strong>How it works.</strong> Store one vector per chunk, plus its metadata. For a query: embed it, compute the similarity with every stored vector (a matrix multiplication, as in Chapter 2), optionally keep only rows whose metadata matches the filter, sort, return the top k. Here we use TF-IDF vectors from Chapter 1 as a stand-in for an embedding model, because we have no model to download. The code, the filter and the scoring are identical when you use real embeddings.</p>
+<p><strong>Predict, run, explain.</strong> Version 1 uses a plain tokenizer. The query is "how long do refunds take". The doc says "Refund requests are processed within 7 business days". Do you expect a match?</p>
+<pre class="code lang-python"><code>import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+docs=[("d1","Refund requests are processed within 7 business days.","billing"),
+("d2","To reset your password click Forgot Password on the login page.","account"),
+("d3","Invoices are emailed on the first day of every month.","billing"),
+("d4","Two factor authentication can be enabled in security settings.","account"),
+("d5","Premium plan includes 24x7 phone support.","plans"),
+("d6","Cancel your subscription any time from the billing page.","billing")]
+tf=TfidfVectorizer(stop_words="english",sublinear_tf=True)
+M=tf.fit_transform([d[1] for d in docs]).toarray()
+M/=np.linalg.norm(M,axis=1,keepdims=True)
+def retrieve(q,k=3,meta=None):
+    v=tf.transform([q]).toarray()[0]; n=np.linalg.norm(v)
+    v=v/n if n else v
+    s=M@v
+    order=[i for i in np.argsort(-s) if meta is None or docs[i][2]==meta]
+    return [(docs[i][0],round(float(s[i]),3)) for i in order[:k]]
+print(retrieve("how long do refunds take"))
+print(retrieve("how do I reset my password"))
+print(retrieve("billing page", meta="billing"))
+print(retrieve("billing page", meta="plans"))</code></pre>
+<pre class="code lang-text"><code>[('d1', 0.0), ('d2', 0.0), ('d3', 0.0)]
+[('d2', 0.694), ('d1', 0.0), ('d3', 0.0)]
+[('d6', 0.598), ('d1', 0.0), ('d3', 0.0)]
+[('d5', 0.0)]</code></pre>
+<p>Explain line by line. <code>M</code> is a matrix with one unit-length row per document, so <code>M @ v</code> gives all cosines in one step. The first query scored <strong>0.0 for the right document</strong>: the query word <code>refunds</code> is not the document word <code>refund</code>, and TF-IDF treats them as different words. This is exactly the vocabulary-mismatch problem that real embeddings are meant to solve, and it shows why you test retrieval before you trust it. The password query worked since the words overlap. The third call shows the filter: only billing documents are considered, and <code>d6</code> wins. The fourth shows that a filter can remove all relevant documents: <code>d5</code> is returned with score 0, which is a "result" in name only. In production, apply a minimum score or return "no results".</p>
+<p>Now we add a one-line crude stemmer (cut a final <code>s</code>) to the tokenizer, to see the fix:</p>
+<pre class="code lang-text"><code>[('d1', 0.369), ('d2', 0.0), ('d3', 0.0)]
+[('d2', 0.592), ('d1', 0.0), ('d3', 0.0)]
+[('d6', 0.462), ('d1', 0.0), ('d3', 0.0)]
+[('d5', 0.0)]</code></pre>
+<p>With the stemmer, <code>d1</code> now scores 0.369 for the refund query, and it is first. (The extra code was a custom <code>tokenizer</code> function passed to <code>TfidfVectorizer</code> with <code>token_pattern=None</code>.)</p>
+<p class="problem"><span class="pl">Problem 6.1.1</span> The password query scored 0.694 for d2 in the first run. Which words overlapped, and why is the score below 1?</p>
+<table class="steps"><tr><th>Step 1</th><td>Query words after stop-word removal: <code>reset</code>, <code>password</code> (<code>how</code>, <code>do</code>, <code>i</code> are removed).</td></tr><tr><th>Step 2</th><td>d2 contains <code>reset</code>, <code>password</code> (twice, in "your password" and "Forgot Password"), <code>click</code>, <code>forgot</code>, <code>login</code>, <code>page</code>. Overlap is <code>reset</code> and <code>password</code>.</td></tr><tr><th>Step 3</th><td>The d2 vector has more words than the query, so after length normalisation its share along the two shared words is below 1.</td></tr><tr><th>Answer</th><td>Two words overlap; the score is below 1 because d2 also has many words the query lacks.</td></tr><tr><th>Check</th><td>A document that is exactly "reset password" would score 1.0 for this query.</td></tr></table>
+<p class="problem"><span class="pl">Problem 6.1.2</span> A metadata filter on <code>department = "billing"</code> leaves 3 of 6 documents. How many cosine computations does the filtered search need, compared with unfiltered?</p>
+<table class="steps"><tr><th>Compute</th><td>In our code we computed all 6 and filtered after, but a database that filters first computes only 3. Savings = (6 − 3)/6 = 50%.</td></tr><tr><th>Answer</th><td>3 instead of 6, half the work (databases may filter before or after the vector search; this changes recall and speed, see Section 6.2).</td></tr><tr><th>Check</th><td>If the filter keeps 1% of 10 million vectors, a pre-filter needs only 100,000 comparisons, which is why filters matter at scale.</td></tr></table>
+<p><strong>Permissions belong in the filter.</strong> If user A may only read documents from the "legal" team, the filter must be part of the search itself, not applied after the model has read the chunks. This is <em>permissions-aware retrieval</em> (Chapter 7 and 9).</p>
+<p><strong>Applications</strong></p>
+<ul><li><em>GenAI:</em> the retrieval step in RAG, duplicate detection, "related tickets".</li><li><em>Data Engineering:</em> similarity joins and entity matching.</li><li><em>Security:</em> per-user document access control through filters.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Returning the top k results regardless of score. When nothing is relevant, the top result is just the least-bad one, and the generator will happily answer from it. Use a score threshold and let the system say "I could not find this".</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why did the refund query score 0.0 on the right document?</li></ol>
+<p>Answer: <code>refunds</code> and <code>refund</code> were different tokens for TF-IDF.</p>
+<ol><li>Why apply permission filters inside the search?</li></ol>
+<p>Answer: So that unauthorised chunks are never retrieved or shown to the model.</p>
+<ol><li>What does <code>M @ v</code> compute when rows are unit vectors?</li></ol>
+<p>Answer: The cosine similarity of every document with the query.</p>
+<h2 id="s2-6-2-approximate-nearest-neighbour-indexes-flat-ivf-hnsw-pq">6.2 Approximate Nearest Neighbour Indexes: Flat, IVF, HNSW, PQ</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Finding a friend in a big city. Exact search: knock on every door. IVF (inverted file): first decide which neighbourhood they probably live in and only search those neighbourhoods. HNSW: like asking people on the street, who point you to someone closer, who points you to someone closer still: a short chain of hops. PQ: store a rough sketch of each person instead of a full portrait, so more people fit in memory.</div></div>
+<p><strong>The index types.</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Index</th><th>Idea</th><th>Memory</th><th>Speed</th><th>Accuracy</th></tr></thead><tbody><tr><td>Flat</td><td>Compare with all vectors</td><td>Full vectors</td><td>Slow at scale</td><td>Exact (100% recall)</td></tr><tr><td>IVF</td><td>Cluster vectors with k-means into lists; search only the nearest <code>nprobe</code> lists</td><td>Full + small centroid table</td><td>Fast</td><td>Approximate; higher nprobe means higher recall</td></tr><tr><td>HNSW</td><td>Multi-layer graph; greedy walk from coarse upper layer to dense bottom layer</td><td>Full vectors + graph links (more memory)</td><td>Very fast</td><td>Approximate; controlled by <code>M</code>, <code>efConstruction</code>, <code>efSearch</code></td></tr><tr><td>PQ (product quantization)</td><td>Split each vector into pieces and replace each piece with a short code from a codebook</td><td>Much smaller</td><td>Fast, slightly less accurate</td><td>Lossy compression</td></tr></tbody></table></div>
+<p>HNSW stands for Hierarchical Navigable Small World. In HNSW the search effort grows roughly with the logarithm of the number of vectors, which is why it is the common default in many vector databases. Its knobs: <code>M</code> (links per node: more means better recall and more memory), <code>efConstruction</code> (effort when building the graph), <code>efSearch</code> (effort per query: more means higher recall and slower). In IVF the knobs are the number of lists and <code>nprobe</code>.</p>
+<figure><img src="images/ivf.svg" alt="IVF clusters: search only the nearest lists" loading="lazy"/><figcaption>IVF clusters: search only the nearest lists</figcaption></figure>
+<p><em>How to read the picture:</em> each dotted circle is a cluster (a "list") of vectors. The red marker is the query. We search only the blue clusters nearest to it (nprobe = 2) and skip the grey ones. The true nearest neighbour might sit in a skipped cluster near a boundary; that is the "approximate" in ANN.</p>
+<p><strong>A real experiment.</strong> We build 50,000 synthetic vectors of 64 dimensions that form 200 natural groups, run exact search as the truth, and then an IVF index with 100 lists, trying <code>nprobe</code> = 1, 3 and 10, measuring recall@10 against the exact answer. Predict first: will recall at nprobe = 1 be above or below 50%?</p>
+<pre class="code lang-python"><code>import numpy as np, time
+rng=np.random.default_rng(0)
+N,d=50000,64
+centers=rng.normal(size=(200,d))*3
+X=(centers[rng.integers(0,200,N)]+rng.normal(size=(N,d))).astype("float32")
+X/=np.linalg.norm(X,axis=1,keepdims=True)
+Q=X[rng.choice(N,100,replace=False)]+0.1*rng.normal(size=(100,d)).astype("float32")
+Q/=np.linalg.norm(Q,axis=1,keepdims=True)
+t=time.perf_counter(); S=Q@X.T; truth=np.argsort(-S,axis=1)[:,:10]; tf=time.perf_counter()-t
+print(f"flat exact: {tf*1000/100:.2f} ms/query (batched)")
+K=100
+C=X[rng.choice(N,K,replace=False)].copy()
+for _ in range(8):                                   # a few k-means rounds
+    a=np.argmax(X@C.T,axis=1)
+    for j in range(K):
+        m=X[a==j]
+        if len(m): c=m.mean(0); C[j]=c/np.linalg.norm(c)
+a=np.argmax(X@C.T,axis=1)
+lists=[np.nonzero(a==j)[0] for j in range(K)]
+for nprobe in [1,3,10]:
+    t=time.perf_counter(); hit=0; scanned=0
+    for qi,q in enumerate(Q):
+        cs=np.argsort(-(C@q))[:nprobe]
+        cand=np.concatenate([lists[j] for j in cs]); scanned+=len(cand)
+        top=cand[np.argsort(-(X[cand]@q))[:10]]
+        hit+=len(set(top)&amp;set(truth[qi]))
+    el=time.perf_counter()-t
+    print(f"nprobe={nprobe:2d} recall@10={hit/1000:.3f} scanned={scanned/100/N:.1%} of data, {el*10:.2f} ms/query")</code></pre>
+<pre class="code lang-text"><code>flat exact: 3.17 ms/query (batched)
+nprobe= 1 recall@10=0.970 scanned=1.2% of data, 0.14 ms/query
+nprobe= 3 recall@10=0.990 scanned=3.3% of data, 0.21 ms/query
+nprobe=10 recall@10=1.000 scanned=10.3% of data, 0.58 ms/query</code></pre>
+<p>Explain. <code>truth</code> holds the exact top 10 for each of the 100 queries. After k-means, each vector belongs to its nearest centroid's list. For a query we find the <code>nprobe</code> nearest centroids, gather only their vectors as candidates, and rank those. Recall@10 is (number of true top-10 found) / (100 queries × 10). With nprobe = 1 we scanned only 1.2% of the data and still found 97% of the true neighbours. Raising nprobe to 10 found all of them (recall 1.000) while scanning 10% of the data, still about 5 times faster than the batched flat search. <strong>Timings depend on your machine, and the data are artificially clustered, which flatters IVF</strong>; real text embeddings are less cleanly clustered, so you typically need more probes. The lesson is the shape of the trade-off: more work buys more recall with diminishing returns.</p>
+<p class="problem"><span class="pl">Problem 6.2.1</span> From the table, how much work did nprobe = 3 do compared with scanning everything, and what did it cost in recall?</p>
+<table class="steps"><tr><th>Formula</th><td>work fraction = vectors scanned / total vectors</td></tr><tr><th>Plug in</th><td>3.3% scanned of N = 50,000</td></tr><tr><th>Compute</th><td>0.033 × 50,000 = 1,650 vectors per query (plus 100 centroid comparisons). Recall = 0.990, so the miss rate is 1 − 0.990 = 0.010.</td></tr><tr><th>Answer</th><td>It compared the query with about 1,650 vectors plus 100 centroids instead of 50,000, and lost 1% of the true top-10 results.</td></tr><tr><th>Check</th><td>1,750 / 50,000 = 3.5%, matching "3.3% plus centroids".</td></tr><tr><th>Why it matters</th><td>Whether a 1% miss is acceptable depends on the product: for a help-desk search, usually yes; for finding every similar fraud case, maybe not.</td></tr></table>
+<p class="problem"><span class="pl">Problem 6.2.2</span> Product quantization: a 768-dimension float32 vector takes 3,072 bytes. PQ splits it into 96 pieces and stores one 1-byte code per piece. How big is the compressed vector, and how much memory is saved for 10 million vectors?</p>
+<table class="steps"><tr><th>Formula</th><td>bytes = dimension × 4 (float32); compressed = pieces × 1</td></tr><tr><th>Compute</th><td>768 × 4 = 3,072 bytes; compressed = 96 bytes; ratio = 3,072 / 96 = 32. For 10 million vectors: 30.72 GB versus 0.96 GB.</td></tr><tr><th>Answer</th><td>PQ shrinks each vector 32 times; 10 million vectors go from about 30.7 GB to about 0.96 GB.</td></tr><tr><th>Check</th><td>10,000,000 × 3,072 = 30,720,000,000 bytes; 10,000,000 × 96 = 960,000,000 bytes.</td></tr><tr><th>Why it matters</th><td>It is the difference between needing a big RAM machine and a laptop-size index, at some accuracy cost, which is why PQ is often followed by a rescoring step with full vectors.</td></tr></table>
+<p><strong>Filters meet ANN.</strong> Pre-filtering (filter first, then search the subset) is accurate but can be slow for small subsets in graph indexes. Post-filtering (search, then drop non-matching) is fast but can return fewer than k results if most hits are filtered out. Good vector databases implement filtered search carefully; read how yours does it.</p>
+<p><strong>The vector store landscape</strong> (names, not rankings; capabilities change, so read current docs):</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Option</th><th>What it is</th><th>Typical use</th></tr></thead><tbody><tr><td>FAISS</td><td>A library (not a server) of ANN indexes from Meta</td><td>Research, embedded in your app</td></tr><tr><td>Chroma</td><td>Simple embedded vector store</td><td>Prototypes, local apps</td></tr><tr><td>Qdrant, Weaviate, Milvus</td><td>Dedicated vector databases (open source, also hosted)</td><td>Production search with filters</td></tr><tr><td>pgvector</td><td>Vector search inside PostgreSQL</td><td>When you already use Postgres; one system for data and vectors</td></tr><tr><td>Pinecone</td><td>Hosted managed vector database</td><td>When you want no operations work</td></tr><tr><td>Elasticsearch / OpenSearch</td><td>Search engines with BM25 and vector support</td><td>Hybrid search, existing search clusters</td></tr></tbody></table></div>
+<p><strong>Picking one:</strong> start with what you have (Postgres with pgvector, or your search engine), measure recall and latency on your data, and move to a dedicated store only if you hit limits.</p>
+<p><strong>Applications</strong></p>
+<ul><li><em>GenAI engineering:</em> RAG at scale.</li><li><em>Data Engineering:</em> operating and tuning the index, rebuild jobs.</li><li><em>MLOps:</em> capacity planning for index memory.</li><li><em>Operations and serving:</em> stress-checking the vector store with simulated traffic (p95 latency at target QPS, recall under load).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Measuring only speed. A fast index with 70% recall silently drops relevant chunks. Always report recall@k against an exact baseline on a sample of your real queries, next to latency.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does increasing <code>nprobe</code> do?</li></ol>
+<p>Answer: Searches more clusters, raising recall and latency.</p>
+<ol><li>Which index is exact?</li></ol>
+<p>Answer: Flat.</p>
+<ol><li>Memory for 1 million 384-dim float32 vectors?</li></ol>
+<p>Answer: 1,000,000 × 384 × 4 = 1.536 GB.</p>
+<h2 id="s3-6-3-hybrid-search-and-reranking">6.3 Hybrid Search and Reranking</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Two detectives: one is great at exact clues (names, error codes), the other at the general idea. Ask both, merge their lists. Then hire a careful third expert who reads each of the top 20 candidates properly together with the question and picks the best 5.</div></div>
+<p><strong>Hybrid search.</strong> Run BM25 (Chapter 1) and vector search, then merge. A simple, robust merge is <strong>Reciprocal Rank Fusion (RRF)</strong>, which uses only ranks (not scores, which live on different scales):</p>
+<pre class="code lang-text"><code>RRF score(d) = Σ over rankings of  1 / (k + rank of d)       (k is usually 60)</code></pre>
+<pre class="code lang-python"><code>def rrf(rankings,k=60):
+    s={}
+    for r in rankings:
+        for pos,d in enumerate(r,1): s[d]=s.get(d,0)+1/(k+pos)
+    return sorted(s.items(),key=lambda x:-x[1])
+bm25=["d3","d1","d7","d2"]; vec=["d1","d5","d3","d9"]
+for d,sc in rrf([bm25,vec]): print(d,round(sc,5))</code></pre>
+<pre class="code lang-text"><code>d1 0.03252
+d3 0.03227
+d5 0.01613
+d7 0.01587
+d2 0.01562
+d9 0.01562</code></pre>
+<p class="problem"><span class="pl">Problem 6.3.1</span> Verify the scores of d1 and d3 by hand.</p>
+<table class="steps"><tr><th>Formula</th><td>RRF = 1/(60 + rank in list 1) + 1/(60 + rank in list 2)</td></tr><tr><th>Plug in</th><td>d1 is rank 2 in BM25 and rank 1 in vectors. d3 is rank 1 in BM25 and rank 3 in vectors.</td></tr><tr><th>Compute</th><td>d1: 1/62 + 1/61 = 0.016129 + 0.016393 = 0.032522. d3: 1/61 + 1/63 = 0.016393 + 0.015873 = 0.032266.</td></tr><tr><th>Answer</th><td>d1 (0.03252) beats d3 (0.03227): it ranks high in both lists.</td></tr><tr><th>Check</th><td>The code printed 0.03252 and 0.03227. A document in one list only (d5, rank 2 in vectors) gets 1/62 = 0.01613, below any document that appears in both high up.</td></tr><tr><th>Why it matters</th><td>RRF rewards agreement between independent retrievers and needs no score calibration.</td></tr></table>
+<p><strong>Reranking.</strong> The first stage (bi-encoder: the query and the document are embedded <em>separately</em>, which allows precomputing document vectors) is fast but coarse. A <strong>cross-encoder</strong> reads the query and one document <em>together</em> in one pass and outputs a relevance score. It is more accurate and much slower, so it is applied only to the top 20 to 100 candidates. Hosted rerank APIs (for example Cohere Rerank) and open cross-encoder models exist; the pattern is: retrieve 50, rerank, keep 5.</p>
+<p class="problem"><span class="pl">Problem 6.3.2</span> A cross-encoder takes 20 ms per (query, chunk) pair on your hardware. How long does reranking 50 candidates take sequentially, and would you rerank all 1 million chunks?</p>
+<table class="steps"><tr><th>Compute</th><td>50 × 20 ms = 1,000 ms = 1 s sequentially (batching and a GPU reduce this a lot). Whole index: 1,000,000 × 20 ms = 20,000 s = 5.6 hours per query.</td></tr><tr><th>Answer</th><td>Reranking 50 candidates costs about 1 s sequentially, which is acceptable only with batching; reranking everything is impossible.</td></tr><tr><th>Check</th><td>20,000 s / 3,600 = 5.56 hours.</td></tr><tr><th>Why it matters</th><td>This is why retrieval is a funnel: cheap and wide first, expensive and narrow later.</td></tr></table>
+<pre class="code lang-text"><code>1 million chunks --(BM25 + vector, ANN)--&gt; top 50 --(cross-encoder rerank)--&gt; top 5 --&gt; prompt</code></pre>
+<p><strong>Applications</strong></p>
+<ul><li><em>GenAI:</em> hybrid search plus rerank is the standard strong baseline for RAG.</li><li><em>E-commerce / site search:</em> exact SKUs by BM25, intent by vectors.</li><li><em>Support tooling:</em> find similar past incidents by error code and by description.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Adding a reranker without measuring. Run the eval set (Chapter 8) with and without it, and record recall@5, latency and cost. Keep it only if the gain is worth it.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why is RRF used instead of adding BM25 and cosine scores?</li></ol>
+<p>Answer: The scores have different scales; ranks can be compared directly.</p>
+<ol><li>Why not use a cross-encoder on the whole index?</li></ol>
+<p>Answer: It must read each pair together, which is too slow for millions.</p>
+<ol><li>What is a bi-encoder?</li></ol>
+<p>Answer: A model that embeds query and document separately so document vectors can be precomputed.</p>
+<h2 id="s4-chapter-recap">Chapter recap</h2>
+<ul><li>A retriever = embeddings + index + metadata filter + score threshold.</li><li>Test retrieval directly: <code>refund</code> versus <code>refunds</code> showed how a zero score hides in plain sight.</li><li>Exact search is always right but slow at scale; ANN trades a little recall for big speed.</li><li>IVF searches the nearest clusters (knob: <code>nprobe</code>); HNSW walks a graph (knobs: <code>M</code>, <code>efSearch</code>); PQ compresses vectors.</li><li>Report recall@k against exact search, together with latency.</li><li>Metadata and permission filters belong inside the search.</li><li>Hybrid search (BM25 plus vectors, merged by RRF) beats either alone on mixed queries.</li><li>Rerank only the top candidates with a cross-encoder; measure the benefit.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Formula or code</th></tr></thead><tbody><tr><td>Cosine for all docs</td><td><code>scores = M @ q</code> (unit-length rows)</td></tr><tr><td>Vector memory</td><td><code>N × dim × 4</code> bytes (float32)</td></tr><tr><td>RRF</td><td><code>Σ 1/(60 + rank)</code></td></tr><tr><td>Recall@k (ANN)</td><td>`</td></tr><tr><td>Funnel</td><td>retrieve 50 then rerank then keep 5</td></tr></tbody></table></div>
+<h2 id="s5-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 6.P.1</span> (easy) What does ANN stand for and what does it trade? <strong>Answer:</strong> Approximate Nearest Neighbour; it trades a small loss of accuracy (recall) for large speed gains.</p>
+<p class="problem"><span class="pl">Problem 6.P.2</span> (easy) Which index type is exact? <strong>Answer:</strong> Flat.</p>
+<p class="problem"><span class="pl">Problem 6.P.3</span> (computation) 5 million vectors of 1,024 dimensions as float16. Memory? <strong>Answer:</strong> 5,000,000 × 1,024 × 2 = 10,240,000,000 bytes, about 10.2 GB.</p>
+<p class="problem"><span class="pl">Problem 6.P.4</span> (computation) RRF with k = 60: a document is rank 1 in list A only. Score? <strong>Answer:</strong> 1/61 = 0.01639.</p>
+<p class="problem"><span class="pl">Problem 6.P.5</span> (what is the output?) A filter keeps no documents and the code returns <code>order[:k]</code> of an empty list. What does the caller get? <strong>Answer:</strong> An empty list; the caller must handle "no results" instead of assuming at least one.</p>
+<p class="problem"><span class="pl">Problem 6.P.6</span> (find the bug) A team post-filters by department after retrieving the top 5, and users in small departments often see only one or zero results. Why? <strong>Answer:</strong> Most of the top 5 belong to other departments and get dropped. Use pre-filtering (filter inside the search) or retrieve more candidates, then filter.</p>
+<p class="problem"><span class="pl">Problem 6.P.7</span> (computation) Recall@10 of an ANN index is 0.95 over 200 queries. How many true neighbours were missed? <strong>Answer:</strong> Total true = 2,000; found = 1,900; missed = 100.</p>
+<p class="problem"><span class="pl">Problem 6.P.8</span> (scenario) Your vector search returns good results for natural-language questions but fails on exact product codes like <code>XJ-4471</code>. What do you add? <strong>Answer:</strong> BM25 keyword search combined with vectors (hybrid search with RRF), and make sure the tokenizer keeps the code intact.</p>
+<p class="problem"><span class="pl">Problem 6.P.9</span> (interview) Explain the difference between a bi-encoder and a cross-encoder and where each is used. <strong>Answer:</strong> Bi-encoders embed texts independently (fast, precomputable) and are used for first-stage retrieval. Cross-encoders read the query and document together (slower, more accurate) and are used to rerank a few candidates.</p>
+<p class="problem"><span class="pl">Problem 6.P.10</span> (interview) How would you choose between pgvector and a dedicated vector database? <strong>Answer:</strong> Start from the existing stack and the size: for up to a few million vectors with moderate QPS, pgvector in Postgres is simple and keeps data and vectors together. Measure recall and p95 latency on real queries. Move to a dedicated database if you need larger scale, advanced filtering or lower latency.</p>
+<h2 id="s6-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: Vector databases and retrieval: exact search, ANN indexes (IVF, HNSW, PQ), metadata filters, hybrid search with RRF and reranking. Explain this topic step by step from first principles using an everyday analogy, then a worked example with real numbers. After each step, ask me one question to check I understood before continuing.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: Vector databases and retrieval: exact search, ANN indexes (IVF, HNSW, PQ), metadata filters, hybrid search with RRF and reranking. Give me 8 graded exercises on this topic, from easy to hard, with small numbers and a few code-reading questions. Do NOT give solutions until I reply with my answers; then mark them and explain my mistakes.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: Vector databases and retrieval: exact search, ANN indexes (IVF, HNSW, PQ), metadata filters, hybrid search with RRF and reranking. Quiz me one question at a time on this topic, about 12 questions in total. Wait for my answer, say whether it is right, explain briefly, and adapt the difficulty to my answers. At the end summarise my weak points.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: Vector databases and retrieval: exact search, ANN indexes (IVF, HNSW, PQ), metadata filters, hybrid search with RRF and reranking. Review my work on this topic. I will paste my code, my calculation or my explanation below. Check it for errors, explain each error in simple words, and show a corrected version. Then give me one follow-up exercise.
+
+[PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: Vector databases and retrieval: exact search, ANN indexes (IVF, HNSW, PQ), metadata filters, hybrid search with RRF and reranking. Run a mock interview on this topic for a GenAI or data role in India. Ask 6 questions of rising difficulty, one at a time, including one scenario question and one 'find the bug' question. After each answer give a score out of 10 and a model answer. Focus especially on recall@k of ANN indexes, PQ memory savings and reciprocal rank fusion.</pre></div><div class="readbtn"><button class="btn" data-read="study:genai:ch06">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch05.html">← Chapter 5: Using LLM APIs Safely and Reliably</a><a class="btn" href="ch07.html">Chapter 7: RAG End to End →</a></div></div><script src="../../assets/study.js"></script></body></html>

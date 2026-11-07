@@ -1,0 +1,232 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 7: Model Serving</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#2b4fd6"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 7</div><h1>Model Serving</h1><p>How to wrap a trained model in a safe, observable, fast service that other systems can call.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-7-1-a-prediction-service-with-validation-and-health-checks">7.1 A Prediction Service with Validation and Health Checks</a></li><li><a href="#s2-7-2-batching-why-one-row-at-a-time-is-wasteful">7.2 Batching: Why One Row at a Time Is Wasteful</a></li><li><a href="#s3-7-3-model-formats-and-the-pickle-risk">7.3 Model Formats and the Pickle Risk</a></li><li><a href="#s4-7-4-serving-frameworks-and-llm-serving-concepts">7.4 Serving Frameworks and LLM Serving (Concepts)</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>A model file on your laptop helps nobody. The app team needs a URL they can call, get an answer from in a few milliseconds, and trust at 3 a.m. In this chapter you will take the churn model from earlier chapters and put it behind an HTTP service that checks its input, reports its health, counts its own errors and can score many rows at once. You will measure why batching makes a model faster, simulate a dynamic batcher, see why loading a pickle file from a stranger is dangerous, and learn the names and jobs of the serving tools you will meet at work (ONNX, Triton, KServe, vLLM). Think of a bank counter: latency is how long one customer waits, throughput is customers served per hour, and queues form when customers arrive faster than the teller works. Here those ideas meet a model.</p>
+<p>Words you need in this chapter:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Endpoint</td><td>One URL path the service answers, for example <code>/v1/predict</code>.</td></tr><tr><td>Payload</td><td>The data sent in a request (here, JSON with the features).</td></tr><tr><td>Validation</td><td>Checking that the input has the right shape and type before using it.</td></tr><tr><td>HTTP status code</td><td>A number in the reply: 200 means OK, 4xx means the caller was wrong, 5xx means the server was wrong.</td></tr><tr><td>Health check</td><td>A tiny endpoint that says "I am alive" or "I am ready".</td></tr><tr><td>Batch (of rows)</td><td>Several inputs scored in one model call.</td></tr><tr><td>Serialisation</td><td>Saving a model object to bytes (a file) so it can be loaded elsewhere.</td></tr></tbody></table></div>
+<p>Our running example is the <code>churn-api</code> from Chapter 1 and Chapter 3: a model that takes 8 numeric features of a customer and returns a churn probability. The model is a random forest saved as <code>model_v1.joblib</code>. The service code ran for real; FastAPI could not be installed on this machine, so I use Python's standard library and show the FastAPI version labelled "not run here".</p>
+<h2 id="s1-7-1-a-prediction-service-with-validation-and-health-checks">7.1 A Prediction Service with Validation and Health Checks</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A model service is a restaurant counter. The cook (the model) only knows how to cook from correct orders. The waiter (the service) reads the order slip, rejects "pizza with 14 seats" before it reaches the kitchen, tells customers when the kitchen is closed, and keeps a tally of how many orders failed. Without the waiter, one bad slip can crash the kitchen.</div></div>
+<h3>How it works</h3>
+<p>A prediction service has four jobs.</p>
+<ol><li><strong>Parse</strong> the request (read JSON bytes into Python objects).</li><li><strong>Validate</strong> it (right field names, right count, right types, sane ranges). Bad input gets a 4xx reply and never touches the model.</li><li><strong>Predict</strong> (call the model, round the result, attach the model version).</li><li><strong>Report</strong> (health, readiness and metrics endpoints, plus one line per request in the logs).</li></ol>
+<p>Two health endpoints matter, and people mix them up.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Endpoint</th><th>Question it answers</th><th>Who calls it</th><th>If it fails</th></tr></thead><tbody><tr><td><code>/health</code> (liveness)</td><td>Is the process alive at all?</td><td>Kubernetes liveness probe</td><td>Restart the container</td></tr><tr><td><code>/ready</code> (readiness)</td><td>Can it take traffic now? (model loaded, warm)</td><td>Kubernetes readiness probe, load balancer</td><td>Stop sending traffic, but do not restart</td></tr><tr><td><code>/metrics</code></td><td>How are you doing? (counts, latency)</td><td>Prometheus (Chapter 10)</td><td>Alert on missing data</td></tr></tbody></table></div>
+<p>Remember the Deployment YAML from Chapter 2 and the probes in <code>deploy.yaml</code>: <code>readinessProbe</code> points to <code>/ready</code>, <code>livenessProbe</code> points to <code>/health</code>. That is why we build both.</p>
+<p>The picture below shows one request end to end. The client calls a load balancer, which picks a pod (one running copy of the service). Each pod validates the input and runs the model. The pods also report counters to Prometheus, which feeds a dashboard and alerts (Chapter 10).</p>
+<figure><img src="images/serving.svg" alt="One request, end to end" loading="lazy"/><figcaption>One request, end to end</figcaption></figure>
+<h3>Predict, run, explain</h3>
+<p>Here is the core of the service (shortened; the full file is <code>service.py</code>). Read it first, then predict what the client will print for a request with only 3 features.</p>
+<pre class="code lang-python"><code>N_FEAT = 8
+class ValidationError(Exception): pass
+
+def validate(body):
+    if not isinstance(body, dict) or "features" not in body:
+        raise ValidationError("field 'features' is required")
+    f = body["features"]
+    if not isinstance(f, list) or len(f) != N_FEAT:
+        raise ValidationError(f"features must be a list of {N_FEAT} numbers")
+    if not all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in f):
+        raise ValidationError("features must be numbers")
+    if not all(abs(x) &lt; 1e6 for x in f):
+        raise ValidationError("feature out of range")
+    return f</code></pre>
+<p>The handler calls <code>validate(body)</code> first, then <code>MODEL.predict_proba(np.array([f]))[0, 1]</code>, and returns <code>{"probability": ..., "model_version": "v1"}</code>. A <code>ValidationError</code> becomes HTTP status <strong>422</strong> ("I understood the request but the content is wrong"). Broken JSON becomes <strong>400</strong>. The endpoint is <code>/v1/predict</code>: the <code>v1</code> in the path is the <strong>API version</strong>, so you can later add <code>/v2/predict</code> with a new input format without breaking old callers.</p>
+<p>Before you run it: what do you think happens for <code>{"features": [1, 2, 3]}</code>? And for <code>{"features": ["a", ... 8 times]}</code>?</p>
+<p>I started the server and ran the client (<code>client_test.py</code>, same calls, different port). Real output:</p>
+<pre class="code lang-text"><code>(200, '{"status": "ok"}')
+(200, '{"model": "v1", "ready": true}')
+(200, '{"probability": 0.781, "model_version": "v1"}')
+(422, '{"error": "features must be a list of 8 numbers"}')
+(422, '{"error": "features must be numbers"}')
+(422, '{"error": "field \'features\' is required"}')
+(200, '{"probabilities": [0.6751, 0.8159], "model_version": "v1"}')
+predict_requests_total 5
+predict_errors_total 3
+predict_latency_seconds_sum 0.038589</code></pre>
+<p>Line by line:</p>
+<ul><li>Lines 1-2: health and readiness answer 200. <code>ready: true</code> means <code>MODEL is not None</code>, so the model loaded.</li><li>Line 3: a valid request. 0.781 means 78.1% churn probability.</li><li>Lines 4-6: three kinds of bad input, each with a clear message and a 422. The model was never called.</li><li>Line 7: the batch endpoint took two rows and returned two probabilities. We study why that matters in 7.2.</li><li>Last block: counters in Prometheus text format. 5 requests, 3 errors. The mean latency is 0.038589 / 5 = 7.7 ms (the first call includes warm-up).</li></ul>
+<p class="problem"><span class="pl">Problem 7.1.1</span> From the metrics above, what is the error rate, and what is the average latency per request?</p>
+<table class="steps"><tr><th>Formula</th><td>error rate = errors ÷ requests; mean latency = latency_sum ÷ requests</td></tr><tr><th>Plug in</th><td>3 ÷ 5 and 0.038589 s ÷ 5</td></tr><tr><th>Compute</th><td>3 ÷ 5 = 0.6 = 60%. 0.038589 ÷ 5 = 0.0077178 s = 7.7 ms</td></tr><tr><th>Answer</th><td>60% of these test requests failed (on purpose, they were bad inputs), and the mean latency was about 7.7 ms.</td></tr><tr><th>Check</th><td>0.6 × 5 = 3 errors, which matches <code>predict_errors_total</code>.</td></tr><tr><th>Why it matters</th><td>Counters like these are what Prometheus scrapes. Rate of errors and mean latency are computed from the <em>difference</em> between two scrapes, not from the raw totals.</td></tr></table>
+<p>The wrong version (what happens without validation): a request with 3 features reaches <code>np.array([[1,2,3]])</code> and scikit-learn raises <code>ValueError: X has 3 features, but RandomForestClassifier is expecting 8 features as input</code>. The service returns 500 ("my fault") and the caller thinks your service is broken, when they sent a wrong request. Validation turns a confusing 500 into a precise 422.</p>
+<h3>The same service in FastAPI (not run here)</h3>
+<p>Most teams use FastAPI with Pydantic, because the validation code above is written for you from a class. This is standard code; I could not run it here because the packages are not installed.</p>
+<pre class="code lang-python"><code># not run here
+from fastapi import FastAPI
+from pydantic import BaseModel, Field, conlist
+import joblib, numpy as np
+
+app = FastAPI(title="churn-api")
+model = joblib.load("model_v1.joblib")
+
+class Request(BaseModel):
+    features: conlist(float, min_length=8, max_length=8)
+
+class Response(BaseModel):
+    probability: float = Field(ge=0, le=1)
+    model_version: str
+
+@app.get("/health")
+def health(): return {"status": "ok"}
+
+@app.post("/v1/predict", response_model=Response)
+def predict(req: Request):
+    p = float(model.predict_proba(np.array([req.features]))[0, 1])
+    return Response(probability=round(p, 4), model_version="v1")</code></pre>
+<p>Run with <code>uvicorn main:app --host 0.0.0.0 --port 8000</code>. FastAPI replies 422 automatically for wrong input and publishes interactive docs at <code>/docs</code>. A production service also needs authentication (an API key or token checked at a gateway, so strangers cannot call or copy your model), rate limiting, timeouts, and one structured log line per request with a request ID and the model version.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Doing CPU-heavy model work inside an <code>async def</code> handler. The event loop is blocked while the model computes, so health checks and all other requests wait. For CPU-bound prediction use a normal <code>def</code> handler (FastAPI runs it in a thread pool) or a separate worker process.</div></div>
+<h3>Connection to the real job</h3>
+<p>Every ML team ships this service. In interviews you are asked: "What happens if a caller sends a wrong feature count?" The good answer is: validation returns 422 with a clear message, it is counted in a metric, and the model never sees it. Think of a shop: <code>/health</code> is "is the door unlocked?" and <code>/ready</code> is "are the shelves stocked and the till working?". Check both before sending any customers in, and when you send test traffic to an ML service.</p>
+<h3>Applications</h3>
+<ul><li><strong>ML engineering</strong>: churn, fraud and recommendation APIs behind a company gateway.</li><li><strong>Platform / MLOps</strong>: one service template (validation, health, metrics, logs) that every team copies.</li><li><strong>GenAI</strong>: an LLM gateway that validates prompt length and rejects oversized requests before they cost money.</li><li><strong>Data science</strong>: a quick internal demo endpoint for a stakeholder to try the model.</li></ul>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which probe should restart a container, <code>/health</code> or <code>/ready</code>? Answer: <code>/health</code> (liveness). Readiness only removes it from traffic.</li><li>Should a wrong feature count return 4xx or 5xx? Answer: 4xx (422), because the caller made the mistake.</li><li>Why put <code>v1</code> in the URL? Answer: So a new input format can be added as <code>/v2</code> without breaking existing callers.</li></ol>
+<h2 id="s2-7-2-batching-why-one-row-at-a-time-is-wasteful">7.2 Batching: Why One Row at a Time Is Wasteful</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A bus driver with one passenger loses money, because the engine, driver and route cost almost the same with 1 or 40 people. A model call has a <strong>fixed cost</strong> (set-up, Python overhead, loading weights to the CPU or GPU) and a small <strong>per-row cost</strong>. If you score one row per call you pay the fixed cost every time. Carry many rows in one call and the fixed cost is shared.</div></div>
+<h3>Static batching and dynamic batching</h3>
+<ul><li><strong>Batch endpoint</strong> (static batching): the caller sends many rows in one request. That is <code>/v1/predict_batch</code> above. Good for nightly jobs and for callers that already have a list.</li><li><strong>Dynamic batching</strong> (also called micro-batching): the server collects single requests from <em>different</em> callers for a few milliseconds, scores them together, and splits the answers back. The caller still sends one row. Triton Server and KServe do this for you with two settings: a <strong>maximum batch size</strong> and a <strong>maximum wait</strong> time (a queue delay).</li></ul>
+<h3>Measure it</h3>
+<p>Program <code>ch7_batch.py</code> times <code>predict_proba</code> on 8 features with different batch sizes (random forest with 150 trees, one CPU thread). Predict first: if one row takes about 3.5 ms, does 256 rows take 256 × 3.5 ms?</p>
+<pre class="code lang-text"><code>batch=  1  rows/s=      289  ms per call=   3.46
+batch=  8  rows/s=     2333  ms per call=   3.43
+batch= 32  rows/s=     8510  ms per call=   3.76
+batch=128  rows/s=    29913  ms per call=   4.28
+batch=256  rows/s=    50572  ms per call=   5.06</code></pre>
+<p>No. A call with 256 rows takes only 5.06 ms, so throughput rose from 289 to 50,572 rows per second, about 175 times more. (These numbers are from my laptop and will differ on yours; the <em>shape</em> is what matters.)</p>
+<p class="problem"><span class="pl">Problem 7.2.1</span> From the table, estimate the fixed cost and the per-row cost of one call.</p>
+<table class="steps"><tr><th>Formula</th><td>call time = fixed + per_row × n</td></tr><tr><th>Plug in</th><td>n = 1 gives 3.46 ms; n = 256 gives 5.06 ms</td></tr><tr><th>Compute</th><td>per_row = (5.06 − 3.46) ÷ (256 − 1) = 1.60 ÷ 255 = 0.0063 ms. fixed = 3.46 − 0.0063 = 3.45 ms</td></tr><tr><th>Answer</th><td>About 3.4 ms of every call is fixed set-up, and each extra row costs only about 0.0063 ms.</td></tr><tr><th>Check</th><td>With n = 32: 3.45 + 0.0063 × 32 = 3.65 ms, close to the measured 3.76 ms.</td></tr><tr><th>Why it matters</th><td>When the fixed cost dominates, batching is the cheapest speed-up you will ever get. This is also why GPUs, with an even larger fixed cost, love big batches.</td></tr></table>
+<h3>Simulate a dynamic batcher</h3>
+<p>Batching helps throughput, but waiting to fill a batch adds latency. Is the trade worth it? I simulated requests arriving at random (a Poisson process: customers arrive at random, like shoppers at a checkout, with a steady average rate), a single model worker, and the cost model from Problem 7.2.1 (<code>3.4 + 0.0065 × n</code> ms). The batcher dispatches when the batch is full (32 rows) or when the oldest request has waited the maximum wait. Real output (the simulator is <code>c7b.py</code>):</p>
+<pre class="code lang-text"><code>rate/s             mode   mean ms    p95 ms rows/call
+   100      no batching       4.3       7.9       1.0
+   100 max 32, wait 5ms       7.6       8.4       1.5
+   100 max 32, wait 20ms      16.7      23.4       3.0
+   250      no batching      13.8      36.7       1.0
+   250 max 32, wait 5ms       7.0       8.4       2.3
+   250 max 32, wait 20ms      15.0      23.4       6.0
+   400      no batching    3564.0    6750.8       1.0
+   400 max 32, wait 5ms       6.8       8.4       3.0
+   400 max 32, wait 20ms      14.5      23.5       8.9</code></pre>
+<p>How to read it:</p>
+<ul><li>At 100 requests per second the server is idle most of the time. Batching only <em>adds</em> delay (4.3 ms becomes 7.6 ms). Dynamic batching has no benefit at low load.</li><li>At 250 per second no-batching is close to its limit (capacity is 1000 ÷ 3.4 ≈ 294 per second), so the queue builds and p95 is 36.7 ms. A 5 ms batcher cuts p95 to 8.4 ms.</li><li>At 400 per second no-batching is <strong>overloaded</strong>: requests arrive faster than one-per-call can serve, the queue grows without end and the mean latency is 3.5 seconds. The batcher still answers in 6.8 ms. Same hardware, same model.</li><li>A longer wait (20 ms) is never better here. The wait is a latency tax; pick the smallest wait that gives enough batching.</li></ul>
+<p>This is the same queueing lesson as a shop checkout near 100% busy: latency does not grow slowly, it explodes. Batching raises the capacity so you stay away from the cliff.</p>
+<p class="problem"><span class="pl">Problem 7.2.2</span> The service above must meet p95 under 25 ms at 400 requests per second. Which settings in the table pass, and which do you choose?</p>
+<table class="steps"><tr><th>Step 1</th><td>Check each 400-per-second row. No batching: p95 6,750 ms, fail. Wait 5 ms: p95 8.4 ms, pass. Wait 20 ms: p95 23.5 ms, pass but close to the limit.</td></tr><tr><th>Step 2</th><td>Prefer the setting with the most headroom. 8.4 ms leaves 16.6 ms spare.</td></tr><tr><th>Answer</th><td>Choose maximum 32 rows with a 5 ms wait. It passes with the biggest margin and keeps cost low.</td></tr><tr><th>Check</th><td>8.4 ms is below 25 ms, and a batch of 3 rows per call needs only about 133 calls per second, far below capacity.</td></tr><tr><th>Why it matters</th><td>Real tuning is exactly this: sweep the two knobs, read p95 and throughput, choose the smallest wait that works.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Turning on dynamic batching with a long wait for a low-traffic service. You add 20 ms of delay and gain nothing, because batches never fill. Batch when traffic is high or the fixed cost is large (GPU models). Measure before you enable it.</div></div>
+<h3>Connection to the real job</h3>
+<p>A careful sweep of batch size against p95 is the useful skill here, and many teams skip it. Chapter 14 builds a full load test; the two knobs here (max batch, max wait) are the ones you will tune.</p>
+<h3>Applications</h3>
+<ul><li><strong>ML engineering</strong>: scoring 2 million rows in one nightly job uses very large batches.</li><li><strong>Deep learning</strong>: GPU inference servers batch image requests to keep the GPU busy.</li><li><strong>GenAI</strong>: LLM servers use <em>continuous batching</em> (7.4), a more advanced cousin of this idea.</li><li><strong>Cost</strong>: higher throughput per server means fewer servers (Chapter 14 turns this into cost per 1,000 predictions).</li></ul>
+<p><strong>Check yourself</strong></p>
+<ol><li>Name the two parts of a model call's time. Answer: a fixed cost and a per-row cost.</li><li>Why does batching hurt at low traffic? Answer: Requests wait for a batch to fill, adding delay, and batches stay small anyway.</li><li>What two settings define dynamic batching? Answer: Maximum batch size and maximum wait time.</li></ol>
+<h2 id="s3-7-3-model-formats-and-the-pickle-risk">7.3 Model Formats and the Pickle Risk</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A model file is like a parcel. A <em>safe format</em> is a sealed box of numbers: you open it and find only numbers. A <em>pickle</em> is a box that may contain a note saying "run this program when opened". You would not open a parcel from a stranger and let it run commands in your kitchen.</div></div>
+<h3>Why pickle is dangerous</h3>
+<p>Python's <code>pickle</code> (and <code>joblib</code>, which uses it) saves objects by recording <em>how to rebuild them</em>. A rebuild instruction can be "call any function with these arguments". So loading a pickle can run arbitrary code. Predict the output of this program:</p>
+<pre class="code lang-python"><code>import pickle, json
+class Evil:
+    def __reduce__(self): return (print, ("!!! code ran just by loading this pickle !!!",))
+blob = pickle.dumps(Evil())
+pickle.loads(blob)
+print("JSON loads only data:", json.loads('{"w":[0.1,0.2]}'))</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>!!! code ran just by loading this pickle !!!
+JSON loads only data: {'w': [0.1, 0.2]}</code></pre>
+<p>The first line was printed by <code>pickle.loads</code>, before any "model" existed. Here the function is a harmless <code>print</code>; an attacker would use <code>os.system</code> and steal your cloud keys. JSON, by contrast, can only produce data.</p>
+<p><strong>Rule:</strong> never unpickle a file from a source you do not control, and prefer a safe format for anything crossing a trust boundary (for example a model downloaded from a public hub).</p>
+<h3>Formats you should know</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Format</th><th>What it stores</th><th>Safe to load?</th><th>Typical use</th></tr></thead><tbody><tr><td>pickle / joblib</td><td>Python objects (scikit-learn models)</td><td>No (can run code)</td><td>Your own trusted pipelines only</td></tr><tr><td>ONNX</td><td>A graph of operations plus weights, framework-neutral</td><td>Yes (data)</td><td>Serve scikit-learn, PyTorch, XGBoost models fast and portable</td></tr><tr><td>TorchScript / <code>torch.export</code></td><td>PyTorch model as a graph</td><td>Mostly (check loader docs)</td><td>Serve PyTorch without Python code</td></tr><tr><td>SavedModel</td><td>TensorFlow graph and weights</td><td>Yes (data), but custom ops need care</td><td>TensorFlow Serving</td></tr><tr><td>safetensors</td><td>Only tensors (numbers)</td><td>Yes, by design</td><td>Sharing LLM and deep-learning weights</td></tr><tr><td>GGUF</td><td>Quantised LLM weights</td><td>Data format</td><td>Running LLMs locally on CPU/laptop</td></tr></tbody></table></div>
+<p><strong>Why ONNX exists.</strong> Before it, each framework had its own runtime. <strong>ONNX</strong> (Open Neural Network Exchange) is a shared file format: export once, run on <strong>ONNX Runtime</strong>, which is often faster than the training framework on CPU and runs the same model on servers, phones and browsers. The idea in code (not run here, because <code>onnx</code> and <code>onnxruntime</code> are not installed):</p>
+<pre class="code lang-python"><code># not run here
+from skl2onnx import to_onnx
+import onnxruntime as ort, numpy as np
+onx = to_onnx(model, X[:1].astype(np.float32))      # convert scikit-learn model
+open("churn.onnx", "wb").write(onx.SerializeToString())
+sess = ort.InferenceSession("churn.onnx")
+out = sess.run(None, {sess.get_inputs()[0].name: X[:5].astype(np.float32)})</code></pre>
+<p><strong>Always check the converted model against the original</strong> on a sample: the maximum absolute difference should be tiny (for example below 1e-5). Conversion can silently change behaviour, for example from float64 to float32.</p>
+<h3>A safe format you can build yourself</h3>
+<p>For a simple linear model, the safest format is plain JSON. I trained a logistic regression on 3 features and saved only its numbers. Real output:</p>
+<pre class="code lang-text"><code>{"coef": [3.346128, -4.451848, 1.012133], "intercept": -0.278137}
+sklearn: 0.5343  json+numpy: 0.5343</code></pre>
+<p>The prediction code is 3 lines: <code>z = Σ coef×x + intercept</code>, then <code>1 / (1 + e^(−z))</code>. Both routes give 0.5343 for the input <code>[0.1, 0.05, 0.3]</code>.</p>
+<p class="problem"><span class="pl">Problem 7.3.1</span> Verify 0.5343 by hand.</p>
+<table class="steps"><tr><th>Formula</th><td>z = c₁x₁ + c₂x₂ + c₃x₃ + b; p = 1 ÷ (1 + e^(−z))</td></tr><tr><th>Plug in</th><td>z = 3.346128×0.1 + (−4.451848)×0.05 + 1.012133×0.3 + (−0.278137)</td></tr><tr><th>Compute</th><td>0.3346128 − 0.2225924 + 0.3036399 − 0.278137 = 0.1375233. e^(−0.1375233) = 0.87153. p = 1 ÷ 1.87153 = 0.5343</td></tr><tr><th>Answer</th><td>The probability is 0.5343, about 53%.</td></tr><tr><th>Check</th><td>z is slightly positive, so p must be slightly above 0.5. It is.</td></tr><tr><th>Why it matters</th><td>A model you can rebuild from numbers needs no unsafe loader. It is also easy to test and version (Chapter 4).</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Pickling a model with one scikit-learn version and loading with another. Even a safe-looking file can fail or, worse, load and behave differently. Record library versions next to the artefact (Chapter 2) and test loading in CI.</div></div>
+<h3>Quantization, distillation, pruning (awareness)</h3>
+<p><strong>Quantization</strong> stores numbers in 8-bit or 4-bit instead of 32-bit (2 to 4 times smaller, small accuracy drop, always re-test). <strong>Distillation</strong> trains a small student model to copy a large teacher. <strong>Pruning</strong> removes weights that matter little. <strong>Edge and mobile inference</strong> (TFLite, CoreML, ONNX Runtime Mobile, WebAssembly) runs the model on the device: it works offline and answers fast, but you cannot update it instantly.</p>
+<h3>Connection to the real job</h3>
+<p>Security teams ask "do you load pickles from outside?" and your answer should be "no, only from our own registry, with hashes checked". Public model hubs have had malicious pickle files, so many now scan for them and promote safetensors.</p>
+<h3>Applications</h3>
+<ul><li><strong>ML engineering</strong>: exporting a PyTorch model to ONNX for faster CPU serving.</li><li><strong>Security</strong>: scanning model artefacts, verifying hashes before loading.</li><li><strong>GenAI</strong>: safetensors for downloaded LLM weights, GGUF for local models.</li><li><strong>Mobile</strong>: quantised TFLite model for on-device image classification.</li></ul>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why can loading a pickle be unsafe? Answer: Unpickling can call any function, so it can run attacker code.</li><li>What is safetensors for? Answer: Storing only tensors, so loading cannot run code.</li><li>What must you test after converting to ONNX? Answer: That predictions match the original within a small tolerance.</li></ol>
+<h2 id="s4-7-4-serving-frameworks-and-llm-serving-concepts">7.4 Serving Frameworks and LLM Serving (Concepts)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Writing your own service (7.1) is like cooking at home for four friends. Triton, KServe and vLLM are catering companies: they bring the kitchen, the queue manager and the batching rules, and you hand them the recipe (the model). You use them when you have many models, GPUs or strict latency and cost goals.</div></div>
+<p>None of these were run here (no GPU, cluster or Docker). This table is the map you need at work.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Tool</th><th>One-line job</th><th>Strong at</th><th>Notes</th></tr></thead><tbody><tr><td>FastAPI / Flask</td><td>Your own HTTP wrapper</td><td>Full control, small models</td><td>You write validation, metrics, batching</td></tr><tr><td>BentoML, Ray Serve</td><td>Python-first packaging and serving</td><td>Simple deployment, model composition</td><td>Adaptive batching (Bento)</td></tr><tr><td>Triton Inference Server (NVIDIA)</td><td>Serve many models and formats on GPU/CPU</td><td>Dynamic batching, high throughput</td><td>Model repository folder plus <code>config.pbtxt</code></td></tr><tr><td>KServe, Seldon Core</td><td>Kubernetes serving layer</td><td>Autoscaling (even to zero), canary, standard API</td><td>Uses Triton or other runtimes inside</td></tr><tr><td>vLLM, TGI, TensorRT-LLM</td><td>Serve large language models</td><td>Fast token generation, continuous batching</td><td>Need GPUs</td></tr><tr><td>SageMaker / Vertex AI / Azure ML endpoints</td><td>Managed endpoints</td><td>Less operations work</td><td>Cloud lock-in, pay per hour</td></tr></tbody></table></div>
+<h3>How Triton does dynamic batching</h3>
+<p>You drop the model into a folder and describe it. This is the standard shape (not run here):</p>
+<pre class="code lang-text"><code>model_repository/
+  churn/
+    config.pbtxt
+    1/model.onnx</code></pre>
+<pre class="code lang-text"><code># config.pbtxt (not run here)
+name: "churn"
+platform: "onnxruntime_onnx"
+max_batch_size: 32
+dynamic_batching { max_queue_delay_microseconds: 5000 }</code></pre>
+<p>These are the same two knobs you tuned in 7.2: batch up to 32 rows, wait up to 5 ms (5,000 microseconds). The folder name <code>1</code> is the model version.</p>
+<h3>KServe in one picture</h3>
+<p>KServe turns a small YAML into an autoscaling HTTPS endpoint on Kubernetes. We cover it in Chapter 11. The idea (not run here):</p>
+<pre class="code lang-yaml"><code>apiVersion: serving.kserve.io/v1beta1
+kind: InferenceService
+metadata: {name: churn}
+spec:
+  predictor:
+    minReplicas: 1
+    model:
+      modelFormat: {name: sklearn}
+      storageUri: s3://models/churn/v7</code></pre>
+<p>KServe pulls the model from storage, starts a container, creates the URL and scales on load. A <code>canaryTrafficPercent</code> field lets you send a small share to a new version, which is Chapter 8.</p>
+<h3>Why LLM serving is different</h3>
+<p>A large language model produces one <strong>token</strong> (a word piece) at a time, so one answer needs hundreds of model calls, and the GPU memory holds a large <strong>KV cache</strong> (stored attention keys and values for text already processed, so it is not recomputed). Three ideas make vLLM fast:</p>
+<ul><li><strong>Continuous batching</strong>: new requests join the running batch as soon as a slot frees, instead of waiting for the whole batch to finish. This is dynamic batching at the token level.</li><li><strong>PagedAttention</strong>: manage the KV cache in small blocks like an operating system manages memory pages, so little memory is wasted and more requests fit.</li><li><strong>Streaming</strong>: send tokens to the user as they are produced, so the first words appear quickly.</li></ul>
+<p>LLM latency has two numbers you must separate: <strong>time to first token</strong> (how long before text starts) and <strong>tokens per second</strong> after that. A load test must report both. Chapter 13 covers LLM cost and operations.</p>
+<h3>Serverless, autoscaling and cold starts</h3>
+<p><strong>Serverless</strong> means you upload a function or container and the cloud runs it only when requests arrive (AWS Lambda, Azure Functions, Cloud Run). It is cheap for spiky, low traffic. Its problem is the <strong>cold start</strong>: the first request after idle waits while a container starts and a model loads, which can take seconds. Remedies: keep a minimum of one warm instance, a <strong>warm pool</strong> of pre-started machines, smaller models, lazy loading, and a readiness probe so traffic is not sent too early. Serverless is wrong for steady high traffic, large GPU models or strict p99 targets.</p>
+<p><strong>Autoscaling</strong> adds replicas when load rises. CPU is a poor signal for GPU or batched models; scaling on requests per second or queue length is usually better. Because a new replica needs time to load the model, scale <em>before</em> you hit the limit.</p>
+<p class="problem"><span class="pl">Problem 7.4.1</span> One replica handles 120 requests per second. Peak is 500 per second. No replica should exceed 70% of capacity. How many replicas?</p>
+<table class="steps"><tr><th>Formula</th><td>replicas = ⌈peak ÷ (capacity × target utilisation)⌉</td></tr><tr><th>Compute</th><td>120 × 0.70 = 84. 500 ÷ 84 = 5.95, round up to 6</td></tr><tr><th>Answer</th><td>Run 6 replicas at peak.</td></tr><tr><th>Check</th><td>6 × 84 = 504, which is at least 500.</td></tr><tr><th>Why it matters</th><td>100% utilisation leaves no room for spikes (the queue cliff from 7.2). Chapter 14 returns to this with Little's law.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Adopting Triton or KServe for one small model that a 50-line FastAPI app serves fine. Choose by need: many models, GPUs, strict throughput targets, or a platform team that already runs Kubernetes.</div></div>
+<h3>Connection to the real job</h3>
+<p>Job posts list "Triton, KServe, vLLM" often. You do not need to have run all of them. You need to explain what problem each solves, what the knobs are (batch size, queue delay, replicas, KV cache) and how you would load-test them.</p>
+<h3>Applications</h3>
+<ul><li><strong>MLOps</strong>: KServe on Kubernetes as the standard serving layer for many team models.</li><li><strong>Deep learning</strong>: Triton for image models on GPUs.</li><li><strong>GenAI</strong>: vLLM behind an internal chat API with a request queue.</li><li><strong>Cloud</strong>: managed SageMaker or Vertex endpoints when the team is small.</li></ul>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does continuous batching do? Answer: New requests join a running batch as soon as a slot frees, so the GPU stays busy.</li><li>Name two Triton batching settings. Answer: <code>max_batch_size</code> and <code>max_queue_delay_microseconds</code>.</li><li>What is a cold start? Answer: The delay on the first request after idle while the container starts and the model loads.</li></ol>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>A model service parses, validates, predicts and reports. Validation turns bad input into a 422, not a 500.</li><li><code>/health</code> says alive (restart on failure); <code>/ready</code> says able to serve (remove from traffic on failure); <code>/metrics</code> feeds Prometheus.</li><li>Put the API version in the path (<code>/v1/predict</code>).</li><li>A model call has a fixed cost and a per-row cost. Batching shares the fixed cost: in my test throughput rose from 289 to 50,572 rows per second.</li><li>Dynamic batching helps at high load (it avoided overload at 400 requests per second) and hurts at low load. Use the smallest wait that works.</li><li>Never unpickle untrusted files. Prefer ONNX, safetensors or plain JSON weights across trust boundaries, and check converted models against the original.</li><li>Triton and KServe give you batching, versions and autoscaling; vLLM adds continuous batching and a paged KV cache for LLMs.</li><li>Serverless is cheap for spiky traffic but suffers cold starts; scale before the limit, not at it.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Formula or command</th><th>Note</th></tr></thead><tbody><tr><td>Call time</td><td><code>fixed + per_row × n</code></td><td>Fit from two measurements</td></tr><tr><td>Capacity</td><td><code>1000 ÷ ms per call</code> per second per worker</td><td>Single worker, no batching</td></tr><tr><td>Replicas</td><td><code>⌈peak ÷ (capacity × target utilisation)⌉</code></td><td>Target 60-70%</td></tr><tr><td>Error rate</td><td><code>errors ÷ requests</code></td><td>From two Prometheus scrapes</td></tr><tr><td>Liveness / readiness</td><td><code>/health</code> / <code>/ready</code></td><td>Kubernetes probes</td></tr><tr><td>Run a FastAPI app</td><td><code>uvicorn main:app --port 8000</code></td><td>Not run here</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p><strong>1.</strong> (Easy) A service answers 4,850 of 5,000 requests with 200 and the rest with 422. What is the error rate?</p>
+<p><strong>Answer:</strong> 150 ÷ 5,000 = 0.03 = 3%. All errors are client errors, so check callers, not the model.</p>
+<p><strong>2.</strong> (Easy) A request body is <code>{"feature": [1,2,3,4,5,6,7,8]}</code> (note the missing "s"). Which status does our service return, and why?</p>
+<p><strong>Answer:</strong> 422 with "field 'features' is required", because the key <code>features</code> is absent.</p>
+<p><strong>3.</strong> (Medium) A model call costs 5 ms fixed plus 0.02 ms per row. What are the rows per second at batch size 1, 50 and 500?</p>
+<p><strong>Answer:</strong> Batch 1: 5.02 ms, so 1 ÷ 0.00502 = 199 rows/s. Batch 50: 5 + 1 = 6 ms, so 50 ÷ 0.006 = 8,333 rows/s. Batch 500: 5 + 10 = 15 ms, so 500 ÷ 0.015 = 33,333 rows/s.</p>
+<p><strong>4.</strong> (Medium) Find the bug: the handler is <code>async def predict(...)</code> and calls a 200 ms CPU-only model directly. Under 10 concurrent requests the <code>/health</code> check times out. Why, and what is the fix?</p>
+<p><strong>Answer:</strong> The blocking model call freezes the event loop, so no other request (including <code>/health</code>) runs. Use a plain <code>def</code> handler (thread pool), run the model in a worker process, or use <code>run_in_executor</code>.</p>
+<p><strong>5.</strong> (Medium) A replica handles 90 requests per second. Peak is 400 per second, target utilisation 60%. How many replicas?</p>
+<p><strong>Answer:</strong> 90 × 0.6 = 54. 400 ÷ 54 = 7.4, so 8 replicas.</p>
+<p><strong>6.</strong> (Hard) In the batching simulation at 100 requests per second, the 20 ms batcher has mean latency 16.7 ms versus 4.3 ms without batching. Explain in two sentences and say when you would still choose it.</p>
+<p><strong>Answer:</strong> At 100 per second the server is mostly idle, so waiting for a batch to fill only adds delay. Choose batching only if the fixed cost per call is large (an expensive GPU) so that cost savings matter more than the extra latency, or if traffic is expected to grow a lot.</p>
+<p><strong>7.</strong> (Hard) After converting a model to ONNX, the maximum probability difference from the original is 0.03 on 1,000 test rows. Do you ship it? What do you check?</p>
+<p><strong>Answer:</strong> No, not yet. 0.03 is large. Check the dtype (float32 vs float64), the preprocessing inside the pipeline (was the scaler exported?), operator-version warnings and whether the difference changes decisions at the chosen threshold. Ship only when the difference is tiny or the decision agreement is acceptable and signed off.</p>
+<p><strong>8.</strong> (Interview) "Walk me through what happens between a customer clicking a button and your model returning a score." Give a short, structured answer.</p>
+<p><strong>Answer:</strong> Gateway checks auth and rate limits, routes to a replica via the load balancer (which only uses ready pods). The service parses and validates the payload, fetches online features if needed, optionally queues for dynamic batching, calls the model (with a timeout), applies post-processing, logs request ID and model version, increments metrics, and returns JSON. If the model fails or times out, a fallback (a rule or the previous model) answers.</p>
+<p><strong>9.</strong> (Interview) "Your p99 latency doubled after you enabled dynamic batching. What are three possible causes?"</p>
+<p><strong>Answer:</strong> (1) The maximum wait is too long for the traffic level, so requests wait for batches that rarely fill. (2) The maximum batch size is too big, so one slow large batch delays everyone in it. (3) Traffic is low, so there is no benefit and only waiting cost. Check batch-size histograms, queue time and arrival rate, then lower the wait.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into MLOps and ML engineering, and English is my second language. Teach me Chapter 7 topic "building a prediction API with input validation, health checks and metrics". Explain step by step with a small churn model, using simple English. Show a FastAPI plus Pydantic version, say which status codes to return for which errors, and explain liveness versus readiness probes. After each part, ask me one question and wait for my answer before continuing. Check my understanding at the end with three scenario questions.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning MLOps. The topic is "batching for model inference: static batching, dynamic batching, fixed cost versus per-row cost". Give me 8 graded exercises with real numbers (easy to hard), including one queueing scenario at high and low traffic, and one about choosing max batch size and max wait. Do not give solutions yet. After I answer, mark my work and explain each mistake in simple English.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML engineering. The topic is "model serialisation formats and the pickle security risk (pickle, joblib, ONNX, safetensors, TorchScript)". Quiz me one question at a time on which format is safe, when to use which, and how to verify an ONNX conversion. Start easy and get harder. After each answer tell me if I am right, explain why, and keep a running score. End with a short list of what to revise.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning MLOps. Review my work on "serving a model": here is my service code, my load-test results and my batching settings: [PASTE HERE]. Check input validation, health and readiness endpoints, error handling, metrics, security of model loading, and whether my batching choice makes sense for my traffic. Give a prioritised list of problems and fixes in simple English, and tell me which single fix to do first.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into MLOps, preparing for interviews. Run a mock interview on "model serving": Triton, KServe, vLLM, ONNX, dynamic batching, autoscaling, cold starts and safe model formats. Ask me one question at a time, ranging from basic to design-level. After each answer, give feedback, a stronger model answer, and a score out of 5. Include one question that asks me to design a serving setup for a fraud model with an 80 ms latency limit.</pre></div><div class="readbtn"><button class="btn" data-read="study:mlops:ch07">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch06.html">← Chapter 6: Training Pipelines, Distributed Training</a><a class="btn" href="ch08.html">Chapter 8: Deployment Strategies →</a></div></div><script src="../../assets/study.js"></script></body></html>

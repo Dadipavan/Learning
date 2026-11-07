@@ -1,0 +1,333 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 13: Beyond SQL</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#2b4fd6"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">SQL &amp; Databases Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 13</div><h1>Beyond SQL</h1><p>Document, key-value, wide-column, time-series, graph, search and vector databases: what each is good at, what each is bad at, and how to choose.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-13-1-document-stores-mongodb">13.1 Document Stores (MongoDB)</a></li><li><a href="#s2-13-2-key-value-stores-and-caches-redis">13.2 Key-Value Stores and Caches (Redis)</a></li><li><a href="#s3-13-3-wide-column-stores-cassandra-dynamodb">13.3 Wide-Column Stores (Cassandra, DynamoDB)</a></li><li><a href="#s4-13-4-time-series-databases">13.4 Time-Series Databases</a></li><li><a href="#s5-13-5-graph-databases-neo4j">13.5 Graph Databases (Neo4j)</a></li><li><a href="#s6-13-6-search-engines-and-vector-databases">13.6 Search Engines and Vector Databases</a></li><li><a href="#s7-13-7-cap-consistency-models-and-choosing-a-store">13.7 CAP, Consistency Models and Choosing a Store</a></li><li><a href="#s8-chapter-recap">Chapter recap</a></li><li><a href="#s9-practice-set">Practice set</a></li><li><a href="#s10-prompt-pack">Prompt pack</a></li></ol></details><p>Sooner or later an interviewer or a senior engineer says: "Why not just put it in MongoDB?" or "We use Redis in front of Postgres. Why?" A strong data professional does not memorise product names. They ask one question: <strong>how will this data be read and written?</strong> Each database family below is built around one access pattern, and it gives up something else to be fast at that pattern. By the end of this chapter you can describe seven families in plain words, run small versions of their ideas in SQLite (so you feel how they work), and pick a store for a given problem using the CAP theorem and a simple decision table.</p>
+<p>A promise about honesty: MongoDB, Redis, Cassandra, DynamoDB, Neo4j and Elasticsearch are not installed here. Their own commands are shown as short, standard snippets labelled "not run here". The ideas themselves are demonstrated with real SQLite output.</p>
+<h2 id="s1-13-1-document-stores-mongodb">13.1 Document Stores (MongoDB)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A relational database is a filing cabinet of forms: the order form in one drawer, the item lines in another, joined by numbers. A document store is a folder per order: the customer, the status and all item lines are inside one folder. To read an order you open one folder, not three drawers. The price is that the same customer name is copied into many folders.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th></tr></thead><tbody><tr><td>Document</td><td>One record stored as JSON-like data (MongoDB stores it in a binary form called BSON)</td></tr><tr><td>Collection</td><td>A group of documents, like a table</td></tr><tr><td>Embed</td><td>Put related data inside the document</td></tr><tr><td>Reference</td><td>Store only the other document's id, like a foreign key</td></tr><tr><td>Aggregation pipeline</td><td>MongoDB's step-by-step query (<code>$match</code>, <code>$group</code>, ...)</td></tr></tbody></table></div>
+<h3>How it works</h3>
+<p>You choose a shape per query pattern. <strong>Embed</strong> when the child data is always read with the parent and is small (order and its lines). <strong>Reference</strong> when the child is large, shared or changes often (a customer profile used by millions of orders). There is no join by default; MongoDB has <code>$lookup</code>, but it is slower than a relational join, so schema design avoids it.</p>
+<p>We can feel this in SQLite, which can store JSON text (Chapter 6):</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.1.1</span> Store three orders as documents (items embedded) and read fields from them. Predict: three rows; order 104 has a coupon, the others do not.</p>
+<pre class="code lang-sql"><code>CREATE TABLE orders_doc (id INTEGER PRIMARY KEY, doc TEXT);
+INSERT INTO orders_doc VALUES
+(101,'{"customer":{"id":1,"name":"Asha"},"status":"paid","items":[{"sku":"KB","qty":1,"price":1500},{"sku":"NB","qty":2,"price":80}]}'),
+(102,'{"customer":{"id":2,"name":"Ravi"},"status":"paid","items":[{"sku":"MS","qty":1,"price":600}]}'),
+(104,'{"customer":{"id":3,"name":"Meena"},"status":"cancelled","items":[{"sku":"NB","qty":5,"price":80}],"coupon":"SAVE10"}');
+SELECT id, json_extract(doc,'$.customer.name') AS who, json_extract(doc,'$.status') AS status,
+  json_array_length(doc,'$.items') AS n_items, json_extract(doc,'$.coupon') AS coupon
+FROM orders_doc;</code></pre>
+<pre class="code lang-text"><code>id   who    status     n_items  coupon
+---  -----  ---------  -------  ------
+101  Asha   paid       2              
+102  Ravi   paid       1              
+104  Meena  cancelled  1        SAVE10</code></pre>
+<ul><li><strong>Answer</strong> One query on one table gives the whole order with no join. A missing key (<code>coupon</code> on 101) simply gives NULL. That flexibility (each document may have different fields) is the "schema-flexible" promise.</li><li><strong>Meaning</strong> Reading an order is one lookup. The equivalent in MongoDB (not run here): <code>db.orders.find({ "customer.name": "Asha" })</code>.</li></ul>
+<p class="problem"><span class="pl">Problem 13.1.2</span> Compute the total of each order from the embedded items.</p>
+<pre class="code lang-sql"><code>SELECT d.id, SUM(json_extract(j.value,'$.qty')*json_extract(j.value,'$.price')) AS total
+FROM orders_doc d, json_each(d.doc,'$.items') j GROUP BY d.id;</code></pre>
+<pre class="code lang-text"><code>id   total
+---  -----
+101  1660 
+102  600  
+104  400  </code></pre>
+<ul><li><strong>Check</strong> Order 101: 1 x 1500 + 2 x 80 = 1660. Order 104: 5 x 80 = 400. Both match Chapter 4's totals.</li><li><strong>Answer</strong> Totals are 1660, 600 and 400.</li><li><strong>Meaning</strong> The MongoDB version is an aggregation pipeline (not run here):</li></ul>
+<pre class="code lang-text"><code>db.orders.aggregate([
+  { $unwind: "$items" },
+  { $group: { _id: "$_id", total: { $sum: { $multiply: ["$items.qty", "$items.price"] } } } }
+])</code></pre>
+<p><code>$unwind</code> is the same as <code>json_each</code> here: one row per array element.</p>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> RELATIONAL                         DOCUMENT
+ orders --&lt; order_items &gt;-- products    { _id:101, customer:{...},
+ (3 tables, joins at read time)           items:[ {...}, {...} ] }
+                                          (1 document, no join)</code></pre>
+<h3>Connection to the real job</h3>
+<p>Application backends store user profiles, product catalogues and event payloads as documents. Data engineers meet MongoDB as a <strong>source</strong>: you export documents, flatten the arrays (as above) and load them into a warehouse.</p>
+<h3>Applications</h3>
+<ul><li><strong>Backend:</strong> product catalogue where each product category has different attributes.</li><li><strong>Data Engineering:</strong> ingesting JSON from APIs and apps.</li><li><strong>Content systems:</strong> articles with comments embedded.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Choosing a document store because "schema is annoying", then needing reports that join five collections. Flexible schema moves the work from write time to read time. If your questions are "revenue by customer city", a relational model is simpler.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>When do you embed? Answer: when the child data is small and always read with the parent.</li><li>What is <code>$unwind</code> like in SQL? Answer: unnesting an array into rows, like <code>json_each</code> or <code>UNNEST</code>.</li><li>What is the cost of embedding customer details in every order? Answer: copies; a name change must be updated in many places.</li></ol>
+<h2 id="s2-13-2-key-value-stores-and-caches-redis">13.2 Key-Value Stores and Caches (Redis)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A hotel key rack. You say the room number and get the key at once. You cannot ask "which keys are blue?". A <strong>key-value store</strong> gives the fastest possible "get by key" and nothing else. <strong>Redis</strong> keeps data in memory (RAM), so reads take well under a millisecond, but memory is small and costly compared with disk.</div></div>
+<h3>How it works</h3>
+<ul><li>Keys map to values. Redis values can be strings, hashes (small field-value maps), lists, sets, sorted sets (a set ordered by a score, used for leaderboards), and others.</li><li><strong>TTL</strong> (time to live): each key can expire automatically after N seconds.</li><li><strong>Cache-aside pattern:</strong> the application first asks the cache. On a <strong>hit</strong> it uses the value. On a <strong>miss</strong> it reads the database, writes the result to the cache with a TTL, and returns it.</li><li><strong>Write-through:</strong> every write goes to the cache and the database together, so the cache is never stale, at the cost of slower writes.</li><li><strong>Invalidation:</strong> deleting or updating a cached value when the source changes. It is famously hard: if you forget, users see stale data.</li></ul>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.2.1</span> The speed benefit in numbers. A cache hit costs 1 ms. A miss costs 1 ms (the failed cache check) plus 20 ms (the database). With a 90% hit ratio, what is the average latency?</p>
+<table class="steps"><tr><th>Formula</th><td>average = hit_ratio x hit_time + miss_ratio x miss_time</td></tr><tr><th>Plug in</th><td>0.9 x 1 + 0.1 x (1 + 20)</td></tr><tr><th>Compute</th><td>0.9 + 0.1 x 21 = 0.9 + 2.1 = 3.0</td></tr><tr><th>Answer</th><td>3.0 ms on average, against 20 ms with no cache, about 6.7 times faster.</td></tr><tr><th>Check</th><td>If the hit ratio were 0%, the formula gives 21 ms (slower than no cache by the 1 ms check). If it were 100%, it gives 1 ms. 3.0 lies between, as it should.</td></tr><tr><th>Meaning</th><td>For a service owner: the <strong>tail</strong> matters too. The 10% of requests at 21 ms still set your p95 and p99, so a cache improves the average more than the worst case.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.2.2</span> TTL and rate limiting, shown with SQL tables (Redis equivalents below, not run here). First, a key-value table with expiry times (seconds since some clock). At time 1030, which keys are alive, and how long do they have left?</p>
+<pre class="code lang-sql"><code>CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT, expires_at INTEGER);
+INSERT INTO kv VALUES ('user:1','Asha',1000),('user:2','Ravi',1060);
+SELECT k, v, expires_at-1030 AS ttl_left FROM kv WHERE expires_at &gt; 1030;</code></pre>
+<pre class="code lang-text"><code>k       v     ttl_left
+------  ----  --------
+user:2  Ravi  30      </code></pre>
+<ul><li><strong>Answer</strong> <code>user:1</code> expired at 1000, so only <code>user:2</code> is alive, with 30 seconds left.</li><li><strong>Redis equivalent (not run here):</strong> <code>SET user:2 Ravi EX 60</code> then <code>TTL user:2</code>.</li></ul>
+<p>Now a <strong>fixed-window rate limit</strong>: allow at most 3 requests per 60-second window per IP.</p>
+<pre class="code lang-sql"><code>CREATE TABLE hits (ip TEXT, ts INTEGER);
+INSERT INTO hits VALUES ('a',1),('a',2),('a',3),('a',4),('a',61),('b',5),('b',6);
+SELECT ip, ts/60 AS minute_bucket, COUNT(*) AS n,
+  CASE WHEN COUNT(*)&gt;3 THEN 'BLOCK' ELSE 'ok' END AS verdict
+FROM hits GROUP BY ip, ts/60;</code></pre>
+<pre class="code lang-text"><code>ip  minute_bucket  n  verdict
+--  -------------  -  -------
+a   0              4  BLOCK  
+a   1              1  ok     
+b   0              2  ok     </code></pre>
+<ul><li><strong>Check</strong> IP <code>a</code> sent 4 requests in seconds 1 to 4 (bucket 0), over the limit of 3. The request at second 61 begins a new bucket.</li><li><strong>Answer</strong> Only IP <code>a</code> in the first minute is blocked.</li><li><strong>Meaning</strong> In Redis you do it with one counter per bucket (not run here): <code>INCR rate:a:0</code> and <code>EXPIRE rate:a:0 60</code>, then reject if the value is above 3. <code>INCR</code> is atomic, so two servers cannot both read "3" and both allow a request.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> App --1. GET user:2--&gt; [Cache RAM] --hit--&gt; value (1 ms)
+  |                          | miss
+  |&lt;--4. value---------------+-- 2. SELECT ... --&gt; [Database] (20 ms)
+  |                          &lt;-- 3. SET user:2 value EX 60 --</code></pre>
+<h3>Connection to the real job</h3>
+<p>Almost every large web system has a cache in front of the database. A shop that opens in the morning shows the "cold cache" problem: the first minute after a restart is slow because every request is a miss.</p>
+<h3>Applications</h3>
+<ul><li><strong>Web backend:</strong> session storage, product page cache.</li><li><strong>Gaming / analytics:</strong> leaderboards with sorted sets.</li><li><strong>Platform:</strong> rate limiting, distributed locks, pub/sub messaging.</li><li><strong>ML serving:</strong> caching features or model answers.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Treating Redis as the only copy of important data. By default it is a cache; if memory is lost, data can be lost (it has options to save to disk, but know what you configured). Keep the source of truth in a durable database.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is a cache miss? Answer: the key is not in the cache, so the app must read the database.</li><li>Why is <code>INCR</code> good for rate limits? Answer: it is atomic, so concurrent requests cannot both read the same old value.</li><li>What does a TTL do? Answer: deletes the key automatically after a set time.</li></ol>
+<h2 id="s3-13-3-wide-column-stores-cassandra-dynamodb">13.3 Wide-Column Stores (Cassandra, DynamoDB)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A post office with a PIN code for every street. Letters for one street are always stored together and in date order, so "latest 10 letters for Street 5" is one quick walk. But "all letters from Ravi, in any street" means walking every street. <strong>Wide-column</strong> stores spread data over many machines by a <strong>partition key</strong> and keep rows inside a partition sorted by a <strong>clustering key</strong>. They are built for huge write volume and predictable reads, and they refuse queries that do not follow the key.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th></tr></thead><tbody><tr><td>Partition key</td><td>Decides which machine(s) hold the row (hashed)</td></tr><tr><td>Clustering key</td><td>Decides the sort order of rows inside one partition</td></tr><tr><td>Query-first modelling</td><td>You design the table from the question you will ask, one table per question</td></tr><tr><td>Replication factor (N)</td><td>How many copies of each row exist</td></tr><tr><td>Quorum</td><td>A majority of the N copies</td></tr></tbody></table></div>
+<h3>How it works</h3>
+<p>In Cassandra and DynamoDB you declare the key first: one table per access pattern, even if data is duplicated across tables. There are no joins. Reads must give the partition key. Consistency is <strong>tunable</strong>: with N copies, a write waits for W copies to confirm and a read asks R copies. If <strong>R + W &gt; N</strong>, every read overlaps at least one copy that has the latest write.</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.3.1</span> Model "latest messages of a user". We imitate with a SQLite table whose primary key is (user_id, ts), which makes the rows of one user contiguous and time-sorted.</p>
+<pre class="code lang-sql"><code>CREATE TABLE msgs_by_user (user_id INTEGER, ts INTEGER, body TEXT,
+  PRIMARY KEY (user_id, ts)) WITHOUT ROWID;
+INSERT INTO msgs_by_user VALUES (1,100,'hi'),(1,105,'yo'),(1,130,'ok'),(2,101,'hey'),(2,140,'bye');
+SELECT * FROM msgs_by_user WHERE user_id=1 AND ts&gt;=105 ORDER BY ts DESC LIMIT 2;</code></pre>
+<pre class="code lang-text"><code>user_id  ts   body
+-------  ---  ----
+1        130  ok  
+1        105  yo  </code></pre>
+<ul><li><strong>Answer</strong> The two newest messages of user 1 from time 105 on.</li><li><strong>Check</strong> User 1 has messages at 100, 105, 130. From 105: 105 and 130, newest first: 130, 105. Correct.</li><li><strong>The same in Cassandra's CQL (not run here):</strong></li></ul>
+<pre class="code lang-text"><code>CREATE TABLE msgs_by_user (user_id int, ts int, body text,
+  PRIMARY KEY ((user_id), ts)) WITH CLUSTERING ORDER BY (ts DESC);
+SELECT * FROM msgs_by_user WHERE user_id = 1 AND ts &gt;= 105 LIMIT 2;</code></pre>
+<p class="problem"><span class="pl">Problem 13.3.2</span> What happens if you filter on a non-key column? Ask SQLite for the query plan (Chapter 10) of two queries.</p>
+<pre class="code lang-sql"><code>EXPLAIN QUERY PLAN SELECT * FROM msgs_by_user WHERE user_id=1 AND ts&gt;=105;
+EXPLAIN QUERY PLAN SELECT * FROM msgs_by_user WHERE body='hey';</code></pre>
+<pre class="code lang-text"><code>QUERY PLAN
+`--SEARCH msgs_by_user USING PRIMARY KEY (user_id=? AND ts&gt;?)
+QUERY PLAN
+`--SCAN msgs_by_user</code></pre>
+<ul><li><strong>Answer</strong> The first query jumps straight to the right place (SEARCH). The second reads every row (SCAN).</li><li><strong>Meaning</strong> On one laptop a scan is cheap. In Cassandra, a scan means asking every machine, so the database refuses (or warns) unless you add <code>ALLOW FILTERING</code>. The lesson: design the key from the question.</li></ul>
+<p class="problem"><span class="pl">Problem 13.3.3</span> Quorum arithmetic. N = 3 copies. Is W = 2, R = 2 strongly consistent? What about W = 1, R = 1?</p>
+<table class="steps"><tr><th>Formula</th><td>consistent reads when R + W &gt; N</td></tr><tr><th>Plug in</th><td>2 + 2 = 4 &gt; 3 (yes). 1 + 1 = 2, which is not &gt; 3 (no).</td></tr><tr><th>Answer</th><td>W = 2, R = 2 is consistent; W = 1, R = 1 is fast but a read may hit a copy that missed the write.</td></tr><tr><th>Meaning</th><td>You trade latency for freshness, per query.</td></tr></table>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> partition key hash --&gt; node
+ user_id=1 --&gt; [Node A][Node B][Node C]  (3 copies)
+ inside the partition:  ts=100 | ts=105 | ts=130   (sorted)</code></pre>
+<h3>Connection to the real job</h3>
+<p>Messaging, IoT events, shopping carts and activity feeds use these stores. DynamoDB is the managed AWS version; its "single-table design" is the same query-first idea (cloud service, not run here).</p>
+<h3>Applications</h3>
+<ul><li><strong>Backend:</strong> user activity feeds, chat history, order history by user.</li><li><strong>IoT:</strong> sensor writes in huge volume.</li><li><strong>Data Engineering:</strong> a serving layer for pre-computed results.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">A "hot partition": choosing a partition key such as <code>date</code> so that all today's writes land on one node while others idle. Choose a key with many distinct, evenly used values (user id, not date).</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What decides the machine that holds a row? Answer: the partition key.</li><li>Why are there no joins? Answer: data is spread over machines, so joins would be too slow; you duplicate data instead.</li><li>With N = 5, what is the smallest W if R = 3 and you want strong consistency? Answer: W = 3, because 3 + 3 = 6 &gt; 5 (and W = 2 gives 5, which is not &gt; 5).</li></ol>
+<h2 id="s4-13-4-time-series-databases">13.4 Time-Series Databases</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A weather station or a server produces a measurement every second: "temperature = 31 C" or "CPU = 63%". The data only grows, is almost never updated, and you mostly ask "what happened between 10:00 and 10:05?". A <strong>time-series database</strong> (TSDB) is a store tuned for this: fast appends, time-range reads, automatic downsampling and expiry. Examples: InfluxDB, TimescaleDB (an extension on PostgreSQL), Prometheus.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th></tr></thead><tbody><tr><td>Downsampling</td><td>Replacing fine data with coarser summaries (per second to per minute)</td></tr><tr><td>Retention</td><td>How long data is kept before auto-deletion</td></tr><tr><td>Cardinality</td><td>The number of distinct series (host x metric x label combinations)</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.4.1</span> Downsample raw CPU readings (two per minute) into one row per minute per host, keeping average and max (a max keeps spikes visible).</p>
+<pre class="code lang-sql"><code>CREATE TABLE metrics (ts TEXT, host TEXT, cpu REAL);
+INSERT INTO metrics VALUES
+('2024-05-01 10:00:10','h1',40),('2024-05-01 10:00:40','h1',60),
+('2024-05-01 10:01:10','h1',50),('2024-05-01 10:01:40','h1',90),
+('2024-05-01 10:00:20','h2',20),('2024-05-01 10:01:20','h2',30);
+SELECT substr(ts,1,16) AS minute, host, ROUND(AVG(cpu),1) AS avg_cpu, MAX(cpu) AS max_cpu, COUNT(*) AS n
+FROM metrics GROUP BY minute, host ORDER BY host, minute;</code></pre>
+<pre class="code lang-text"><code>minute            host  avg_cpu  max_cpu  n
+----------------  ----  -------  -------  -
+2024-05-01 10:00  h1    50.0     60.0     2
+2024-05-01 10:01  h1    70.0     90.0     2
+2024-05-01 10:00  h2    20.0     20.0     1
+2024-05-01 10:01  h2    30.0     30.0     1</code></pre>
+<ul><li><strong>Check</strong> h1 at 10:00: (40 + 60) / 2 = 50. At 10:01: (50 + 90) / 2 = 70.</li><li><strong>Answer</strong> Six raw rows became four summary rows.</li><li><strong>Meaning</strong> Keep raw data for a week, per-minute data for a year. TimescaleDB does this with "continuous aggregates"; InfluxDB with tasks (not run here).</li></ul>
+<p class="problem"><span class="pl">Problem 13.4.2</span> Why averages hide spikes. Compare the whole-period summary with the per-minute view.</p>
+<pre class="code lang-sql"><code>SELECT host, ROUND(AVG(cpu),1) AS avg_all, MAX(cpu) AS max_all FROM metrics GROUP BY host;</code></pre>
+<pre class="code lang-text"><code>host  avg_all  max_all
+----  -------  -------
+h1    60.0     90.0   
+h2    25.0     30.0   </code></pre>
+<ul><li><strong>Check</strong> h1: (40 + 60 + 50 + 90) / 4 = 240 / 4 = 60.</li><li><strong>Answer</strong> h1 averages 60% but touched 90%.</li><li><strong>Meaning</strong> This is the same reason a train-delay report shows the worst delays and not just the average. Downsample with several statistics (avg, max, p95), never only the average.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> raw (1s)        |||||||||||||||||||||||| ... 7 days
+ 1-minute rollup |    |    |    |    |    ... 1 year
+ 1-hour rollup   |       |       |         ... 5 years</code></pre>
+<p>Each row is a coarser copy of the row above. Older data is smaller because fine detail is thrown away.</p>
+<h3>Connection to the real job</h3>
+<p>Prometheus plus Grafana is the standard monitoring stack. Monitoring data (server metrics, sensor readings, hospital vital signs) is time-series data.</p>
+<h3>Applications</h3>
+<ul><li><strong>Monitoring / SRE:</strong> CPU, latency, error rates.</li><li><strong>Finance:</strong> tick prices.</li><li><strong>IoT:</strong> temperature and vibration sensors.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Cardinality explosion. Putting <code>user_id</code> or <code>request_id</code> in a metric label creates one series per user. Millions of series exhaust memory. Labels must have few distinct values (service, region, status code).</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is downsampling? Answer: replacing fine-grained points with coarser summaries.</li><li>What is cardinality? Answer: the count of distinct series (unique label combinations).</li><li>Why store <code>MAX</code> too? Answer: the average hides short spikes.</li></ol>
+<h2 id="s5-13-5-graph-databases-neo4j">13.5 Graph Databases (Neo4j)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of Facebook friends. "Who are friends of my friends who I don't know yet?" In SQL that is a join of the friends table with itself, and "friends of friends of friends" is three joins, and so on. A <strong>graph database</strong> stores the connections as first-class data, so following a link is cheap and the query for "3 hops away" is short. A graph has <strong>nodes</strong> (things) and <strong>edges</strong> (relationships between them).</div></div>
+<h3>How it works</h3>
+<p>Neo4j uses the query language <strong>Cypher</strong>, where you draw the pattern with ASCII art: <code>(a)-[:FOLLOWS]-&gt;(b)</code>. SQL can do it too with recursive CTEs (Chapter 5). We try that with a small follow network.</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.5.1</span> Who can Asha reach within 3 hops, and how many hops is the shortest?</p>
+<pre class="code lang-sql"><code>CREATE TABLE follows (src TEXT, dst TEXT);
+INSERT INTO follows VALUES ('Asha','Ravi'),('Ravi','Meena'),('Meena','John'),
+  ('Asha','Priya'),('Priya','John'),('John','Kabir');
+WITH RECURSIVE reach(person, hops, path) AS (
+  SELECT 'Asha', 0, 'Asha'
+  UNION ALL
+  SELECT f.dst, r.hops+1, r.path||'&gt;'||f.dst
+  FROM reach r JOIN follows f ON f.src=r.person WHERE r.hops&lt;3)
+SELECT person, MIN(hops) AS shortest, COUNT(*) AS paths
+FROM reach GROUP BY person ORDER BY shortest, person;</code></pre>
+<pre class="code lang-text"><code>person  shortest  paths
+------  --------  -----
+Asha    0         1    
+Priya   1         1    
+Ravi    1         1    
+John    2         2    
+Meena   2         1    
+Kabir   3         1    </code></pre>
+<ul><li><strong>Check</strong> Asha to John: Asha &gt; Priya &gt; John is 2 hops; Asha &gt; Ravi &gt; Meena &gt; John is 3 hops. So John has 2 paths with shortest 2. Kabir is only reachable through John: 3 hops by the short path.</li><li><strong>Answer</strong> Two people at one hop, two at two hops, one at three.</li><li><strong>Meaning</strong> The <code>hops &lt; 3</code> limit stops the recursion, which also protects against cycles.</li></ul>
+<p class="problem"><span class="pl">Problem 13.5.2</span> List the actual paths to John.</p>
+<pre class="code lang-sql"><code>WITH RECURSIVE reach(person, hops, path) AS (
+  SELECT 'Asha', 0, 'Asha'
+  UNION ALL
+  SELECT f.dst, r.hops+1, r.path||'&gt;'||f.dst
+  FROM reach r JOIN follows f ON f.src=r.person WHERE r.hops&lt;3)
+SELECT path FROM reach WHERE person='John';</code></pre>
+<pre class="code lang-text"><code>path                
+--------------------
+Asha&gt;Priya&gt;John     
+Asha&gt;Ravi&gt;Meena&gt;John</code></pre>
+<ul><li><strong>Answer</strong> The two paths found. In Cypher the same question is one line (not run here): <code>MATCH p = shortestPath((a:Person {name:'Asha'})-[:FOLLOWS*..3]-&gt;(j:Person {name:'John'})) RETURN p</code>.</li><li><strong>Meaning</strong> Fraud detection works like this: "accounts that share a phone number and a device with a known fraudster, within 3 hops".</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> Asha --&gt; Ravi --&gt; Meena --&gt; John --&gt; Kabir
+   \                          ^
+    +----&gt; Priya -------------+</code></pre>
+<p>Arrows mean "follows". Each arrow is one hop. Two different routes join at John.</p>
+<h3>Connection to the real job</h3>
+<p>Recommendation ("people who bought this also bought"), fraud rings, knowledge graphs, and network dependency maps (which service calls which) use graph queries. GenAI "GraphRAG" systems also use knowledge graphs.</p>
+<h3>Applications</h3>
+<ul><li><strong>Fraud analytics:</strong> rings of accounts sharing devices.</li><li><strong>Recommendation:</strong> friends of friends, similar buyers.</li><li><strong>IT operations:</strong> impact analysis of a failing service.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using a graph database for ordinary tabular reporting. For "sum by month" it is slower and clumsier than SQL. Use a graph when the question is about <strong>paths and relationships</strong>, and depth is unknown or large.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What are nodes and edges? Answer: nodes are things, edges are relationships between them.</li><li>Why limit hops in a recursive CTE? Answer: to stop infinite loops on cycles and keep results small.</li><li>When is SQL enough? Answer: a few fixed hops, or no path questions at all.</li></ol>
+<h2 id="s6-13-6-search-engines-and-vector-databases">13.6 Search Engines and Vector Databases</h2>
+<blockquote><p><strong>INTUITION (search):</strong> The index at the back of a textbook: for each word it lists the pages. To find pages about "caching" you do not read the book; you look up the word. A search engine (Elasticsearch, OpenSearch, Solr) builds this <strong>inverted index</strong> for every word of every document.</p><p><strong>INTUITION (vectors):</strong> Search by <em>meaning</em>. "Cheap laptop" and "budget notebook" share no words, but an AI model can turn both into lists of numbers (<strong>embeddings</strong>) that are close together. A <strong>vector database</strong> finds the nearest lists to a query list.</p></blockquote>
+<h3>How it works</h3>
+<p><strong>Inverted index.</strong> For every word (term) store the list of documents that contain it (the <strong>posting list</strong>), with the count of occurrences (term frequency, tf). A query looks up each word and combines lists. <strong>Analyzers</strong> clean the text first: lowercase, split into words, remove stop-words, reduce words to stems ("running" to "run"). <strong>Relevance</strong> scores rank results; the standard score is <strong>BM25</strong>, which rewards words that appear often in a document, are rare in the whole collection, and appear in a short document.</p>
+<p><strong>Vector search.</strong> Two vectors are similar when the angle between them is small. <strong>Cosine similarity</strong> = dot(a, b) / (|a| x |b|); 1 means the same direction. Exact search compares the query with every vector, which is slow for millions. Vector databases (Pinecone, Milvus, Qdrant, the pgvector extension of PostgreSQL) use <strong>approximate nearest neighbour (ANN)</strong> indexes such as HNSW (a layered graph of vectors): much faster, a little less exact. (Details of embeddings belong to your GenAI study.)</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.6.1</span> Build a tiny inverted index and search for "fast car". Documents: 1 = "fast red car", 2 = "slow red bus", 3 = "fast blue car fast".</p>
+<pre class="code lang-sql"><code>CREATE TABLE inv (term TEXT, doc_id INTEGER, tf INTEGER);
+INSERT INTO inv
+SELECT 'fast',1,1 UNION ALL SELECT 'red',1,1 UNION ALL SELECT 'car',1,1
+UNION ALL SELECT 'slow',2,1 UNION ALL SELECT 'red',2,1 UNION ALL SELECT 'bus',2,1
+UNION ALL SELECT 'fast',3,2 UNION ALL SELECT 'blue',3,1 UNION ALL SELECT 'car',3,1;
+SELECT term, GROUP_CONCAT(doc_id) AS posting_list FROM inv GROUP BY term ORDER BY term;
+SELECT doc_id, SUM(tf) AS score FROM inv WHERE term IN ('fast','car') GROUP BY doc_id ORDER BY score DESC;</code></pre>
+<pre class="code lang-text"><code>term  posting_list
+----  ------------
+blue  3           
+bus   2           
+car   1,3         
+fast  1,3         
+red   1,2         
+slow  2           
+doc_id  score
+------  -----
+3       3    
+1       2    </code></pre>
+<ul><li><strong>Check</strong> Doc 3 has "fast" twice and "car" once: 2 + 1 = 3. Doc 1 has each once: 2. Doc 2 has neither, so it is never touched.</li><li><strong>Answer</strong> Doc 3 ranks first, doc 1 second; doc 2 is not returned.</li><li><strong>Meaning</strong> We never scanned documents. Counting tf is a crude score; BM25 improves it. SQLite has a real full-text engine, FTS5, which ranks by BM25:</li></ul>
+<pre class="code lang-sql"><code>CREATE VIRTUAL TABLE d5 USING fts5(body);
+INSERT INTO d5(body) VALUES ('fast red car'),('slow red bus'),('fast blue car fast');
+SELECT rowid, body FROM d5 WHERE d5 MATCH 'fast car' ORDER BY rank;</code></pre>
+<pre class="code lang-text"><code>rowid  body              
+-----  ------------------
+3      fast blue car fast
+1      fast red car      </code></pre>
+<p>Same order as our hand-made score. (PostgreSQL has built-in full text search; Elasticsearch scales it over many machines. Elasticsearch syntax: not run here.)</p>
+<p class="problem"><span class="pl">Problem 13.6.2</span> Find the animal nearest to a query vector <code>(1.0, 0.2, 0.0)</code> using cosine similarity. Three tiny 3-number vectors: cat (0.9, 0.1, 0.0), dog (0.8, 0.3, 0.1), car (0.1, 0.9, 0.4).</p>
+<pre class="code lang-sql"><code>CREATE TABLE vec (id INTEGER, name TEXT, x REAL, y REAL, z REAL);
+INSERT INTO vec VALUES (1,'cat',0.9,0.1,0.0),(2,'dog',0.8,0.3,0.1),(3,'car',0.1,0.9,0.4);
+WITH q(x,y,z) AS (SELECT 1.0,0.2,0.0)
+SELECT v.name,
+ ROUND((v.x*q.x+v.y*q.y+v.z*q.z)/(sqrt(v.x*v.x+v.y*v.y+v.z*v.z)*sqrt(q.x*q.x+q.y*q.y+q.z*q.z)),4) AS cosine
+FROM vec v, q ORDER BY cosine DESC;</code></pre>
+<pre class="code lang-text"><code>name  cosine
+----  ------
+cat   0.9962
+dog   0.9803
+car   0.2774</code></pre>
+<ul><li><strong>Compute for cat</strong> dot = 0.9 x 1.0 + 0.1 x 0.2 + 0 = 0.92. |cat| = √(0.81 + 0.01) = √0.82 = 0.9055. |q| = √(1 + 0.04) = 1.0198. Cosine = 0.92 / (0.9055 x 1.0198) = 0.92 / 0.9234 = 0.9962.</li><li><strong>Answer</strong> The cat vector is nearest, then dog, and car is far.</li><li><strong>Meaning</strong> A vector database does exactly this for millions of vectors using ANN indexes, so it does not compute every cosine. This is the retrieval step of RAG (retrieval-augmented generation).</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> Search:  "fast car" --&gt; look up 'fast' -&gt; [1,3]
+                         look up 'car'  -&gt; [1,3]   --&gt; score, rank: 3, 1
+ Vectors:       ^ y
+                |   car .
+                |
+                |  dog .
+                | cat .   (small angle to query = similar)
+                +-------------&gt; x</code></pre>
+<h3>Connection to the real job</h3>
+<p>Log search (ELK stack, OpenSearch) is a daily tool for operations and support teams. Vector stores power chatbot memory and document Q&amp;A, which is the main use in GenAI jobs.</p>
+<h3>Applications</h3>
+<ul><li><strong>Search:</strong> product search, log analysis, autocomplete.</li><li><strong>GenAI:</strong> RAG retrieval, semantic search, recommendations.</li><li><strong>Data Engineering:</strong> indexing documents from pipelines.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using a search engine as the main database. Elasticsearch is not built for strong transactions; keep the source of truth elsewhere and treat the index as a rebuildable copy. Also, never compare vectors from different embedding models; their numbers mean different things.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does an inverted index map? Answer: each word to the list of documents containing it.</li><li>What does cosine similarity 1 mean? Answer: the vectors point in exactly the same direction.</li><li>Why use ANN? Answer: exact comparison with millions of vectors is too slow; ANN trades a little accuracy for large speed.</li></ol>
+<h2 id="s7-13-7-cap-consistency-models-and-choosing-a-store">13.7 CAP, Consistency Models and Choosing a Store</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Two bank branches share one ledger by phone. If the phone line breaks, each branch must choose: stop serving customers until the line is back (stay <strong>consistent</strong>, lose <strong>availability</strong>), or keep serving with their own copy and fix differences later (stay <strong>available</strong>, risk <strong>inconsistency</strong>). That choice, forced by a network failure, is the <strong>CAP theorem</strong>.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th></tr></thead><tbody><tr><td>Consistency (C)</td><td>Every read sees the latest write</td></tr><tr><td>Availability (A)</td><td>Every request to a working node gets an answer</td></tr><tr><td>Partition tolerance (P)</td><td>The system keeps working when the network between nodes breaks</td></tr><tr><td>Eventual consistency</td><td>Copies may differ for a while, but become equal if writes stop</td></tr><tr><td>Strong consistency</td><td>A read after a write always sees that write</td></tr></tbody></table></div>
+<h3>How it works</h3>
+<p>CAP says: when a network partition happens (P is not optional on real networks), you must pick C or A. So the real choice is <strong>CP</strong> (refuse some requests to stay correct, e.g. most relational clusters with one primary, HBase, MongoDB with majority writes) or <strong>AP</strong> (always answer, maybe with old data, e.g. Cassandra at low consistency, DynamoDB with eventually consistent reads). Behaviour depends on configuration, so treat these labels as defaults. The <strong>PACELC</strong> extension adds: even when there is no partition (Else), you trade <strong>L</strong>atency against <strong>C</strong>onsistency, exactly the R and W choice in 13.3.</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.7.1</span> A shopping cart in an AP store. Two servers each hold a copy. During a partition, you add a book on server 1 and a pen on server 2. What does each show, and what should the merge produce after the line is restored?</p>
+<table class="steps"><tr><th>Step 1</th><td>Server 1 cart: {book}. Server 2 cart: {pen}.</td></tr><tr><th>Step 2</th><td>After healing, a "last write wins" rule keeps only one cart, so one item is lost.</td></tr><tr><th>Step 3</th><td>A set-union merge keeps both: {book, pen}.</td></tr><tr><th>Answer</th><td>For carts, merge by union (never lose an add); for a bank balance, you need CP and a single agreed order.</td></tr><tr><th>Meaning</th><td>Eventual consistency is acceptable when a merge rule exists and a wrong read is cheap.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.7.2</span> Choose a store for eight needs, and say why.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Need</th><th>Best fit</th><th>Reason</th></tr></thead><tbody><tr><td>Orders, payments, money</td><td>PostgreSQL (relational)</td><td>ACID transactions, joins, constraints</td></tr><tr><td>Product catalogue with varied attributes</td><td>MongoDB</td><td>One document per product, flexible fields</td></tr><tr><td>Session store, rate limits, hot lookups</td><td>Redis</td><td>In-memory, TTL, atomic counters</td></tr><tr><td>Chat history, 1M writes per second</td><td>Cassandra / DynamoDB</td><td>Partitioned writes, query-first keys</td></tr><tr><td>CPU and latency metrics</td><td>Prometheus / TimescaleDB</td><td>Time-range reads, downsampling, retention</td></tr><tr><td>"Friends of friends", fraud rings</td><td>Neo4j</td><td>Path queries</td></tr><tr><td>Log and text search</td><td>Elasticsearch / OpenSearch</td><td>Inverted index, BM25</td></tr><tr><td>Meaning-based document retrieval</td><td>Vector DB or pgvector</td><td>Nearest-neighbour search</td></tr></tbody></table></div>
+<ul><li><strong>Answer</strong> Eight needs, eight different best fits; the table is the answer.</li><li><strong>Meaning</strong> Real systems combine them: <strong>polyglot persistence</strong>. A typical shop: PostgreSQL as the source of truth, Redis in front for hot reads, Elasticsearch for product search, a warehouse for analytics. The cost of every extra store is more to operate, more to keep in sync and more failure modes. <strong>Default to PostgreSQL</strong> and add a store only when a measured need appears.</li></ul>
+<p>Also know <strong>NewSQL / distributed SQL</strong> (CockroachDB, Spanner, TiDB): relational databases that spread over many machines and offer SQL with transactions. They aim at CP with high availability, at higher latency per write. And <strong>OLAP engines</strong> (ClickHouse, Druid, Pinot, plus the warehouses of Chapter 14) answer huge aggregations over columns quickly; they are not for single-row updates.</p>
+<h3>The picture</h3>
+<pre class="code lang-text"><code>            Consistency
+               /\
+              /  \
+         CP  /    \  CA (only on one machine: no partition)
+            /______\
+   Partition tolerance ---- Availability
+              AP</code></pre>
+<p>Each corner is a property. With a real network you must keep P, so you pick the left side (CP) or the bottom side (AP).</p>
+<h3>Connection to the real job</h3>
+<p>System-design interviews ask "which database and why?" Your answer: name the access pattern, the consistency need, the scale, and the operating cost, then give one trade-off.</p>
+<h3>Applications</h3>
+<ul><li><strong>Interviews:</strong> "design a URL shortener, a chat app, a leaderboard".</li><li><strong>Data Engineering:</strong> choosing a serving layer for a pipeline's output.</li><li><strong>Architecture:</strong> deciding where the single source of truth lives.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Saying "NoSQL is faster than SQL." Speed comes from fitting the access pattern and from giving up something (joins, transactions, flexible queries). A well-indexed PostgreSQL table beats a badly modelled NoSQL store for most workloads under a few thousand requests per second.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>If the network between two data centres fails, what does CAP force? Answer: a choice between consistency (refuse some requests) and availability (answer, maybe stale).</li><li>What is eventual consistency? Answer: copies may differ now but become equal later if writes stop.</li><li>Which store would you use for money transfers? Answer: a relational database with ACID transactions.</li></ol>
+<h2 id="s8-chapter-recap">Chapter recap</h2>
+<ul><li>Choose a store by <strong>access pattern</strong>, not by fashion; every store gives up something to be fast at one thing.</li><li>Document stores keep a whole record in one document; embed what is read together, reference what is large or shared.</li><li>Redis is an in-memory key-value store with TTL; use cache-aside and expect a cold-cache slowdown.</li><li>Cassandra and DynamoDB are query-first: partition key spreads data, clustering key sorts it; no joins; R + W &gt; N gives consistent reads.</li><li>Time-series databases fit append-heavy, time-range data; downsample with avg and max; watch cardinality.</li><li>Graph databases fit path questions; SQL can do a few hops with recursive CTEs.</li><li>Search engines use inverted indexes and BM25; vector databases use embeddings, cosine similarity and ANN.</li><li>CAP: during a partition choose consistency or availability; PACELC adds latency versus consistency. Default to PostgreSQL and add stores only for measured needs.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Family</th><th>Example</th><th>Strong at</th><th>Weak at</th></tr></thead><tbody><tr><td>Relational</td><td>PostgreSQL</td><td>joins, ACID, ad-hoc queries</td><td>massive write scale on one node</td></tr><tr><td>Document</td><td>MongoDB</td><td>nested records, flexible fields</td><td>multi-document joins</td></tr><tr><td>Key-value</td><td>Redis</td><td>sub-ms lookup, TTL, counters</td><td>queries by value, large data</td></tr><tr><td>Wide-column</td><td>Cassandra, DynamoDB</td><td>huge writes, key lookups</td><td>ad-hoc queries</td></tr><tr><td>Time-series</td><td>Prometheus, TimescaleDB</td><td>time ranges, rollups</td><td>high cardinality</td></tr><tr><td>Graph</td><td>Neo4j</td><td>multi-hop paths</td><td>bulk reporting</td></tr><tr><td>Search</td><td>Elasticsearch</td><td>text, logs, relevance</td><td>transactions</td></tr><tr><td>Vector</td><td>pgvector, Qdrant</td><td>similarity by meaning</td><td>exact filters alone</td></tr></tbody></table></div>
+<h2 id="s9-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 13.P.1</span> (easy) Which store family fits a leaderboard of top 10 players updated every second? <strong>Answer:</strong> Redis, using a sorted set (members ordered by score).</p>
+<p class="problem"><span class="pl">Problem 13.P.2</span> (easy) Define cache-aside in one sentence. <strong>Answer:</strong> The app checks the cache first; on a miss it reads the database, stores the result in the cache with a TTL and returns it.</p>
+<p class="problem"><span class="pl">Problem 13.P.3</span> (computation) Hit ratio 80%, hit 1 ms, miss 21 ms in total (1 ms check plus 20 ms database). Average latency? <strong>Answer:</strong> 0.8 x 1 + 0.2 x 21 = 0.8 + 4.2 = 5.0 ms.</p>
+<p class="problem"><span class="pl">Problem 13.P.4</span> (what is the output?) Using the <code>hits</code> table of 13.2.2, how many requests does IP <code>b</code> have in minute bucket 0, and is it blocked? <strong>Answer:</strong> 2 requests (seconds 5 and 6), not blocked (limit is 3).</p>
+<p class="problem"><span class="pl">Problem 13.P.5</span> (computation) N = 5 copies, W = 3. What is the smallest R for consistent reads? <strong>Answer:</strong> R + W &gt; N means R &gt; 2, so R = 3.</p>
+<p class="problem"><span class="pl">Problem 13.P.6</span> (find the bug) A team uses <code>date</code> as the Cassandra partition key for an events table. What goes wrong? <strong>Answer:</strong> All of today's writes go to one partition (hot partition) and one node. Use a key such as <code>device_id</code>, or <code>(device_id, date)</code>.</p>
+<p class="problem"><span class="pl">Problem 13.P.7</span> (find the bug) A Prometheus metric has the label <code>user_id</code>. What goes wrong? <strong>Answer:</strong> Cardinality explosion: one time series per user exhausts memory. Remove the label and log per-user data elsewhere.</p>
+<p class="problem"><span class="pl">Problem 13.P.8</span> Using the follows graph of 13.5, who are the people exactly 2 hops from Asha? <strong>Answer:</strong> Meena (Asha &gt; Ravi &gt; Meena) and John (Asha &gt; Priya &gt; John). The result table of 13.5.1 shows shortest = 2 for exactly these two.</p>
+<p class="problem"><span class="pl">Problem 13.P.9</span> (scenario) A web shop's product page is slow because the same 1,000 popular products are read 50,000 times per minute from PostgreSQL. What is your first fix and what is the risk? <strong>Answer:</strong> Put a Redis cache-aside layer with a short TTL in front. The risk is stale data (a price change not shown) and a cache stampede (many misses at once when a key expires); use short TTLs, invalidate on update, and add random jitter to expiry times.</p>
+<p class="problem"><span class="pl">Problem 13.P.10</span> (interview) Explain CAP to a non-technical manager in three sentences. <strong>Answer:</strong> When the connection between our servers breaks, we must choose. Either we stop answering some requests so nobody sees wrong data (consistency), or we keep answering and may show slightly old data (availability). Banking picks the first, shopping carts often pick the second.</p>
+<p class="problem"><span class="pl">Problem 13.P.11</span> (interview) When would you NOT use MongoDB? <strong>Answer:</strong> When the data is highly relational and needs multi-row transactions and joins, such as accounting. Also when the main workload is analytical aggregation across many collections; a relational or columnar warehouse is simpler and faster.</p>
+<h2 id="s10-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data and AI roles and I know SQL basics. Explain how to choose between PostgreSQL, MongoDB, Redis, Cassandra, Elasticsearch, a time-series database and a graph database. Use one running example (an online shop) and a decision table. Then ask me five scenario questions one at a time and correct my answers.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning databases beyond SQL. Teach me Redis caching: cache-aside, write-through, TTL, invalidation, cache stampede and rate limiting. Use real numbers for hit ratio and latency, show the commands, and give me 8 graded exercises without solutions. Wait for my answers before revealing anything.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for system design interviews. Teach me the CAP theorem, PACELC, eventual versus strong consistency, and quorum reads and writes (R + W &gt; N), step by step with small numeric examples and a shopping-cart story. After each part, check my understanding with a question.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data engineering. Explain how documents from MongoDB or JSON APIs are flattened into relational tables, including arrays, optional fields and nested objects. Give a small JSON sample and show the SQL to flatten it in PostgreSQL. Then review my own example: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into GenAI roles. Teach me inverted indexes, BM25, embeddings, cosine similarity and approximate nearest-neighbour search, and when to use a search engine versus a vector database. Use tiny numeric examples I can calculate by hand, then run a mock interview of five questions on retrieval systems and grade each answer.</pre></div><div class="readbtn"><button class="btn" data-read="study:sql:ch13">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch12.html">← Chapter 12: Analytics SQL Patterns</a><a class="btn" href="ch14.html">Chapter 14: SQL Dialect Differences and the 40-Probl →</a></div></div><script src="../../assets/study.js"></script></body></html>

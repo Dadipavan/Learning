@@ -1,0 +1,261 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 16: Project Lab 2: Regression Detection, CI/CD Gates and Drift Monitoring</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 16</div><h1>Project Lab 2: Regression Detection, CI/CD Gates and Drift Monitoring</h1><p>Three portfolio projects about trust: knowing when a new release is slower, blocking a bad model before it ships, and noticing when live data has changed.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-16-1-project-regression-detector-across-releases">16.1 Project: Regression Detector Across Releases</a></li><li><a href="#s2-16-2-project-ci-cd-for-ml-with-model-gating-tests">16.2 Project: CI/CD for ML With Model-Gating Tests</a></li><li><a href="#s3-16-3-project-drift-monitoring-with-a-retraining-trigger">16.3 Project: Drift Monitoring With a Retraining Trigger</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>Chapter 15 gave you the method for running a project and three builds. This chapter gives three more, and all of them answer the same hard question: "Can I trust what is running?" A new release can be a little slower and nobody notices for weeks. A new model can pass the overall score and still fail a group of customers. Live data can drift away from the training data without any error message. For each, you will build a tool that finds the problem with evidence, using a neutral dataset such as delivery times. Use the project method from section 15.1 (plan, layout, commits, definition of done, README template, post, checklist) for each one. All code in this chapter was run, and the outputs are real. Anything not run is labelled.</p>
+<p>Words you need in this chapter:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Bootstrap</td><td>Resample your data with replacement many times to see how much a number wobbles.</td></tr><tr><td>Confidence interval (CI)</td><td>A range that likely holds the true value, for example 95%.</td></tr><tr><td>Change point</td><td>The moment a series switches from one normal level to another.</td></tr><tr><td>Gate</td><td>An automatic check that blocks a release when a rule fails.</td></tr><tr><td>PSI</td><td>Population Stability Index: a score for how much a distribution moved.</td></tr><tr><td>KS test</td><td>Kolmogorov-Smirnov test: asks whether two samples come from the same distribution.</td></tr></tbody></table></div>
+<h2 id="s1-16-1-project-regression-detector-across-releases">16.1 Project: Regression Detector Across Releases</h2>
+<h3>Goal and why employers care</h3>
+<p>You will build a tool that compares each release of a service with the previous one, using a bootstrap test on the median, and a second tool that scans the whole history for the release where behaviour changed. Employers care because "it feels slower" is not evidence. A detector that says "release 9 is between 7% and 25% slower, with 95% confidence" lets teams act, and one that stays quiet when nothing changed saves them from false alarms.</p>
+<h3>Skills used</h3>
+<p>Chapter 14, section 14.4 (Regression Detection, Observability and AIOps): the idea of comparing releases. Chapter 10 (Monitoring, Drift and Observability): percentiles and robust statistics. Chapter 8 (Deployment Strategies): why we compare a new version with the old one. Chapter 15, section 15.3 (the load test): the latency numbers come from tests like that.</p>
+<h3>Data</h3>
+<p>A generator. Each release has 300 delivery-lookup times in milliseconds, drawn from a skewed (log-normal) distribution, because real times have a long right tail. The true median is about 100 for releases 1 to 8, then 108 to 111 from release 9 on: a real 9% step. Seeded with <code>default_rng(7)</code>.</p>
+<h3>Architecture</h3>
+<pre class="code lang-text"><code>release_samples() x 12 --&gt; list of arrays
+   |                                   |
+bootstrap_ratio(prev, curr)      cusum_changepoint(medians)
+   |                                   |
+verdict: REGRESSION / ok /       permutation test: is the split real?
+         improvement
+   |
+A/A test (no real change) --&gt; false alarm rate
+power test (real +6%)     --&gt; detection rate</code></pre>
+<pre class="code lang-text"><code>regress/
+  regress.py       bootstrap, change point, A/A and power checks
+  tests/test_regress.py</code></pre>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Two classes take the same exam. Class A averages 62 and class B averages 65. Is B better, or did B just have luckier students? To find out, you imagine re-drawing students from each class many times and see how often the gap disappears. That "re-drawing" is the bootstrap.</div></div>
+<h3>Step-by-step build</h3>
+<ol><li><strong>Bootstrap the ratio of medians.</strong> Resample both groups with replacement 2,000 times, take the median of each, divide, and read the 2.5th and 97.5th percentiles. A ratio of 1.00 means no change.</li></ol>
+<pre class="code lang-python"><code>def bootstrap_ratio(a, b, B=2000, seed=0):
+    r = np.random.default_rng(seed); ratios = np.empty(B)
+    for i in range(B):
+        ratios[i] = np.median(r.choice(b, len(b))) / np.median(r.choice(a, len(a)))
+    return np.percentile(ratios, [2.5, 97.5])</code></pre>
+<ol><li><strong>Two gates for a regression: real and big enough.</strong> The lower end of the interval must be above a minimum effect (3%). That gives "surely at least 3% slower", not just "probably not equal".</li></ol>
+<pre class="code lang-python"><code>def verdict(a, b, min_effect=1.03, B=2000):
+    lo, hi = bootstrap_ratio(a, b, B)
+    if lo &gt; min_effect:          return "REGRESSION", lo, hi
+    if hi &lt; 1 / min_effect:      return "improvement", lo, hi
+    return "ok", lo, hi</code></pre>
+<ol><li><strong>Compare each release with the one before.</strong> Predict first: how many of the 11 comparisons will say REGRESSION?</li></ol>
+<pre class="code lang-text"><code>rel  median   vs previous: ratio 95% CI        verdict
+r2      96.2   [0.944, 1.044]   ok
+r3      96.6   [0.959, 1.063]   ok
+r4      98.5   [0.962, 1.075]   ok
+r5     101.0   [0.961, 1.115]   ok
+r6      96.7   [0.875, 1.037]   ok
+r7     100.8   [0.968, 1.114]   ok
+r8      97.6   [0.901, 1.047]   ok
+r9     113.6   [1.074, 1.253]   REGRESSION
+r10    105.1   [0.860, 0.995]   ok
+r11    110.7   [0.990, 1.132]   ok
+r12    110.3   [0.935, 1.040]   ok</code></pre>
+<p>Only release 9 is flagged. Its interval, 1.074 to 1.253, sits entirely above 1.03: it is between 7% and 25% slower. Look at r10: the measured median drops from 113.6 to 105.1, but the interval [0.860, 0.995] is not below 1/1.03 = 0.971, so we do not call it an improvement. Single samples are noisy. The release-9 sample median (113.6) also looks higher than the true 109, which shows why you never trust one median.</p>
+<ol><li><strong>Find the change point in the whole history.</strong> Try every split point; for each, compare the mean of the log-medians on the left and right, weighted by group size. The split with the biggest gap is the change point. Then ask whether a gap this big could be luck, by shuffling the series 2,000 times (a <strong>permutation test</strong>).</li></ol>
+<pre class="code lang-python"><code>def cusum_changepoint(series):
+    x = np.log(series); n = len(x); best, best_k = 0, None
+    for k in range(2, n - 1):
+        l, r = x[:k], x[k:]
+        stat = abs(l.mean() - r.mean()) * np.sqrt(len(l) * len(r) / n)
+        if stat &gt; best: best, best_k = stat, k
+    return best_k, best</code></pre>
+<pre class="code lang-text"><code>change point: releases up to r8 vs from r9; stat=0.19, permutation p=0.0040</code></pre>
+<p>The change point is found at release 9, with p = 0.004: only about 4 in 1,000 shuffles produce a gap this large. Pairwise tests find a step; the change-point scan finds where a slow creep or a step began, even when no single pair looks alarming.</p>
+<ol><li><strong>Measure the detector itself.</strong> A tool you have not tested on known truth is a guess.</li></ol>
+<pre class="code lang-text"><code>false alarms in 300 A/A comparisons: 0
+detections of a real +6% change in 100 tries: 13
+same +6% change with 3000 samples per release, 40 tries: 29</code></pre>
+<p>An A/A test compares two samples from the same release: any alarm is false. We got 0 of 300. Good. But a real +6% change with 300 samples was caught only 13 of 100 times (13%). With 3,000 samples it was caught 29 of 40 times (72%). Power, the chance of catching a real change, depends on the sample size. Small samples miss small regressions. This is the most important lesson in the project.</p>
+<h3>Evaluation / acceptance criteria</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Criterion</th><th>Target</th><th>Achieved</th></tr></thead><tbody><tr><td>Real +9% step flagged</td><td>flagged at release 9</td><td>yes</td></tr><tr><td>Other pairs quiet</td><td>0 false flags in 11 pairs</td><td>0</td></tr><tr><td>A/A false alarm rate</td><td>at most 5%</td><td>0 of 300</td></tr><tr><td>Change point location</td><td>release 9, p below 0.05</td><td>release 9, p = 0.004</td></tr><tr><td>Power reported</td><td>detection rate at 2 sample sizes</td><td>13% and 72%</td></tr></tbody></table></div>
+<h3>Common pitfalls</h3>
+<ul><li><strong>Comparing means of skewed data.</strong> Detect: one slow request moves the mean. Fix: use medians or percentiles.</li><li><strong>Declaring victory on one comparison.</strong> Detect: run the A/A test; if 1 in 20 A/A pairs alarms at a loose rule, you have noise. Fix: add the minimum-effect gate.</li><li><strong>Too few samples.</strong> Detect: wide intervals (r6 spans 0.875 to 1.037). Fix: more samples per release or a bigger target effect.</li><li><strong>Mixing conditions.</strong> Detect: releases tested on different machines or at different times. Fix: same hardware, same load, same data.</li><li><strong>Searching for a change point and trusting it blindly.</strong> Detect: the scan always finds some best split. Fix: the permutation p-value.</li></ul>
+<h3>Three extensions</h3>
+<ol><li>Test p95 as well as the median (bootstrap the 95th percentile).</li><li>Detect several change points by running the scan again on each side (binary segmentation).</li><li>Wire the verdict into the CI gate of Project 41, so a regression blocks the release.</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. How do you decide if a new release is really slower?</strong> I do not compare two numbers. I compare two samples and get a range for the difference, using a bootstrap. If the whole range is above a size I care about, it is a regression. If the range includes no change, I say I cannot tell and, if it matters, collect more data.</p>
+<p><strong>Q2. Why is your test sometimes silent on a real slowdown?</strong> Because of power. With few samples and noisy data, a small real change hides inside the noise. In my test a 6% slowdown was caught 13% of the time with 300 samples and 72% with 3,000. I report that number, so the team knows what the tool can and cannot see.</p>
+<p><strong>Q3. What is the difference between the pairwise test and the change-point scan?</strong> The pairwise test asks whether this release differs from the last one. The scan looks at the whole history and asks where the level changed. The scan can catch a slow creep spread over several releases, and the pairwise test would miss it, because each step is small.</p>
+<h3>README outline</h3>
+<p>The question; the 12-release table; the two methods in 5 lines each; the A/A and power results; the lesson on sample size; limits (synthetic data, independent samples); next steps (percentiles, CI integration).</p>
+<h2 id="s2-16-2-project-ci-cd-for-ml-with-model-gating-tests">16.2 Project: CI/CD for ML With Model-Gating Tests</h2>
+<h3>Goal and why employers care</h3>
+<p>You will write a GitHub Actions workflow that tests code and data, trains a small candidate and runs a gate that blocks the release if the candidate is worse than the current model: overall, on important slices, or in speed. You will parse the workflow file and run the gate for real. Employers care because teams ship models often, and a gate is what lets them do it safely.</p>
+<h3>Skills used</h3>
+<p>Chapter 9 (CI/CD for Machine Learning), sections 9.1 (Continuous Integration for ML), 9.2 (Model Tests: Testing Behaviour, Not Just Accuracy) and 9.3 (Promotion Gates and Continuous Delivery). Chapter 2 (Reproducibility): pinned dependencies. Chapter 3 (Experiment Tracking and the Model Registry): the baseline metrics come from the registry.</p>
+<h3>Data</h3>
+<p>Two small JSON files stand in for metrics: <code>baseline/metrics.json</code> (the production model) and a candidate file written by training. Each holds overall MAE (mean absolute error, in minutes of delivery time), p95 latency in ms, number of evaluation rows and MAE per slice (<code>rush_hour</code>, <code>night</code>). The baseline is MAE 3.00, p95 40 ms, 2,000 rows, slices 4.0 and 2.5.</p>
+<h3>Architecture</h3>
+<pre class="code lang-text"><code>pull request --&gt; workflow ml-ci.yml
+                   |- checkout, setup python, install (pinned)
+                   |- unit + data tests          (fail fast)
+                   |- train candidate on small CI sample
+                   |- gate.py candidate vs baseline --&gt; exit 0 or 1
+                   '- upload evidence (always)</code></pre>
+<pre class="code lang-text"><code>ml-ci/
+  .github/workflows/ml-ci.yml
+  src/gate.py            rules + CLI, exit code is the verdict
+  tests/test_gate.py     the gate is itself tested
+  check_workflow.py      parses the YAML and checks it
+  baseline/metrics.json</code></pre>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A school does not let a new teacher's whole class sit the final exam without checks. It looks at the average mark, at each group (a class can hide failing students behind a good average), and at whether the exam finished on time. The gate does the same for a model: average, groups, speed, and enough data to judge.</div></div>
+<h3>Step-by-step build</h3>
+<ol><li><strong>Write the workflow.</strong> It runs on pull requests that touch code, tests or configs, uses least-privilege permissions, pins action versions and has a timeout. This file was parsed (below) but not run on GitHub: not run here.</li></ol>
+<pre class="code lang-yaml"><code>name: ml-ci
+on:
+  pull_request:
+    paths: ["src/**", "tests/**", "configs/**"]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  test-and-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+      - run: pip install -r requirements.txt
+      - name: Unit and data tests
+        run: python -m unittest discover -s tests -v
+      - name: Gate the candidate against the baseline
+        run: python src/gate.py --candidate out/candidate.json --baseline baseline/metrics.json
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with: { name: gate-report, path: out/ }</code></pre>
+<p>The full file also has a training step between tests and gate. The tags <code>@v4</code> and <code>@v5</code> were current when this was written; check yours.</p>
+<ol><li><strong>Write the gate.</strong> Lower MAE and lower latency are better, so "worse" means higher. Each check returns pass or fail with a reason.</li></ol>
+<pre class="code lang-python"><code>RULES = {"max_mae_worsening_pct": 2.0, "max_p95_ms_worsening_pct": 10.0,
+         "max_slice_mae_worsening_pct": 8.0, "min_rows": 500}
+
+def pct_worse(new, old): return (new - old) / old * 100
+
+def gate(candidate, baseline, rules=RULES):
+    out = [("enough eval rows", candidate["eval_rows"] &gt;= rules["min_rows"], "")]
+    d = pct_worse(candidate["mae"], baseline["mae"])
+    out.append(("overall MAE", d &lt;= rules["max_mae_worsening_pct"], f"{d:+.2f}%"))
+    d = pct_worse(candidate["p95_ms"], baseline["p95_ms"])
+    out.append(("p95 latency", d &lt;= rules["max_p95_ms_worsening_pct"], f"{d:+.2f}%"))
+    for name, mae in candidate["slice_mae"].items():
+        d = pct_worse(mae, baseline["slice_mae"][name])
+        out.append((f"slice {name}", d &lt;= rules["max_slice_mae_worsening_pct"], f"{d:+.2f}%"))
+    return all(ok for _, ok, _ in out), out</code></pre>
+<p>The command-line wrapper prints each line and ends with <code>sys.exit(0 if passed else 1)</code>. The exit code is what CI reads: non-zero means the job fails and the merge button stays locked.</p>
+<ol><li><strong>Test the gate.</strong> Six tests: same model passes; +1.33% passes (noise); +3.33% overall blocks; a +12.5% hidden slice regression blocks even if the overall number is fine; a +15% slower model blocks; a tiny evaluation set blocks.</li></ol>
+<pre class="code lang-text"><code>Ran 6 tests in 0.000s
+OK</code></pre>
+<p>Test names show in the log, for example <code>test_hidden_slice_regression_blocks ... ok</code>.</p>
+<ol><li><strong>Run the gate on two candidates.</strong> Predict first: a candidate that is better overall (MAE 2.95) but much worse on rush hour (4.6 against 4.0). Pass or block?</li></ol>
+<pre class="code lang-text"><code>PASS  overall MAE        -1.67% vs baseline (limit +2.0%)
+PASS  p95 latency        +2.50% vs baseline (limit +10.0%)
+FAIL  slice rush_hour    +15.00% (limit +8.0%)
+PASS  slice night        -12.00% (limit +8.0%)
+GATE: BLOCKED</code></pre>
+<p>The good candidate (MAE 3.04, rush 4.1, night 2.4) printed <code>GATE: PASSED</code> with exit code 0. The second printed <code>GATE: BLOCKED</code> with exit code 1. Check the first line: <code>(2.95 - 3.00) / 3.00 x 100 = -1.67</code>. Check rush hour: <code>(4.6 - 4.0) / 4.0 x 100 = 15.0</code>. The better average hides a group that got 15% worse, and the gate catches it.</p>
+<ol><li><strong>Parse the workflow and check it.</strong> A small script loads the YAML with PyYAML (a library, not in the standard library) and checks permissions, timeouts, pinned actions and that the test and gate steps exist.</li></ol>
+<pre class="code lang-text"><code>keys at top level: ['name', True, 'permissions', 'jobs']
+jobs: {'test-and-gate': 7}
+problems: none</code></pre>
+<p>Look at the second key: <code>True</code>, not <code>on</code>. YAML 1.1 reads the bare word <code>on</code> as the boolean true. So <code>wf["on"]</code> fails with a <code>KeyError</code>. The script reads <code>wf.get("on", wf.get(True))</code>. This is a classic trap in tools that validate workflows.</p>
+<h3>Evaluation / acceptance criteria</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Criterion</th><th>Target</th><th>Achieved</th></tr></thead><tbody><tr><td>Gate tests</td><td>6 of 6 pass</td><td>yes</td></tr><tr><td>Hidden slice regression blocked</td><td>exit code 1</td><td>yes</td></tr><tr><td>Noise-level change passes</td><td>exit code 0</td><td>yes</td></tr><tr><td>Workflow lint</td><td>0 problems</td><td>none</td></tr><tr><td>Workflow runs on GitHub</td><td>green run</td><td>not run here</td></tr></tbody></table></div>
+<h3>Common pitfalls</h3>
+<ul><li><strong>Gate on the average only.</strong> Detect: a slice test that should fail, passes. Fix: add slice rules.</li><li><strong>Tolerance of zero.</strong> Detect: a retrained identical model sometimes fails. Fix: allow a noise margin (2% here) based on the A/A spread, as in section 16.1.</li><li><strong>Gate with too little data.</strong> Detect: huge swings between runs. Fix: the <code>min_rows</code> rule.</li><li><strong>Secrets in the workflow file.</strong> Detect: keys in YAML. Fix: repository secrets, and <code>permissions: contents: read</code>.</li><li><strong>Unpinned actions or no timeout.</strong> Detect: the lint script. Fix: pin versions, set <code>timeout-minutes</code>.</li></ul>
+<h3>Three extensions</h3>
+<ol><li>Fetch the baseline automatically from the registry and fail if it is missing.</li><li>Add a data-schema test and a "no leakage" test (Chapter 5).</li><li>On a pass, publish the model with a new version and the commit id, and promote it to staging (Chapter 8).</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. What is a model gate?</strong> An automatic rule that compares the new model with the current one and blocks the release if the new one is worse. It checks the overall score, important groups, speed and whether there is enough data to judge.</p>
+<p><strong>Q2. Why test slices and not only the overall score?</strong> An average can hide a group that got worse. In my example the overall error improved by 1.7% while rush-hour orders got 15% worse. Customers in that group would feel it.</p>
+<p><strong>Q3. How do you stop the gate from blocking good models by noise?</strong> I set a small tolerance based on how much a retrained identical model varies, and I require enough evaluation data. I also log the gate report so a person can override with a reason.</p>
+<h3>README outline</h3>
+<p>Workflow diagram; the rules table and why each limit; the six test names; the two gate runs; the <code>on</code> as <code>True</code> note; limits (small sample, rules are examples); "not run here": real GitHub run.</p>
+<h2 id="s3-16-3-project-drift-monitoring-with-a-retraining-trigger">16.3 Project: Drift Monitoring With a Retraining Trigger</h2>
+<h3>Goal and why employers care</h3>
+<p>You will watch seven weeks of delivery orders against a reference week, compute PSI and the KS test per feature, print a text dashboard and decide, by a written rule, when to retrain. Employers care because "monitor the model" is easy to say. Showing which feature moved, how much and what action follows is rarely seen in portfolios.</p>
+<h3>Skills used</h3>
+<p>Chapter 10 (Monitoring, Drift and Observability), section 10.2 (Data Drift: PSI, KS, Wasserstein and Friends) and section 10.4 (Alert Design, Runbooks and Incident Response). Chapter 9, section 9.4 (Continuous Training and MLOps Maturity): when training should start. Chapter 15, section 15.2 (the pipeline): where the monitored inputs come from.</p>
+<h3>Data</h3>
+<p>A weekly generator. Reference week: 5,000 orders with <code>distance_km</code> (gamma), <code>items</code> and <code>rush_hour</code> (50% of orders). From week 3, delivery distance creeps up by 0.8 km each week. From week 5, rush-hour share jumps to 75%. Items never change. Each week has 1,500 orders.</p>
+<h3>Architecture</h3>
+<pre class="code lang-text"><code>reference week (5000) ---------\
+                                +--&gt; per feature: PSI (10 quantile bins), KS statistic, p-value
+week 1..7 (1500 each) ---------/            |
+                                   label: ok (&lt;0.1) / watch (&lt;0.25) / ALERT
+                                            |
+                         retrain_rule: &gt;=1 feature in ALERT for 2 weeks in a row
+                                            |
+                              text dashboard + decision</code></pre>
+<pre class="code lang-text"><code>drift/
+  drift.py            psi(), make_week(), retrain_rule(), report
+  tests/test_drift.py</code></pre>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A shop that planned stock for walk-in students suddenly gets office workers at lunch. Sales are fine today, but the shelves are wrong for the new crowd. PSI is a number for "how different is today's crowd from the crowd I planned for", and the rule says when it is time to re-plan.</div></div>
+<h3>Step-by-step build</h3>
+<ol><li><strong>PSI with quantile bins.</strong> Cut the reference data into 10 bins with equal counts, so each holds 10%. Count the share of current data in each bin. PSI is the sum over bins of <code>(current share - reference share) x ln(current share / reference share)</code>. Rules of thumb: below 0.1 stable, 0.1 to 0.25 watch, above 0.25 act. These limits are conventions, not laws.</li></ol>
+<pre class="code lang-python"><code>def psi(ref, cur, bins=10):
+    edges = np.quantile(ref, np.linspace(0, 1, bins + 1)); edges[0], edges[-1] = -np.inf, np.inf
+    r = np.histogram(ref, edges)[0] / len(ref); c = np.histogram(cur, edges)[0] / len(cur)
+    r, c = np.clip(r, 1e-4, None), np.clip(c, 1e-4, None)      # avoid log(0)
+    return float(np.sum((c - r) * np.log(c / r)))</code></pre>
+<p>Hand check on 2 bins: reference 50/50, current 70/30. <code>(0.7-0.5) x ln(0.7/0.5) + (0.3-0.5) x ln(0.3/0.5) = 0.2 x 0.3365 + (-0.2) x (-0.5108) = 0.0673 + 0.1022 = 0.1695</code>. That is "watch".</p>
+<ol><li><strong>KS statistic.</strong> <code>scipy.stats.ks_2samp(ref, cur)</code> returns the biggest gap between the two cumulative curves (0 to 1) and a p-value. With thousands of rows, even tiny gaps get tiny p-values, so use PSI or the statistic size to judge importance, and the p-value only to confirm it is not luck.</li></ol>
+<ol><li><strong>The retrain rule, as code.</strong> Writing it down prevents arguments at 3 a.m.</li></ol>
+<pre class="code lang-python"><code>def retrain_rule(history, psi_alert=0.25, features_needed=1, weeks_in_row=2):
+    if len(history) &lt; weeks_in_row: return False
+    return all(sum(v &gt;= psi_alert for v in w.values()) &gt;= features_needed
+               for w in history[-weeks_in_row:])</code></pre>
+<ol><li><strong>Run seven weeks.</strong> Predict first: in which week will the rule say "retrain"?</li></ol>
+<pre class="code lang-text"><code>week feature         PSI      KS     KS p  status
+1    distance_km   0.007   0.032   0.1771  ok
+1    items         0.011   0.027   0.3486  ok
+1    rush_hour     0.001   0.012   0.9943  ok
+      -&gt; retrain? False
+2    distance_km   0.014   0.032   0.1789  ok
+      -&gt; retrain? False
+3    distance_km   0.156   0.136   0.0000  watch
+      -&gt; retrain? False
+4    distance_km   0.415   0.198   0.0000  ALERT
+      -&gt; retrain? False
+5    distance_km   1.197   0.319   0.0000  ALERT
+5    rush_hour     0.252   0.241   0.0000  ALERT
+      -&gt; retrain? True</code></pre>
+<p>Weeks 6 and 7 (not all shown) also show ALERT on distance (2.075 and 3.349) and on rush hour (0.289, 0.252), and the rule stays True. Week 4 is the first ALERT but the rule waits for a second week in a row, so it fires in week 5. The <code>items</code> feature never left "ok", which is correct, because it never changed.</p>
+<ol><li><strong>A text dashboard.</strong> One line per week, one <code>#</code> per 0.05 of PSI, capped at 30 characters with a <code>&gt;</code>.</li></ol>
+<pre class="code lang-text"><code>week 1                                 0.007
+week 2                                 0.014
+week 3 ###                             0.156
+week 4 ########                        0.415
+week 5 ########################        1.197
+week 6 ##############################&gt; 2.075
+week 7 ##############################&gt; 3.349</code></pre>
+<p>Read it left to right: each bar is a week of PSI for <code>distance_km</code>. A flat empty line means stable. A growing bar means a steady creep, here about 0.8 km a week. PSI grows faster than the shift itself, because it measures how many orders land in the wrong bins.</p>
+<ol><li><strong>Document the runbook.</strong> In the README, write what a person does on "watch" (look at the feature, check for upstream data changes), on "ALERT" (confirm with the KS and the business, check model error if labels exist) and on "retrain" (start training on recent data, run the gate from section 16.2, canary the result).</li></ol>
+<h3>Evaluation / acceptance criteria</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Criterion</th><th>Target</th><th>Achieved</th></tr></thead><tbody><tr><td>Stable weeks quiet</td><td>PSI below 0.1 in weeks 1-2</td><td>0.007 and 0.014</td></tr><tr><td>Unchanged feature stays ok</td><td><code>items</code> ok all 7 weeks</td><td>yes</td></tr><tr><td>Drift detected early</td><td>distance flagged by week 4</td><td>ALERT in week 4, watch in week 3</td></tr><tr><td>Trigger rule</td><td>no retrain from one noisy week</td><td>first True in week 5</td></tr><tr><td>Hand check of PSI</td><td>matches 0.1695 on the 2-bin example</td><td>yes</td></tr></tbody></table></div>
+<h3>Common pitfalls</h3>
+<ul><li><strong>Bins from the current data.</strong> Detect: PSI near zero always. Fix: build bins from the reference.</li><li><strong>Empty bins give infinity.</strong> Detect: <code>inf</code> or <code>nan</code> in the output. Fix: clip shares to a small value.</li><li><strong>Trusting the p-value alone.</strong> Detect: p = 0.0000 for a trivial shift on huge data. Fix: judge by effect size (PSI, KS statistic).</li><li><strong>Retraining on every blip.</strong> Detect: weekly retraining jobs. Fix: persistence rule, as above.</li><li><strong>Treating drift as accuracy loss.</strong> Detect: inputs moved but error did not. Fix: confirm with labels when they arrive (Chapter 10, section 10.3).</li></ul>
+<h3>Three extensions</h3>
+<ol><li>Add the prediction distribution as a monitored "feature" and a delayed-label error check.</li><li>Use a rolling reference window instead of one fixed week and compare behaviour.</li><li>Open an automatic ticket with the dashboard text when the rule fires, and trigger the pipeline of section 15.2.</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. What is PSI and how do you read it?</strong> It compares the share of data in each bin between a reference and the current data. Below 0.1 is stable, 0.1 to 0.25 is worth watching, above 0.25 is a big shift. The limits are conventions, so I check them against my own data.</p>
+<p><strong>Q2. Drift happened. Do you retrain right away?</strong> Not automatically. I confirm the shift is real, find the cause (a data pipeline change, a new customer group, a season), check model error if labels exist, and then retrain if needed. I run the new model through the gate before it replaces the old one.</p>
+<p><strong>Q3. Why use a rule like "two weeks in a row"?</strong> One noisy week should not start an expensive job. Persistence cuts false triggers. The price is a delay of one week, which I write down and agree with the business.</p>
+<h3>README outline</h3>
+<p>The generator and the two drifts; PSI formula with the hand check; the 7-week table; the dashboard; the retrain rule and the runbook; limits (synthetic, thresholds are conventions, per-feature not joint drift); next steps.</p>
+<h2 id="s4-chapter-recap">Chapter recap</h2>
+<ul><li>A release comparison needs a range, not two numbers: bootstrap the ratio of medians and require the whole range to sit above a minimum effect.</li><li>Test your detector on known truth: A/A runs for false alarms and injected changes for power. Power drops fast with fewer samples.</li><li>A change-point scan finds where a series changed; a permutation test says whether the best split is real or luck.</li><li>A CI/CD workflow runs fast tests first, trains a small candidate, then a gate with an exit code decides.</li><li>Gate on the overall score, on important slices, on speed and on the amount of evaluation data. An average can hide a group that got worse.</li><li>Test the gate itself, lint the workflow, and remember that YAML 1.1 reads <code>on</code> as <code>True</code>.</li><li>PSI and KS say how far a feature moved; the effect size matters more than the p-value on big data.</li><li>Write the retraining rule as code, with persistence, and attach a runbook to each alert level.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Formula or command</th><th>Use</th></tr></thead><tbody><tr><td>Bootstrap ratio</td><td>resample both, median(b)/median(a), 2.5 and 97.5 percentiles</td><td>release comparison</td></tr><tr><td>Regression rule</td><td>lower bound above 1.03</td><td>real and big enough</td></tr><tr><td>Change point</td><td>max of <code>abs(mean_L - mean_R) x sqrt(nL nR / n)</code></td><td>where the level changed</td></tr><tr><td>Gate exit code</td><td><code>sys.exit(0 or 1)</code></td><td>CI pass or fail</td></tr><tr><td>Percent worse</td><td><code>(new - old) / old x 100</code></td><td>gate rule</td></tr><tr><td>PSI</td><td><code>sum (c - r) x ln(c / r)</code></td><td>drift size</td></tr><tr><td>Retrain rule</td><td>alert on k features for m weeks in a row</td><td>trigger</td></tr></tbody></table></div>
+<h2 id="s5-practice-set">Practice set</h2>
+<p><strong>1. (easy)</strong> A bootstrap interval for the ratio new/old median is [0.97, 1.08]. Regression or not? <strong>Answer:</strong> Not proven. The interval includes 1.00 (and 0.97), so the data do not show a change. Collect more samples if the question matters.</p>
+<p><strong>2. (easy)</strong> Baseline MAE is 4.0. Candidate MAE is 4.2. With a 2% limit, does the gate pass? <strong>Answer:</strong> <code>(4.2 - 4.0) / 4.0 x 100 = 5%</code>, above 2%, so it blocks.</p>
+<p><strong>3. (easy)</strong> Compute PSI for reference shares 0.6/0.4 and current shares 0.5/0.5. <strong>Answer:</strong> <code>(0.5-0.6) x ln(0.5/0.6) + (0.5-0.4) x ln(0.5/0.4) = (-0.1)(-0.1823) + (0.1)(0.2231) = 0.0182 + 0.0223 = 0.0405</code>. Stable.</p>
+<p><strong>4. (medium)</strong> The workflow YAML has <code>on: push</code>. <code>wf["on"]</code> raises <code>KeyError</code> after <code>yaml.safe_load</code>. Why, and what is the fix? <strong>Answer:</strong> YAML 1.1 turns the unquoted word <code>on</code> into the boolean <code>True</code>, so the key is <code>True</code>. Read <code>wf.get("on", wf.get(True))</code> or quote the key as <code>"on"</code> in the file.</p>
+<p><strong>5. (medium)</strong> An A/A test (same release twice) alarms in 14 of 100 tries. What does it mean and what do you change? <strong>Answer:</strong> The detector produces 14% false alarms. Add or raise the minimum-effect gate, use more samples, and check that the two groups are measured under the same conditions.</p>
+<p><strong>6. (medium, what is the output?)</strong> <code>retrain_rule([{"a":0.3},{"a":0.1},{"a":0.3}])</code> with default settings. <strong>Answer:</strong> <code>False</code>. The last two weeks are 0.1 and 0.3, and the first of them is not an alert, so there are no two alert weeks in a row.</p>
+<p><strong>7. (interview)</strong> Your gate blocks a model that is better overall. The team is angry. What do you say? <strong>Answer:</strong> The gate shows which slice got worse, here by a measured percentage. I explain that customers in that slice would see worse results. If the business accepts the trade-off, a named person can override with a written reason, and we log it. If not, we improve the slice and rerun.</p>
+<p><strong>8. (interview)</strong> You have 10 releases of latency data and a manager asks "when did it get slower?" How do you answer, with evidence? <strong>Answer:</strong> Run the change-point scan on the release medians, report the release with the largest level change and its permutation p-value, and confirm with a bootstrap comparison of the releases on either side. Report the range of the change, not one number, and list the code commits in that release as the suspects.</p>
+<h2 id="s6-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into MLOps. Teach me "comparing two releases with a bootstrap test and finding a change point" using delivery-time data. Explain the bootstrap with a classroom example, then walk through the ratio of medians, the minimum-effect rule, an A/A test and the idea of power with real numbers. Check my understanding with one question at a time, and finish with three graded exercises with answers.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into MLOps. Review my GitHub Actions workflow and my model-gating script [PASTE HERE]. Check triggers, permissions, pinned actions, timeouts, secrets, test order, the gate rules (overall, slices, speed, minimum data), the exit code and the tests of the gate itself. Give a prioritised list of problems in simple English, and show one corrected snippet for the most serious one.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into MLOps. Explain PSI and the KS test for drift monitoring step by step with a two-bin hand example, then with ten quantile bins. Tell me how to choose thresholds, why the p-value alone misleads on large data, and how to write a retraining rule with persistence. Then give me 8 graded exercises without solutions, and offer to mark my answers.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into MLOps. My drift dashboard and retraining trigger gave these results: [PASTE HERE]. Help me debug them. Check my reference data, bin edges, empty-bin handling, thresholds, persistence rule and whether I confirm drift with labels. Suggest one change at a time, explain the trade-off of each in simple English, and tell me how to test my trigger on a stable week and a drifting week.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into MLOps and preparing interviews. Run a mock interview on three projects: a release regression detector, CI/CD with model gates and drift monitoring with a retraining trigger. Ask one question at a time, from basic to design level. After each answer, give feedback, a stronger model answer in simple English and a score out of 5. Include one question about a gate that blocks a model that looks better overall.</pre></div><div class="readbtn"><button class="btn" data-read="study:mlops:ch16">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch15.html">← Chapter 15: Project Lab 1: Pipeline, Load Test and A</a><a class="btn" href="appendix.html">Appendix: Cheat Sheet →</a></div></div><script src="../../assets/study.js"></script></body></html>

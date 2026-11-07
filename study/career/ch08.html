@@ -1,0 +1,263 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 8: System Design I: Software Systems</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#6a2fd0"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Career, Communication &amp; System Design</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 8</div><h1>System Design I: Software Systems</h1><p>How to design a service for millions of users, with real numbers, in the language of a working professional.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-8-1-the-design-framework-and-the-words-you-need">8.1 The Design Framework and the Words You Need</a></li><li><a href="#s2-8-2-estimation-with-little-s-law">8.2 Estimation With Little&#x27;s Law</a></li><li><a href="#s3-8-3-caching">8.3 Caching</a></li><li><a href="#s4-8-4-sharding-replication-and-consistent-hashing">8.4 Sharding, Replication and Consistent Hashing</a></li><li><a href="#s5-8-5-queues-retries-and-reliability">8.5 Queues, Retries and Reliability</a></li><li><a href="#s6-8-6-worked-design-1-url-shortener">8.6 Worked Design 1: URL Shortener</a></li><li><a href="#s7-8-7-worked-design-2-rate-limiter">8.7 Worked Design 2: Rate Limiter</a></li><li><a href="#s8-8-8-worked-design-3-news-feed">8.8 Worked Design 3: News Feed</a></li><li><a href="#s9-chapter-recap">Chapter recap</a></li><li><a href="#s10-practice-set">Practice set</a></li><li><a href="#s11-prompt-pack">Prompt pack</a></li></ol></details><p>In a system design interview someone says "design a URL shortener" and watches how you think for 45 minutes. At work, the same skill decides whether your service survives launch day. You already know the hard part: load, bottlenecks, percentiles and capacity. What you may lack is a vocabulary (cache, shard, queue) and a framework that turns a vague request into a clear design. By the end of this chapter you will estimate load from a few assumptions, choose between a cache, a shard and a queue with a reason, and walk through three classic designs: a URL shortener, a rate limiter and a news feed. Chapter 6 taught estimation as a thinking tool; here we apply it to machines.</p>
+<h2 id="s1-8-1-the-design-framework-and-the-words-you-need">8.1 The Design Framework and the Words You Need</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Designing a system is like planning a restaurant before it opens. You do not start by buying stoves. You ask how many guests come, what they order, how fast they expect food, and what happens if the chef is ill. Weak answers draw boxes in minute one. Strong answers spend the first five minutes on questions and numbers.</div></div>
+<h3>The eight steps</h3>
+<p>Use the same order every time.</p>
+<ol><li><strong>Requirements.</strong> Functional (what the system does) and non-functional (how well: latency, availability, scale, cost, consistency).</li><li><strong>Estimates.</strong> Requests per second, storage, bandwidth, memory. Say your assumptions aloud.</li><li><strong>API.</strong> The few calls a client makes.</li><li><strong>Data model.</strong> What is stored, the lookup key, the read and write pattern.</li><li><strong>High-level design.</strong> Boxes and arrows for one request, end to end.</li><li><strong>Deep dives.</strong> The two or three hardest parts.</li><li><strong>Bottlenecks.</strong> What breaks first at 10 times the load? Capacity thinking lives here.</li><li><strong>Trade-offs.</strong> What you gave up and why.</li></ol>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th><th>Where it appears</th></tr></thead><tbody><tr><td>REST / gRPC</td><td>Web-style named calls (<code>GET /urls/abc</code>) / faster binary calls between services</td><td>APIs</td></tr><tr><td>DNS</td><td>The phone book that turns <code>example.com</code> into an IP address</td><td>Before the first request</td></tr><tr><td>CDN</td><td>Content Delivery Network: copies of files near the user</td><td>Images, scripts</td></tr><tr><td>Load balancer</td><td>A traffic officer that spreads requests over servers</td><td>In front of app servers</td></tr><tr><td>Cache</td><td>A small fast copy of slow data</td><td>Redis, browser, CDN</td></tr><tr><td>Sharding</td><td>Splitting data over machines by key</td><td>Big tables</td></tr><tr><td>Replication</td><td>Copies of data on several machines</td><td>Reads and failover</td></tr><tr><td>Queue</td><td>A waiting line between producer and consumer</td><td>Kafka, SQS</td></tr><tr><td>Idempotent</td><td>Doing it twice has the same effect as once</td><td>Payments, retries</td></tr><tr><td>Stateless</td><td>A server keeps nothing between requests, so any server can serve any request</td><td>App servers</td></tr></tbody></table></div>
+<p><strong>SQL or NoSQL?</strong> SQL gives rules, joins and transactions (all-or-nothing changes). NoSQL stores (key-value, document, wide-column) usually trade some of that for easier scaling. Choose by access pattern: "find one row by key, billions of rows" leans NoSQL; "many questions with joins" leans SQL.</p>
+<p><strong>CAP in one paragraph.</strong> When the network between machines breaks (a <em>partition</em>), a system must choose: stay <em>consistent</em> (everyone sees the same data, some requests fail) or stay <em>available</em> (every request is answered, some answers are stale). PACELC adds that even without a partition you trade latency against consistency. Partitions do happen, so the real choice is C or A during a failure. Observability (logs, metrics, traces) is how you see all of this at run time; it is your home ground.</p>
+<p class="problem"><span class="pl">Problem 8.1.1</span> Interviewer: "Design profile-photo upload." Write the requirements you confirm in two minutes.</p>
+<table class="steps"><tr><th>Step 1</th><td>Functional: upload one photo, replace it, view anyone's photo, delete.</td></tr><tr><th>Step 2</th><td>Non-functional: max size 5 MB, view latency (reads far exceed writes), durability (never lose a photo), availability.</td></tr><tr><th>Step 3</th><td>Out of scope: editing, albums, face detection.</td></tr><tr><th>Answer</th><td>You design upload, storage and delivery, and you state that editing is excluded. A CDN, a load balancer with several servers, and an idempotent upload (a client-made request ID so a retry cannot create two photos) follow from these lines.</td></tr><tr><th>Check</th><td>Each line says what or how well, never how it is built. Requirements must not contain the solution.</td></tr></table>
+<pre class="code lang-text"><code>Client -&gt; DNS -&gt; CDN (static files)
+              \-&gt; Load balancer -&gt; App servers (stateless)
+                                      |-&gt; Cache (Redis)
+                                      |-&gt; Database (primary + replicas)
+                                      |-&gt; Queue -&gt; Workers (slow jobs)</code></pre>
+<h3>Where it is used</h3>
+<p>Data engineers design ingestion services, ML engineers prediction APIs, AI engineers chat backends. All start with these eight steps.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Saying "Kafka and microservices" in minute one. If you cannot justify a box with a number or a requirement, remove it.</div></div>
+<div class="callout cream"><div class="lab">INTERVIEW TIP</div><div class="txt">Say your method aloud. Interviewers score structure.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>First two steps? Answer: requirements, then estimates.</li><li>Is "latency under 200 ms" functional? Answer: no, non-functional.</li><li>Idempotent means? Answer: doing it twice equals doing it once.</li></ol>
+<h2 id="s2-8-2-estimation-with-little-s-law">8.2 Estimation With Little's Law</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A bank manager sets the number of counters by asking how many customers arrive per minute and how long each takes. If 60 arrive per minute and each needs 30 seconds, about 30 customers are being served at any moment, so you need about 30 counters. That is Little's law, which planners use to size counters, tills and servers.</div></div>
+<h3>Formal definition</h3>
+<p><strong>Little's law:</strong> <code>L = λ × W</code>. <code>L</code> is the average number of requests inside the system, <code>λ</code> (lambda) is the arrival rate per second, <code>W</code> is the average seconds each request spends inside. It holds for any stable system. For a system with think time (the pause between a user's actions): <code>users = throughput × (response time + think time)</code>.</p>
+<p>Peak traffic is not average. A common assumption is peak = 2 to 3 times the average; state it as an assumption. A month has about 2.6 million seconds, a day 86,400.</p>
+<p class="problem"><span class="pl">Problem 8.2.1</span> 100 requests per second, each in the system 0.2 s. How many in flight?</p>
+<table class="steps"><tr><th>Formula</th><td><code>L = λ × W</code></td></tr><tr><th>Compute</th><td><code>100 × 0.2 = 20</code></td></tr><tr><th>Answer</th><td>About 20 requests in flight, so you need at least 20 worker slots.</td></tr><tr><th>Check</th><td>One slot serves 1 / 0.2 = 5 per second; 20 slots serve 100 per second.</td></tr></table>
+<p class="problem"><span class="pl">Problem 8.2.2</span> A shortener team says: 100 million new short URLs per month, each read 100 times. Estimate writes and reads per second, peak, and 5-year storage at 500 bytes per record. Predict first: are writes nearer 4, 40 or 400 per second?</p>
+<pre class="code lang-python"><code>new_per_month = 100_000_000
+read_write = 100
+secs_month = 30 * 86400
+writes = new_per_month / secs_month
+reads = writes * read_write
+print("writes/s      :", round(writes, 1))
+print("reads/s avg   :", round(reads))
+print("reads/s peak  :", round(reads * 3))
+records = new_per_month * 12 * 5
+print("records 5y    :", f"{records:,}")
+print("storage TB    :", records * 500 / 1e12)
+print("7-char base62 :", f"{62**7:,}", "ratio", round(62**7 / records))
+print("bandwidth MB/s:", round(reads * 500 / 1e6, 2))</code></pre>
+<pre class="code lang-text"><code>writes/s      : 38.6
+reads/s avg   : 3858
+reads/s peak  : 11574
+records 5y    : 6,000,000,000
+storage TB    : 3.0
+7-char base62 : 3,521,614,606,208 ratio 587
+bandwidth MB/s: 1.93</code></pre>
+<ul><li><strong>Step 1</strong> Seconds per month: 30 × 86,400 = 2,592,000. Writes: 100,000,000 / 2,592,000 = 38.6 per second.</li><li><strong>Step 2</strong> Reads are 100 times writes: 3,858 per second; peak at 3 times: 11,574.</li><li><strong>Step 3</strong> Records: 100 M × 12 × 5 = 6 billion. Storage: 6 × 10⁹ × 500 bytes = 3 TB. Seven base62 characters give 587 times more codes than we need.</li><li><strong>Answer</strong> About 39 writes and 3,900 reads per second (11,600 at peak), 3 TB in five years, 2 MB per second of bandwidth.</li><li><strong>Check</strong> 3,858 / 100 gives back 38.6. 3 TB fits on one modern disk, so size alone does not force sharding.</li><li><strong>Why it matters</strong> This is a read-heavy, small-data system, so caching matters more than sharding. The numbers shape the design.</li></ul>
+<p class="problem"><span class="pl">Problem 8.2.3</span> If each read takes 50 ms end to end, how many requests are in flight at average and peak, and how many servers if one handles 100 concurrent requests?</p>
+<table class="steps"><tr><th>Compute</th><td>average <code>3,858 × 0.05 = 192.9</code>; peak <code>11,574 × 0.05 = 578.7</code></td></tr><tr><th>Answer</th><td>About 193 in flight on average and 579 at peak: at least 6 servers at peak, so plan 8 with spare for failures.</td></tr><tr><th>Check</th><td>578.7 / 100 = 5.8, rounded up to 6.</td></tr></table>
+<pre class="code lang-text"><code> arrival rate λ ----&gt; [ system: W seconds each ] ----&gt; done
+                      requests inside = L = λ × W</code></pre>
+<h3>Where it is used</h3>
+<p>Pipelines: events per second × seconds per event = busy workers, which sizes a Kafka consumer group. ML serving: replicas = requests per second × latency per request. Prices change, so look up current cloud prices before costing.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Sizing for the average, or mixing ms and seconds in <code>λ × W</code>. Write units beside every number.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>500 per second, 0.4 s each. In flight? Answer: 200.</li><li>8 jobs run at once, 0.5 s each. Max throughput? Answer: λ = L / W = 16 per second.</li><li>Why design for peak? Answer: the system must work at its busiest moment.</li></ol>
+<h2 id="s3-8-3-caching">8.3 Caching</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You keep a water bottle on your desk instead of walking to the kitchen. The kitchen is the database: complete but slow. The bottle is the cache: small, near, quick, and sometimes out of date.</div></div>
+<h3>How it works</h3>
+<p>A <strong>cache</strong> keeps popular results in fast memory. A read asks the cache first: found is a <strong>hit</strong>; not found is a <strong>miss</strong>, so read the database, store the result, return it (the <strong>cache-aside</strong> pattern). The share of hits is the <strong>hit ratio</strong> <code>h</code>.</p>
+<p><code>average latency = h × cache_time + (1 − h) × database_time</code></p>
+<p>Levels: the browser, the <strong>CDN</strong>, and an application cache such as <strong>Redis</strong> (an in-memory key-value store). <strong>Invalidation</strong> (removing stale data) is the hard part: use a <strong>TTL</strong> (time to live, the entry expires), or delete the entry when the row changes. <strong>LRU</strong> (least recently used) evicts the item untouched longest when the cache is full.</p>
+<p class="problem"><span class="pl">Problem 8.3.1</span> Cache 1 ms, database 10 ms, hit ratio 80%. Average latency?</p>
+<table class="steps"><tr><th>Compute</th><td><code>0.8 × 1 + 0.2 × 10 = 0.8 + 2.0 = 2.8</code></td></tr><tr><th>Answer</th><td>2.8 ms, against 10 ms without a cache.</td></tr><tr><th>Check</th><td>h = 0 gives 10 and h = 1 gives 1; 2.8 is between.</td></tr></table>
+<p class="problem"><span class="pl">Problem 8.3.2</span> The shortener has 3,858 reads per second. What happens to the database at hit ratios 0, 50, 90, 99%, and how big is the cache for the hottest 20% of 100 million URLs?</p>
+<pre class="code lang-python"><code>reads = 3858
+for h in (0.0, 0.5, 0.9, 0.99):
+    avg_ms = h * 1 + (1 - h) * 10
+    db = reads * (1 - h)
+    print(f"hit {h:4.2f}: avg {avg_ms:5.2f} ms, DB reads/s {db:7.1f}")
+hot = 100_000_000 * 0.2 * 500 / 1e9
+print("cache GB for hottest 20% of 100M urls:", hot)</code></pre>
+<pre class="code lang-text"><code>hit 0.00: avg 10.00 ms, DB reads/s  3858.0
+hit 0.50: avg  5.50 ms, DB reads/s  1929.0
+hit 0.90: avg  1.90 ms, DB reads/s   385.8
+hit 0.99: avg  1.09 ms, DB reads/s    38.6
+cache GB for hottest 20% of 100M urls: 10.0</code></pre>
+<ul><li><strong>Step 1</strong> Database reads = reads × miss ratio = 3,858 × (1 − h).</li><li><strong>Step 2</strong> At h = 0.9 the database sees 386 per second (a 10 times cut); at 0.99, 38.6.</li><li><strong>Step 3</strong> Cache: 20,000,000 URLs × 500 bytes = 10 GB, one Redis machine.</li><li><strong>Answer</strong> A 90% hit ratio cuts database reads from 3,858 to 386 per second and latency from 10 to 1.9 ms, using 10 GB.</li><li><strong>Check</strong> "20% of URLs get 80% of reads" is an assumption; measure your real hit ratio.</li><li><strong>Why it matters</strong> The first 90% is cheap. Going to 99% needs a much bigger cache, so the return per GB falls.</li></ul>
+<p><strong>A failure mode: stampede.</strong> If a viral key expires while 50,000 requests per second ask for it, all miss together and crush the database. Fixes: let one request refill while others wait, add random jitter to TTLs, refresh popular keys early. A traffic spike right after a cache flush (a test you can run with a tool such as Locust or k6) reproduces it.</p>
+<h3>Where it is used</h3>
+<p>Feature stores cache features for model serving. RAG systems cache embeddings and repeat answers (saves tokens). BI tools cache query results; pre-aggregated tables are a cache of an expensive query.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Caching without an invalidation plan. For each cached item write down how stale is acceptable. A profile photo can be minutes old; an account balance cannot.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>h = 95%, cache 2 ms, database 20 ms. Average? Answer: 1.9 + 1.0 = 2.9 ms.</li><li>TTL means? Answer: how long an entry lives before it expires.</li><li>Stampede means? Answer: many requests miss at once and all hit the database.</li></ol>
+<h2 id="s4-8-4-sharding-replication-and-consistent-hashing">8.4 Sharding, Replication and Consistent Hashing</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A library with one librarian has long queues. Copy popular books to more branches (replication: more readers served). Or split the collection, A to M in one building and N to Z in another (sharding: more data and writes fit). One helps reading, the other helps size.</div></div>
+<h3>Definitions</h3>
+<ul><li><strong>Replication:</strong> the same data on several machines. A <strong>primary</strong> takes writes, <strong>replicas</strong> copy it and serve reads. If the primary dies, a replica takes over (<strong>failover</strong>). Replicas lag a little, so a replica read can be slightly old.</li><li><strong>Sharding:</strong> each machine owns a slice of the keys. The <strong>shard key</strong> picks the slice. A skewed key makes a <strong>hot shard</strong>.</li><li><strong>Choosing the shard:</strong> <code>hash(key) mod N</code> is easy, but when N changes nearly all keys move. <strong>Consistent hashing</strong> puts machines (many virtual points each) on a circle; a key belongs to the next machine clockwise, so adding a machine takes keys only from its neighbours.</li></ul>
+<p class="problem"><span class="pl">Problem 8.4.1</span> Shard = <code>id mod 4</code>. Ids 10 to 14. Where do they go, and what if we move to 5 shards?</p>
+<table class="steps"><tr><th>Step 1</th><td>Mod 4: 10→2, 11→3, 12→0, 13→1, 14→2.</td></tr><tr><th>Step 2</th><td>Mod 5: 10→0, 11→1, 12→2, 13→3, 14→4.</td></tr><tr><th>Answer</th><td>All five ids change shard when N goes from 4 to 5.</td></tr><tr><th>Check</th><td>A key stays only if <code>k mod 4 = k mod 5</code>; in general about 80% of keys move (next problem).</td></tr></table>
+<p class="problem"><span class="pl">Problem 8.4.2</span> Compare mod and consistent hashing on 100,000 keys, 4 to 5 machines.</p>
+<pre class="code lang-python"><code>import hashlib, bisect
+def h(s): return int(hashlib.md5(s.encode()).hexdigest(), 16)
+keys = [f"key{i}" for i in range(100000)]
+moved = sum(1 for k in keys if h(k) % 4 != h(k) % 5)
+print("mod 4 -&gt; mod 5 moved:", moved / len(keys))
+def ring(nodes, vn=100):
+    pts = sorted((h(f"{n}#{v}"), n) for n in nodes for v in range(vn))
+    return [p for p, _ in pts], [n for _, n in pts]
+def owner(r, k):
+    ps, ns = r
+    i = bisect.bisect(ps, h(k)) % len(ps)
+    return ns[i]
+r4 = ring(["A","B","C","D"]); r5 = ring(["A","B","C","D","E"])
+moved = sum(1 for k in keys if owner(r4, k) != owner(r5, k))
+print("ring 4 -&gt; 5 moved   :", moved / len(keys))
+from collections import Counter
+print(sorted(Counter(owner(r5, k) for k in keys).items()))</code></pre>
+<pre class="code lang-text"><code>mod 4 -&gt; mod 5 moved: 0.80045
+ring 4 -&gt; 5 moved   : 0.19343
+[('A', 20388), ('B', 22592), ('C', 19712), ('D', 17965), ('E', 19343)]</code></pre>
+<ul><li><strong>Step 1</strong> <code>h</code> turns text into a big number. <code>ring</code> puts 100 points per machine on a sorted list (the circle). <code>owner</code> finds the first point after the key's hash, wrapping with <code>% len(ps)</code>.</li><li><strong>Step 2</strong> Mod moved 80.0% of keys; the ring moved 19.3%. The ideal is 1/5 = 20%.</li><li><strong>Step 3</strong> The last line shows each machine holds about 20,000 keys: balanced.</li><li><strong>Answer</strong> Consistent hashing moves about 19% of keys instead of 80% when adding a fifth machine.</li><li><strong>Check</strong> The moved keys all go to the new machine E, so only neighbours gave up keys.</li><li><strong>Why it matters</strong> Moving 80% of cached data means an empty cache and a crushed database; 19% is survivable. For the shortener (3 TB, about 1 TB per machine, writes only 39 per second) we shard because of size, not write speed: 6 shards with replicas leave room to grow.</li></ul>
+<pre class="code lang-text"><code>key -&gt; hash -&gt; position on circle:   A ---- B
+                                    /        \   key goes to next machine clockwise
+                                   D -------- C  add E: only one arc changes owner</code></pre>
+<h3>Where it is used</h3>
+<p>Kafka topics split into partitions by key. Spark and warehouses shuffle by key; one customer producing 40% of events gives the "slow last task" you know from performance work. Vector indexes and embedding tables are sharded too.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Sharding by a skewed key (country, or date, where today's shard takes all writes). Check the key's distribution first.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which helps write scale, replicas or shards? Answer: shards.</li><li>Why is mod N bad when N changes? Answer: almost all keys move.</li><li>What is a hot shard? Answer: one shard getting far more load than the rest.</li></ol>
+<h2 id="s5-8-5-queues-retries-and-reliability">8.5 Queues, Retries and Reliability</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A restaurant counter takes orders and sends tickets to the kitchen on a rail. In the rush the rail fills, but the counter does not collapse. The kitchen works at its own speed. A queue separates how fast work arrives from how fast it is done.</div></div>
+<h3>How it works</h3>
+<p>A <strong>queue</strong> sits between a <strong>producer</strong> and <strong>consumers</strong>. It smooths bursts, lets slow work happen later, and lets you add consumers. A <strong>stream</strong> (Kafka) is a queue that keeps a log so many readers can replay it. <em>At-least-once</em> delivery never loses a message but may repeat it, so consumers must be idempotent (store a message ID, skip repeats).</p>
+<p><strong>The utilization curve.</strong> In a simple random queue (the M/M/1 model), time in the system is <code>service_time / (1 − utilization)</code>. Utilization is the share of time a worker is busy. Near 100% small increases cause huge waits: the hockey-stick you see in any latency-versus-load graph. It is a simplified model; the shape is right, real numbers differ.</p>
+<p><strong>Retries</strong> help brief faults but can crush a struggling service. Use <strong>exponential backoff</strong> (0.1 s, 0.2, 0.4, ...), a cap, and <strong>jitter</strong> (randomness, so clients do not retry together). A <strong>circuit breaker</strong> stops calling a failing service and fails fast; <strong>graceful degradation</strong> shows a simpler result instead of an error.</p>
+<p class="problem"><span class="pl">Problem 8.5.1</span> 1,000 jobs per second, 20 ms of one worker each. Workers for 60% utilization? Time in system at 50, 80, 95%?</p>
+<pre class="code lang-python"><code>jobs = 1000; svc = 0.020
+busy = jobs * svc
+print("busy workers (Little):", busy)
+for u in (0.5, 0.6, 0.8, 0.9, 0.95):
+    print(f"util {u:.2f} -&gt; workers {busy/u:5.1f}, time in system = service x {1/(1-u):4.1f} = {svc/(1-u)*1000:6.1f} ms")</code></pre>
+<pre class="code lang-text"><code>busy workers (Little): 20.0
+util 0.50 -&gt; workers  40.0, time in system = service x  2.0 =   40.0 ms
+util 0.60 -&gt; workers  33.3, time in system = service x  2.5 =   50.0 ms
+util 0.80 -&gt; workers  25.0, time in system = service x  5.0 =  100.0 ms
+util 0.90 -&gt; workers  22.2, time in system = service x 10.0 =  200.0 ms
+util 0.95 -&gt; workers  21.1, time in system = service x 20.0 =  400.0 ms</code></pre>
+<ul><li><strong>Step 1</strong> Little's law: 1,000 × 0.020 = 20 busy workers. That would be 100% utilization, which is unstable.</li><li><strong>Step 2</strong> For utilization <code>u</code>, workers = 20 / u. At 60%: 33.3, so 34.</li><li><strong>Step 3</strong> Time = 20 ms / (1 − u). At 95%: 20 / 0.05 = 400 ms.</li><li><strong>Answer</strong> Use about 34 workers; time in system is about 50 ms. Running at 95% saves 12 workers (34 versus 22) but multiplies latency by 8 (400 versus 50 ms).</li><li><strong>Check</strong> At u = 0 the formula gives 20 ms, the bare service time.</li><li><strong>Why it matters</strong> This is the capacity argument for keeping CPU near 60 to 70%: headroom buys latency.</li></ul>
+<p class="problem"><span class="pl">Problem 8.5.2</span> Three services in a chain, each 99.9% available. Chain availability? Two 99% replicas in parallel? Downtime of 99.9% per month?</p>
+<pre class="code lang-python"><code>for a in (0.99, 0.999, 0.9999):
+    print(a, "downtime min/month:", round((1-a) * 30 * 1440, 1))
+print("3 services in series at 99.9% each:", round(0.999**3, 6))
+print("2 replicas each 99%, parallel:", 1 - 0.01**2)
+base, cap = 0.1, 5
+print([min(cap, base * 2**i) for i in range(8)])</code></pre>
+<pre class="code lang-text"><code>0.99 downtime min/month: 432.0
+0.999 downtime min/month: 43.2
+0.9999 downtime min/month: 4.3
+3 services in series at 99.9% each: 0.997003
+2 replicas each 99%, parallel: 0.9999
+[0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 5, 5]</code></pre>
+<ul><li><strong>Step 1</strong> Series (all must work): 0.999³ = 0.997003.</li><li><strong>Step 2</strong> Parallel (fails only if both fail): 1 − 0.01 × 0.01 = 0.9999, assuming independent failures.</li><li><strong>Step 3</strong> 0.001 × 30 × 1,440 = 43.2 minutes per month. The last line is backoff: 0.1 s doubling to the 5 s cap.</li><li><strong>Answer</strong> The chain gives 99.70% (about 130 minutes of downtime per month), the replicas 99.99%, and 99.9% allows 43 minutes.</li><li><strong>Check</strong> 0.003 × 43,200 = 129.6 minutes. Series lowers availability; parallel raises it.</li></ul>
+<pre class="code lang-text"><code>Producer --&gt; [ queue: waiting jobs ] --&gt; Consumer 1
+ (bursty)                             --&gt; Consumer 2   (add consumers to drain faster)</code></pre>
+<h3>Where it is used</h3>
+<p>Consumer lag (messages waiting) is the data engineer's key health metric: it is <code>L</code> of Little's law. ML batch scoring and GenAI request queues in front of rate-limited models use the same pattern.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Retrying instantly in a loop. Add backoff, a cap and jitter, and make the operation idempotent first.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>200 jobs per second, 50 ms each. Busy workers? Answer: 10.</li><li>Why can at-least-once duplicate? Answer: a lost acknowledgement makes the queue resend.</li><li>Two services in series, each 99%? Answer: 98.01%.</li></ol>
+<h2 id="s6-8-6-worked-design-1-url-shortener">8.6 Worked Design 1: URL Shortener</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A shortener is a giant phone book: short code in, long address out. Few writes, many reads. The clever parts are making unique short codes and answering reads very fast.</div></div>
+<figure><img src="images/url_shortener.svg" alt="URL shortener architecture" loading="lazy"/><figcaption>URL shortener architecture</figcaption></figure>
+<p><em>Read it left to right. A request passes a load balancer to stateless app servers. A read asks Redis first and falls back to the database on a miss. A write asks the ID generator (counter ranges) for a number, turns it into a code and stores it.</em></p>
+<h3>The eight steps</h3>
+<ol><li><strong>Requirements.</strong> Create a short URL; open it and be redirected; optional alias and expiry. Redirect p99 under about 100 ms (assumed), high availability, links never change.</li><li><strong>Estimates.</strong> From 8.2: 39 writes and 3,858 reads per second (11,574 peak), 3 TB, 10 GB hot cache.</li><li><strong>API.</strong> <code>POST /urls</code> with <code>{long_url}</code> returns <code>{short_code}</code>. <code>GET /{short_code}</code> redirects: 301 (permanent, browsers may cache) or 302 (temporary, you count every click). Choose by whether analytics matter.</li><li><strong>Data model.</strong> One table: <code>short_code</code> (key), <code>long_url</code>, <code>created_at</code>, <code>expires_at</code>, <code>user_id</code>. Lookup by key only.</li><li><strong>High-level design.</strong> The picture above.</li><li><strong>Deep dive: codes.</strong> (a) Hash the long URL and take 7 characters: needs collision checks. (b) A counter converted to base62 (digits <code>0-9a-zA-Z</code>): no collisions, but guessable. (c) Random 7 characters with a retry on collision.</li><li><strong>Bottlenecks.</strong> At 10 times load the cache still absorbs 90%; the database sees about 11,500 reads per second, so shard and add replicas. The counter is a single point of failure: give each app server a <strong>range</strong> of numbers (say 1,000,000 at a time).</li><li><strong>Trade-offs.</strong> Counter codes are short and collision-free but predictable; random codes hide order but need a collision check. 302 gives analytics but more traffic.</li></ol>
+<p class="problem"><span class="pl">Problem 8.6.1</span> Write counter 125 in base62 (<code>0-9</code>, then <code>a-z</code> for 10 to 35, then <code>A-Z</code> for 36 to 61). At 39 writes per second, when do we need more than 6 characters?</p>
+<table class="steps"><tr><th>Step 1</th><td>125 / 62 = 2 remainder 1, so the digits are 2 and 1: <code>21</code>.</td></tr><tr><th>Step 2</th><td>Six characters hold 62⁶ = 56,800,235,584 codes.</td></tr><tr><th>Step 3</th><td>Time to use them: 56.8 × 10⁹ / 38.6 per second / 86,400 / 365 = about 47 years.</td></tr><tr><th>Answer</th><td>125 becomes <code>21</code>, and 6 characters would already last decades. Seven characters are generous.</td></tr><tr><th>Check</th><td>2 × 62 + 1 = 125.</td></tr></table>
+<p class="problem"><span class="pl">Problem 8.6.2</span> Chance a random 7-character code collides when 6 billion of 3.52 trillion are used?</p>
+<table class="steps"><tr><th>Compute</th><td><code>6 × 10⁹ / 3.52 × 10¹² = 0.0017</code></td></tr><tr><th>Answer</th><td>About 0.17% at the end of 5 years, so one retry almost always fixes it.</td></tr><tr><th>Check</th><td>1 / 587 = 0.0017, the ratio from 8.2.</td></tr></table>
+<h3>Where it is used</h3>
+<p>Click analytics is a data pipeline: redirect logs flow through a queue into a warehouse. It makes a good portfolio project (Chapter 11).</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Designing for write scale. The numbers say writes are only 39 per second. Read the estimate before choosing the architecture.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Reads or writes bigger here? Answer: reads, by 100 times.</li><li>Why counter ranges? Answer: no call to the counter on every write, and no single point of failure.</li><li>301 or 302 for click counting? Answer: 302.</li></ol>
+<h2 id="s7-8-7-worked-design-2-rate-limiter">8.7 Worked Design 2: Rate Limiter</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A nightclub lets in 5 people a minute, and a group of 10 at once if it has been quiet. The bouncer holds a bucket of tokens; each guest takes one; the bucket refills slowly; when empty, guests wait.</div></div>
+<h3>The problem</h3>
+<p>A <strong>rate limiter</strong> rejects requests from a client above an allowed speed. It protects servers, controls cost and stops abuse. The reply is HTTP status 429 (too many requests), often with a <code>Retry-After</code> header.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Algorithm</th><th>Idea</th><th>Good</th><th>Weak</th></tr></thead><tbody><tr><td>Fixed window</td><td>Count per minute, reset at the minute</td><td>Simple</td><td>Edge burst up to 2x</td></tr><tr><td>Sliding window log</td><td>Store timestamps</td><td>Exact</td><td>Memory per request</td></tr><tr><td>Sliding window counter</td><td>Blend of two windows</td><td>Cheap, close</td><td>Approximate</td></tr><tr><td>Token bucket</td><td>Tokens refill at a rate; capacity = burst</td><td>Allows bursts, tiny memory</td><td>Two parameters</td></tr><tr><td>Leaky bucket</td><td>Requests drain at a fixed speed</td><td>Smooth output</td><td>No burst</td></tr></tbody></table></div>
+<p>A <strong>token bucket</strong> keeps two numbers per client: <code>tokens</code> and <code>last_time</code>. On each request, add <code>(now − last) × rate</code> tokens (up to <code>capacity</code>), then spend one if at least one is there.</p>
+<p class="problem"><span class="pl">Problem 8.7.1</span> Rate 5 per second, capacity 10, bucket starts full. 15 requests arrive at t = 0. Then 16 requests arrive 0.125 s apart from t = 1. Predict which pass, then run.</p>
+<pre class="code lang-python"><code>class TokenBucket:
+    def __init__(self, rate, capacity):
+        self.rate, self.capacity = rate, capacity
+        self.tokens, self.last = capacity, 0.0
+    def allow(self, now):
+        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+        self.last = now
+        if self.tokens &gt;= 1:
+            self.tokens -= 1
+            return True
+        return False
+
+b = TokenBucket(rate=5, capacity=10)
+out = [b.allow(0.0) for _ in range(15)]
+print("burst of 15 at t=0:", "".join("Y" if x else "N" for x in out))
+out = [b.allow(1.0 + i * 0.125) for i in range(16)]
+print("8 req/s for 2 s   :", "".join("Y" if x else "N" for x in out))</code></pre>
+<pre class="code lang-text"><code>burst of 15 at t=0: YYYYYYYYYYNNNNN
+8 req/s for 2 s   : YYYYYYYYYYYNYYNY</code></pre>
+<ul><li><strong>Step 1</strong> At t = 0 there are 10 tokens and no time passes: 10 pass, 5 are refused.</li><li><strong>Step 2</strong> Tokens are 0. At t = 1 the refill is 5. Each next request is 0.125 s later: +0.625 tokens, then −1.</li><li><strong>Step 3</strong> Levels after each allowed request: 4, 3.625, 3.25, 2.875, 2.5, 2.125, 1.75, 1.375, 1.0, 0.625, 0.25: eleven in a row.</li><li><strong>Step 4</strong> Request 12 sees 0.875: refused. Request 13 sees 1.5: allowed (0.5 left). Request 14 sees 1.125: allowed (0.125). Request 15 sees 0.75: refused. Request 16 sees 1.375: allowed.</li><li><strong>Answer</strong> 14 of 16 pass: the saved burst credit drains, then traffic settles toward 5 per second.</li><li><strong>Check</strong> Tokens supplied after t = 1: 5 + 1.875 × 5 = 14.375, so at most 14 can pass. We got exactly 14.</li><li><strong>Why it matters</strong> A limiter must give a predictable answer you can verify by hand.</li></ul>
+<p class="problem"><span class="pl">Problem 8.7.2</span> Memory for 10 million users at 64 bytes each (tokens 8, time 8, key and overhead about 48, an assumption)?</p>
+<table class="steps"><tr><th>Compute</th><td><code>10,000,000 × 64 = 640,000,000 bytes</code></td></tr><tr><th>Answer</th><td>About 640 MB: one Redis instance. At 50,000 API requests per second with two Redis operations each, Redis sees 100,000 operations per second, which you must confirm with a traffic test.</td></tr><tr><th>Check</th><td>6.4 × 10⁸ bytes = 640 MB.</td></tr></table>
+<h3>Deep dive: many servers</h3>
+<p>The counters must be shared, so use Redis. "Read then write" is a <strong>race</strong> (two servers read the same value), so use an atomic operation (<code>INCR</code> or a script). If Redis is down, <strong>fail open</strong> (allow all, risk overload) or <strong>fail closed</strong> (block all, risk an outage). A payment API leans closed; a search page leans open.</p>
+<pre class="code lang-text"><code>Request -&gt; App server -&gt; Redis: [user42: tokens=3.2, last=...]
+               | allowed? yes -&gt; backend      no -&gt; 429</code></pre>
+<h3>Where it is used</h3>
+<p>LLM providers limit tokens per minute, so a RAG client needs its own limiter plus backoff (8.5). Data extraction and scrapers must respect limits and site terms.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">A fixed window: a client sends the full limit at 11:59:59 and again at 12:00:00, doubling the rate. Use a bucket or sliding window when it matters.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which status code? Answer: 429.</li><li>Rate 2 per second, capacity 4, full: instant requests passed? Answer: 4.</li><li>Fail open means? Answer: allow requests when the limiter store is down.</li></ol>
+<h2 id="s8-8-8-worked-design-3-news-feed">8.8 Worked Design 3: News Feed</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Each person has a notice board. When a friend posts, a helper copies the post onto each follower's board (push): reading is instant, posting costs more. Or you walk to each friend's board when you open the app (pull): posting is cheap, reading is slow.</div></div>
+<figure><img src="images/feed_fanout.svg" alt="News feed fan-out" loading="lazy"/><figcaption>News feed fan-out</figcaption></figure>
+<p><em>A post goes to a post service and a queue. Workers fan it out into each follower's feed cache (a list of post IDs) for normal users. Accounts with millions of followers skip fan-out; their posts are merged in when a follower opens the feed.</em></p>
+<p>Assume 50 million daily active users (DAU), 10 feed opens per user per day, 20% of users post once a day, 200 followers on average, 16 bytes per feed entry.</p>
+<pre class="code lang-python"><code>dau = 50_000_000
+opens = 10
+print("feed reads/s avg :", round(dau * opens / 86400))
+print("feed reads/s peak:", round(dau * opens / 86400 * 3))
+posts = dau * 0.2 / 86400
+print("posts/s          :", round(posts, 1))
+fan = 200
+print("fanout writes/s  :", round(posts * fan))
+print("entries/day      :", dau * 0.2 * fan, "-&gt; GB at 16 B:", dau * 0.2 * fan * 16 / 1e9)
+print("one celebrity post to 10M followers:", 10_000_000, "writes")
+print("at 20k writes/s that takes", 10_000_000 / 20000, "s")</code></pre>
+<pre class="code lang-text"><code>feed reads/s avg : 5787
+feed reads/s peak: 17361
+posts/s          : 115.7
+fanout writes/s  : 23148
+entries/day      : 2000000000.0 -&gt; GB at 16 B: 32.0
+one celebrity post to 10M followers: 10000000 writes
+at 20k writes/s that takes 500.0 s</code></pre>
+<p class="problem"><span class="pl">Problem 8.8.1</span> What is the read-to-post ratio, and does it favour push or pull?</p>
+<table class="steps"><tr><th>Step 1</th><td>5,787 / 115.7 = 50 reads per post.</td></tr><tr><th>Step 2</th><td>Push: each post becomes 200 writes (23,148 per second); each read is one cache lookup.</td></tr><tr><th>Step 3</th><td>Pull: each read gathers from about 200 sources: 5,787 × 200 = 1,157,400 lookups per second.</td></tr><tr><th>Answer</th><td>Reads dominate 50 to 1, so push is cheaper: 23 thousand writes per second versus 1.16 million lookups per second for pull.</td></tr><tr><th>Check</th><td>1,157,400 / 23,148 = 50, the read-to-post ratio.</td></tr></table>
+<p class="problem"><span class="pl">Problem 8.8.2</span> A celebrity with 10 million followers posts. What goes wrong with push, and what is the fix?</p>
+<table class="steps"><tr><th>Step 1</th><td>Push means 10,000,000 feed writes: 500 seconds of the whole fan-out capacity at 20,000 per second, so followers wait.</td></tr><tr><th>Step 2</th><td><strong>Hybrid:</strong> push for accounts under a threshold (say 100,000 followers; set it by measurement). Larger accounts store the post once and are merged in at read time.</td></tr><tr><th>Step 3</th><td>Read path: take the precomputed list, add recent posts of the few celebrities this user follows, sort, return the top 20.</td></tr><tr><th>Answer</th><td>Push for normal users, pull for celebrities. It caps write cost and adds only a few lookups per read.</td></tr><tr><th>Check</th><td>Storage: 2 billion entries per day at 16 bytes is 32 GB per day, so keep only the latest 500 entries per user.</td></tr></table>
+<p>Other deep dives: ranking by a model (Chapter 9), cursor pagination ("posts older than ID X", since new posts shift page numbers), and deletes (mark deleted and filter at read time).</p>
+<h3>Where it is used</h3>
+<p>Fan-out is the pattern behind notification services and event distribution. E-commerce uses it for personalised home pages; ML systems precompute recommendations per user.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Presenting push or pull as the answer. Show the numbers and the hybrid, with a threshold and a reason.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which is cheaper for readers? Answer: push.</li><li>Why skip fan-out for celebrities? Answer: one post would cause millions of writes.</li><li>What is cursor pagination? Answer: asking for posts after a given ID instead of a page number.</li></ol>
+<h2 id="s9-chapter-recap">Chapter recap</h2>
+<ul><li>Use the eight steps in order; tools come last.</li><li>Little's law <code>L = λ × W</code> turns rates and latency into concurrency and servers.</li><li>Estimate first: numbers tell you read-heavy or write-heavy, large or small.</li><li>A cache cuts database load by the miss ratio; plan invalidation; beware stampedes.</li><li>Replicas help reads and failover; shards help size and writes; consistent hashing moves about 1/N of keys.</li><li>Queues smooth bursts; keep utilization near 60 to 70%, since waits grow like <code>1 / (1 − u)</code>.</li><li>Retries need backoff, a cap, jitter and idempotency.</li><li>Shortener: read-heavy, cache plus ID ranges. Limiter: token bucket in Redis, atomic. Feed: hybrid push and pull.</li></ul>
+<p><strong>Pattern cheat-sheet</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Need</th><th>Pattern</th></tr></thead><tbody><tr><td>Requests in flight</td><td><code>L = λ × W</code></td></tr><tr><td>Servers needed</td><td><code>L / concurrency per server</code>, plus spare</td></tr><tr><td>Latency with cache</td><td><code>h × t_cache + (1 − h) × t_db</code></td></tr><tr><td>DB load with cache</td><td><code>reads × (1 − h)</code></td></tr><tr><td>Queue wait</td><td><code>service / (1 − utilization)</code></td></tr><tr><td>Availability</td><td>series: multiply; parallel: <code>1 − (1 − a)ⁿ</code></td></tr><tr><td>Backoff</td><td><code>min(cap, base × 2ⁿ)</code> plus jitter</td></tr></tbody></table></div>
+<h2 id="s10-practice-set">Practice set</h2>
+<ol><li>(Easy) 300 requests per second, 0.1 s each. In flight? <strong>Answer:</strong> 30.</li><li>(Easy) Hit ratio 80%, cache 2 ms, database 20 ms. Average? <strong>Answer:</strong> 1.6 + 4 = 5.6 ms.</li><li>(Easy) Downtime of 99.9% in a 30-day month? <strong>Answer:</strong> 43.2 minutes.</li><li>(Medium) 20 million new records per month, read:write 50:1. Reads per second? <strong>Answer:</strong> writes 20,000,000 / 2,592,000 = 7.72 per second; reads about 386.</li><li>(Medium) What is <code>min(5, 0.1 * 2**6)</code>? <strong>Answer:</strong> 6.4 is above the cap, so 5.</li><li>(Medium) Find the bug: <code>count = redis.get(k); redis.set(k, count + 1)</code> on 20 servers. <strong>Answer:</strong> a race; two servers read the same count and one increment is lost. Use atomic <code>INCR</code>.</li><li>(Medium) 95% hits; the database handles 500 reads per second. Max total reads? <strong>Answer:</strong> 500 / 0.05 = 10,000 per second.</li><li>(Hard) 20 workers, 20 ms jobs, 900 arrivals per second. Utilization, time, workers for 60%? <strong>Answer:</strong> busy 18, utilization 0.9, time 20 ms / 0.1 = 200 ms; 18 / 0.6 = 30 workers.</li><li>(Hard, interview) "Design a notification service." <strong>Answer:</strong> Requirements: push, email, SMS, priorities, preferences, deduplication. Estimate: 100 million per day is 1,157 per second, with spikes. A queue per channel, workers with provider rate limits and backoff, an idempotency key against duplicates, cached preferences. Trade-off: guaranteed delivery versus duplicates.</li><li>(Hard, interview) "p99 doubled after a launch; the average did not." <strong>Answer:</strong> Look for a slow subset: a hot key or shard, cache misses for a new data type, GC pauses, a slow dependency, retries. Compare percentiles per instance and endpoint, check queue depth and utilization, reproduce with a traffic test.</li></ol>
+<h2 id="s11-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional in India moving into data and AI roles; English is my second language. Topic: the system design framework (requirements, estimates, API, data model, high-level design, deep dives, bottlenecks, trade-offs). Act as interviewer for "design a pastebin service". Ask one step at a time, wait for my answer, score each step, and correct my numbers.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional in India moving into data and AI roles. Topic: back-of-envelope estimation for system design (requests per second, storage, bandwidth, Little's law, peak versus average). Give me 8 graded exercises with real numbers, without solutions. After each answer, check my arithmetic, units and assumptions, and give a Python snippet to verify.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data. Topic: caching, sharding, replication and consistent hashing. Explain each with an everyday analogy, then give a product scenario with numbers and ask me to choose between cache, replica and shard with reasons. Quiz me one question at a time on hit ratio, stampede, hot shard, and keys moved when a machine is added.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data. Topic: queues, retries, idempotency and availability maths, including the utilization curve service / (1 - utilization). Teach step by step, then give me 6 exercises one at a time, including a "find the bug" about retries without backoff. Review each answer and ask me to explain it back in two sentences.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional in India moving to data roles. Topic: worked designs (URL shortener, rate limiter, news feed). Review my own design for [CHOOSE ONE] with the eight-step framework: check my estimates, find the first bottleneck at 10x load, challenge one trade-off, and tell me what a strong answer adds. My design: [PASTE HERE].</pre></div><div class="readbtn"><button class="btn" data-read="study:career:ch08">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch07.html">← Chapter 7: Technical Interview Preparation by Role</a><a class="btn" href="ch09.html">Chapter 9: System Design II: Data and ML Systems →</a></div></div><script src="../../assets/study.js"></script></body></html>

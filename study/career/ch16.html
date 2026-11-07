@@ -1,0 +1,306 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 16: Project Lab 2 — Mock-Interview Kit and Resume Sprint</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Career, Communication &amp; System Design</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 16</div><h1>Project Lab 2 — Mock-Interview Kit and Resume Sprint</h1><p>Two small tools that make interview practice measurable and resume bullets honest, specific and strong.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-16-1-project-mock-interview-kit-and-answer-bank">16.1 Project: Mock-Interview Kit and Answer Bank</a></li><li><a href="#s2-16-2-project-resume-and-linkedin-refresh-sprint">16.2 Project: Resume and LinkedIn Refresh Sprint</a></li><li><a href="#s3-chapter-recap">Chapter recap</a></li><li><a href="#s4-practice-set">Practice set</a></li><li><a href="#s5-prompt-pack">Prompt pack</a></li></ol></details><p>Chapter 15 gave you the project method and two public-proof projects. This chapter adds two projects that sharpen the last step of the journey: being chosen. In Project A you build a mock-interview kit: a question tracker in SQLite, a STAR story template, a scoring sheet, and a script that quizzes you on your weakest questions first. In Project B you run a resume and LinkedIn refresh sprint: you rewrite weak bullets into bullets with impact numbers, and a small script flags the weak ones for you. Both projects use only the Python standard library, and every output shown below was produced by running the code. Chapter 7 (Technical Interview Preparation by Role) gives the question types; Chapter 11 (Portfolio, GitHub, LinkedIn and Resume) gives the bullet rules. Here you turn both into working tools. Use the method of Chapter 15.1: success criteria first, small commits, definition of done.</p>
+<h2 id="s1-16-1-project-mock-interview-kit-and-answer-bank">16.1 Project: Mock-Interview Kit and Answer Bank</h2>
+<h3>Goal and why employers care</h3>
+<p>You will build a personal practice system: a database of questions with model answers, a way to score every practice attempt, a report of strengths and gaps, and a quiz that picks weak questions more often. Employers never see the tool itself, but they see the result: calm, structured answers. As a portfolio item, the repository shows that you can design a small database, write a command-line tool and use data to improve your own performance, which is exactly what analysts do for a business.</p>
+<h3>Skills used</h3>
+<ul><li>Interview round types and what each tests (Chapter 7, Technical Interview Preparation by Role).</li><li>Spoken delivery and structure (Chapter 3.3, Spoken English; Chapter 2.1, Learning How to Learn, for spaced practice).</li><li>SQL tables, joins, <code>GROUP BY</code> and <code>HAVING</code> (the SQL study document) and Python's <code>sqlite3</code> module.</li><li>Weighted random choice (a gentle use of probability).</li><li>Project method (Chapter 15.1).</li></ul>
+<h3>Data</h3>
+<p>You generate it yourself. The script seeds six starter questions across four topics (behavioral, SQL, statistics, project walk-through). You add your own with one command. Never paste confidential interview questions that you signed an agreement about, and never store real company or client details in your STAR stories.</p>
+<h3>Architecture and folder structure</h3>
+<pre class="code lang-text"><code>interview-kit/
+├── kit.py              # the command-line tool (init, add, quiz, log, report)
+├── kit.db              # created on first run (add to .gitignore)
+├── stories/
+│   └── star_template.md
+├── scoring_sheet.md
+├── README.md
+└── .gitignore</code></pre>
+<p>Flow: <code>init</code> creates two tables, <code>questions</code> and <code>attempts</code> → you practise → <code>quiz</code> shows a question and the model answer → you score yourself 1 to 5 on clarity, structure and evidence → <code>report</code> shows the average by topic.</p>
+<h3>Step-by-step build</h3>
+<ol><li><strong>Design the tables.</strong> One row per question; one row per practice attempt, with a <code>CHECK</code> rule so a score outside 1 to 5 is rejected.</li></ol>
+<ol><li><strong>Write the tool.</strong> Before you read it, predict: why does the quiz use a weight such as <code>6 - average score</code> instead of picking at random?</li></ol>
+<pre class="code lang-python"><code>"""Mock-interview kit. Commands: init | add | quiz | log | report"""
+import argparse, random, sqlite3, sys
+from datetime import date
+
+DB = "kit.db"
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS questions(
+  id INTEGER PRIMARY KEY, topic TEXT NOT NULL, question TEXT NOT NULL,
+  model_answer TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS attempts(
+  id INTEGER PRIMARY KEY, question_id INTEGER NOT NULL REFERENCES questions(id),
+  day TEXT NOT NULL, clarity INTEGER, structure INTEGER, evidence INTEGER,
+  CHECK (clarity BETWEEN 1 AND 5 AND structure BETWEEN 1 AND 5 AND evidence BETWEEN 1 AND 5));
+"""
+SEED = [
+ ("behavioral", "Tell me about a time you disagreed with a teammate.", "STAR: situation, task, action (listened, tested both ideas), result (with a number)."),
+ ("behavioral", "Describe a mistake you made and what you changed.", "Own the mistake early, show the fix, show the habit that now prevents it."),
+ ("sql", "What is the difference between WHERE and HAVING?", "WHERE filters rows before grouping; HAVING filters groups after aggregation."),
+ ("sql", "How do you find duplicate order ids?", "GROUP BY order_id HAVING COUNT(*) &gt; 1."),
+ ("stats", "What does a p-value of 0.03 mean?", "If there were no real effect, we would see a result this extreme about 3 percent of the time."),
+ ("project", "Walk me through your best project in two minutes.", "Problem, data, method, result with a number, one limit, one next step."),
+]
+
+def connect():
+    con = sqlite3.connect(DB); con.row_factory = sqlite3.Row
+    con.executescript(SCHEMA); return con
+
+def cmd_init(a):
+    con = connect()
+    if con.execute("SELECT COUNT(*) FROM questions").fetchone()[0] == 0:
+        con.executemany("INSERT INTO questions(topic,question,model_answer) VALUES(?,?,?)", SEED)
+        con.commit()
+    print("questions:", con.execute("SELECT COUNT(*) FROM questions").fetchone()[0])
+
+def cmd_add(a):
+    con = connect()
+    con.execute("INSERT INTO questions(topic,question,model_answer) VALUES(?,?,?)", (a.topic, a.question, a.answer))
+    con.commit(); print("added")
+
+def pick(con, n, rng):
+    """Weakest-first: questions never tried or with a low average score are likelier."""
+    rows = con.execute("""
+      SELECT q.id, q.topic, q.question, q.model_answer,
+             COALESCE(AVG((at.clarity+at.structure+at.evidence)/3.0), 0) AS avg_score
+      FROM questions q LEFT JOIN attempts at ON at.question_id = q.id
+      GROUP BY q.id""").fetchall()
+    weights = [6 - r["avg_score"] if r["avg_score"] else 5 for r in rows]
+    chosen = []
+    pool = list(zip(rows, weights))
+    for _ in range(min(n, len(pool))):
+        r = rng.choices([p[0] for p in pool], [p[1] for p in pool])[0]
+        chosen.append(r); pool = [p for p in pool if p[0]["id"] != r["id"]]
+    return chosen
+
+def cmd_quiz(a):
+    con = connect(); rng = random.Random(a.seed)
+    for r in pick(con, a.n, rng):
+        print(f"\n[{r['topic']}] Q{r['id']}: {r['question']}")
+        if a.demo:
+            print("  (demo mode: answer aloud, then compare)")
+            print("  Model answer:", r["model_answer"])
+            continue
+        input("  Answer aloud, then press Enter to see the model answer... ")
+        print("  Model answer:", r["model_answer"])
+        s = [int(input(f"  Score {k} 1-5: ")) for k in ("clarity", "structure", "evidence")]
+        con.execute("INSERT INTO attempts(question_id,day,clarity,structure,evidence) VALUES(?,?,?,?,?)",
+                    (r["id"], str(date.today()), *s)); con.commit()
+
+def cmd_log(a):
+    con = connect()
+    con.execute("INSERT INTO attempts(question_id,day,clarity,structure,evidence) VALUES(?,?,?,?,?)",
+                (a.qid, a.day, a.clarity, a.structure, a.evidence)); con.commit(); print("logged")
+
+def cmd_report(a):
+    con = connect()
+    print(f"{'topic':&lt;11}{'tries':&gt;6}{'avg':&gt;6}")
+    for r in con.execute("""SELECT q.topic, COUNT(at.id) n,
+        ROUND(AVG((at.clarity+at.structure+at.evidence)/3.0),2) avg
+        FROM questions q LEFT JOIN attempts at ON at.question_id=q.id
+        GROUP BY q.topic ORDER BY avg IS NULL, avg"""):
+        print(f"{r['topic']:&lt;11}{r['n']:&gt;6}{(r['avg'] if r['avg'] is not None else '-'):&gt;6}")
+    ready = con.execute("""SELECT COUNT(*) FROM (SELECT question_id FROM attempts
+        GROUP BY question_id HAVING AVG((clarity+structure+evidence)/3.0) &gt;= 4)""").fetchone()[0]
+    total = con.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
+    print(f"interview-ready questions (avg &gt;= 4): {ready} of {total}")
+
+p = argparse.ArgumentParser(); sub = p.add_subparsers(dest="cmd", required=True)
+sub.add_parser("init").set_defaults(f=cmd_init)
+s = sub.add_parser("add"); [s.add_argument(x) for x in ("topic", "question", "answer")]; s.set_defaults(f=cmd_add)
+s = sub.add_parser("quiz"); s.add_argument("-n", type=int, default=3); s.add_argument("--seed", type=int)
+s.add_argument("--demo", action="store_true"); s.set_defaults(f=cmd_quiz)
+s = sub.add_parser("log"); s.add_argument("qid", type=int); s.add_argument("day")
+[s.add_argument(x, type=int) for x in ("clarity", "structure", "evidence")]; s.set_defaults(f=cmd_log)
+sub.add_parser("report").set_defaults(f=cmd_report)
+a = p.parse_args(); a.f(a)</code></pre>
+<p>How it works: <code>pick</code> joins every question to its attempts and computes the average of the three scores. A question never tried gets weight 5 (high). Otherwise the weight is <code>6 - avg</code>, so an average of 2 gives weight 4 and an average of 5 gives weight 1: weak questions come up about four times as often as mastered ones. <code>random.Random(seed)</code> makes a quiz repeatable, which is useful for testing.</p>
+<ol><li><strong>Initialise and add your own question.</strong></li></ol>
+<pre class="code lang-bash"><code>python3 kit.py init
+python3 kit.py add stats "What is overfitting?" "The model memorises training data and fails on new data; check with a held-out test set."</code></pre>
+<pre class="code lang-text"><code>questions: 6
+added</code></pre>
+<ol><li><strong>Log some attempts and read the report.</strong> <code>log qid day clarity structure evidence</code> records one attempt.</li></ol>
+<pre class="code lang-bash"><code>python3 kit.py log 3 2026-11-01 3 2 2
+python3 kit.py log 3 2026-11-05 4 4 4
+python3 kit.py log 1 2026-11-02 2 3 2
+python3 kit.py log 5 2026-11-03 5 4 4
+python3 kit.py report</code></pre>
+<pre class="code lang-text"><code>logged
+logged
+logged
+logged
+topic       tries   avg
+behavioral      1  2.33
+sql             2  3.17
+stats           1  4.33
+project         0     -
+interview-ready questions (avg &gt;= 4): 1 of 7</code></pre>
+<p>Check by hand: SQL question 3 has attempts averaging (3+2+2)/3 = 2.33 and (4+4+4)/3 = 4.00, so the topic average is (2.33 + 4.00) / 2 = 3.17. The <code>project</code> row shows <code>-</code> because it has no attempts yet, and it sorts last because the query puts empty averages at the end. Plain meaning: behavioral is weakest (2.33), so practise it next; project walk-through is untouched.</p>
+<ol><li><strong>Quiz yourself.</strong> Use <code>--demo</code> to preview without scoring, or run without it to be asked for scores.</li></ol>
+<pre class="code lang-bash"><code>python3 kit.py quiz -n 3 --seed 7 --demo</code></pre>
+<pre class="code lang-text"><code>[sql] Q3: What is the difference between WHERE and HAVING?
+  (demo mode: answer aloud, then compare)
+  Model answer: WHERE filters rows before grouping; HAVING filters groups after aggregation.
+
+[behavioral] Q2: Describe a mistake you made and what you changed.
+  (demo mode: answer aloud, then compare)
+  Model answer: Own the mistake early, show the fix, show the habit that now prevents it.
+
+[project] Q6: Walk me through your best project in two minutes.
+  (demo mode: answer aloud, then compare)
+  Model answer: Problem, data, method, result with a number, one limit, one next step.</code></pre>
+<p>The weighted pick is random, so the order depends on the seed (and on your Python version); the weak and untried topics appear. In interactive mode, answer out loud first (record yourself if you can; Chapter 3), then compare, then enter three scores.</p>
+<ol><li><strong>Test the guard rail.</strong> A bad score is rejected by the <code>CHECK</code> rule:</li></ol>
+<pre class="code lang-bash"><code>python3 kit.py log 3 2026-11-05 9 1 1</code></pre>
+<pre class="code lang-text"><code>sqlite3.IntegrityError: CHECK constraint failed: clarity BETWEEN 1 AND 5 AND structure BETWEEN 1 AND 5 AND evidence BETWEEN 1 AND 5</code></pre>
+<p>The raw traceback is fine for a personal tool; a production tool would catch it and print a friendly message.</p>
+<ol><li><strong>Add the STAR story template.</strong> Save as <code>stories/star_template.md</code> and write eight stories (Chapter 7.3 explains the eight stories; Chapter 3.3 explains STAR).</li></ol>
+<pre class="code lang-text"><code>Title:      (6 words, e.g. "Fixed the wrong monthly report")
+Situation:  (1-2 sentences. Where, when, what was at stake?)
+Task:       (1 sentence. What was YOUR responsibility?)
+Action:     (3-4 bullets. What did YOU do? Use "I", not "we".)
+Result:     (1-2 sentences WITH A NUMBER. What changed?)
+Lesson:     (1 sentence. What do you do differently now?)
+Fits questions: (conflict / mistake / leadership / deadline / ambiguity)
+Time to tell:   (target 90 seconds, about 200 words)</code></pre>
+<ol><li><strong>Add the scoring sheet.</strong> Save as <code>scoring_sheet.md</code> and use it after every mock.</li></ol>
+<div class="tablewrap"><table class="data"><thead><tr><th>Dimension</th><th>1 (weak)</th><th>3 (okay)</th><th>5 (strong)</th></tr></thead><tbody><tr><td>Clarity</td><td>Rambles; jargon undefined</td><td>Mostly clear; one muddy part</td><td>One main idea per sentence; terms defined</td></tr><tr><td>Structure</td><td>No order</td><td>Has a start and end</td><td>Clear frame, e.g. STAR or "answer, reason, example"</td></tr><tr><td>Evidence</td><td>Opinions only</td><td>One example</td><td>Specific example with a number</td></tr></tbody></table></div>
+<p>Rule of thumb: total of 12 or more out of 15 (an average of 4) counts as interview-ready, which is the threshold the <code>report</code> command uses.</p>
+<ol><li><strong>Schedule it.</strong> Spaced practice beats cramming: 3 questions a day, 5 days a week, one full 45-minute mock every Sunday with a friend or an AI interviewer (see the Prompt pack). Review the report every Sunday and choose next week's weakest topic.</li></ol>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li><code>init</code> creates both tables and seeds 6 questions; running it twice does not duplicate them.</li><li><code>add</code>, <code>log</code>, <code>quiz</code> and <code>report</code> all run without error.</li><li>A score outside 1 to 5 is rejected by the database.</li><li>After 10 attempts, <code>report</code> shows a topic average that matches a hand calculation for one topic.</li><li>Weak questions are picked more often: run <code>quiz</code> 200 times with different seeds in a test and check that a question with average 2 appears more often than one with average 5.</li><li>The question bank has at least 40 questions and 8 written STAR stories by the end of week 4.</li><li>After 4 weeks, at least 60% of questions have an average of 4 or more.</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Scoring yourself too kindly.</strong> Everything becomes a 4. Detect it: if your average never goes below 3.5, record yourself and ask a friend to score three answers; compare.</li><li><strong>Reading the model answer first.</strong> You then recognise rather than recall. Say the answer aloud before pressing Enter.</li><li><strong>A bank full of easy questions.</strong> Count questions per topic with <code>report</code>; add questions from the topics with the lowest averages.</li><li><strong>Memorised scripts.</strong> A word-for-word story sounds robotic. Memorise the five STAR beats, not the sentences.</li><li><strong>Leaking secrets in stories.</strong> Remove client names, internal tool names and exact figures that belong to a company; use rounded or relative numbers ("cut by about a third").</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Add a <code>due</code> column and a rule to show a question again after 1, 3, 7 and 14 days (spaced repetition).</li><li>Plot your weekly average score with matplotlib and add the chart to the README.</li><li>Add a <code>timer</code> command that gives 90 seconds per answer and records the answer length.</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. Tell me about a tool you built to improve yourself.</strong> Model answer: "I built a small interview tracker. Questions and attempts live in two SQLite tables, and a report shows my average score by topic. The quiz picks weak questions more often. In four weeks my average on behavioral questions went from about 2.3 to above 4. The data told me where to spend time."</p>
+<p><strong>Q2. Why two tables and not one?</strong> Model answer: "One question has many attempts. If I stored attempts inside the question row, I would repeat the question text or lose history. Two tables linked by a question id avoids repetition and lets me use a join and group by."</p>
+<p><strong>Q3. How would you check that the weighting works?</strong> Model answer: "I would seed a random generator, run the picker many times, count how often each question appears, and check that low-score questions appear more. Fixed seeds make the test repeatable."</p>
+<h3>README outline</h3>
+<p>Title and one-line result; why (practice is measured); how to run (the five commands); the schema in a small table; sample report output; the STAR template and scoring sheet links; limits (self-scoring is biased); next steps.</p>
+<h2 id="s2-16-2-project-resume-and-linkedin-refresh-sprint">16.2 Project: Resume and LinkedIn Refresh Sprint</h2>
+<h3>Goal and why employers care</h3>
+<p>In one focused week you will rewrite your resume bullets so each one shows an action and a measurable result, refresh your LinkedIn, and use a script to flag weak bullets. Recruiters scan a resume in seconds (Chapter 11), and bullets like "worked on data pipelines" give them nothing to remember. A bullet with a verb and a number gives them a reason to call you.</p>
+<h3>Skills used</h3>
+<ul><li>The bullet formula and impact numbers (Chapter 11.3, Resume Bullets With Impact Numbers).</li><li>Percentages and before/after comparison (the learner's Math PDF; Chapter 5, Data Storytelling).</li><li>LinkedIn headline, About and Featured (Chapter 11.4).</li><li>Python strings, regular expressions and exit codes (the Python study document).</li><li>Honest reporting: never invent numbers, because interviewers will ask how you counted (Chapter 7.4 on resume alignment).</li></ul>
+<h3>Data</h3>
+<p>Your own bullets, in a plain text file, one per line. For this lab, <code>bullets.txt</code> holds six realistic example bullets built on neutral shop-order work. Use your real work, but remove client names and anything confidential.</p>
+<h3>Architecture and folder structure</h3>
+<pre class="code lang-text"><code>resume-sprint/
+├── bullets.txt            # before: your current bullets, one per line
+├── after.txt              # after: your rewritten bullets
+├── check_bullets.py       # flags weak bullets
+├── linkedin_checklist.md  # headline, About, Featured, skills
+└── README.md</code></pre>
+<p>Flow: <code>bullets.txt</code> → <code>check_bullets.py</code> → read flags → rewrite → <code>after.txt</code> → check again until all pass.</p>
+<h3>Step-by-step build</h3>
+<ol><li><strong>Collect the before bullets.</strong> Write down everything you did in the last 2 to 3 years, one line each. Do not edit yet.</li></ol>
+<pre class="code lang-text"><code>Responsible for testing of applications and reporting issues
+Worked on data pipelines using Python and SQL
+Built a nightly Python job that loads 50,000 shop orders into SQLite, cutting manual report time from 3 hours to 10 minutes
+Helped the team with dashboards
+Wrote SQL checks that caught 14 duplicate-order bugs before release, reducing refund requests by 22%
+Participated in meetings and was involved in various activities</code></pre>
+<ol><li><strong>Write the checker.</strong> Predict first: which of these six bullets will pass? The rules are: a strong first verb, at least one digit, no filler words, and 8 to 30 words.</li></ol>
+<pre class="code lang-python"><code>"""Flag weak resume bullets. Usage: python3 check_bullets.py bullets.txt"""
+import re, sys
+
+WEAK_STARTS = ("responsible for", "worked on", "helped", "participated", "involved in",
+               "assisted", "duties included", "tasked with")
+FILLER = ("various", "etc", "multiple things", "many", "several", "hard-working")
+STRONG_VERBS = {"built", "wrote", "cut", "reduced", "automated", "designed", "launched",
+                "analysed", "analyzed", "migrated", "created", "improved", "led", "fixed", "tested"}
+
+def check(b):
+    low, issues = b.lower().strip(), []
+    if low.startswith(WEAK_STARTS):
+        issues.append("weak opening phrase")
+    elif low.split()[0] not in STRONG_VERBS:
+        issues.append("does not start with a strong verb")
+    if not re.search(r"\d", b):
+        issues.append("no number")
+    if any(re.search(rf"\b{re.escape(w)}\b", low) for w in FILLER):
+        issues.append("filler word")
+    n = len(b.split())
+    if n &lt; 8: issues.append(f"too short ({n} words)")
+    if n &gt; 30: issues.append(f"too long ({n} words)")
+    return issues
+
+bullets = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+flagged = 0
+for i, b in enumerate(bullets, 1):
+    issues = check(b)
+    flagged += bool(issues)
+    print(f"{i}. [{'FIX' if issues else 'OK '}] {b[:60]}{'...' if len(b) &gt; 60 else ''}")
+    for x in issues: print(f"      - {x}")
+print(f"\n{len(bullets) - flagged} of {len(bullets)} bullets pass")
+sys.exit(1 if flagged else 0)</code></pre>
+<p>How it works: <code>low.startswith(WEAK_STARTS)</code> accepts a tuple, so one call tests all weak openers. The <code>elif</code> checks the first word against a set of strong verbs. <code>re.search(r"\d", b)</code> finds any digit. The regex <code>\b...\b</code> matches whole words, so "many" does not match inside "company". The script exits with code 1 if any bullet fails, so it can run in an automatic check.</p>
+<ol><li><strong>Run it on the before file.</strong></li></ol>
+<pre class="code lang-bash"><code>python3 check_bullets.py bullets.txt</code></pre>
+<pre class="code lang-text"><code>1. [FIX] Responsible for testing of applications and reporting issues
+      - weak opening phrase
+      - no number
+2. [FIX] Worked on data pipelines using Python and SQL
+      - weak opening phrase
+      - no number
+3. [OK ] Built a nightly Python job that loads 50,000 shop orders int...
+4. [FIX] Helped the team with dashboards
+      - weak opening phrase
+      - no number
+      - too short (5 words)
+5. [OK ] Wrote SQL checks that caught 14 duplicate-order bugs before ...
+6. [FIX] Participated in meetings and was involved in various activit...
+      - weak opening phrase
+      - no number
+      - filler word
+
+2 of 6 bullets pass</code></pre>
+<p>Two of six pass. The exit code is 1.</p>
+<ol><li><strong>Rewrite using the formula</strong> <code>Action verb + what you did + how/with what + result with a number</code>. A number can be a count, a percentage, a time saved, a money amount or a team size. If you truly have no number, estimate honestly ("about", "roughly") and be ready to explain how you counted. Never invent one.</li></ol>
+<div class="tablewrap"><table class="data"><thead><tr><th>Before</th><th>After</th><th>Impact numbers used</th></tr></thead><tbody><tr><td>Responsible for testing of applications and reporting issues</td><td>Tested 12 order-processing screens and logged 31 defects, 9 of them critical, before the release</td><td>12 screens, 31 defects, 9 critical</td></tr><tr><td>Worked on data pipelines using Python and SQL</td><td>Built a Python and SQL pipeline that loads 50,000 daily orders and flags 2 percent bad rows</td><td>50,000 rows, 2 percent</td></tr><tr><td>Helped the team with dashboards</td><td>Wrote 4 dashboard views used weekly by a 6-person team, cutting report requests by 40%</td><td>4 views, 6 people, 40%</td></tr></tbody></table></div>
+<ol><li><strong>Check the after bullets.</strong></li></ol>
+<pre class="code lang-bash"><code>python3 check_bullets.py after.txt</code></pre>
+<pre class="code lang-text"><code>1. [OK ] Tested 12 order-processing screens and logged 31 defects, 9 ...
+2. [OK ] Built a Python and SQL pipeline that loads 50,000 daily orde...
+3. [OK ] Wrote 4 dashboard views used weekly by a 6-person team, cutt...
+
+3 of 3 bullets pass</code></pre>
+<p>An honest note: my first run flagged the first after-bullet, "Tested 12 order-processing...", with "does not start with a strong verb", because "tested" was not in my verb list. I added it. The checker is a <strong>heuristic</strong> (a rough rule of thumb), not a judge. It cannot tell whether a number is real or whether a bullet matters. Use it to catch the obvious weaknesses, then read each bullet as a stranger would.</p>
+<p>Impact arithmetic is worth practising. For the third bullet of the earlier file, "cutting manual report time from 3 hours to 10 minutes":</p>
+<ul><li><strong>Formula</strong> time saved % = (old − new) / old × 100</li><li><strong>Plug in</strong> old = 3 hours = 180 minutes; new = 10 minutes. (180 − 10) / 180 × 100</li><li><strong>Compute</strong> 170 / 180 = 0.9444, so 94.4%</li><li><strong>Answer</strong> The job went from 180 minutes to 10, about 94% faster, so you can write "cut report time by 94%".</li><li><strong>Check</strong> 180 × (1 − 0.944) = 10.1 minutes, which matches the new time.</li></ul>
+<ol><li><strong>Refresh LinkedIn with a checklist.</strong> Save as <code>linkedin_checklist.md</code> and tick each item.</li></ol>
+<div class="tablewrap"><table class="data"><thead><tr><th>Section</th><th>Rule</th><th>Example</th></tr></thead><tbody><tr><td>Headline</td><td>Target role + 2 skills + proof</td><td>"Data analyst</td></tr><tr><td>About</td><td>3 short paragraphs: who, proof with a number, what you want</td><td>First line works without clicking "see more"</td></tr><tr><td>Featured</td><td>Link to your site (Project 43), best repo, best post</td><td>3 items, newest proof first</td></tr><tr><td>Experience</td><td>Reuse the after bullets (same numbers on both)</td><td>Consistent with the resume</td></tr><tr><td>Skills</td><td>Top 10 match the job posts you want</td><td>Pin the 3 most wanted</td></tr><tr><td>Photo and URL</td><td>Clear face photo; custom profile URL</td><td><code>linkedin.com/in/your-name</code></td></tr></tbody></table></div>
+<ol><li><strong>Run a 7-day sprint.</strong> Day 1 collect bullets; Day 2 run the checker and mark weak ones; Day 3 rewrite with numbers; Day 4 resume layout (one page, plain format that scanners read well); Day 5 LinkedIn; Day 6 ask one friend to read it for 30 seconds and tell you what they remember; Day 7 fix and publish.</li></ol>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li>At least 80% of bullets pass the checker (for example, 8 of 10), and the remaining ones have a written reason.</li><li>Every bullet has a number you can defend in two sentences; keep a note of how each was counted.</li><li>Resume is one page for under 8 years of experience (a common guideline, not a law).</li><li>LinkedIn headline, first About line and Featured links are updated and match the resume numbers.</li><li>A friend can recall two of your strongest facts after a 30-second read.</li><li>No confidential names or exact internal figures appear.</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Inventing or inflating numbers.</strong> It collapses in interviews. Detect it by asking yourself "How did I measure this?" for each bullet; if you cannot answer in two sentences, change it.</li><li><strong>Gaming the checker.</strong> Adding a random digit ("worked on 3 things") passes the rule but not a human. Detect it by reading each passing bullet aloud: does it say what changed?</li><li><strong>One resume for every role.</strong> Match the keywords in the job post (honestly). Keep a master file and trim copies per role.</li><li><strong>Tools list instead of results.</strong> "Python, SQL, Excel" lines tell nothing about depth. Attach each tool to an outcome.</li><li><strong>Resume and LinkedIn disagree.</strong> Different dates or numbers look careless. Compare the two side by side before sending.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Add a rule that flags passive voice ("was done by") and bullets longer than 2 lines.</li><li>Add a keyword-match score between your resume and a pasted job post (count shared skill words) and print the missing ones.</li><li>Generate a one-page resume as HTML with a print stylesheet, using your Project 43 builder.</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. How did you quantify your impact?</strong> Model answer: "I listed each task, then asked three questions: how many, how long, how much better. For example, a nightly job that took 3 hours by hand now takes 10 minutes, a 94% cut. When I did not have an exact number I gave an honest range and noted how I counted."</p>
+<p><strong>Q2. Tell me about a time you improved something with data.</strong> Model answer: "I reviewed my own resume as a dataset. A script flagged four of six bullets as weak because they had no number and a weak opening. I rewrote them and reached a pass rate of 100%. The lesson was that a quick automatic check finds the obvious problems so I can spend my time on the hard ones."</p>
+<p><strong>Q3. What are the limits of your checker?</strong> Model answer: "It is a rule of thumb. It checks for a strong verb, a digit, filler words and length. It cannot tell if a number is true or meaningful, and a clever writer can fool it. So it supports a human review; it does not replace one."</p>
+<h3>README outline</h3>
+<p>Title and one-line result (pass rate before and after); why (recruiters scan quickly); how to run; the rules the checker uses; a before/after table; LinkedIn checklist; limits (heuristic, English only); next steps.</p>
+<h2 id="s3-chapter-recap">Chapter recap</h2>
+<ul><li>A practice system needs two things: questions with model answers, and scores over time.</li><li>Two linked SQLite tables (questions, attempts) give you history without repeating text.</li><li>A <code>CHECK</code> rule in the table stops bad data (scores outside 1 to 5) from being saved.</li><li>Weighted picking (<code>6 − average score</code>) makes weak questions come up more often.</li><li>Score yourself on clarity, structure and evidence; an average of 4 or more means interview-ready.</li><li>A strong bullet is: action verb + what + how + result with a number.</li><li>Percent saved = (old − new) / old × 100; 180 to 10 minutes is 94.4%.</li><li>A checker script is a heuristic: it finds obvious weaknesses, not truth.</li><li>Resume, LinkedIn and your projects should tell one consistent story.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Command or rule</th></tr></thead><tbody><tr><td>Create bank</td><td><code>python3 kit.py init</code></td></tr><tr><td>Add question</td><td><code>python3 kit.py add topic "question" "answer"</code></td></tr><tr><td>Log attempt</td><td><code>python3 kit.py log qid day clarity structure evidence</code></td></tr><tr><td>Weekly review</td><td><code>python3 kit.py report</code></td></tr><tr><td>Quiz weak first</td><td><code>python3 kit.py quiz -n 3</code></td></tr><tr><td>Bullet formula</td><td>Verb + what + how + number</td></tr><tr><td>Check bullets</td><td><code>python3 check_bullets.py file.txt</code> (exit 1 if any weak)</td></tr><tr><td>Percent change</td><td>(old − new) / old × 100</td></tr></tbody></table></div>
+<h2 id="s4-practice-set">Practice set</h2>
+<p><strong>1.</strong> (Easy) Why does the <code>attempts</code> table store <code>question_id</code> instead of the question text? <strong>Answer:</strong> to avoid repeating the text and to link many attempts to one question; a join brings the text back when needed.</p>
+<p><strong>2.</strong> (Easy) A question has attempts scoring (3,3,3) and (5,5,5). What is its average and what quiz weight does it get? <strong>Answer:</strong> average = (3 + 5) / 2 = 4.0; weight = 6 − 4.0 = 2.0.</p>
+<p><strong>3.</strong> (Easy) Does "Helped the team with dashboards" pass <code>check_bullets.py</code>? <strong>Answer:</strong> No: weak opening phrase, no number, and too short (5 words).</p>
+<p><strong>4.</strong> (Medium) Calculate the percent change: a report took 45 minutes and now takes 9. <strong>Answer:</strong> (45 − 9) / 45 × 100 = 36 / 45 × 100 = 80% faster. Check: 45 × 0.2 = 9.</p>
+<p><strong>5.</strong> (Medium) Rewrite: "Responsible for monthly sales reports." You know it covered 5 regions and took you 2 hours a month, down from 6. <strong>Answer:</strong> "Automated the monthly sales report for 5 regions, cutting prep time from 6 hours to 2 (a 67% saving)." Check: (6 − 2) / 6 = 0.667.</p>
+<p><strong>6.</strong> (Medium) What is the output of the checker for a bullet "Led many projects"? <strong>Answer:</strong> It starts with a strong verb, but it has no number, contains the filler word "many", and is too short (3 words), so three flags.</p>
+<p><strong>7.</strong> (Interview) "Tell me about your weakest area and what you did about it." <strong>Answer:</strong> a model structure: name one real weakness (behavioral answers rambling), show the data (average 2.3), the action (daily STAR practice, recorded), and the result (average above 4 in four weeks). Keep it under 90 seconds.</p>
+<p><strong>8.</strong> (Scenario) Your checker passes every bullet but a friend says your resume is still unclear. What do you do? <strong>Answer:</strong> trust the human. Read the bullets aloud, look for vague nouns ("things", "stuff", "systems"), remove numbers that have no meaning, and add the missing outcome (who benefited and how).</p>
+<h2 id="s5-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. The topic is the Chapter 16 mock-interview kit: a question bank, STAR stories, a scoring sheet and a quiz script. Act as my interviewer for a 45-minute mock for a data role. Ask one question at a time, wait for my answer, then score clarity, structure and evidence from 1 to 5 with one sentence of advice. At the end, summarise my averages and name my weakest area. My target role: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Review my STAR story from the Chapter 16 template. I will paste it. Check that the Situation is short, the Task is my own responsibility, the Action uses "I" with specific steps, and the Result contains a real number. Tell me what the interviewer will remember, what will confuse them, and rewrite it in about 200 words, keeping every fact. Story: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Help me debug my interview-kit project from Chapter 16 (Python, SQLite, two tables: questions and attempts). I will paste my code and the error message. Explain in simple English what the error means, show the smallest fix, and suggest one test I can add so it does not return. Also point out any SQL mistakes in grouping or joins. Code and error: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Rewrite my resume bullets using the Chapter 16 formula: action verb, what I did, how or with what, and a result with a number. I will paste my bullets and the facts I know. Do not invent any number; if a number is missing, ask me a question to find an honest one. Show before and after, and mark which numbers still need proof. Bullets and facts: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Review my resume sprint from Chapter 16: my bullet checker script, the pass rates before and after, and my LinkedIn headline and About text. I will paste them. List the checker's blind spots, suggest three new rules with code, and critique my headline and first About line for clarity and proof. Rank your advice from most to least useful. Material: [PASTE HERE]</pre></div><div class="readbtn"><button class="btn" data-read="study:career:ch16">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch15.html">← Chapter 15: Project Lab — Portfolio Site and First O</a><a class="btn" href="appendix.html">Appendix: Cheat Sheet →</a></div></div><script src="../../assets/study.js"></script></body></html>

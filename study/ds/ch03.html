@@ -1,0 +1,264 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 3: Exploratory Data Analysis for Modelling</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#357a70"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Science in Practice</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 3</div><h1>Exploratory Data Analysis for Modelling</h1><p>A step-by-step method to learn what generated your data, find its bugs, and catch leakage, shown on one complete worked example.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-3-1-profiling-and-missing-values">3.1 Profiling and Missing Values</a></li><li><a href="#s2-3-2-one-column-at-a-time-then-against-the-target">3.2 One Column at a Time, Then Against the Target</a></li><li><a href="#s3-3-3-segments-time-and-simpson-s-check">3.3 Segments, Time and Simpson&#x27;s Check</a></li><li><a href="#s4-3-4-leakage-hunting-and-writing-it-up">3.4 Leakage Hunting and Writing It Up</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>You have a clean-looking table and a deadline. Where do you start? A beginner draws twenty random charts. A professional follows a fixed order, writes down every surprise, and finishes with a short list of facts, hypotheses and decisions. In this chapter you learn that order. You will profile a table, study missing values, look at single columns, compare columns with the target, split by segments and time, and hunt for leakage. We do all of it on the churn table from Chapters 1 and 2, where we have secretly planted three problems for you to find: a default value, informative missingness and a leaky column. By the end you will be able to run an EDA you could hand to a colleague, who can rerun it and trust it.</p>
+<p><strong>Method.</strong> Broad first, then narrow: shape, types, missingness; then one column at a time; then each column against the target; then interactions and segments; then time. Write down every surprise.</p>
+<pre class="code lang-text"><code>Profile -&gt; Missingness -&gt; Univariate -&gt; Target -&gt; Bivariate -&gt; Segments -&gt; Time -&gt; Leakage -&gt; Write-up
+ (what)     (what's gone)   (shapes)     (the goal) (links)     (who)       (when)   (cheats)   (so what)</code></pre>
+<p>Setup used in this chapter (the full code builds a features table for any date <code>T</code>, using only data before <code>T</code>, then plants the three problems):</p>
+<pre class="code lang-python"><code>from ds_common import *
+from sklearn.metrics import roc_auc_score, mutual_info_score
+
+c, o = make_data()
+rng = np.random.default_rng(11)
+
+def features(T):
+    d = make_label_table(c, o, pred_date=T)
+    past = o[o.order_ts &lt; T]
+    w = past[past.order_ts &gt;= T - pd.Timedelta(days=90)]
+    g = w.groupby("customer_id")
+    f = pd.DataFrame({"orders_90d": g.size(), "spend_90d": g.amount.sum(),
+                      "avg_order": g.amount.mean(),
+                      "recency_days": (T - past.groupby("customer_id").order_ts.max()).dt.days})
+    d = d.merge(f, left_on="customer_id", right_index=True, how="left")
+    d["tenure_days"] = (T - d.signup_date).dt.days
+    return d
+
+d = features(pd.Timestamp("2025-01-01"))
+d["age_raw"] = d.age.copy()
+d.loc[rng.random(len(d)) &lt; 0.07, "age_raw"] = -1                  # planted: default value
+miss_p = np.where(d.churn == 1, 0.18, 0.05)
+d.loc[rng.random(len(d)) &lt; miss_p, "age_raw"] = np.nan            # planted: informative missingness
+d["cancel_ticket"] = ((d.churn == 1) &amp; (rng.random(len(d)) &lt; 0.55)).astype(int) \
+                     | ((d.churn == 0) &amp; (rng.random(len(d)) &lt; 0.01)).astype(int)  # planted: created AFTER T</code></pre>
+<h2 id="s1-3-1-profiling-and-missing-values">3.1 Profiling and Missing Values</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Before a doctor treats you, she checks height, weight, pulse and temperature. She does not yet know what is wrong, but she learns what normal looks like for you. Profiling is the pulse check of a dataset: how many rows, what types, how many distinct values, how many blanks.</div></div>
+<p><strong>Words you need</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th><th>Example</th></tr></thead><tbody><tr><td>Profile</td><td>A quick summary of shape and columns</td><td>2,562 rows, 15 columns</td></tr><tr><td>Cardinality</td><td>Number of distinct values in a column</td><td><code>city</code> has 6</td></tr><tr><td>Mode spike</td><td>One value appears far too often</td><td><code>age = -1</code> for 6.5%</td></tr><tr><td>MCAR</td><td>Missing completely at random: blanks unrelated to anything</td><td>A sensor drops 1% of readings by chance</td></tr><tr><td>MAR</td><td>Missing at random given other columns: blanks depend on other observed data</td><td>Younger users skip the income field</td></tr><tr><td>MNAR</td><td>Missing not at random: blanks depend on the missing value itself</td><td>High earners hide their income</td></tr></tbody></table></div>
+<p><strong>Run the profile.</strong> Before you run it, predict: how many rows, and will <code>age_raw</code> have a count of 2,562?</p>
+<pre class="code lang-python"><code>print("shape", d.shape, " memory MB", round(d.memory_usage(deep=True).sum() / 1e6, 2))
+print(d[["plan", "channel", "city"]].nunique().to_dict(), " duplicate ids:", d.customer_id.duplicated().sum())
+print(d[["age_raw", "orders_90d", "spend_90d", "avg_order", "recency_days", "tenure_days"]]
+      .describe().round(1).T[["count", "mean", "50%", "max"]])</code></pre>
+<pre class="code lang-text"><code>shape (2562, 15)  memory MB 0.66
+{'plan': 2, 'channel': 3, 'city': 6}  duplicate ids: 0
+               count    mean     50%      max
+age_raw         2380.0    30.1    32.0     61.0
+orders_90d      2562.0     9.2      7.0     67.0
+spend_90d       2562.0  5260.5   3512.9  41356.7
+avg_order       2562.0   548.4    528.7   2840.2
+recency_days    2562.0    19.4      9.0     90.0
+tenure_days     2562.0   258.4    210.0    730.0</code></pre>
+<p>Line by line. <code>d.shape</code> gives rows and columns. <code>memory_usage(deep=True)</code> tells you whether the table fits comfortably in memory (0.66 MB: tiny). <code>nunique()</code> is the cardinality: low for all three categoricals, so one-hot encoding is fine (Chapter 5). <code>duplicated().sum()</code> should be 0 for an id column. <code>describe()</code> gives count, mean, median (<code>50%</code>) and max. Notice <code>age_raw</code> has a count of 2,380, not 2,562: 182 values are missing. Also notice that spend has a mean (5,260) well above the median (3,513): a long right tail.</p>
+<p><strong>Missingness analysis.</strong> Two questions: how much is missing, and does the missingness <em>carry information</em>? Compare the missing rate across the target.</p>
+<pre class="code lang-python"><code>print(d[["age_raw"]].isna().groupby(d.churn).mean().round(3)
+        .rename(columns={"age_raw": "age_missing_rate"}))
+print("share with age == -1:", round((d.age_raw == -1).mean(), 3))</code></pre>
+<pre class="code lang-text"><code>       age_missing_rate
+churn                  
+0                 0.044
+1                 0.149</code></pre>
+<pre class="code lang-text"><code>share with age == -1: 0.065</code></pre>
+<p><strong>Worked problems</strong></p>
+<p class="problem"><span class="pl">Problem 3.1.1</span> Compute how much more often <code>age</code> is missing for churners than for non-churners, and decide whether the blank is informative.</p>
+<table class="steps"><tr><th>Formula</th><td>ratio = rate for churners / rate for non-churners</td></tr><tr><th>Plug in</th><td>0.149 / 0.044</td></tr><tr><th>Compute</th><td>0.149 / 0.044 = 3.39</td></tr><tr><th>Answer</th><td>Churners have a missing age 3.4 times as often (14.9% vs 4.4%).</td></tr><tr><th>Check</th><td>Overall missing share = (182 of 2,562) = 0.071. A weighted mix of 74.6% × 0.044 + 25.4% × 0.149 = 0.0328 + 0.0378 = 0.0707. It matches.</td></tr><tr><th>Why it matters</th><td>The blank itself predicts churn, so deleting those rows would remove signal, and filling with the mean would hide it. Keep an <code>age_is_missing</code> flag (Chapter 5). This is MAR or MNAR-style missingness, not MCAR.</td></tr></table>
+<p class="problem"><span class="pl">Problem 3.1.2</span> In the output, 6.5% of ages equal -1. Explain what this is and decide what to do.</p>
+<table class="steps"><tr><th>Step 1</th><td>An age of -1 is impossible, so it is not a real age. Systems often store "unknown" as -1, 0 or 9999. This is a <em>mode spike</em>.</td></tr><tr><th>Step 2</th><td>Count it: 0.065 × 2,562 = 166 rows.</td></tr><tr><th>Step 3</th><td>Convert -1 to missing (<code>NaN</code>) and treat it as a second kind of missing, or keep the flag.</td></tr><tr><th>Answer</th><td>The -1 values are a default code meaning "not provided". Convert them to <code>NaN</code>, then handle with other missing values.</td></tr><tr><th>Check</th><td>With the -1 values left in, the mean age is 30.1; after <code>d.age_raw.replace(-1, np.nan).mean()</code> it is 32.5. So 166 fake values pulled the average down by 2.4 years (we ran this).</td></tr><tr><th>Why it matters</th><td>A model could treat -1 as "very young" and learn a false pattern about a data-entry habit.</td></tr></table>
+<p><strong>Reasoning about MCAR, MAR, MNAR.</strong> Ask: "what process creates blanks here?" If you can explain blanks using other columns (younger users, mobile app), they are MAR and imputation using other columns is reasonable. If blanks depend on the value itself (people hide high income), they are MNAR and no imputation fully repairs it, so the indicator flag becomes essential. A missingness heatmap (<code>missingno</code>, not run here) shows patterns by row; our table-based rate by target is the most useful single check.</p>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>Column age_raw (2,562 rows)
+|##########################.| present: 2,380 (92.9%)
+|                          ?| missing:   182 ( 7.1%)   &lt;- 14.9% of churners, 4.4% of stayers
+|                         -1| default code in 6.5% of rows</code></pre>
+<p><strong>Connection to the real job.</strong> Every notebook starts with these four lines. In interviews, "how do you handle missing data?" has one good first answer: "first I find out why it is missing".</p>
+<p><strong>Applications</strong></p>
+<ul><li>Data Science: informative missingness as a feature in credit and churn.</li><li>Data Engineering: detecting columns that silently became null after a schema change.</li><li>Analytics: avoiding averages distorted by default codes like 9999.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Filling missing values with the mean before looking at them. You lose the signal, and you also hide default codes. Look first, then decide.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Cardinality means?</li></ol>
+<p>Answer: the number of distinct values in a column.</p>
+<ol><li>Missing rate is 15% for positives and 4% for negatives. What kind of feature could you add?</li></ol>
+<p>Answer: a missing-value indicator (<code>is_missing</code>).</p>
+<ol><li>Why is age = -1 dangerous?</li></ol>
+<p>Answer: it is a default code, not a real age; a model may treat it as a number.</p>
+<h2 id="s2-3-2-one-column-at-a-time-then-against-the-target">3.2 One Column at a Time, Then Against the Target</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of a delivery company's records. First you look at the histogram of delivery times (shape, long tail). Then you compare it against order volume (does it climb as orders grow?). EDA does the same: shape of each column, then its relationship to the thing you care about.</div></div>
+<p><strong>Univariate: shapes.</strong> For a numeric column, look at a histogram (try a log scale), the median versus the mean, skewness (a number that is 0 for a symmetric shape and positive when the right tail is long), and outliers. An outlier is either an <em>error</em> (impossible) or a <em>real extreme</em> (a very big customer). Never delete before you know which.</p>
+<p>Our spend column: skew is 2.17 (a long right tail). After <code>np.log1p(x) = log(1 + x)</code> the skew is -0.43 (nearly symmetric). That is the picture on the right below.</p>
+<figure><img src="images/eda_recency.png" alt="Left: churn rate by recency bin rises from 4.7% to 89.9%. Right: spend after a log transform looks symmetric." loading="lazy"/><figcaption>Left: churn rate by recency bin rises from 4.7% to 89.9%. Right: spend after a log transform looks symmetric.</figcaption></figure>
+<p>How to read the figure. Left panel: each bar is a group of customers by days since last order; the bar height is the share who churned; the dashed line is the overall 25.4%; <code>n=</code> is the group size. Right panel: a histogram of log spend. The x-axis is log(1 + spend), the y-axis counts customers.</p>
+<p><strong>Target analysis.</strong> First the class balance: churn rate is 25.4%, so the classes are moderately imbalanced (not extreme). Then the target against each column:</p>
+<pre class="code lang-python"><code>d["rec_bin"] = pd.cut(d.recency_days, [0, 7, 14, 30, 60, 91])
+for col in ["plan", "channel", "city"]:
+    print(d.groupby(col).churn.agg(["mean", "size"]).round(3).T.to_string())
+print(d.groupby("rec_bin").churn.agg(["mean", "size"]).round(3).T.to_string())</code></pre>
+<pre class="code lang-text"><code>plan      free      pro
+mean     0.313     0.17
+size  1509.000  1053.00
+channel      ads   organic  referral
+mean       0.309     0.258     0.157
+size     726.000  1372.000   464.000
+city  Bengaluru  Chennai    Delhi  Mumbai    Other     Pune
+mean       0.244    0.252    0.243    0.27    0.238    0.295
+size     504.000  246.000  497.000  525.00  526.000  264.000
+rec_bin    (0, 7]  (7, 14]  (14, 30]  (30, 60]  (60, 91]
+mean        0.047    0.127     0.292      0.63     0.899
+size  1118.000  474.000   401.000    332.00   237.000</code></pre>
+<p><code>pd.cut</code> makes bins: <code>(0, 7]</code> means above 0 and up to and including 7 days. <code>groupby(col).churn.agg(["mean","size"])</code> gives the churn rate and the group size for each level. Always show the size: a rate on 20 customers is noise.</p>
+<p><strong>Worked problems</strong></p>
+<p class="problem"><span class="pl">Problem 3.2.1</span> Compute the lift of the recency group (60, 91] and of the group (0, 7], and say what they mean.</p>
+<table class="steps"><tr><th>Formula</th><td>lift = group churn rate / overall churn rate</td></tr><tr><th>Plug in</th><td>0.899 / 0.254 and 0.047 / 0.254</td></tr><tr><th>Compute</th><td>0.899 / 0.254 = 3.54; 0.047 / 0.254 = 0.19</td></tr><tr><th>Answer</th><td>Customers silent for more than 60 days churn 3.5 times as often as average; customers who ordered within a week churn at about one fifth of average.</td></tr><tr><th>Check</th><td>Weighted average of group rates: (0.047×1118 + 0.127×474 + 0.292×401 + 0.63×332 + 0.899×237) / 2562 = (52.5 + 60.2 + 117.1 + 209.2 + 213.1) / 2562 = 652.1 / 2562 = 0.2545, which matches the overall 0.254.</td></tr><tr><th>Why it matters</th><td>The relationship is strong and monotonic (it only goes up). This is the best single feature and also warns us that a recency rule is a strong baseline (Chapter 1).</td></tr></table>
+<p class="problem"><span class="pl">Problem 3.2.2</span> Measure how strongly each categorical column is linked to churn using Cramér's V, and decide which matters.</p>
+<p>Cramér's V is a number from 0 (no link) to 1 (perfect link) computed from a chi-square test on the cross-table of two categorical columns: <code>V = sqrt(chi² / (n × (min(rows, cols) - 1)))</code>. Mutual information (MI) is another measure: how much knowing the column reduces uncertainty about churn, in <em>nats</em> (units based on the natural log).</p>
+<pre class="code lang-python"><code>def cramers_v(a, b):
+    ct = pd.crosstab(a, b).values; n = ct.sum()
+    exp = ct.sum(1, keepdims=True) * ct.sum(0, keepdims=True) / n
+    chi2 = ((ct - exp) ** 2 / exp).sum()
+    return np.sqrt(chi2 / (n * (min(ct.shape) - 1)))
+print("Cramer's V:", {k: round(float(cramers_v(d[k], d.churn)), 3) for k in ["plan", "channel", "city"]})
+print("MI (nats) rec_bin:", round(mutual_info_score(d.rec_bin.astype(str), d.churn), 4))
+print(d[["churn", "orders_90d", "spend_90d", "recency_days", "tenure_days"]]
+      .corr(method="spearman").round(2)["churn"].to_dict())</code></pre>
+<pre class="code lang-text"><code>Cramer's V: {'plan': 0.161, 'channel': 0.116, 'city': 0.042}
+MI (nats) rec_bin: 0.2042
+{'churn': 1.0, 'orders_90d': -0.41, 'spend_90d': -0.39, 'recency_days': 0.57, 'tenure_days': 0.01}</code></pre>
+<ul><li><strong>Step 1</strong> Plan has V = 0.161, channel 0.116, city 0.042.</li><li><strong>Step 2</strong> Spearman correlation (rank-based, so it catches any steadily rising or falling relation, not only straight lines) with churn: recency +0.57, orders -0.41, spend -0.39, tenure 0.01.</li><li><strong>Answer</strong> Recency, order count and spend are the strong numeric signals; plan and channel are moderate; city is almost nothing; tenure alone says nothing.</li><li><strong>Check</strong> The signs make sense: more recent orders and more frequent orders mean lower churn (negative correlation); longer silence means higher churn (positive). City's V of 0.042 matches the near-flat rates (23.8% to 29.5%) in the table.</li><li><strong>Why it matters</strong> It tells you where to spend feature-engineering time. Also, Pearson and Spearman only see monotone relations; a U-shape would give about zero, so always plot as well.</li></ul>
+<p><strong>The picture.</strong> A feature-vs-target chart (binned rates, as in the left panel above) is also called a <em>partial view</em>. It is the fastest way to see non-linear effects, and it works for trees and linear models alike.</p>
+<p><strong>Connection to the real job.</strong> This table is what you show a business partner: "these are the strongest signals; here is how churn changes with each". It also guides the first model.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Data Science: choosing features and spotting non-linear effects.</li><li>Analytics: segmenting customers for campaigns.</li><li>Credit risk: binning variables by default rate (Chapter 11, WoE).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reading a rate without its group size. A 60% churn rate on 8 customers is noise; always print <code>n</code>, and for small groups add a confidence interval (Chapter 4).</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>When do you use log scale?</li></ol>
+<p>Answer: for right-skewed positive values like spend or time, to see the shape.</p>
+<ol><li>What does lift 3.5 mean?</li></ol>
+<p>Answer: that group's rate is 3.5 times the overall rate.</p>
+<ol><li>Why can a correlation of 0 hide a strong relationship?</li></ol>
+<p>Answer: correlation measures linear or monotone links; a U-shape can give about 0.</p>
+<h2 id="s3-3-3-segments-time-and-simpson-s-check">3.3 Segments, Time and Simpson's Check</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">The average temperature of India is useless for packing your suitcase. You need Shimla or Chennai. An average churn rate is the same: different groups can behave differently, and over time the whole picture can shift (like peak-hour versus night traffic).</div></div>
+<p><strong>Segment analysis.</strong> Ask "who behaves differently?" by geography, device, cohort (customers who joined in the same period), and acquisition channel. In our data, plan and channel matter; city does not (Section 3.2). Combine two segments in a pivot table to see interactions (we do this for plan and channel in Problem 3.3.2 below). Also check that each segment has enough rows.</p>
+<p><strong>Time analysis: drift.</strong> <em>Data drift</em> means the data in the recent period differs from the training period; models trained on the past then fail on the present. Look at: trends, seasonality (weekday, month, festival), and recent change. We build the same churn table at five prediction dates and compare:</p>
+<pre class="code lang-python"><code>rows = []
+for T in pd.to_datetime(["2024-04-01", "2024-07-01", "2024-10-01", "2025-01-01", "2025-02-28"]):
+    t = features(T)
+    rows.append((T.date(), len(t), round(t.churn.mean(), 3), round(t.recency_days.mean(), 1), round(t.orders_90d.mean(), 1)))
+print(pd.DataFrame(rows, columns=["T", "rows", "churn_rate", "mean_recency", "mean_orders90"]).to_string(index=False))</code></pre>
+<pre class="code lang-text"><code>         T  rows  churn_rate  mean_recency  mean_orders90
+2024-04-01  2124       0.249          19.2            8.5
+2024-07-01  2258       0.256          19.4            8.8
+2024-10-01  2424       0.239          18.5            9.2
+2025-01-01  2562       0.254          19.4            9.2
+2025-02-28  2275       0.244          20.0           10.2</code></pre>
+<p><strong>Worked problems</strong></p>
+<p class="problem"><span class="pl">Problem 3.3.1</span> Is the churn rate stable across the five dates? Use a simple range check.</p>
+<table class="steps"><tr><th>Formula</th><td>range = max - min of churn rate across dates</td></tr><tr><th>Plug in</th><td>max = 0.256 (2024-07-01), min = 0.239 (2024-10-01)</td></tr><tr><th>Compute</th><td>0.256 - 0.239 = 0.017</td></tr><tr><th>Answer</th><td>The rate moves by 1.7 percentage points over 11 months; there is no sign of a trend.</td></tr><tr><th>Check</th><td>With about 2,300 customers per date, the standard error of a rate near 0.25 is <code>sqrt(0.25 × 0.75 / 2300)</code> = 0.009, so a 1.7-point spread is within normal noise (about 2 standard errors).</td></tr><tr><th>Why it matters</th><td>A stable label rate and stable feature means (recency 18.5 to 20.0) give you comfort to train on older periods. If instead churn had risen from 25% to 35%, you would weigh recent data more or investigate a business change.</td></tr></table>
+<p>Note: This data is synthetic and simple, so it has no weekday effect (each weekday has about 14.3% of orders) and no seasonal wave. Real order data almost always has both; you would plot daily counts and check holiday weeks. For India, mark Diwali, Holi, end-of-month salary days and IPL season, because they move traffic and orders sharply.</p>
+<p><strong>Simpson's paradox check.</strong> Simpson's paradox is when a trend in the whole data reverses inside every group. Checking costs one line: compute the effect overall and again within each segment, and compare the signs. We study the mechanism and a real numerical example in Chapter 4. In our table, the plan effect has the same direction in every channel, so there is no reversal here.</p>
+<p class="problem"><span class="pl">Problem 3.3.2</span> Run the check for plan inside each channel: is "pro churns less" true in every channel?</p>
+<table class="steps"><tr><th>Step 1</th><td>Overall: pro 17.0%, free 31.3%.</td></tr><tr><th>Step 2</th><td>Within each channel (group by <code>channel</code>, <code>plan</code>) compute the churn rate.</td></tr><tr><th>Step 3</th><td>Look for any channel where pro is higher than free.</td></tr><tr><th>Answer</th><td>The check, in code, is <code>d.groupby(["channel","plan"]).churn.mean().unstack()</code>. The result is printed below; if every row shows pro below free, there is no reversal.</td></tr><tr><th>Check</th><td>The overall pro rate (17.0%) is a mix of the channel-level pro rates weighted by how many pro customers each channel has. The sign of the overall gap can flip only when the channel mix is very different between plans.</td></tr><tr><th>Why it matters</th><td>Without this check, an overall conclusion such as "channel X is better" might be reversed inside every plan.</td></tr></table>
+<pre class="code lang-python"><code>print(d.groupby(["channel", "plan"]).churn.mean().unstack().round(3))</code></pre>
+<pre class="code lang-text"><code>plan         free    pro
+channel                 
+ads         0.402  0.192
+organic     0.319  0.168
+referral    0.171  0.136</code></pre>
+<p>Pro is below free in all three channels (0.192 &lt; 0.402, 0.168 &lt; 0.319, 0.136 &lt; 0.171). No Simpson reversal. The gap is large for ads (21 points) and small for referral (3.5 points): the plan effect depends on the channel, which is an interaction worth a note in the EDA write-up.</p>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>churn
+ rate   free  pro
+ ads    .402 .192
+ org    .319 .168      each row: free &gt; pro   -&gt; consistent
+ ref    .171 .136</code></pre>
+<p><strong>Connection to the real job.</strong> "DAU dropped 10%, what do you do?" The segment and time analysis here is the answer: split by platform, country, new vs old users, and check whether the drop started on a release date or a data-pipeline change.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Product analytics: diagnosing metric drops by segment and date.</li><li>Fraud: new attack patterns appear in one segment first.</li><li>Forecasting: seasonal effects (festivals) drive plans for staffing and stock.</li><li>Operations: peak-hour behaviour differs from average, so segment by hour.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Looking only at overall averages and at the whole time range. Always split by one or two key segments and plot recent vs older periods.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is data drift?</li></ol>
+<p>Answer: the data in recent time differs from the training period.</p>
+<ol><li>Why do you add <code>size</code> to a segment table?</li></ol>
+<p>Answer: small segments give noisy rates.</p>
+<ol><li>Simpson's check in one sentence?</li></ol>
+<p>Answer: compute the effect overall and within each group, and see if the sign flips.</p>
+<h2 id="s4-3-4-leakage-hunting-and-writing-it-up">3.4 Leakage Hunting and Writing It Up</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">If a delivery time looks impossibly fast (2 minutes for a cross-city order), you do not celebrate; you suspect the order was never really delivered. A feature that predicts the target "too well" deserves the same suspicion.</div></div>
+<p><strong>Method 1: single-feature AUC.</strong> AUC of one feature alone against the target. For a binary feature, AUC = 0.5 + (hit rate - false alarm rate) / 2. Any single feature above about 0.9 on a hard problem deserves a hard look. We take <code>max(AUC, 1 - AUC)</code> because a feature that perfectly <em>reverses</em> the target is just as informative.</p>
+<pre class="code lang-python"><code>rows = []
+for col in ["orders_90d", "spend_90d", "avg_order", "recency_days", "tenure_days", "cancel_ticket"]:
+    x = d[col].fillna(d[col].median())
+    a = roc_auc_score(d.churn, x)
+    rows.append((col, round(max(a, 1 - a), 3)))
+print(pd.DataFrame(rows, columns=["feature", "single_feature_AUC"])
+        .sort_values("single_feature_AUC", ascending=False).to_string(index=False))
+print(d.groupby("cancel_ticket").churn.agg(["mean", "size"]).round(3))
+print("ticket share among churners:", round(d[d.churn==1].cancel_ticket.mean(), 3))</code></pre>
+<pre class="code lang-text"><code>      feature  single_feature_AUC
+ recency_days               0.880
+   orders_90d               0.770
+    spend_90d               0.761
+cancel_ticket               0.753
+    avg_order               0.576
+  tenure_days               0.505
+                mean  size
+cancel_ticket                 
+0              0.143  2206
+1              0.944   356
+ticket share among churners: 0.516</code></pre>
+<p><code>cancel_ticket</code> ranks fourth by AUC, so AUC alone did not flag it, because it only covers half of the churners. But the second table is the alarm: customers with a cancellation ticket churn 94.4% of the time. A feature that nearly determines the label, for a group of 356 customers, is suspicious.</p>
+<p><strong>Method 2: the timestamp question.</strong> For every strong feature ask: <em>when is this value written?</em> The ticket in our example is created when a customer asks to cancel, which happens <em>after</em> T (the planted bug). At prediction time on January 1st, the ticket does not exist yet. This is the decisive test; no statistic replaces it.</p>
+<p><strong>Method 3: suspicious jumps.</strong> If adding one column lifts AUC by 0.05 or more, look at it. (In Chapter 2, one future column moved AUC from 0.882 to 0.972.)</p>
+<p><strong>Worked problems</strong></p>
+<p class="problem"><span class="pl">Problem 3.4.1</span> Using the numbers above, how many churners does <code>cancel_ticket</code> flag, and how many false alarms does it produce?</p>
+<table class="steps"><tr><th>Formula</th><td>flagged churners = tickets × churn rate among tickets</td></tr><tr><th>Plug in</th><td>356 × 0.944</td></tr><tr><th>Compute</th><td>356 × 0.944 = 336.1, so 336 churners flagged and 356 - 336 = 20 customers who got a ticket yet stayed</td></tr><tr><th>Answer</th><td>The ticket flags 336 churners with only 20 false alarms.</td></tr><tr><th>Check</th><td>Total churners are 0.254 × 2,562 = 651. Flagged share = 336 / 651 = 0.516, which matches "ticket share among churners 0.516".</td></tr><tr><th>Why it matters</th><td>Precision of 94% looks wonderful, which is the red flag. The ticket is an <em>effect</em> of the churn decision, not a <em>cause</em>; including it would make the model "predict" what we already know.</td></tr></table>
+<p class="problem"><span class="pl">Problem 3.4.2</span> Decide what to do with each column: <code>recency_days</code>, <code>cancel_ticket</code>, <code>age_raw</code>, <code>city</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>recency_days</code>: strong, computed from orders before T. Keep.</td></tr><tr><th>Step 2</th><td><code>cancel_ticket</code>: created after T. Drop from the model. (If a version existed from before T, e.g. "complaint in last 30 days before T", that would be allowed.)</td></tr><tr><th>Step 3</th><td><code>age_raw</code>: convert -1 to NaN, add <code>age_is_missing</code>, impute the median. Keep.</td></tr><tr><th>Step 4</th><td><code>city</code>: almost no signal (V = 0.042), cheap to keep as one-hot but low priority; drop if you want a simpler model.</td></tr><tr><th>Answer</th><td>Keep recency and age (cleaned), drop the ticket, keep or drop city by simplicity.</td></tr><tr><th>Check</th><td>After dropping the ticket, the best single-feature AUC is 0.880 (recency), the same as our honest baseline in Chapter 1, so nothing is inflated.</td></tr><tr><th>Why it matters</th><td>The decision is documented with a reason. Next month, a colleague can see why <code>cancel_ticket</code> was excluded.</td></tr></table>
+<p><strong>Writing findings.</strong> Use three parts for each finding: <em>hypothesis, evidence, so what.</em> Example:</p>
+<pre class="code lang-text"><code>Finding 1
+Hypothesis: Silence predicts churn.
+Evidence:   Churn rate rises from 4.7% (ordered within 7 days) to 89.9% (silent &gt;60 days); lift 3.5x.
+So what:    A recency rule is a strong baseline; the model must beat AUC 0.88 to be worth shipping.
+
+Finding 2
+Hypothesis: Missing age is informative.
+Evidence:   Age is missing for 14.9% of churners vs 4.4% of stayers (3.4x). 6.5% of ages are -1.
+So what:    Clean -1 to missing, add an is_missing flag.
+
+Finding 3 (BUG)
+Hypothesis: cancel_ticket leaks.
+Evidence:   94.4% of ticket holders churn; the ticket is created after T.
+So what:    Exclude; ask data engineering for a point-in-time version.</code></pre>
+<p>Keep an EDA notebook that someone else can rerun: fixed seed, relative paths, a top cell stating the data snapshot date. Tools that automate profiling include <code>ydata-profiling</code>, <code>sweetviz</code> and <code>missingno</code> (not installed or run here). Use them to save time, but still read every column yourself.</p>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>feature value -&gt; "when is it written?"
+   |-- before T  -&gt; allowed
+   |-- at T      -&gt; allowed if available in the serving system at that moment
+   |-- after T   -&gt; LEAK, drop it</code></pre>
+<p><strong>Connection to the real job.</strong> "Find the leakage in an unfamiliar notebook" is a classic mastery test and interview task. The method: list every feature, ask when it is written, look at the strongest features first, check the validation design.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Credit: "account closed" flags or "collections status" used for default prediction.</li><li>Healthcare: lab tests ordered because a doctor already suspected the disease.</li><li>Fraud: "chargeback reason" fields filled after the investigation.</li><li>Support: ticket categories assigned after resolution.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Celebrating a very strong feature. Before you celebrate, ask when the value is written and by which process. Strength is a reason for suspicion, not pride.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which question catches leakage best?</li></ol>
+<p>Answer: when is this value written, compared with the prediction time?</p>
+<ol><li>A binary feature with AUC 0.753 is leaky. How can that be?</li></ol>
+<p>Answer: it covers only a subset of cases but is almost perfect within them; check precision inside the flagged group.</p>
+<ol><li>What are the three parts of a finding?</li></ol>
+<p>Answer: hypothesis, evidence, so what.</p>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>Follow a fixed order: profile, missingness, univariate, target, bivariate, segments, time, leakage, write-up.</li><li>Missing values: find the reason (MCAR, MAR, MNAR), compare missing rate by target, and keep an indicator when it is informative (14.9% vs 4.4%).</li><li>Mode spikes such as -1, 0, 9999 are default codes: convert to missing.</li><li>Look at distributions on a log scale for skewed values; spend had skew 2.17, and after log1p -0.43.</li><li>Always show group sizes next to rates; recency churn rises from 4.7% to 89.9% across bins.</li><li>Use Cramér's V, Spearman correlation and mutual information to rank signals, but also plot.</li><li>Check segments and time (drift) and run the Simpson check (compare overall and within-group effects).</li><li>Hunt leakage with the question "when is this written?" and with suspiciously strong features (94.4% churn for ticket holders).</li><li>Write findings as hypothesis, evidence, so what.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Task</th><th>Code pattern</th><th>Meaning</th></tr></thead><tbody><tr><td>Profile</td><td><code>df.shape</code>, <code>df.describe()</code>, <code>df.nunique()</code></td><td>size, summary, cardinality</td></tr><tr><td>Missing by target</td><td><code>df[c].isna().groupby(df.y).mean()</code></td><td>informative blanks</td></tr><tr><td>Mode spike</td><td><code>(df[c] == -1).mean()</code></td><td>default codes</td></tr><tr><td>Skew</td><td><code>df[c].skew()</code> and <code>np.log1p</code></td><td>tail shape</td></tr><tr><td>Rate by bin</td><td><code>pd.cut</code> then <code>groupby().y.agg(["mean","size"])</code></td><td>feature vs target</td></tr><tr><td>Lift</td><td><code>group rate / overall rate</code></td><td>strength of a segment</td></tr><tr><td>Single-feature AUC</td><td><code>max(a, 1 - a)</code></td><td>leak or signal</td></tr><tr><td>Simpson check</td><td><code>groupby([seg, treat]).y.mean().unstack()</code></td><td>sign flips?</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 3.P.1</span> (easy) 182 of 2,562 ages are missing. What percent? <strong>Answer:</strong> 182 / 2,562 = 7.1%.</p>
+<p class="problem"><span class="pl">Problem 3.P.2</span> (easy) A group has churn rate 0.40; the overall rate is 0.25. What is the lift? <strong>Answer:</strong> 0.40 / 0.25 = 1.6.</p>
+<p class="problem"><span class="pl">Problem 3.P.3</span> (easy) What does <code>pd.cut(x, [0, 7, 14])</code> do to the value 7? <strong>Answer:</strong> It goes to the bin (0, 7] because bins are right-closed.</p>
+<p class="problem"><span class="pl">Problem 3.P.4</span> (medium) What is the output? <code>pd.Series([1, 2, 3, np.nan, -1]).replace(-1, np.nan).isna().sum()</code> <strong>Answer:</strong> 2 (the original NaN and the replaced -1).</p>
+<p class="problem"><span class="pl">Problem 3.P.5</span> (medium) A feature has median 3,500 and mean 5,260. What shape do you suspect, and what transform do you try? <strong>Answer:</strong> Right-skewed with a long tail; try <code>log1p</code>.</p>
+<p class="problem"><span class="pl">Problem 3.P.6</span> (medium) Find the bug: <code>d.groupby("city").churn.mean()</code> is used to claim "Pune is the worst city at 29.5%" without more. What is missing? <strong>Answer:</strong> The group size (Pune has only 264 customers) and the uncertainty. With n = 264 the standard error is about 0.027, so Pune (0.295) is not clearly different from the overall 0.254.</p>
+<p class="problem"><span class="pl">Problem 3.P.7</span> (medium) Missingness: a feature is missing for 30% of positives and 10% of negatives, base rate 20%. What share of all rows are missing? <strong>Answer:</strong> 0.2 × 0.30 + 0.8 × 0.10 = 0.06 + 0.08 = 0.14, so 14%.</p>
+<p class="problem"><span class="pl">Problem 3.P.8</span> (hard) The overall approval rate for loans is higher for men than women, but within each income band women are approved as often or more. What is this called, and what do you check? <strong>Answer:</strong> Simpson's paradox. Check how gender mix differs across income bands (women may apply more in lower-income bands where approval is lower), and report the within-band comparison.</p>
+<p class="problem"><span class="pl">Problem 3.P.9</span> (interview) "Your feature has AUC 0.99 for a hard prediction problem. What do you do?" <strong>Answer:</strong> Suspect leakage. Ask when the feature is written; check whether it is derived from the label or from future data; drop it or rebuild it with a cutoff at T; retrain and see the AUC fall to a realistic value; document.</p>
+<p class="problem"><span class="pl">Problem 3.P.10</span> (interview) "DAU dropped 10% last week. How do you investigate?" <strong>Answer:</strong> Check data first (pipeline, logging change, time zone), then segment by platform, country, new vs returning, channel and version; line up the start date with releases, outages and campaigns; compare with the same week last year; quantify each segment's contribution to the drop; then propose a hypothesis and a test.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional at an Indian MNC moving into data science, and English is my second language. Teach me a step-by-step exploratory data analysis method for modelling: profile, missingness (MCAR, MAR, MNAR), univariate, target analysis, segments, time, leakage, write-up. Use a small customer churn table in pandas as the running example. After each step ask me one question and wait for my answer.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Topic: "missing values and default codes in EDA". Give me 8 graded exercises with small pandas tables (include a -1 default code, informative missingness and a MAR example). Do not give solutions yet. After I answer I will paste my work and you will grade it, explain what I missed and show the pandas code.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional new to data science. Topic: "leakage hunting in notebooks". Quiz me one question at a time: show a short feature list and a validation design for a prediction problem, and ask me which feature leaks and why, using the question "when is this value written compared with the prediction time". Give feedback after each answer. Ask 10 questions with increasing difficulty.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Review my EDA notebook summary below. Check that I used a fixed order, looked at group sizes, checked drift over time, ran a Simpson check, tested for leakage, and wrote each finding as hypothesis, evidence, so what. Point out weak or missing steps in simple English and suggest concrete improvements. My summary: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for data science interviews in India. Run a mock interview on EDA: "DAU dropped 10%", "how do you handle missing data", "your AUC is too good, why", "explain Simpson's paradox". Ask one question at a time, score me out of 10, give a model answer and one follow-up. Do 8 rounds.</pre></div><div class="readbtn"><button class="btn" data-read="study:ds:ch03">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch02.html">← Chapter 2: Getting Trustworthy Data: Collection, Po</a><a class="btn" href="ch04.html">Chapter 4: Statistical Thinking: Ways Data Fools Yo →</a></div></div><script src="../../assets/study.js"></script></body></html>

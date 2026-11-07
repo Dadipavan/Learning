@@ -1,0 +1,282 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 12: Multimodal and Document AI, Text-to-SQL</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">NLP, LLMs, RAG &amp; Agents</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 12</div><h1>Multimodal and Document AI, Text-to-SQL</h1><p>Models that read images, pages and speech, and assistants that turn a business question into a safe database query.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-12-1-how-models-see-images-patches-and-vision-language-models">12.1 How Models See: Images, Patches and Vision-Language Models</a></li><li><a href="#s2-12-2-document-ai-ocr-ocr-free-models-and-structured-extraction">12.2 Document AI: OCR, OCR-Free Models and Structured Extraction</a></li><li><a href="#s3-12-3-speech-asr-tts-diarization-and-word-error-rate">12.3 Speech: ASR, TTS, Diarization and Word Error Rate</a></li><li><a href="#s4-12-4-text-to-sql-building-an-analytics-assistant">12.4 Text-to-SQL: Building an Analytics Assistant</a></li><li><a href="#s5-12-5-copilots-and-analytics-assistants-putting-the-pieces-together">12.5 Copilots and Analytics Assistants: Putting the Pieces Together</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p>Your company has thousands of scanned invoices, recorded support calls and a sales database that only three analysts know how to query. A manager asks: "Can the AI read the invoices, transcribe the calls and answer sales questions in plain English?" Yes, but only if you wrap the model in checks, because these systems fail in quiet ways: a wrong digit in an amount, a misheard word, a query that deletes a table. By the end of this chapter you will know how images and pages become tokens, how to extract structured data from documents and validate it, how to measure speech recognition with word error rate, and how to build a text-to-SQL assistant with guardrails that you run yourself with <code>sqlite3</code>.</p>
+<p><strong>Words you need first</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Modality</td><td>A type of data: text, image, audio, video</td></tr><tr><td>Multimodal model</td><td>A model that accepts or produces more than one modality</td></tr><tr><td>VLM</td><td>Vision-language model: reads images and text together and answers in text</td></tr><tr><td>OCR</td><td>Optical character recognition: turning pixels of text into real characters</td></tr><tr><td>ASR</td><td>Automatic speech recognition: audio to text (Whisper is a well-known open example)</td></tr><tr><td>TTS</td><td>Text to speech: text to audio</td></tr><tr><td>Diarization</td><td>Working out who spoke when ("speaker 1", "speaker 2")</td></tr><tr><td>Text-to-SQL</td><td>Turning a question in English into a SQL query</td></tr></tbody></table></div>
+<p><strong>Running examples.</strong> We use three small things: an invoice (INV-204), a short call transcript, and the <code>orders</code> table from your SQL practice (four rows: asha, ravi, asha, meena). Everything we run uses mock model output, because no paid API or GPU is available here. Where code needs a real provider, we mark it "not run here".</p>
+<h2 id="s1-12-1-how-models-see-images-patches-and-vision-language-models">12.1 How Models See: Images, Patches and Vision-Language Models</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A language model reads a sentence word by word. To make it "see", you cut a photo into small square tiles, like a chocolate bar, and turn each tile into a number-vector, exactly like a word. Then the model reads the tiles like words. More tiles means more detail, and more tokens to pay for.</div></div>
+<p><strong>How it works.</strong> A <em>Vision Transformer (ViT)</em> splits an image into fixed square <em>patches</em> (for example 16 by 16 pixels). Each patch is flattened and projected to a vector, called a patch embedding. The transformer (see the Deep Learning document, <code>study/dl/</code>) then processes these vectors with attention. A <em>vision-language model</em> connects such an image encoder to a language model, so image tiles and text tokens live in one sequence. You can then ask, "What is the total on this invoice?" and the model answers in words.</p>
+<p><strong>CLIP</strong> is the classic idea behind many image search systems. It trains two encoders, one for images and one for text, so that a photo and its caption land close together in the same vector space (it uses <em>contrastive learning</em>: pull matching pairs together, push mismatches apart). Because both live in one space, you can do <em>zero-shot classification</em>: embed the labels as text, embed the image, and pick the label with the highest cosine similarity (Chapter 2). The same trick gives text-to-image search.</p>
+<pre class="code lang-text"><code>image 224x224 --cut--&gt; 14 x 14 grid of 16x16 patches --&gt; 196 patch vectors
+                                                           |
+text "What is the total?" --&gt; text tokens ----------------+--&gt; language model --&gt; "Rs 2,800"</code></pre>
+<p>How to read it: the image becomes 196 vectors, the question becomes some text vectors, and the language model reads both as one sequence. The answer comes out as ordinary text.</p>
+<p><strong>Predict, run, explain.</strong> Before you run it, guess how many patches a 1024 by 768 image gives with 16-pixel patches.</p>
+<pre class="code lang-python"><code>import math, numpy as np
+def patches(h,w,p): return math.ceil(h/p)*math.ceil(w/p)
+print("224x224, p16:", patches(224,224,16))
+print("1024x768, p16:", patches(1024,768,16))
+print("1024x768, p32:", patches(1024,768,32))
+for p in (16,32,64): print("A4 300dpi p%d:"%p, patches(3508,2480,p))
+# toy CLIP-style zero-shot: embeddings are made up, NOT from a real model
+rng=np.random.default_rng(0)
+labels=["a photo of a cat","a photo of a dog","a screenshot of a chart"]
+T=rng.normal(size=(3,8)); T/=np.linalg.norm(T,axis=1,keepdims=True)
+img=T[2]+0.3*rng.normal(size=8); img/=np.linalg.norm(img)
+sims=T@img
+for l,s in zip(labels,sims): print("%-26s cos=%.3f"%(l,s))
+print("predicted:",labels[int(np.argmax(sims))])</code></pre>
+<pre class="code lang-text"><code>224x224, p16: 196
+1024x768, p16: 3072
+1024x768, p32: 768
+A4 300dpi p16: 34100
+A4 300dpi p32: 8580
+A4 300dpi p64: 2145
+a photo of a cat           cos=-0.162
+a photo of a dog           cos=0.364
+a screenshot of a chart    cos=0.846
+predicted: a screenshot of a chart</code></pre>
+<p>Line by line: <code>ceil(h/p) * ceil(w/p)</code> counts tiles in each direction (partial tiles at the edge still count as one). The toy CLIP part builds three random unit vectors as pretend "text embeddings", makes the "image" vector by taking the third one and adding noise, and then uses a dot product of unit vectors, which equals cosine similarity. The chart label wins with 0.846. This is a toy: a real CLIP learns these vectors from hundreds of millions of image-caption pairs. We only show the mechanics of the choice.</p>
+<p><strong>Real-world mapping</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Patch size</td><td>16 px</td><td>Sets how many tokens an image costs</td></tr><tr><td>Image resolution</td><td>1024 by 768</td><td>Higher resolution reads small text better but costs more tokens</td></tr><tr><td>Image embedding</td><td>512 numbers</td><td>Image search, duplicate detection</td></tr><tr><td>Zero-shot labels</td><td>"screenshot of a chart"</td><td>Sorting uploaded images without training</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 12.1.1</span> A ViT uses 16-pixel patches. How many patches does a 320 by 192 image give?</p>
+<table class="steps"><tr><th>Formula</th><td>patches = ceil(h / p) × ceil(w / p)</td></tr><tr><th>Plug in</th><td>ceil(192 / 16) × ceil(320 / 16)</td></tr><tr><th>Compute</th><td>192 / 16 = 12 and 320 / 16 = 20, so 12 × 20 = 240</td></tr><tr><th>Answer</th><td>The image becomes 240 patch vectors.</td></tr><tr><th>Check</th><td>240 × 16 × 16 = 61,440 = 320 × 192, so the tiles cover the image exactly.</td></tr><tr><th>Why it matters</th><td>Every extra tile is extra input to pay for and wait for.</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.1.2</span> You scan an A4 page at 300 dpi (3508 by 2480 pixels). With 32-pixel patches, how many patches? By how much does it drop with 64-pixel patches, and what is the trade-off?</p>
+<table class="steps"><tr><th>Formula</th><td>patches = ceil(h / p) × ceil(w / p)</td></tr><tr><th>Plug in</th><td>p = 32: ceil(3508 / 32) × ceil(2480 / 32)</td></tr><tr><th>Compute</th><td>3508 / 32 = 109.6, rounded up 110; 2480 / 32 = 77.5, rounded up 78; 110 × 78 = 8,580. With p = 64: 55 × 39 = 2,145 (our code printed the same).</td></tr><tr><th>Answer</th><td>8,580 patches at 32 px, and 2,145 at 64 px: four times fewer, so about four times cheaper and faster, but small print may blur into a single tile and be unreadable.</td></tr><tr><th>Check</th><td>8,580 / 2,145 = 4.0. Doubling the patch side divides the count by about 4.</td></tr><tr><th>Why it matters</th><td>In practice providers resize or tile images by their own rules and bill them in their own way; look up your provider's image documentation and measure real token usage on sample pages.</td></tr></table>
+<p><strong>Other generative media (awareness).</strong> <em>Diffusion models</em> generate images by starting from random noise and removing noise step by step, guided by a text prompt (Stable Diffusion is the well-known open family; details are in the DL document). Video generation extends the idea over time. Text-to-speech is covered in 12.3. As an engineer you mostly use these through APIs or open model files; the work is evaluation, cost, licensing and safety (generated images can copy styles or faces, so check licences and your company policy).</p>
+<p><strong>Connection to the real job.</strong> Teams use VLMs for screenshots in bug reports, dashboards and charts, product photos, receipts and forms. For example: feed a screenshot of a weekly sales chart to a VLM and ask for the visible trend. Treat the answer as a helper, not a measurement; numbers read from a picture can be wrong.</p>
+<p><strong>Applications</strong></p>
+<ul><li><em>GenAI:</em> chart and screenshot question answering, image captioning for search.</li><li><em>Data Engineering:</em> image embeddings stored in a vector database (Chapter 6) for visual search.</li><li><em>Machine Learning:</em> zero-shot labelling to bootstrap a training set.</li><li><em>Customer support:</em> customers upload a photo of a damaged product and the assistant classifies the damage.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Trusting a VLM to read exact numbers from a low-resolution image. It may "see" 8 where there is a 6. For anything where the digit matters (amounts, dates, ids), use OCR plus validation (12.2), or ask a human to confirm.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why does a higher-resolution image cost more?</li></ol>
+<p>Answer: It produces more patches, so more tokens enter the model.</p>
+<ol><li>How does CLIP do zero-shot classification?</li></ol>
+<p>Answer: It embeds the label texts and the image into one space and picks the label with the highest cosine similarity.</p>
+<ol><li>A 64 by 64 image with 16-pixel patches gives how many patches?</li></ol>
+<p>Answer: 4 × 4 = 16.</p>
+<h2 id="s2-12-2-document-ai-ocr-ocr-free-models-and-structured-extraction">12.2 Document AI: OCR, OCR-Free Models and Structured Extraction</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">An invoice is a form full of facts printed as pixels. Document AI is the clerk who reads the invoice and types the facts into your database. A careless clerk makes typing errors, so a good company also has a checker who adds up the lines and compares with the total. In AI, the checker is plain code.</div></div>
+<p><strong>Two routes to read a page.</strong></p>
+<ol><li><strong>OCR first, then language model.</strong> An OCR engine (Tesseract, EasyOCR, PaddleOCR and TrOCR are common names, not run here) turns pixels into text with positions. Then a text LLM extracts fields from that text. Good when you need the exact characters and positions, cheap, easy to debug. Weak on complex layouts, tables and handwriting.</li><li><strong>OCR-free (end-to-end) document understanding.</strong> A VLM or a dedicated document model looks at the page image and answers directly, with no separate OCR step. It understands layout (a table cell belongs to a column header) but can hallucinate, and you cannot easily see where a digit came from.</li></ol>
+<p>In real systems people often combine both: OCR gives the text, the VLM sees the image, and a validator decides if the two agree. Remember Chapter 7: parsing quality caps everything after it. The same is true here.</p>
+<p><strong>Structured extraction pattern.</strong> You already know the pattern from Chapter 4: ask for JSON that matches a schema, validate in code, and retry with the error message if validation fails. For documents add <em>business rules</em> that catch silent errors: the line items must sum to the total, dates must parse, ids must match a format.</p>
+<p><strong>Predict, run, explain.</strong> The mock model below returns a wrong answer first and a correct one on the second try. Before you run it, which checks will fail on attempt 1?</p>
+<pre class="code lang-python"><code>import json, re
+from datetime import datetime
+def fake_vlm(attempt):
+    if attempt==1:
+        return '{"invoice_no":"INV-204","date":"05/01/2025","items":[{"desc":"Cable","qty":2,"price":150.0},{"desc":"Router","qty":1,"price":2500.0}],"total":2900.0}'
+    return '{"invoice_no":"INV-204","date":"2025-01-05","items":[{"desc":"Cable","qty":2,"price":150.0},{"desc":"Router","qty":1,"price":2500.0}],"total":2800.0}'
+def validate(raw):
+    errs=[]
+    try: d=json.loads(raw)
+    except json.JSONDecodeError as e: return None,["not JSON: "+str(e)]
+    if not re.fullmatch(r"INV-\d+",str(d.get("invoice_no",""))): errs.append("bad invoice_no")
+    try: datetime.strptime(d.get("date",""),"%Y-%m-%d")
+    except ValueError: errs.append("date must be YYYY-MM-DD, got %r"%d.get("date"))
+    calc=sum(i["qty"]*i["price"] for i in d.get("items",[]))
+    if abs(calc-d.get("total",-1))&gt;0.01: errs.append("total %s != sum of items %s"%(d.get("total"),calc))
+    return d,errs
+for attempt in (1,2):
+    d,errs=validate(fake_vlm(attempt)); print("attempt",attempt,"errors:",errs)
+    if not errs: print("accepted:",d["invoice_no"],d["date"],d["total"]); break</code></pre>
+<pre class="code lang-text"><code>attempt 1 errors: ["date must be YYYY-MM-DD, got '05/01/2025'", 'total 2900.0 != sum of items 2800.0']
+attempt 2 errors: []
+accepted: INV-204 2025-01-05 2800.0</code></pre>
+<p>Line by line: <code>json.loads</code> fails on broken JSON; we return that as an error the model can read. The id check uses <code>fullmatch</code>, so <code>INV-204x</code> would fail. <code>strptime</code> with <code>%Y-%m-%d</code> refuses <code>05/01/2025</code> (which is also ambiguous: 5 January or 1 May?). The business rule <code>sum(qty × price)</code> gives 2 × 150 + 2500 = 2,800, so the total 2,900 on attempt 1 is wrong by 100. In production you would send the error list back to the model for attempt 2, with a limit of two or three tries and then route to a human.</p>
+<p><strong>Real-world mapping</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Check</th><th>Example</th><th>What it catches</th></tr></thead><tbody><tr><td>Schema / type</td><td>qty is a number</td><td>Missing fields, text where a number belongs</td></tr><tr><td>Format</td><td>date as <code>YYYY-MM-DD</code></td><td>Ambiguous dates</td></tr><tr><td>Arithmetic</td><td>lines sum to total</td><td>Misread digits</td></tr><tr><td>Lookup</td><td>vendor exists in master list</td><td>Hallucinated names</td></tr><tr><td>Confidence routing</td><td>low score goes to a human</td><td>Rare hard pages</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 12.2.1</span> An invoice has three lines: 4 × 125.50, 2 × 99.00, 1 × 310.25. The model says total = 1,011.25. Is it consistent?</p>
+<table class="steps"><tr><th>Formula</th><td>expected total = Σ (qty × price)</td></tr><tr><th>Plug in</th><td>4 × 125.50 + 2 × 99.00 + 1 × 310.25</td></tr><tr><th>Compute</th><td>502.00 + 198.00 + 310.25 = 1,010.25</td></tr><tr><th>Answer</th><td>The expected total is 1,010.25, but the model said 1,011.25, so the document fails the arithmetic check by exactly 1.00 (likely a misread digit).</td></tr><tr><th>Check</th><td>502 + 198 = 700; 700 + 310.25 = 1,010.25.</td></tr><tr><th>Why it matters</th><td>A one-rupee error multiplied by 100,000 invoices is a real audit problem; the check costs nothing.</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.2.2</span> You process 20,000 pages a month. Automatic checks pass 90% of pages. A human needs 3 minutes for each failed page. What is the monthly human time, and what happens if the pass rate improves to 95%?</p>
+<table class="steps"><tr><th>Formula</th><td>human minutes = pages × (1 − pass rate) × minutes per page</td></tr><tr><th>Plug in</th><td>20,000 × 0.10 × 3, then 20,000 × 0.05 × 3</td></tr><tr><th>Compute</th><td>2,000 failed pages × 3 = 6,000 minutes = 100 hours; at 95%: 1,000 × 3 = 3,000 minutes = 50 hours</td></tr><tr><th>Answer</th><td>100 hours a month now, 50 hours after the improvement: half the human work.</td></tr><tr><th>Check</th><td>Going from 10% to 5% failures halves the failures, so it halves the time.</td></tr><tr><th>Why it matters</th><td>This is how you justify the project: measure the pass rate, not the demo.</td></tr></table>
+<p><strong>Tables, charts and handwriting.</strong> Tables are the hardest part. Plain OCR text loses the grid. Better options are layout-aware parsers or a VLM that outputs the table as Markdown or CSV, followed by checks (row counts, column totals). Handwriting and low-quality scans need a stronger OCR or a human step. Always keep the original image and the extracted values together so a reviewer can compare them.</p>
+<p><strong>Connection to the real job.</strong> Invoice and receipt processing, KYC (know-your-customer) forms, insurance claims, bank statements, sales-report PDFs. In RAG (Chapter 7) the same extraction feeds the ingestion step. Mind privacy: scanned IDs and bank statements contain personal data, so apply the PII rules of Chapter 9 and India's DPDP Act thinking before sending them to any external API.</p>
+<p><strong>Applications</strong></p>
+<ul><li><em>Finance operations:</em> invoice capture with three-way match against purchase orders.</li><li><em>Data Engineering:</em> turning PDF reports into tables for analytics.</li><li><em>Compliance:</em> extracting clauses from contracts, with a lawyer reviewing.</li><li><em>Retail and finance:</em> parsing old sales-report PDFs into a table of week, category, revenue and returns.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Measuring only "did it return valid JSON". Valid JSON can hold wrong numbers. Measure field-level accuracy against a labelled sample of real pages, and add business-rule checks.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Name one advantage and one risk of OCR-free document models.</li></ol>
+<p>Answer: They understand layout; they can hallucinate and are harder to debug.</p>
+<ol><li>Why check that lines sum to the total?</li></ol>
+<p>Answer: It catches misread digits without needing a human.</p>
+<ol><li>What should happen after two failed retries?</li></ol>
+<p>Answer: Send the page to a human reviewer.</p>
+<h2 id="s3-12-3-speech-asr-tts-diarization-and-word-error-rate">12.3 Speech: ASR, TTS, Diarization and Word Error Rate</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A call-centre recording is a long audio file. Speech recognition is a very fast typist who listens and types. You grade the typist by comparing the typed text with a correct transcript and counting mistakes. That score is Word Error Rate.</div></div>
+<p><strong>How it works.</strong> <em>ASR</em> models such as Whisper (open weights, available through Hugging Face and local tools; not run here) take audio, usually cut into short windows, and output text, often with timestamps and language detection. <em>TTS</em> does the reverse: text in, audio out; check the licence and consent rules before cloning any voice. <em>Diarization</em> labels each segment with a speaker, so a transcript reads "Agent: ... Customer: ...". Typical pipeline for call analytics: audio, ASR, diarization, redact personal data (Chapter 9), then an LLM summarises or classifies. For Indian languages and code-mixed speech (Hinglish), accuracy varies; always test on your own audio, and look at AI4Bharat resources (Chapter 1).</p>
+<p><strong>Word Error Rate (WER).</strong> Count the minimum number of word edits (substitutions S, deletions D, insertions I) needed to turn the hypothesis (what the ASR said) into the reference (the correct text). Then divide by the number of reference words N.</p>
+<pre class="code lang-text"><code>WER = (S + D + I) / N</code></pre>
+<p>The minimum number of edits is the <em>edit distance</em>, found by a small table calculation (dynamic programming).</p>
+<pre class="code lang-python"><code>def wer(ref,hyp):
+    r,h=ref.split(),hyp.split()
+    d=[[0]*(len(h)+1) for _ in range(len(r)+1)]
+    for i in range(len(r)+1): d[i][0]=i
+    for j in range(len(h)+1): d[0][j]=j
+    for i in range(1,len(r)+1):
+        for j in range(1,len(h)+1):
+            c=0 if r[i-1]==h[j-1] else 1
+            d[i][j]=min(d[i-1][j]+1,d[i][j-1]+1,d[i-1][j-1]+c)
+    return d[-1][-1],len(r),d[-1][-1]/len(r)
+print(wer("the server restarted at nine pm","the server restart at nine"))
+print(wer("refund within thirty days","refund within thirty days"))
+print(wer("pay five thousand rupees","pay fifty thousand rupees now"))</code></pre>
+<pre class="code lang-text"><code>(2, 6, 0.3333333333333333)
+(0, 4, 0.0)
+(2, 4, 0.5)</code></pre>
+<p>Line by line: <code>d[i][j]</code> is the least edits to match the first <code>i</code> reference words with the first <code>j</code> hypothesis words. The three <code>min</code> options are delete a word, insert a word, or match or substitute. The last cell is the answer.</p>
+<p class="problem"><span class="pl">Problem 12.3.1</span> Reference: "the server restarted at nine pm" (6 words). Hypothesis: "the server restart at nine". Find the WER.</p>
+<table class="steps"><tr><th>Formula</th><td>WER = (S + D + I) / N</td></tr><tr><th>Plug in</th><td>compare word by word: restarted to restart is 1 substitution; "pm" is missing, 1 deletion; S = 1, D = 1, I = 0, N = 6</td></tr><tr><th>Compute</th><td>(1 + 1 + 0) / 6 = 0.333</td></tr><tr><th>Answer</th><td>WER is 33%: about one word in three needs fixing.</td></tr><tr><th>Check</th><td>The code printed (2, 6, 0.333).</td></tr><tr><th>Why it matters</th><td>The substitution "restarted" to "restart" changes tense, harmless here; the deleted "pm" could change the meaning of a time. WER treats all errors alike, so also inspect the important words.</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.3.2</span> Reference "pay five thousand rupees" (4 words). Hypothesis "pay fifty thousand rupees now". What is the WER, and why is it a serious error for a bank?</p>
+<table class="steps"><tr><th>Step 1</th><td>"five" to "fifty" is 1 substitution; "now" is 1 insertion; S = 1, D = 0, I = 1, N = 4.</td></tr><tr><th>Step 2</th><td>WER = (1 + 0 + 1) / 4 = 0.5.</td></tr><tr><th>Answer</th><td>WER is 50%, and the single substituted word changes the amount tenfold.</td></tr><tr><th>Check</th><td>The code printed (2, 4, 0.5).</td></tr><tr><th>Why it matters</th><td>Add a rule: read numbers back to the customer, or confirm amounts by a second channel.</td></tr></table>
+<p>WER can exceed 100% when the hypothesis has many insertions. It also depends on how you normalise text (case, punctuation, numbers as digits or words), so fix the normalisation before comparing systems.</p>
+<p><strong>Connection to the real job.</strong> Voice bots, meeting summaries, call QA, accessibility captions. Latency matters: streaming ASR gives partial text while someone is speaking; batch ASR is cheaper. Measure real-time factor (processing time divided by audio duration), the speech version of throughput: how many orders a kitchen finishes per hour.</p>
+<p><strong>Applications</strong></p>
+<ul><li><em>Customer support:</em> transcribe and score calls for quality.</li><li><em>Healthcare and legal:</em> dictation, with human review.</li><li><em>Education:</em> lecture captions in regional languages.</li><li><em>Voice assistants:</em> ASR, then LLM, then TTS, with a latency budget for each hop (Chapter 13).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reporting one overall WER from clean studio audio. Real calls have noise, accents and crosstalk. Build a test set from your own audio, report WER per condition (quiet, noisy, accent) and per important word class (numbers, names).</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Define WER.</li></ol>
+<p>Answer: (substitutions + deletions + insertions) divided by the number of reference words.</p>
+<ol><li>Can WER be above 100%?</li></ol>
+<p>Answer: Yes, if there are many insertions.</p>
+<ol><li>What does diarization add?</li></ol>
+<p>Answer: Speaker labels for each segment.</p>
+<h2 id="s4-12-4-text-to-sql-building-an-analytics-assistant">12.4 Text-to-SQL: Building an Analytics Assistant</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Picture a junior analyst who writes SQL very fast and very confidently, but sometimes uses the wrong table, and once in a while writes <code>DELETE</code>. You would never give that person the keys to production. You give them a read-only login, a list of tables they may see, a limit on rows, and you check their work against known answers. That is a text-to-SQL assistant.</div></div>
+<p><strong>How it works.</strong> The pipeline has six steps:</p>
+<ol><li>Receive the question ("total amount per customer").</li><li>Give the model the schema: table names, column names and types, a few sample rows, and short business rules ("amount is in rupees"). Chapter 4 on context engineering applies: include only the relevant tables.</li><li>Model writes one SQL query (ask for SQL only, one statement).</li><li><strong>Guard it</strong> (below).</li><li>Run the query on a read-only connection.</li><li>Return the rows, and optionally let the model explain them in words, with the SQL shown for transparency.</li></ol>
+<p><strong>Defence in layers.</strong> Do not trust any single check. In order:</p>
+<ul><li><strong>Prompt:</strong> "Only write SELECT statements." This helps but is not security; models can be tricked (Chapter 9, prompt injection).</li><li><strong>Code guard:</strong> accept only one statement, only <code>SELECT</code>, no forbidden keywords, add a <code>LIMIT</code>.</li><li><strong>Database permissions:</strong> the connection itself is read-only, and ideally limited to a few tables or views. This is the layer that really protects you.</li><li><strong>Resource limits:</strong> query timeout and row limit, so one bad <code>JOIN</code> cannot freeze the server.</li><li><strong>Audit log:</strong> store question, SQL, user and row count.</li></ul>
+<p><strong>Predict, run, explain.</strong> The model is mocked: <code>fake_text2sql</code> returns canned SQL for four questions. Before you run it, which of the four will be rejected, and which will fail inside the database?</p>
+<pre class="code lang-python"><code>import sqlite3, re
+con=sqlite3.connect(":memory:")
+con.executescript("""
+create table orders(id integer primary key, customer text, amount real, created date);
+insert into orders values (1,'asha',120.0,'2025-01-05'),(2,'ravi',80.5,'2025-01-20'),(3,'asha',45.0,'2025-02-02'),(4,'meena',200.0,'2025-02-11');
+""")
+def fake_text2sql(q):
+    if "total" in q and "customer" in q: return "SELECT customer, SUM(amount) AS total FROM orders GROUP BY customer ORDER BY total DESC"
+    if "delete" in q: return "DELETE FROM orders"
+    if "salary" in q: return "SELECT salary FROM employees"
+    return "SELECT COUNT(*) FROM orders"
+FORBIDDEN=re.compile(r"\b(insert|update|delete|drop|alter|create|attach|pragma|replace)\b",re.I)
+def guard(sql):
+    s=sql.strip().rstrip(";")
+    if ";" in s: raise ValueError("multiple statements")
+    if not re.match(r"(?i)select\b",s): raise ValueError("only SELECT allowed")
+    if FORBIDDEN.search(s): raise ValueError("forbidden keyword")
+    return s+" LIMIT 100" if "limit" not in s.lower() else s
+def ask(q):
+    sql=fake_text2sql(q); print("Q:",q,"\n SQL:",sql)
+    try:
+        g=guard(sql); rows=con.execute(g).fetchall(); print(" rows:",rows)
+    except Exception as e: print(" REJECTED/ERROR:",type(e).__name__,e)
+ask("total amount per customer"); ask("please delete everything"); ask("average salary"); ask("how many orders")</code></pre>
+<pre class="code lang-text"><code>Q: total amount per customer 
+ SQL: SELECT customer, SUM(amount) AS total FROM orders GROUP BY customer ORDER BY total DESC
+ rows: [('meena', 200.0), ('asha', 165.0), ('ravi', 80.5)]
+Q: please delete everything 
+ SQL: DELETE FROM orders
+ REJECTED/ERROR: ValueError only SELECT allowed
+Q: average salary 
+ SQL: SELECT salary FROM employees
+ REJECTED/ERROR: OperationalError no such table: employees
+Q: how many orders 
+ SQL: SELECT COUNT(*) FROM orders
+ rows: [(4,)]</code></pre>
+<p>Line by line: the guard strips a trailing semicolon, then refuses any other semicolon (stops <code>SELECT ...; DROP TABLE ...</code>), requires the text to start with <code>select</code>, scans for forbidden words, and appends <code>LIMIT 100</code>. The delete question is stopped by our code. The salary question passes the guard (it is a SELECT), so the <em>database</em> rejects it because the table does not exist: that is why you also need database-level protection. The first result is the sum per customer: asha 120 + 45 = 165, ravi 80.5, meena 200.</p>
+<p><strong>The layer that really protects you: database permissions.</strong> Keyword filters can be bypassed; for example a table or column might be named <code>update_time</code>, which a naive filter would block by mistake, while a clever comment or odd spelling might sneak something through. Use the database's own controls. SQLite supports a read-only connection and an <em>authorizer</em> callback that lets you allow or deny each action, including reading individual tables. In server databases (PostgreSQL, MySQL and others) you create a read-only user with <code>GRANT SELECT</code> on a few tables or views only.</p>
+<pre class="code lang-python"><code># read-only connection (needs a file database; ':memory:' cannot be reopened read-only)
+ro=sqlite3.connect(f"file:{path}?mode=ro",uri=True)
+ro.execute("insert into t values (1)")</code></pre>
+<pre class="code lang-text"><code>read-only db: attempt to write a readonly database</code></pre>
+<p>(From our run of a small temporary file database.) Now the authorizer, with a second table <code>staff</code> that holds salaries and must stay hidden:</p>
+<pre class="code lang-python"><code>ALLOWED={"orders"}
+def auth(action,a1,a2,dbname,src):
+    if action==sqlite3.SQLITE_SELECT: return sqlite3.SQLITE_OK
+    if action==sqlite3.SQLITE_READ: return sqlite3.SQLITE_OK if a1 in ALLOWED else sqlite3.SQLITE_DENY
+    if action==sqlite3.SQLITE_FUNCTION: return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+con.set_authorizer(auth)</code></pre>
+<pre class="code lang-text"><code>SELECT SUM(amount) FROM orders -&gt; [(445.5,)]
+SELECT salary FROM staff -&gt; BLOCKED: DatabaseError access to staff.salary is prohibited
+DELETE FROM orders -&gt; BLOCKED: DatabaseError not authorized
+SELECT * FROM orders WHERE 1=1; DROP TABLE orders -&gt; BLOCKED: ProgrammingError You can only execute one statement at a time.</code></pre>
+<p>Read it: the authorizer is called for every action SQLite is about to take. We allow SELECT, reading columns of <code>orders</code>, and function calls such as <code>SUM</code>; everything else is denied. The <code>staff</code> table is invisible, the delete is refused, and Python's <code>execute</code> itself refuses two statements at once. The sum 120 + 80.5 + 45 + 200 = 445.5 is correct.</p>
+<p class="problem"><span class="pl">Problem 12.4.1</span> The guard receives <code>SELECT * FROM orders;</code> What does it return? And for <code>SELECT * FROM orders LIMIT 5</code>?</p>
+<table class="steps"><tr><th>Step 1</th><td>First query: <code>rstrip(";")</code> gives <code>SELECT * FROM orders</code>; no other <code>;</code>; starts with select; no forbidden word; no "limit", so append.</td></tr><tr><th>Step 2</th><td>Second query: it contains "limit", so it is returned unchanged.</td></tr><tr><th>Answer</th><td><code>SELECT * FROM orders LIMIT 100</code>, and <code>SELECT * FROM orders LIMIT 5</code>.</td></tr><tr><th>Check</th><td>Run <code>guard</code> on both strings and compare.</td></tr><tr><th>Why it matters</th><td>A forced row limit protects memory and cost when the question is vague ("show me everything").</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.4.2</span> Is <code>SELECT update_time FROM jobs</code> allowed by our guard? What is the lesson?</p>
+<table class="steps"><tr><th>Step 1</th><td>The regex <code>\b(update)\b</code> needs a word boundary after "update". In <code>update_time</code>, the next character <code>_</code> counts as a word character, so there is no boundary.</td></tr><tr><th>Step 2</th><td>So the keyword does not match and the query passes. (A filter written without <code>\b</code> would wrongly block it.)</td></tr><tr><th>Answer</th><td>It is allowed. Keyword filters are fragile in both directions, which is why database permissions are the real defence.</td></tr><tr><th>Check</th><td><code>re.search(r"\b(update)\b","update_time")</code> returns <code>None</code>.</td></tr><tr><th>Why it matters</th><td>Never let a regex be your only security layer.</td></tr></table>
+<p><strong>Evaluating text-to-SQL.</strong> Do not judge by whether the SQL "looks right". Use <em>execution accuracy</em>: run the model SQL and a trusted gold SQL on a test database and compare the result sets (sorted, because row order does not matter without <code>ORDER BY</code>). Use test data that exposes differences, and use several test databases. Here is a trap that fooled us:</p>
+<pre class="code lang-text"><code>orders in feb          gold: created &gt;= '2025-02-01'   model: created &gt; '2025-02-01'
+on the demo data   -&gt; both return 2: "match"</code></pre>
+<p>The demo data had no order exactly on 1 February, so the wrong operator matched by luck. We repeated the test on a small database with one order dated <code>2025-02-01</code>:</p>
+<pre class="code lang-text"><code>before: [(1,)] [(1,)]
+after:  [(2,)] [(1,)]</code></pre>
+<p>After inserting the boundary order, gold returns 2 and the model query returns 1, so the mismatch appears. Lesson: add edge cases (boundaries, nulls, duplicates, empty results) to the test database. On the demo data our three questions scored 3 of 3 (execution accuracy 100%), which overstates quality; with the boundary row it would be 2 of 3.</p>
+<p><strong>Making it better.</strong> Provide only relevant tables (use retrieval over table descriptions when you have hundreds), column descriptions and example queries (few-shot, Chapter 4), definitions of business terms ("active customer = ordered in last 90 days") in a small <em>semantic layer</em>, and a repair loop that sends the database error back to the model (limit 2 retries). Constrained decoding (a grammar that allows only valid SQL) is an advanced option. For a real project, check that your database supports the permission features above.</p>
+<p><strong>Connection to the real job.</strong> Business teams want self-service analytics. The assistant lets them ask without waiting for an analyst, and your guardrails make it safe. It combines everything: context engineering (Chapter 4), tool use (Chapter 11), evaluation (Chapter 8), guardrails (Chapter 9) and tracing (Chapter 13).</p>
+<p><strong>Applications</strong></p>
+<ul><li><em>Data Analytics:</em> natural-language questions over sales, HR or support data.</li><li><em>Data Engineering:</em> a documented semantic layer that makes both humans and models more accurate.</li><li><em>Retail analytics:</em> "show average order value per category for the last three weeks" over a sales database.</li><li><em>Security:</em> read-only roles, row-level security and audit logs for AI access.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Giving the assistant a database user with write access "because the prompt says SELECT only". A prompt is a request, not a lock. Use a read-only role on a replica or limited views, plus a statement timeout.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which layer is the strongest protection: prompt, regex guard or database role?</li></ol>
+<p>Answer: The database role (permissions).</p>
+<ol><li>Why compare result sets instead of SQL text?</li></ol>
+<p>Answer: Different SQL can give the same correct result, and similar-looking SQL can give a wrong one.</p>
+<ol><li>Why add edge cases to the test database?</li></ol>
+<p>Answer: Wrong logic can match by luck on easy data (like the boundary date).</p>
+<h2 id="s5-12-5-copilots-and-analytics-assistants-putting-the-pieces-together">12.5 Copilots and Analytics Assistants: Putting the Pieces Together</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A copilot is a helper sitting next to the user's work: it sees the document, the table or the screen, and offers answers and drafts. A good copilot knows what it is allowed to touch and says clearly when it does not know.</div></div>
+<p><strong>The common shape.</strong> Every assistant in this chapter is the same machine with different inputs:</p>
+<pre class="code lang-text"><code>input (image, PDF, audio, question)
+   -&gt; convert to text or structure (OCR / ASR / VLM / schema)
+   -&gt; model call with a clear task and examples
+   -&gt; VALIDATE (schema, arithmetic, SQL guard, citations)
+   -&gt; act or answer, with the evidence shown
+   -&gt; log everything (Chapter 13)</code></pre>
+<div class="tablewrap"><table class="data"><thead><tr><th>Application</th><th>Input</th><th>Model step</th><th>Validation</th></tr></thead><tbody><tr><td>Invoice capture</td><td>scanned PDF</td><td>VLM or OCR then LLM</td><td>total equals sum of lines</td></tr><tr><td>Call QA</td><td>audio</td><td>ASR, then LLM scoring</td><td>WER on a test set; PII redaction</td></tr><tr><td>Support copilot</td><td>ticket plus knowledge base</td><td>RAG (Chapter 7)</td><td>citations checked</td></tr><tr><td>Analytics assistant</td><td>English question</td><td>text-to-SQL</td><td>read-only role, execution accuracy</td></tr><tr><td>Code assistant</td><td>repository context</td><td>LLM with tools (Chapter 11)</td><td>tests must pass</td></tr><tr><td>Image search</td><td>text query</td><td>CLIP-style embeddings</td><td>recall@k on labelled pairs</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 12.5.1</span> A support copilot handles 10,000 tickets a month. Each has 1,200 input tokens and 250 output tokens, plus an image of about 800 tokens in 20% of tickets. Using the made-up prices from Chapter 5 (1.00 per million input, 4.00 per million output), what is the monthly cost?</p>
+<table class="steps"><tr><th>Formula</th><td>cost = (total input tokens × 1.00 + total output tokens × 4.00) / 10⁶</td></tr><tr><th>Plug in</th><td>input per ticket = 1,200 + 0.20 × 800 = 1,360 on average; output 250</td></tr><tr><th>Compute</th><td>input total = 10,000 × 1,360 = 13,600,000; output total = 10,000 × 250 = 2,500,000; cost = (13,600,000 × 1 + 2,500,000 × 4) / 10⁶ = (13,600,000 + 10,000,000) / 10⁶ = 23.6</td></tr><tr><th>Answer</th><td>About 23.6 currency units a month at these made-up prices.</td></tr><tr><th>Check</th><td>Input share = 13.6 of 23.6 (58%): even with images, outputs are 42% of cost from only 2.5 million tokens.</td></tr><tr><th>Why it matters</th><td>Real prices differ by provider and change often: look up the current price page before any estimate (Chapter 13 shows a full cost model).</td></tr></table>
+<div class="callout blue"><div class="lab">PROFESSOR'S NOTE</div><div class="txt">Responsible use matters more with media. Do not run face recognition on people without consent and legal basis. Do not scrape images or audio that you have no right to use. Check licence terms for models and datasets, and for voice cloning get written consent.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is the common shape of all these assistants?</li></ol>
+<p>Answer: Convert input to text or structure, call the model, validate, act with evidence, log.</p>
+<ol><li>Where does validation sit?</li></ol>
+<p>Answer: Between the model output and any action or answer.</p>
+<ol><li>Why show the SQL or the source image to the user?</li></ol>
+<p>Answer: So a human can verify the evidence.</p>
+<h2 id="s6-chapter-recap">Chapter recap</h2>
+<ul><li>Multimodal models turn images into patches (tiles), which become tokens; more resolution means more tokens and cost.</li><li>CLIP puts images and text in one vector space, giving zero-shot classification and image search by cosine similarity.</li><li>Document AI: OCR gives exact characters, OCR-free models understand layout; combine them and validate.</li><li>Extraction needs a schema plus business rules (dates, ids, lines sum to total), a retry with the error message, then a human fallback.</li><li>Measure by field-level accuracy and automatic pass rate on real pages, not by demos.</li><li>ASR is graded by WER = (S + D + I) / N; test on your own noisy, accented audio and watch numbers and names.</li><li>Text-to-SQL needs layered defence: prompt, code guard, read-only and table-limited database role, row and time limits, audit log.</li><li>Evaluate SQL by execution accuracy on test data with edge cases; wrong SQL can match by luck.</li><li>Every media assistant: convert, call, validate, act with evidence, log. Respect consent, privacy and licences.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Rule or code</th></tr></thead><tbody><tr><td>Patch count</td><td><code>ceil(h/p) × ceil(w/p)</code></td></tr><tr><td>Zero-shot image label</td><td>argmax of cosine(image, label text)</td></tr><tr><td>Invoice check</td><td><code>abs(sum(qty × price) − total) ≤ 0.01</code></td></tr><tr><td>Word error rate</td><td><code>(S + D + I) / N</code></td></tr><tr><td>Read-only SQLite</td><td><code>sqlite3.connect("file:db?mode=ro", uri=True)</code></td></tr><tr><td>Table allowlist</td><td><code>con.set_authorizer(callback)</code></td></tr><tr><td>Execution accuracy</td><td>compare sorted result sets of model and gold SQL</td></tr></tbody></table></div>
+<h2 id="s7-practice-set">Practice set</h2>
+<p><strong>1.</strong> (Easy) How many 16-pixel patches in a 160 by 96 image?</p>
+<p><strong>Answer:</strong> ceil(96/16) × ceil(160/16) = 6 × 10 = 60.</p>
+<p><strong>2.</strong> (Easy) Compute the WER: reference "restart the server now" (4 words), hypothesis "restart the server". Edits?</p>
+<p><strong>Answer:</strong> One deletion ("now"), so WER = 1/4 = 0.25.</p>
+<p><strong>3.</strong> (Easy) Why does a prompt saying "only SELECT" not secure a database?</p>
+<p><strong>Answer:</strong> A prompt is only a request; a model can be tricked or make mistakes. Permissions in the database enforce the rule.</p>
+<p><strong>4.</strong> (Medium) An invoice has lines 3 × 40.00 and 5 × 12.50 and the stated total is 182.50. Is it consistent?</p>
+<p><strong>Answer:</strong> 120 + 62.5 = 182.5, so yes, it is consistent.</p>
+<p><strong>5.</strong> (Medium) What is the output? <code>re.search(r"\b(drop)\b","drop table x") is not None</code></p>
+<p><strong>Answer:</strong> <code>True</code>: "drop" is a whole word at the start of the string.</p>
+<p><strong>6.</strong> (Medium, find the bug) Our guard does <code>if not re.match(r"(?i)select\b", s)</code>. A model returns <code>WITH t AS (SELECT * FROM orders) SELECT * FROM t</code>. What happens, and is that a problem?</p>
+<p><strong>Answer:</strong> It is rejected because it starts with <code>WITH</code>. It is safe but too strict; if you want to allow common table expressions, accept <code>with</code> too and rely on the read-only role and authorizer as the real protection.</p>
+<p><strong>7.</strong> (Medium) A page pipeline passes 92% of 50,000 pages automatically. A reviewer needs 2 minutes per failed page. How many hours of review a month?</p>
+<p><strong>Answer:</strong> Failures = 0.08 × 50,000 = 4,000; minutes = 8,000; hours = 8,000 / 60 = 133.3.</p>
+<p><strong>8.</strong> (Hard) Your text-to-SQL test passes 20 of 20 questions on the demo database. Why might real accuracy be lower, and what do you do?</p>
+<p><strong>Answer:</strong> Demo data may lack edge cases (boundaries, nulls, duplicates, empty results), so wrong SQL matches by luck, as the <code>&gt;</code> versus <code>&gt;=</code> example showed. Add edge-case rows, use several test databases and more questions written by real users.</p>
+<p><strong>9.</strong> (Hard) Design the checks for a bank's voice bot that hears "pay five thousand rupees".</p>
+<p><strong>Answer:</strong> Evaluate WER on numbers specifically; read the amount back and ask for confirmation; require a second factor for money movement; log audio and transcript with consent; escalate to a human on low confidence.</p>
+<p><strong>10.</strong> (Interview) "How would you build a text-to-SQL assistant for the HR database, safely?"</p>
+<p><strong>Answer:</strong> Read-only role on a replica, limited to approved views with salary and personal columns masked; schema and business definitions in the prompt with only relevant tables; code guard for single SELECT statements with limits and timeout; execution-accuracy test set with edge cases; audit log; show the SQL to the user; block sensitive questions by policy; monitor and review failures weekly.</p>
+<p><strong>11.</strong> (Interview) "OCR plus LLM, or a VLM straight on the page image?"</p>
+<p><strong>Answer:</strong> Neither is always better. OCR plus LLM gives exact characters and easy debugging but weak layout understanding; a VLM understands layout but may hallucinate digits. Test both on a labelled sample of your own pages, measure field-level accuracy and cost, and consider combining them with validation rules.</p>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: multimodal models and document AI: image patches and vision-language models, OCR versus OCR-free extraction, speech recognition with word error rate, and text-to-SQL assistants with guardrails. Explain this topic step by step from first principles using an everyday analogy, then a worked example with real numbers. After each step, ask me one question to check I understood before continuing.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: multimodal models and document AI: image patches and vision-language models, OCR versus OCR-free extraction, speech recognition with word error rate, and text-to-SQL assistants with guardrails. Give me 8 graded exercises on this topic, from easy to hard, with small numbers: patch counts, WER, invoice validation and SQL guard behaviour. Do NOT give solutions until I reply with my answers; then mark them and explain my mistakes.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: multimodal models and document AI: image patches and vision-language models, OCR versus OCR-free extraction, speech recognition with word error rate, and text-to-SQL assistants with guardrails. Quiz me one question at a time, about 12 questions in total. Wait for my answer, say whether it is right, explain briefly, and adapt the difficulty to my answers. At the end summarise my weak points.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: text-to-SQL guardrails and document extraction validation. Review my work. I will paste my guard function, my SQL permission setup or my extraction validator below. Check it for security holes and false rejections, explain each problem in simple words, show a corrected version, and then give me three tricky test inputs to try.
+
+[PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: multimodal and document AI and text-to-SQL assistants. Run a mock interview for a GenAI engineer role in India. Ask 6 questions of rising difficulty, one at a time, including one system-design question about a safe analytics assistant and one 'find the bug' question about a SQL guard. After each answer give a score out of 10 and a model answer. Focus on layered security and evaluation with edge cases.</pre></div><div class="readbtn"><button class="btn" data-read="study:genai:ch12">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch11.html">← Chapter 11: AI Agents</a><a class="btn" href="ch13.html">Chapter 13: LLMOps: Observability, Caching, Routing, →</a></div></div><script src="../../assets/study.js"></script></body></html>

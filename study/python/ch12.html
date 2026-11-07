@@ -1,0 +1,683 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 12: APIs, the Web, Scraping and Command-Line Tools</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Python &amp; Software Engineering</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 12</div><h1>APIs, the Web, Scraping and Command-Line Tools</h1><p>How programs talk to other programs over HTTP, and how you build tools that other people can run.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-12-1-http-and-rest-design">12.1 HTTP and REST Design</a></li><li><a href="#s2-12-2-calling-apis-urllib-requests-and-httpx">12.2 Calling APIs: urllib, requests and httpx</a></li><li><a href="#s3-12-3-building-apis-fastapi-and-flask-basics">12.3 Building APIs: FastAPI and Flask Basics</a></li><li><a href="#s4-12-4-pagination-idempotency-versioning-openapi-and-graphql">12.4 Pagination, Idempotency, Versioning, OpenAPI and GraphQL</a></li><li><a href="#s5-12-5-authentication-and-authorization-basics">12.5 Authentication and Authorization Basics</a></li><li><a href="#s6-12-6-scraping-responsibly">12.6 Scraping Responsibly</a></li><li><a href="#s7-12-7-command-line-tools-argparse-typer-and-subprocess">12.7 Command-Line Tools: argparse, typer and subprocess</a></li><li><a href="#s8-chapter-recap">Chapter recap</a></li><li><a href="#s9-practice-set">Practice set</a></li><li><a href="#s10-prompt-pack">Prompt pack</a></li></ol></details><p>Imagine your manager says: "Pull yesterday's orders from the partner's system, score them with our model, and run it every night." To do that you must call a web service, understand its replies, handle failures, build a small service of your own, and wrap it all in a command you can schedule. By the end of this chapter you will be able to read and design a REST API, call it safely from Python, protect it with tokens, scrape a page politely, and package your work as a command-line tool. You have seen HTTP from the outside: every time you open a web page, your browser sends a request and waits for a reply. Now you will learn the inside.</p>
+<p><em>Words you need.</em> <strong>API</strong> (Application Programming Interface) is a doorway that lets one program use another program. <strong>HTTP</strong> is the language web programs use to talk. <strong>JSON</strong> is a plain-text format for data that looks like Python dicts and lists. <strong>Client</strong> is the program that asks. <strong>Server</strong> is the program that answers.</p>
+<p>In this chapter, everything marked "run" was executed with Python 3.14 and only the standard library. Third-party libraries (<code>requests</code>, <code>httpx</code>, <code>FastAPI</code>, <code>Flask</code>, <code>typer</code>, <code>BeautifulSoup</code>, <code>Scrapy</code>, <code>Selenium</code>, <code>Playwright</code>) were <strong>not run here</strong> because this study machine had no network access to install them. Their code is short, standard and minimal. Check each library's current docs for version changes.</p>
+<h2 id="s1-12-1-http-and-rest-design">12.1 HTTP and REST Design</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">HTTP is a postal system with strict forms. You write a request on a form (method, address, headers, body), post it, and get back a reply form (status code, headers, body). REST is a set of habits for filling these forms in a predictable way, so that a stranger can guess how your service works. Every call a program makes to a web service is exactly one such form, like one order slip handed to a shop counter.</div></div>
+<h3>How it works</h3>
+<p>An HTTP request has four parts:</p>
+<ul><li><strong>Method</strong>: what you want to do. <code>GET</code> reads, <code>POST</code> creates, <code>PUT</code> replaces, <code>PATCH</code> changes part, <code>DELETE</code> removes.</li><li><strong>URL</strong>: the address, such as <code>/v1/items/2?limit=3</code>. The part after <code>?</code> is the <strong>query string</strong>.</li><li><strong>Headers</strong>: small labels, such as <code>Content-Type: application/json</code> or <code>Authorization: ...</code>.</li><li><strong>Body</strong>: the data (usually JSON) for <code>POST</code>, <code>PUT</code>, <code>PATCH</code>.</li></ul>
+<p>A response has a <strong>status code</strong>, headers and a body. Status codes come in families:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Code</th><th>Name</th><th>When to use</th></tr></thead><tbody><tr><td>200</td><td>OK</td><td>Success with a body</td></tr><tr><td>201</td><td>Created</td><td>A new thing was made (add a <code>Location</code> header)</td></tr><tr><td>204</td><td>No Content</td><td>Success, nothing to return (common for DELETE)</td></tr><tr><td>400</td><td>Bad Request</td><td>The client sent nonsense</td></tr><tr><td>401</td><td>Unauthorized</td><td>Not logged in (really means "unauthenticated")</td></tr><tr><td>403</td><td>Forbidden</td><td>Logged in, but not allowed</td></tr><tr><td>404</td><td>Not Found</td><td>No such thing</td></tr><tr><td>409</td><td>Conflict</td><td>Clash with current state (duplicate)</td></tr><tr><td>422</td><td>Unprocessable</td><td>Valid JSON but wrong content</td></tr><tr><td>429</td><td>Too Many Requests</td><td>Rate limit hit</td></tr><tr><td>500</td><td>Internal Server Error</td><td>Your bug</td></tr><tr><td>503</td><td>Service Unavailable</td><td>Overloaded or down</td></tr></tbody></table></div>
+<p><strong>REST</strong> design habits:</p>
+<ol><li>Use <strong>nouns</strong> in URLs, not verbs: <code>/items</code>, not <code>/getItems</code>.</li><li>Use plural collections: <code>/items</code> (all), <code>/items/2</code> (one).</li><li>The method carries the action: <code>GET /items/2</code>, <code>DELETE /items/2</code>.</li><li>Return JSON and correct status codes.</li><li>Be <strong>stateless</strong>: each request carries everything the server needs (for example a token).</li></ol>
+<p>Two properties matter a lot. A method is <strong>safe</strong> if it does not change data (<code>GET</code>). A method is <strong>idempotent</strong> if doing it many times has the same effect as doing it once (<code>GET</code>, <code>PUT</code>, <code>DELETE</code>). <code>POST</code> is normally not idempotent. This matters for retries (see 12.4).</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 12.1.1</span> Start a tiny web server inside a Python script, call it, and read the status, header and body. Also see what a missing page looks like.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>http.server.HTTPServer</code> listens on a port. Port <code>0</code> means "pick any free port".</td></tr><tr><th>Step 2</th><td>A handler class defines <code>do_GET</code>. We send the status, headers, then the body.</td></tr><tr><th>Step 3</th><td>We run the server in a background thread and call it with <code>urllib.request</code>.</td></tr></table>
+<pre class="code lang-python"><code>import threading, json, urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/hello":
+            body = b"hello, world"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+    def log_message(self, *a): pass
+
+srv = HTTPServer(("127.0.0.1", 0), H)
+port = srv.server_address[1]
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+base = f"http://127.0.0.1:{port}"
+with urllib.request.urlopen(base + "/hello") as r:
+    print(r.status, r.reason)
+    print(r.headers["Content-Type"])
+    print(r.read().decode())
+try:
+    urllib.request.urlopen(base + "/nope")
+except urllib.error.HTTPError as e:
+    print("error:", e.code, e.reason)
+srv.shutdown()</code></pre>
+<pre class="code lang-text"><code>200 OK
+text/plain
+hello, world
+error: 404 Not Found</code></pre>
+<ul><li><strong>Answer</strong> The server replied 200 with text for <code>/hello</code>, and <code>urllib</code> raised <code>HTTPError</code> with code 404 for the unknown path. Note: <code>urllib</code> raises an exception for 4xx and 5xx codes, while <code>requests</code> does not (you call <code>raise_for_status()</code>).</li><li><strong>Check</strong> <code>404</code> is in the 4xx family ("client asked for something wrong"), and the output matches the status table above.</li><li><strong>Why it matters</strong> In a pipeline, an unhandled 404 or 503 stops the whole job. You must decide in code what each status means.</li></ul>
+<p class="problem"><span class="pl">Problem 12.1.2</span> You must design URLs for a "delivery results" service. Fix these bad designs: <code>POST /createRun</code>, <code>GET /getRunById?id=5</code>, <code>GET /deleteRun/5</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>Replace verbs with a noun collection: <code>runs</code>.</td></tr><tr><th>Step 2</th><td>Let the method express the action.</td></tr><tr><th>Step 3</th><td>Never use <code>GET</code> to delete: crawlers and browsers prefetch <code>GET</code> links.</td></tr><tr><th>Answer</th><td><code>POST /v1/runs</code> (create, return 201), <code>GET /v1/runs/5</code> (read), <code>DELETE /v1/runs/5</code> (delete, return 204).</td></tr><tr><th>Check</th><td>Every URL is now a noun and the three actions use three different methods. No verb is left in a URL.</td></tr><tr><th>Why it matters</th><td>A new teammate can guess your API without reading docs. That is the whole point of REST.</td></tr></table>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>HTTP piece</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Method</td><td><code>POST</code></td><td>The verb on the request form; <code>POST /predict</code> for a model</td></tr><tr><td>URL + query</td><td><code>/v1/items?limit=3</code></td><td>Ingestion code pages through data</td></tr><tr><td>Header</td><td><code>Authorization: Bearer ...</code></td><td>Login token in every pipeline call</td></tr><tr><td>Status</td><td><code>429</code></td><td>Your retry logic must slow down</td></tr><tr><td>Body</td><td><code>{"name": "widget"}</code></td><td>Data you send to create records</td></tr></tbody></table></div>
+<p><strong>Predict, Run, Explain.</strong> In Problem 12.1.1, before you run it, ask: what does <code>urlopen</code> do for the unknown path <code>/nope</code>? Many beginners expect it to return a page with status 404. The real result is an exception, shown in the output above (<code>error: 404 Not Found</code>). The typical wrong version is:</p>
+<pre class="code lang-python"><code>r = urllib.request.urlopen(base + "/nope")   # no try/except
+print(r.status)</code></pre>
+<p>It never prints a status. It stops with <code>urllib.error.HTTPError: HTTP Error 404: Not Found</code>. The fix is the <code>try/except urllib.error.HTTPError</code> you saw above. <code>urllib</code> treats 4xx and 5xx as errors; line by line: <code>urlopen</code> sends the request, sees code 404, and raises instead of returning.</p>
+<h3>The picture</h3>
+<p>Read this diagram top to bottom: the client writes the request lines, the server finds the item, and writes back a status line, headers, and the body.</p>
+<pre class="code lang-text"><code> Client                                   Server
+   |  GET /v1/items/2 HTTP/1.1              |
+   |  Host: example.com                     |
+   |  Authorization: Bearer &lt;token&gt;   ---&gt;  |
+   |                                        |  find item 2
+   |  &lt;---  HTTP/1.1 200 OK                 |
+   |        Content-Type: application/json  |
+   |        {"id": 2, "name": "item2"}      |</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>Data engineers pull data from REST APIs (CRM, payments, weather) in ingestion jobs.</li><li>ML engineers serve a model as <code>POST /predict</code>.</li><li>QA and support teams test these endpoints. Knowing 429, 503 and timeouts helps you read results.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> nightly pull of orders from a partner API, page by page.</li><li><strong>Machine Learning / MLOps:</strong> a <code>POST /predict</code> endpoint behind a load balancer.</li><li><strong>Data Analytics:</strong> refreshing a dashboard from a SaaS tool's API.</li><li><strong>Testing and QA:</strong> every automated API test script is an HTTP client.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Returning status 200 with <code>{"error": "..."}</code> in the body. Clients, monitors and automated checks look at the status code first. Use the right 4xx or 5xx code.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which of GET, POST, PUT, DELETE are idempotent? Answer: GET, PUT and DELETE. POST normally is not.</li><li>What is the difference between 401 and 403? Answer: 401 means "I do not know who you are". 403 means "I know you, but you may not do this".</li><li>Why is <code>/getItems</code> poor REST design? Answer: The verb is already in the HTTP method. The URL should name the thing: <code>/items</code>.</li></ol>
+<h2 id="s2-12-2-calling-apis-urllib-requests-and-httpx">12.2 Calling APIs: urllib, requests and httpx</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A client library is a good envelope-maker. You say what you want to send. The library handles connections, encoding, headers, and reading the answer. <code>urllib</code> is the plain envelope that comes with Python. <code>requests</code> and <code>httpx</code> are nicer ones with better handles.</div></div>
+<h3>How it works</h3>
+<p>The standard library offers <code>urllib.request</code>. It works, but it is low level. Most people install <code>requests</code> (simple, synchronous) or <code>httpx</code> (same style, plus <code>async</code> support and HTTP/2). Their calls look alike.</p>
+<p>Rules for good API clients, whichever library you use:</p>
+<ol><li><strong>Always set a timeout.</strong> Without one, a hung server hangs your program forever.</li><li><strong>Check the status.</strong> Call <code>raise_for_status()</code>.</li><li><strong>Retry only safe or idempotent calls</strong>, with growing waits (exponential backoff).</li><li><strong>Reuse a connection</strong> with a <code>Session</code> (requests) or <code>Client</code> (httpx). It is much faster for many calls.</li><li><strong>Never hardcode keys</strong> (see Chapter 13).</li></ol>
+<p>Not run here (needs install and a network):</p>
+<pre class="code lang-python"><code>import requests
+
+with requests.Session() as s:
+    s.headers["Authorization"] = "Bearer &lt;TOKEN&gt;"
+    r = s.get("https://api.example.com/v1/items", params={"limit": 3}, timeout=5)
+    r.raise_for_status()
+    items = r.json()["data"]</code></pre>
+<pre class="code lang-python"><code>import httpx
+
+with httpx.Client(timeout=5.0) as client:
+    r = client.post("https://api.example.com/v1/items", json={"name": "widget"})
+    r.raise_for_status()
+    print(r.status_code, r.json())</code></pre>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 12.2.1</span> Build a small JSON API with the standard library (list with pagination, get one, create, delete) and call it with <code>urllib</code>. Show status codes for success and failure.</p>
+<table class="steps"><tr><th>Step 1</th><td>The server keeps items in a dict. It routes by path.</td></tr><tr><th>Step 2</th><td>It returns JSON with the right codes: 200, 201 (with <code>Location</code>), 204, 400, 404, 422.</td></tr><tr><th>Step 3</th><td>A helper <code>call()</code> sends a request and returns <code>(status, json, location)</code>, catching <code>HTTPError</code>.</td></tr></table>
+<pre class="code lang-python"><code>import threading, json, urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse, parse_qs
+
+ITEMS = {i: {"id": i, "name": f"item{i}"} for i in range(1, 8)}
+NEXT = [8]
+
+class API(BaseHTTPRequestHandler):
+    def _send(self, code, obj=None, headers=None):
+        body = json.dumps(obj).encode() if obj is not None else b""
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        q = parse_qs(u.query)
+        if u.path == "/v1/items":
+            limit = int(q.get("limit", ["3"])[0])
+            offset = int(q.get("offset", ["0"])[0])
+            data = list(ITEMS.values())[offset:offset + limit]
+            nxt = offset + limit if offset + limit &lt; len(ITEMS) else None
+            return self._send(200, {"data": data, "next_offset": nxt, "total": len(ITEMS)})
+        if u.path.startswith("/v1/items/"):
+            try:
+                i = int(u.path.rsplit("/", 1)[1])
+            except ValueError:
+                return self._send(400, {"error": "id must be an integer"})
+            if i in ITEMS:
+                return self._send(200, ITEMS[i])
+            return self._send(404, {"error": "not found"})
+        self._send(404, {"error": "no such route"})
+
+    def do_POST(self):
+        if self.path != "/v1/items":
+            return self._send(404, {"error": "no such route"})
+        n = int(self.headers.get("Content-Length", 0))
+        try:
+            payload = json.loads(self.rfile.read(n))
+            name = payload["name"]
+        except (ValueError, KeyError):
+            return self._send(422, {"error": "need JSON with 'name'"})
+        i = NEXT[0]; NEXT[0] += 1
+        ITEMS[i] = {"id": i, "name": name}
+        self._send(201, ITEMS[i], {"Location": f"/v1/items/{i}"})
+
+    def do_DELETE(self):
+        i = int(self.path.rsplit("/", 1)[1])
+        ITEMS.pop(i, None)       # idempotent: same result every time
+        self._send(204)
+
+    def log_message(self, *a): pass
+
+srv = HTTPServer(("127.0.0.1", 0), API)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+base = f"http://127.0.0.1:{srv.server_address[1]}"
+
+def call(method, path, obj=None):
+    data = json.dumps(obj).encode() if obj is not None else None
+    req = urllib.request.Request(base + path, data=data, method=method,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req) as r:
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw else None), r.headers.get("Location")
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read()), None
+
+print(call("GET", "/v1/items?limit=3"))
+print(call("GET", "/v1/items?limit=3&amp;offset=6"))
+print(call("GET", "/v1/items/2"))
+print(call("GET", "/v1/items/99"))
+print(call("GET", "/v1/items/abc"))
+print(call("POST", "/v1/items", {"name": "widget"}))
+print(call("POST", "/v1/items", {"nom": "x"}))
+print(call("DELETE", "/v1/items/1"))
+print(call("DELETE", "/v1/items/1"))
+srv.shutdown()</code></pre>
+<pre class="code lang-text"><code>(200, {'data': [{'id': 1, 'name': 'item1'}, {'id': 2, 'name': 'item2'}, {'id': 3, 'name': 'item3'}], 'next_offset': 3, 'total': 7}, None)
+(200, {'data': [{'id': 7, 'name': 'item7'}], 'next_offset': None, 'total': 7}, None)
+(200, {'id': 2, 'name': 'item2'}, None)
+(404, {'error': 'not found'}, None)
+(400, {'error': 'id must be an integer'}, None)
+(201, {'id': 8, 'name': 'widget'}, '/v1/items/8')
+(422, {'error': "need JSON with 'name'"}, None)
+(204, None, None)
+(204, None, None)</code></pre>
+<ul><li><strong>Answer</strong> Each call returned the status we designed. Deleting item 1 twice returned 204 both times: DELETE is idempotent.</li><li><strong>Check</strong> <code>ITEMS</code> started with 7 items. After the POST there were 8 and after the delete 7 again, which is why the page walk in 12.4.1 finds 7 names.</li><li><strong>Why it matters</strong> Every status above is something your client code must handle: retry, skip, or fail loudly.</li></ul>
+<p><strong>Predict, Run, Explain.</strong> Before you run it, predict what <code>call("GET", "/v1/items/abc")</code> returns. The real answer was <code>(400, {'error': 'id must be an integer'}, None)</code>. Line by line: the server runs <code>int("abc")</code>, which raises <code>ValueError</code>; the <code>except</code> turns it into a 400. The typical wrong version has no <code>try/except</code> in the handler. Then the server thread crashes inside <code>int("abc")</code> with <code>ValueError: invalid literal for int() with base 10: 'abc'</code>, and the client gets a dropped connection instead of a clear 400. The fix is the <code>try/except</code> you see in <code>do_GET</code>.</p>
+<p>Two more typical wrong versions you can reproduce (real output from a test run): a server that sleeps for one second, and a client that sets <code>timeout=0.2</code>, fails with <code>TimeoutError timed out</code>, and shows why a timeout is better than waiting forever. And <code>json.loads("")</code> on a 204 reply (empty body) fails with <code>JSONDecodeError: Expecting value: line 1 column 1 (char 0)</code>. That is why <code>call()</code> checks <code>if raw</code> before parsing.</p>
+<p class="problem"><span class="pl">Problem 12.2.2</span> Write a retry helper with exponential backoff and show it on a function that fails twice and then works.</p>
+<table class="steps"><tr><th>Step 1</th><td>Wait <code>base * 2**attempt</code> seconds between tries (here tiny numbers so the demo is fast).</td></tr><tr><th>Step 2</th><td>Retry only on errors that are temporary.</td></tr><tr><th>Step 3</th><td>After the last try, raise the error.</td></tr></table>
+<pre class="code lang-python"><code>import time
+
+def retry(fn, tries=4, base=0.01, retry_on=(ConnectionError, TimeoutError)):
+    for attempt in range(tries):
+        try:
+            return fn()
+        except retry_on as e:
+            if attempt == tries - 1:
+                raise
+            wait = base * 2 ** attempt
+            print(f"attempt {attempt+1} failed ({e}); waiting {wait:.2f}s")
+            time.sleep(wait)
+
+calls = {"n": 0}
+def flaky():
+    calls["n"] += 1
+    if calls["n"] &lt; 3:
+        raise ConnectionError("server reset")
+    return "ok after %d calls" % calls["n"]
+
+print(retry(flaky))</code></pre>
+<p>Before you run it, predict: how many times is <code>flaky()</code> called, and how long is each wait? Real output:</p>
+<pre class="code lang-text"><code>attempt 1 failed (server reset); waiting 0.01s
+attempt 2 failed (server reset); waiting 0.02s
+ok after 3 calls</code></pre>
+<ul><li><strong>Answer</strong> The helper waited 0.01s, then 0.02s (doubling) and succeeded on the third call.</li><li><strong>Check</strong> Wait = base x 2^attempt: 0.01 x 2^0 = 0.01 and 0.01 x 2^1 = 0.02. <code>flaky</code> fails while n &lt; 3, so success on call 3 is correct.</li><li><strong>Why it matters</strong> Doubling the wait gives a struggling server time to recover. Retrying instantly makes an outage worse (every client piles on).</li></ul>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Client habit</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Timeout</td><td><code>timeout=5</code></td><td>Stops a nightly job from hanging forever</td></tr><tr><td>Retry with backoff</td><td>wait 0.01, 0.02, 0.04 s</td><td>Surviving a 503 from an overloaded partner</td></tr><tr><td>Session / Client</td><td>one connection for 1,000 calls</td><td>Faster ingestion, lower load on the server</td></tr><tr><td><code>raise_for_status()</code></td><td>raises on 4xx/5xx</td><td>The job fails loudly instead of loading bad data</td></tr></tbody></table></div>
+<h3>The picture</h3>
+<p>Read it left to right: your code sends through a session (with a timeout), the server answers, and the status code is checked before the data is used.</p>
+<pre class="code lang-text"><code> your code --&gt; Session (keeps connection open) --&gt; server
+      ^             |  timeout=5                       |
+      |             v                                  |
+      +--- raise_for_status() &lt;---- status code &lt;------+</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>Ingestion scripts call APIs page by page and must survive 429 and 503.</li><li>Calling a hosted LLM or model API is the same pattern: JSON in, JSON out, API key in a header.</li><li>A Python client with <code>httpx</code> is also the base of traffic-generating tools such as Locust (named only as an example).</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> ingestion with retries and pagination.</li><li><strong>GenAI:</strong> calling a hosted language-model API with a key and a timeout.</li><li><strong>MLOps:</strong> health checks and smoke tests after a deploy.</li><li><strong>Testing and QA:</strong> API test automation with Python HTTP clients.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting <code>timeout=</code>. The default in <code>requests</code> is to wait forever. A single stuck call can freeze a nightly pipeline. Always pass a timeout.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why use a <code>Session</code>? Answer: It reuses the connection and shared headers, so many calls are faster and shorter to write.</li><li>Which calls are safe to retry blindly? Answer: Idempotent ones: GET, PUT, DELETE. For POST use an idempotency key.</li><li>What does <code>raise_for_status()</code> do? Answer: It raises an exception if the status is 4xx or 5xx.</li></ol>
+<h2 id="s3-12-3-building-apis-fastapi-and-flask-basics">12.3 Building APIs: FastAPI and Flask Basics</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Writing a server by hand with <code>http.server</code> (as we did) shows how it works, but you would never ship it. A framework is a restaurant kitchen set up for you. You write the recipes (functions) and the framework handles orders, routing, validation, and docs.</div></div>
+<h3>How it works</h3>
+<p><strong>FastAPI</strong> is a modern framework. You write a function, add a <strong>decorator</strong> (Chapter 7) that says "this is <code>GET /items/{item_id}</code>", and use <strong>type hints</strong> (Chapter 9) for validation. It uses <code>pydantic</code> to check bodies, and it creates an <strong>OpenAPI</strong> page automatically at <code>/docs</code>. It runs on an ASGI server such as <code>uvicorn</code>.</p>
+<p><strong>Flask</strong> is older and smaller. It gives routes and a request object. You add validation and other pieces yourself. It is simple and still common.</p>
+<p>Not run here (needs <code>pip install fastapi uvicorn</code>):</p>
+<pre class="code lang-python"><code>from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+app = FastAPI(title="Items API")
+DB = {1: {"id": 1, "name": "pen"}}
+
+class ItemIn(BaseModel):
+    name: str
+
+@app.get("/v1/items/{item_id}")
+def get_item(item_id: int):
+    if item_id not in DB:
+        raise HTTPException(status_code=404, detail="not found")
+    return DB[item_id]
+
+@app.post("/v1/items", status_code=201)
+def create_item(item: ItemIn):
+    new_id = max(DB) + 1
+    DB[new_id] = {"id": new_id, **item.model_dump()}
+    return DB[new_id]</code></pre>
+<p>Start it with <code>uvicorn main:app --reload</code>, then open <code>http://127.0.0.1:8000/docs</code>. If you send <code>item_id=abc</code>, FastAPI answers 422 on its own because of the <code>int</code> hint.</p>
+<p>The same in Flask (not run here):</p>
+<pre class="code lang-python"><code>from flask import Flask, jsonify, request, abort
+
+app = Flask(__name__)
+DB = {1: {"id": 1, "name": "pen"}}
+
+@app.get("/v1/items/&lt;int:item_id&gt;")
+def get_item(item_id):
+    if item_id not in DB:
+        abort(404)
+    return jsonify(DB[item_id])
+
+@app.post("/v1/items")
+def create_item():
+    data = request.get_json()
+    new_id = max(DB) + 1
+    DB[new_id] = {"id": new_id, "name": data["name"]}
+    return jsonify(DB[new_id]), 201</code></pre>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 12.3.1</span> You have the FastAPI app above. What does <code>POST /v1/items</code> with body <code>{"name": 5}</code> return, and why?</p>
+<table class="steps"><tr><th>Step 1</th><td><code>ItemIn.name</code> is declared <code>str</code>.</td></tr><tr><th>Step 2</th><td>Pydantic validates the body before your function runs. In its default (lax) mode, an integer is not turned into a string.</td></tr><tr><th>Step 3</th><td>Validation fails, so FastAPI replies with a 422 error and a JSON description of the problem. (Not run here; this is the documented behaviour.)</td></tr><tr><th>Answer</th><td>A 422 response. Your function is never called. This is why type hints are worth the effort.</td></tr><tr><th>Check</th><td>The docs list 422 as FastAPI's code for validation errors, and the same <code>str</code> declaration appears in <code>ItemIn</code>.</td></tr><tr><th>Why it matters</th><td>A bad client cannot crash your handler or poison your database.</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.3.2</span> Using only the standard library, write the validation step that FastAPI does for you: accept a dict and return clean data or a list of errors.</p>
+<table class="steps"><tr><th>Step 1</th><td>Define the required fields and types.</td></tr><tr><th>Step 2</th><td>Loop and collect messages.</td></tr><tr><th>Step 3</th><td>Return <code>(data, errors)</code>.</td></tr></table>
+<pre class="code lang-python"><code>def validate_item(payload):
+    errors = []
+    if not isinstance(payload, dict):
+        return None, ["body must be a JSON object"]
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        errors.append("name: must be a non-empty string")
+    if "price" in payload and not isinstance(payload["price"], (int, float)):
+        errors.append("price: must be a number")
+    return ({"name": name.strip(), **({"price": payload["price"]} if "price" in payload else {})}
+            if not errors else None), errors
+
+print(validate_item({"name": " pen ", "price": 10}))
+print(validate_item({"name": 5, "price": "ten"}))
+print(validate_item([1, 2]))</code></pre>
+<pre class="code lang-text"><code>({'name': 'pen', 'price': 10}, [])
+(None, ['name: must be a non-empty string', 'price: must be a number'])
+(None, ['body must be a JSON object'])</code></pre>
+<ul><li><strong>Answer</strong> Validation returns clean data or all the errors at once, which is also how good APIs behave: report every problem, not just the first.</li><li><strong>Check</strong> Input 2 has two wrong fields and the output lists exactly two messages. Input 1 has none, and the name is trimmed from <code>' pen '</code> to <code>'pen'</code>.</li><li><strong>Why it matters</strong> Pydantic does this work for you with less code, but now you know what it does.</li></ul>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Framework piece</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Route decorator</td><td><code>@app.get("/v1/items/{item_id}")</code></td><td>One function per endpoint of a model service</td></tr><tr><td>Type hint</td><td><code>item_id: int</code></td><td>Auto 422 for bad input, less defensive code</td></tr><tr><td>pydantic model</td><td><code>class ItemIn(BaseModel)</code></td><td>The "schema" for a request body</td></tr><tr><td><code>/docs</code> page</td><td>auto OpenAPI UI</td><td>Analysts try your endpoint without code</td></tr></tbody></table></div>
+<p><strong>Predict, Run, Explain.</strong> Before you read on: in the Flask example, what happens if the client posts a body with no <code>name</code> key? The code does <code>data["name"]</code>, which raises <code>KeyError: 'name'</code>, and Flask answers with a 500 error (a server bug, not the client's fault). This is the typical wrong version. The fix is validation like the function in Problem 12.3.2 and returning 422. FastAPI avoids it because the pydantic model rejects the body before your code runs (not run here).</p>
+<h3>The picture</h3>
+<p>Read it top to bottom: the request is routed, then validated, then your function runs, which may call a database.</p>
+<pre class="code lang-text"><code> request --&gt; [ routing: which function? ] --&gt; [ validation: pydantic ]
+                                                     |
+                      response &lt;--- [ your function: business logic ]
+                                                     |
+                                      [ database / other services ]</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>Model serving: <code>POST /predict</code> loads a model once at start-up and calls it per request.</li><li>Data teams expose "data products" as small internal APIs.</li><li>A FastAPI service with a database and tests is one of the skill-map mastery tests (see Chapter 14).</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Machine Learning / MLOps:</strong> a <code>POST /predict</code> endpoint that returns a score.</li><li><strong>Data Engineering:</strong> a small service that receives webhook events and writes to a queue.</li><li><strong>GenAI:</strong> a thin API that adds your prompt and guardrails in front of a language model.</li><li><strong>Testing and QA:</strong> a mock service so you can test without touching production.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Loading a big ML model inside the request function. It reloads on every call and your latency explodes. Load it once at start-up, outside the handler.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What gives FastAPI its automatic validation? Answer: Type hints plus pydantic models.</li><li>What does FastAPI's <code>/docs</code> page show? Answer: Interactive documentation made from the OpenAPI description of your routes.</li><li>Where should a heavy model be loaded? Answer: Once, at application start-up, not per request.</li></ol>
+<h2 id="s4-12-4-pagination-idempotency-versioning-openapi-and-graphql">12.4 Pagination, Idempotency, Versioning, OpenAPI and GraphQL</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A server cannot return a million rows in one reply, so it hands them over page by page (pagination). Networks fail, so clients retry, and the server must not charge a card twice (idempotency). Services live for years, so old clients must keep working while new ones arrive (versioning). A contract page (OpenAPI) lets everyone agree on the shape.</div></div>
+<h3>How it works</h3>
+<p><strong>Pagination</strong> styles:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Style</th><th>Example</th><th>Good</th><th>Weak</th></tr></thead><tbody><tr><td>Offset/limit</td><td><code>?limit=3&amp;offset=6</code></td><td>Simple, jump to any page</td><td>Slow for big offsets; rows shift when data changes</td></tr><tr><td>Cursor</td><td><code>?after=abc123</code></td><td>Stable and fast</td><td>Cannot jump to page 50</td></tr><tr><td>Page number</td><td><code>?page=3&amp;size=20</code></td><td>Familiar</td><td>Same weakness as offset</td></tr></tbody></table></div>
+<p><strong>Idempotency key.</strong> For <code>POST</code> calls that must not repeat (payments, orders), the client sends a unique header such as <code>Idempotency-Key: k1</code>. The server remembers keys. A repeat with the same key returns the first result and does not act again.</p>
+<p><strong>Versioning.</strong> Put the version in the URL (<code>/v1/items</code>) or in a header. Never break <code>v1</code>. Add <code>v2</code> when you must change the shape.</p>
+<p><strong>OpenAPI</strong> is a standard JSON/YAML description of an API: routes, parameters, bodies and responses. Tools generate documentation, client code and tests from it. FastAPI makes it for you.</p>
+<p><strong>GraphQL (awareness).</strong> Instead of many URLs, there is one endpoint and the client writes a query that names exactly the fields it wants. It avoids over-fetching, but it is harder to cache and to rate-limit. REST is still the default choice.</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 12.4.1</span> Walk every page of a 7-item collection with <code>limit=3</code>, using the <code>next_offset</code> field of our API. How many requests are needed?</p>
+<table class="steps"><tr><th>Step 1</th><td>Start at offset 0. Ask for 3 items. Server says <code>next_offset=3</code>.</td></tr><tr><th>Step 2</th><td>Offset 3 gives 3 more, <code>next_offset=6</code>.</td></tr><tr><th>Step 3</th><td>Offset 6 gives 1 item (item 7) and <code>next_offset=None</code>, so stop.</td></tr></table>
+<p>The loop (it used the server of Problem 12.2.1, after item 1 was deleted and "widget" was added, so there were 7 items):</p>
+<pre class="code lang-python"><code>off, names = 0, []
+while off is not None:
+    s, body, _ = call("GET", f"/v1/items?limit=3&amp;offset={off}")
+    names += [d["name"] for d in body["data"]]
+    off = body["next_offset"]
+print(names)</code></pre>
+<pre class="code lang-text"><code>['item2', 'item3', 'item4', 'item5', 'item6', 'item7', 'widget']</code></pre>
+<ul><li><strong>Answer</strong> 3 requests: ceil(7 / 3) = 3. All 7 names were collected.</li><li><strong>Check</strong> Pages hold 3 + 3 + 1 = 7 items, matching <code>total: 7</code>.</li><li><strong>Why it matters</strong> If you stop after page 1 you lose data silently. The loop must end on <code>next_offset is None</code>.</li></ul>
+<p class="problem"><span class="pl">Problem 12.4.2</span> Implement an idempotency key on a payment endpoint and show that a repeated key does not create a second payment.</p>
+<table class="steps"><tr><th>Step 1</th><td>The server keeps a dict <code>seen</code> of key to result.</td></tr><tr><th>Step 2</th><td>First time: create, return 201. Repeat: return stored result with 200.</td></tr><tr><th>Step 3</th><td>The client sends <code>k1</code>, <code>k1</code>, <code>k2</code>.</td></tr></table>
+<pre class="code lang-python"><code>import urllib.request, json, threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+seen = {}
+class H(BaseHTTPRequestHandler):
+    def do_POST(self):
+        key = self.headers.get("Idempotency-Key")
+        n = int(self.headers["Content-Length"]); self.rfile.read(n)
+        if key in seen:
+            code, body = 200, seen[key]
+        else:
+            seen[key] = {"payment_id": len(seen) + 1}
+            code, body = 201, seen[key]
+        out = json.dumps(body).encode()
+        self.send_response(code); self.send_header("Content-Length", str(len(out)))
+        self.end_headers(); self.wfile.write(out)
+    def log_message(self, *a): pass
+
+srv = HTTPServer(("127.0.0.1", 0), H)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+url = f"http://127.0.0.1:{srv.server_address[1]}/pay"
+for key in ["k1", "k1", "k2"]:
+    req = urllib.request.Request(url, data=b"{}", method="POST", headers={"Idempotency-Key": key})
+    with urllib.request.urlopen(req) as r:
+        print(key, r.status, r.read().decode())
+srv.shutdown()</code></pre>
+<pre class="code lang-text"><code>k1 201 {"payment_id": 1}
+k1 200 {"payment_id": 1}
+k2 201 {"payment_id": 2}</code></pre>
+<ul><li><strong>Answer</strong> The second <code>k1</code> call returned the same payment (id 1) and did not create id 2. The retry was safe.</li><li><strong>Check</strong> Three calls, two distinct keys, two payments (ids 1 and 2).</li><li><strong>Why it matters</strong> In plain words: the customer is charged once even if the phone retries five times.</li></ul>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Idea</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Offset paging</td><td><code>limit=3&amp;offset=6</code></td><td>Simple partner APIs; 3 requests for 7 rows</td></tr><tr><td>Cursor paging</td><td><code>after=abc123</code></td><td>Large event feeds, social data</td></tr><tr><td>Idempotency key</td><td><code>Idempotency-Key: k1</code></td><td>Payments; safe to retry</td></tr><tr><td>Version in URL</td><td><code>/v1/items</code></td><td>Old clients keep working</td></tr><tr><td><code>Retry-After</code> header</td><td><code>Retry-After: 30</code></td><td>Tells your ingest job how long to pause on 429</td></tr></tbody></table></div>
+<p><strong>Predict, Run, Explain.</strong> Before running Problem 12.4.2, predict the status of the second <code>k1</code> call. A typical wrong prediction is 201 again. The real output shows <code>200</code> with the same <code>payment_id</code>. Line by line: <code>key in seen</code> is true, so we return the stored result and do not create anything. The typical wrong version has no <code>seen</code> dict and increments a counter every time, so a retry would make payment 2 and the customer pays twice (no error message, which is exactly why it is dangerous: nothing fails loudly).</p>
+<h3>The picture</h3>
+<p>Offset paging (left) numbers pages by position, so inserting a row at the front moves everything. Cursor paging (right) remembers the last id seen.</p>
+<pre class="code lang-text"><code> Offset paging: rows shift          Cursor paging: bookmark
+ page1 [1 2 3] | insert row 0       after=3 -&gt; [4 5 6]
+ page2 [3 4 5]  (3 repeated!)       after=6 -&gt; [7]</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>Ingestion code must loop over pages, and must handle the last page and rate limits (429, <code>Retry-After</code> header).</li><li>Idempotent writes make pipelines safe to re-run. This is a core data-engineering idea (Chapter 13 of the data engineering documents expands it).</li><li>OpenAPI files let you generate test data and client test scripts.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> page loops and idempotent loads that can be re-run safely.</li><li><strong>Data Analytics:</strong> export APIs that return reports in pages.</li><li><strong>Machine Learning / MLOps:</strong> versioned model endpoints (<code>/v1/predict</code>, <code>/v2/predict</code>) during a rollout.</li><li><strong>Testing and QA:</strong> OpenAPI files used to generate test scripts.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using offset paging on a table that changes while you read it. You can skip or repeat rows. Prefer cursors for large or live data, and always stop when the next-page marker is empty rather than when a page "looks short".</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why cursor over offset for big data? Answer: It is faster at depth and does not shift when rows are inserted.</li><li>What is an idempotency key for? Answer: To make a repeated POST return the first result instead of acting twice.</li><li>Where can the API version live? Answer: In the URL (<code>/v1/</code>) or a header.</li></ol>
+<h2 id="s5-12-5-authentication-and-authorization-basics">12.5 Authentication and Authorization Basics</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Authentication answers "who are you?". Authorization answers "what are you allowed to do?". A hotel desk checks your ID (authentication), then gives you a key card that opens only your room (authorization).</div></div>
+<h3>How it works</h3>
+<ul><li><strong>API key</strong>: a long random string sent in a header (<code>X-API-Key: ...</code>). Simple. It identifies the calling application. Treat it like a password.</li><li><strong>Bearer token</strong>: <code>Authorization: Bearer &lt;token&gt;</code>. The token proves you logged in.</li><li><strong>OAuth 2.0</strong>: a standard for letting an app act for a user without sharing the password. The user logs in at the provider, and the app receives a short-lived <strong>access token</strong> (and often a <strong>refresh token</strong>). <strong>OIDC</strong> adds identity on top of OAuth 2.0.</li><li><strong>JWT (JSON Web Token)</strong>: a token made of three base64 parts, <code>header.payload.signature</code>. The payload holds <strong>claims</strong> (who, role, expiry <code>exp</code>). The signature (for example HMAC-SHA256 with a secret key) lets the server detect any change. A JWT is <strong>signed, not encrypted</strong>: anyone can read the payload. Never put secrets in it.</li><li><strong>Always use HTTPS</strong> so tokens are not readable in transit.</li></ul>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 12.5.1</span> Build a JWT-like token with HMAC-SHA256 by hand, verify it, then show that expiry and tampering are detected. The key is a fake demo value.</p>
+<table class="steps"><tr><th>Step 1</th><td>Encode header and payload as compact JSON, then base64url.</td></tr><tr><th>Step 2</th><td>Sign <code>header.payload</code> with HMAC.</td></tr><tr><th>Step 3</th><td>To verify, recompute the signature and compare with <code>hmac.compare_digest</code> (safe against timing attacks). Then check <code>exp</code>.</td></tr></table>
+<pre class="code lang-python"><code>import hmac, hashlib, base64, json
+
+SECRET = b"demo-secret-not-real"
+
+def b64(b): return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+def unb64(s): return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
+
+def make_token(claims):
+    header = b64(json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode())
+    payload = b64(json.dumps(claims, separators=(",", ":")).encode())
+    sig = b64(hmac.new(SECRET, f"{header}.{payload}".encode(), hashlib.sha256).digest())
+    return f"{header}.{payload}.{sig}"
+
+def verify(token, now):
+    h, p, s = token.split(".")
+    good = b64(hmac.new(SECRET, f"{h}.{p}".encode(), hashlib.sha256).digest())
+    if not hmac.compare_digest(s, good):
+        return "bad signature"
+    claims = json.loads(unb64(p))
+    if claims["exp"] &lt; now:
+        return "expired"
+    return claims
+
+t = make_token({"sub": "asha", "role": "analyst", "exp": 1000})
+print(t)
+print(verify(t, now=500))
+print(verify(t, now=1500))
+h, p, s = t.split(".")
+evil = b64(json.dumps({"sub": "asha", "role": "admin", "exp": 1000}, separators=(",", ":")).encode())
+print(verify(f"{h}.{evil}.{s}", now=500))
+print(json.loads(unb64(p)))</code></pre>
+<pre class="code lang-text"><code>eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJhc2hhIiwicm9sZSI6ImFuYWx5c3QiLCJleHAiOjEwMDB9.MvOjd9So6hnZyxNsG6Q5vsm-EzJ80cyE8aR_RK5JuRI
+{'sub': 'asha', 'role': 'analyst', 'exp': 1000}
+expired
+bad signature
+{'sub': 'asha', 'role': 'analyst', 'exp': 1000}</code></pre>
+<ul><li><strong>Check</strong> <code>exp</code> is 1000: 500 &lt; 1000 passes, 1500 &gt; 1000 fails, which matches the output.</li><li><strong>Why it matters</strong> Expiry limits damage if a token leaks; the signature stops forged roles.</li><li><strong>Answer</strong> At time 500 the token is valid; at 1500 it is expired. When we swapped the payload to <code>role: admin</code> and kept the old signature, verification said "bad signature". The last line shows that anyone can read the payload: signed is not secret. In real projects use a maintained library (such as PyJWT) and never write your own crypto; this demo only teaches the idea.</li></ul>
+<p class="problem"><span class="pl">Problem 12.5.2</span> A route <code>DELETE /v1/runs/5</code> is called by user "ravi" (role "viewer") with a valid token. Which status code, and why?</p>
+<table class="steps"><tr><th>Step 1</th><td>The token is valid, so authentication passed.</td></tr><tr><th>Step 2</th><td>Role "viewer" cannot delete, so authorization fails.</td></tr><tr><th>Answer</th><td>403 Forbidden. A 401 would be wrong because the user is known.</td></tr><tr><th>Check</th><td>Ask: "Does the server know who this is?" Yes, so not 401. "Is the action allowed?" No, so 403.</td></tr><tr><th>Why it matters</th><td>When many requests fail at once, a wave of 401s means your login or token reuse is broken; a wave of 403s means a permissions problem. Different bugs, different fixes.</td></tr></table>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Credential</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>API key</td><td><code>X-API-Key: &lt;KEY&gt;</code></td><td>Calling a model or SaaS API from a script</td></tr><tr><td>Bearer token</td><td><code>Authorization: Bearer &lt;TOKEN&gt;</code></td><td>After login (token extracted, then reused on every call)</td></tr><tr><td>JWT claims</td><td><code>{"sub": "asha", "role": "analyst", "exp": 1000}</code></td><td>Data API deciding what you may read</td></tr><tr><td>Refresh token</td><td>long-lived, stored safely</td><td>Notebook that must run for days</td></tr></tbody></table></div>
+<p><strong>Predict, Run, Explain.</strong> Before running Problem 12.5.1, predict what <code>verify</code> says for the tampered token. The real output is <code>bad signature</code>. Line by line: the attacker changed the payload but cannot recompute the HMAC without the secret, so the stored signature no longer matches the new <code>header.payload</code>. A typical wrong version compares with <code>==</code> and, worse, a very common bug is to decode the payload and trust it without checking the signature. Then the tampered token (<code>role: admin</code>) would be accepted and no error appears at all.</p>
+<h3>The picture</h3>
+<p>A JWT is three base64 pieces joined by dots. The signature is a fingerprint of the first two pieces.</p>
+<pre class="code lang-text"><code> eyJhbGciOi...  .  eyJzdWIiOi...  .  MvOjd9So6h...
+ \___header___/    \__payload___/    \_signature_/
+ alg, type         claims: sub,      HMAC(secret, header.payload)
+                   role, exp         changes if any byte changes</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>Every cloud and data API (warehouse, model service, BI tool) needs a token or key.</li><li>Service accounts and short-lived tokens are the safe standard.</li><li>Role checks in data APIs decide who sees which data (privacy).</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> service accounts with short-lived tokens for warehouse and cloud access.</li><li><strong>Machine Learning / MLOps:</strong> API keys for model endpoints, rotated regularly.</li><li><strong>GenAI:</strong> keys for hosted model APIs, kept out of notebooks and Git.</li><li><strong>Testing and QA:</strong> token extraction and reuse in test scripts; webhook signature checks use the same HMAC idea.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Thinking a JWT is encrypted. It is only signed. Do not store passwords or personal data inside it, and always verify the signature and the expiry on the server.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>401 or 403 for a known user without permission? Answer: 403.</li><li>Can a client read a JWT payload? Answer: Yes. It is base64, not encrypted.</li><li>Why <code>compare_digest</code>? Answer: It compares in constant time so attackers cannot guess the signature by timing.</li></ol>
+<h2 id="s6-12-6-scraping-responsibly">12.6 Scraping Responsibly</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Scraping is reading a web page with a program instead of your eyes. It is like photocopying pages in a library: allowed in many cases, but there are rules posted at the door, and if you run ten copy machines at once you annoy everyone.</div></div>
+<h3>How it works</h3>
+<p>Order of preference: first use an official API, then a downloadable dataset, and only then scrape.</p>
+<p>Be a good citizen:</p>
+<ol><li>Read <strong>robots.txt</strong> (the site's posted rules) and obey it.</li><li>Read the <strong>terms of service</strong>. Some sites forbid scraping.</li><li>Identify yourself with a clear <code>User-Agent</code> and a contact.</li><li>Go slowly: add a delay (respect <code>Crawl-delay</code>) and limit parallelism.</li><li>Do not collect personal data without a lawful reason. Do not bypass logins or paywalls.</li><li>Cache pages so you do not fetch the same page twice.</li></ol>
+<p>Tools: <code>html.parser</code> (standard library), <strong>BeautifulSoup</strong> (friendly parsing of HTML), <strong>Scrapy</strong> (a framework for large crawls), <strong>Selenium</strong> and <strong>Playwright</strong> (control a real browser, needed when a page builds its content with JavaScript). BeautifulSoup, Scrapy, Selenium and Playwright were not run here.</p>
+<p>Not run here:</p>
+<pre class="code lang-python"><code>import requests
+from bs4 import BeautifulSoup
+
+r = requests.get("https://example.com/shop", headers={"User-Agent": "StudyBot/1.0 (me@example.com)"}, timeout=10)
+soup = BeautifulSoup(r.text, "html.parser")
+for li in soup.select("li.p"):
+    print(li.a.text, li.select_one(".price").text)</code></pre>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 12.6.1</span> Parse a robots.txt text and decide which URLs your bot may fetch.</p>
+<table class="steps"><tr><th>Step 1</th><td>Use <code>urllib.robotparser.RobotFileParser</code> and feed it lines with <code>parse()</code> (no network needed).</td></tr><tr><th>Step 2</th><td>Ask <code>can_fetch(user_agent, url)</code>.</td></tr><tr><th>Step 3</th><td>Read the crawl delay.</td></tr></table>
+<pre class="code lang-python"><code>from urllib.robotparser import RobotFileParser
+
+rules = """User-agent: *
+Disallow: /private/
+Crawl-delay: 5
+
+User-agent: BadBot
+Disallow: /
+"""
+rp = RobotFileParser()
+rp.parse(rules.splitlines())
+for ua, url in [("MyStudyBot", "https://example.com/products"),
+                ("MyStudyBot", "https://example.com/private/data"),
+                ("BadBot", "https://example.com/products")]:
+    print(ua, url, rp.can_fetch(ua, url))
+print("crawl delay:", rp.crawl_delay("MyStudyBot"))</code></pre>
+<pre class="code lang-text"><code>MyStudyBot https://example.com/products True
+MyStudyBot https://example.com/private/data False
+BadBot https://example.com/products False
+crawl delay: 5</code></pre>
+<ul><li><strong>Answer</strong> Our bot may fetch <code>/products</code> but not <code>/private/data</code>, and must wait 5 seconds between requests. "BadBot" is banned everywhere.</li><li><strong>Check</strong> <code>/private/data</code> starts with <code>/private/</code>, so the rule matches. <code>/products</code> does not.</li><li><strong>Why it matters</strong> Obeying these rules keeps you legal, polite and unblocked.</li></ul>
+<p class="problem"><span class="pl">Problem 12.6.2</span> Extract name, link and price from an HTML snippet with the standard library parser.</p>
+<table class="steps"><tr><th>Step 1</th><td>Subclass <code>HTMLParser</code>. <code>handle_starttag</code> sees tags and attributes. <code>handle_data</code> sees text.</td></tr><tr><th>Step 2</th><td>When we see <code>&lt;a href=...&gt;</code>, remember the link. The next text is the name.</td></tr><tr><th>Step 3</th><td>When we see <code>&lt;span class="price"&gt;</code>, the next text is the price.</td></tr></table>
+<pre class="code lang-python"><code>from html.parser import HTMLParser
+
+html = """&lt;html&gt;&lt;body&gt;&lt;h1&gt;Shop&lt;/h1&gt;
+&lt;ul&gt;&lt;li class="p"&gt;&lt;a href="/a"&gt;Pen&lt;/a&gt; &lt;span class="price"&gt;10&lt;/span&gt;&lt;/li&gt;
+&lt;li class="p"&gt;&lt;a href="/b"&gt;Book&lt;/a&gt; &lt;span class="price"&gt;250&lt;/span&gt;&lt;/li&gt;&lt;/ul&gt;&lt;/body&gt;&lt;/html&gt;"""
+
+class P(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.links = []; self.prices = []; self.names = []
+        self._in_price = False; self._href = None
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "a": self._href = a.get("href")
+        if tag == "span" and a.get("class") == "price": self._in_price = True
+    def handle_data(self, d):
+        if self._href:
+            self.names.append(d); self.links.append(self._href); self._href = None
+        elif self._in_price:
+            self.prices.append(int(d)); self._in_price = False
+
+p = P(); p.feed(html)
+print(list(zip(p.names, p.links, p.prices)))</code></pre>
+<pre class="code lang-text"><code>[('Pen', '/a', 10), ('Book', '/b', 250)]</code></pre>
+<ul><li><strong>Check</strong> The input has two <code>&lt;li&gt;</code> items and the result has two tuples. Prices are <code>int</code>, not text, so you can sum them.</li><li><strong>Answer</strong> We got two products with names, links and prices as numbers. BeautifulSoup does the same job in three lines, but it is good to know what is under the hood.</li></ul>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Rule</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>robots.txt</td><td><code>Disallow: /private/</code></td><td>Check before any crawl</td></tr><tr><td>Crawl delay</td><td>5 seconds</td><td>300 pages take at least 25 minutes</td></tr><tr><td>User-Agent</td><td><code>StudyBot/1.0 (me@example.com)</code></td><td>Lets site owners contact you</td></tr><tr><td>Cache</td><td>save HTML to disk</td><td>Re-parse without re-fetching</td></tr></tbody></table></div>
+<p><strong>Predict, Run, Explain.</strong> Before running Problem 12.6.1, predict the answer for <code>BadBot</code>. It is <code>False</code> because the group for <code>BadBot</code> says <code>Disallow: /</code>, which blocks everything; the <code>*</code> group does not apply to a bot that has its own group. A typical wrong version forgets <code>parse()</code> and calls <code>can_fetch</code> on an empty parser. An empty parser (no rules loaded) behaves as if everything is allowed, so you get <code>True</code> with no error. The fix: always call <code>parse()</code> or <code>read()</code> first and check the rules were loaded.</p>
+<h3>The picture</h3>
+<p>Read it as a series of gates. You only reach the last box if every gate lets you through.</p>
+<pre class="code lang-text"><code> official API?  --yes--&gt; use it
+      | no
+ robots.txt allows?  --no--&gt; stop
+      | yes
+ terms of service ok? --no--&gt; stop
+      | yes
+ fetch slowly, identify yourself, cache, store only what you need</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>Price monitoring, job-market analysis, and research datasets often start with scraping. The result above means: 2 products, total price 10 + 250 = 260.</li><li>A legal or privacy mistake can end a project. Teams check terms before building.</li><li>Pages built by JavaScript need a browser tool, which is slower and heavier.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> collecting public prices to compare competitors (where terms allow).</li><li><strong>Data Science:</strong> building a small text dataset for an analysis.</li><li><strong>Machine Learning / GenAI:</strong> collecting documents for search or retrieval, with permission and attention to copyright and privacy.</li><li><strong>Data Engineering:</strong> a polite, scheduled crawler with caching and monitoring.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Hammering a site with parallel requests and no delay. It looks like an attack and may get your IP banned. Add delays, a User-Agent, and caching. Scrape only what you are allowed to.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What file lists the site's crawling rules? Answer: <code>robots.txt</code>.</li><li>When do you need Selenium or Playwright? Answer: When the content is created by JavaScript in the browser.</li><li>What comes before scraping in your order of choice? Answer: An official API or a downloadable dataset.</li></ol>
+<h2 id="s7-12-7-command-line-tools-argparse-typer-and-subprocess">12.7 Command-Line Tools: argparse, typer and subprocess</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A command-line tool is a function with a keyboard-friendly front door. Instead of editing the script each time, you pass options: <code>summ 120 80 300 -p 90</code>. Scripts become reusable tools for you and your team, and schedulers (cron, Airflow) can run them.</div></div>
+<h3>How it works</h3>
+<p><code>argparse</code> (standard library) builds the parser. You declare arguments, their types, defaults and help text. It gives you <code>--help</code> and clear errors for free, and exits with code 2 on a usage error.</p>
+<p><strong>typer</strong> (third-party) makes the same thing from a function with type hints: the parameters become the options. Not run here:</p>
+<pre class="code lang-python"><code>import typer
+
+app = typer.Typer()
+
+@app.command()
+def summ(numbers: list[float], percentile: int = 90, verbose: bool = False):
+    """Summarise delivery times."""
+    ...
+
+if __name__ == "__main__":
+    app()</code></pre>
+<p>Good CLI habits: put the work in a function <code>main(argv=None)</code> so tests can call it, return proper exit codes (0 good, non-zero bad), print results to stdout and logs to stderr (through <code>logging</code>).</p>
+<p><strong>subprocess</strong> runs other programs from Python. Use <code>subprocess.run([...], capture_output=True, text=True, check=True)</code>. Pass a <strong>list</strong>, not a string with <code>shell=True</code>, so that user input cannot inject shell commands.</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 12.7.1</span> Write a CLI called <code>summ</code> that prints count, mean and a percentile of delivery times (nearest-rank). Show normal use, <code>--help</code>, and an error.</p>
+<table class="steps"><tr><th>Step 1</th><td>Declare <code>numbers</code> (one or more floats), <code>-p</code> percentile (default 90, between 1 and 99), <code>-v</code> verbose.</td></tr><tr><th>Step 2</th><td>Sort. Nearest-rank index is <code>ceil(n * p / 100) - 1</code>.</td></tr><tr><th>Step 3</th><td>Run it.</td></tr></table>
+<pre class="code lang-python"><code>import argparse, logging
+
+def build():
+    p = argparse.ArgumentParser(prog="summ", description="Summarise delivery times")
+    p.add_argument("numbers", type=float, nargs="+", help="delivery times in minutes")
+    p.add_argument("-p", "--percentile", type=int, default=90, choices=range(1, 100), metavar="P")
+    p.add_argument("-v", "--verbose", action="store_true")
+    return p
+
+def main(argv=None):
+    a = build().parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if a.verbose else logging.WARNING,
+                        format="%(levelname)s %(message)s")
+    xs = sorted(a.numbers)
+    logging.debug("got %d numbers", len(xs))
+    k = max(0, -(-len(xs) * a.percentile // 100) - 1)
+    print(f"count={len(xs)} mean={sum(xs)/len(xs):.1f} p{a.percentile}={xs[k]}")
+
+if __name__ == "__main__":
+    main()</code></pre>
+<p>Saved as <code>s5.py</code> and run in the shell:</p>
+<pre class="code lang-bash"><code>python3 s5.py 120 80 300 95 110 -p 90 -v
+python3 s5.py --help
+python3 s5.py abc; echo "exit=$?"</code></pre>
+<pre class="code lang-text"><code>DEBUG got 5 numbers
+count=5 mean=141.0 p90=300.0
+usage: summ [-h] [-p P] [-v] numbers [numbers ...]
+
+Summarise delivery times
+
+positional arguments:
+  numbers             delivery times in minutes
+
+options:
+  -h, --help          show this help message and exit
+  -p, --percentile P
+  -v, --verbose
+usage: summ [-h] [-p P] [-v] numbers [numbers ...]
+summ: error: argument numbers: invalid float value: 'abc'
+exit=2</code></pre>
+<ul><li><strong>Check by hand</strong> Sorted: 80, 95, 110, 120, 300. Mean = 705 / 5 = 141.0. For p90: ceil(5 x 0.9) = 5, index 4, value 300.</li><li><strong>Check</strong> Mean by hand: 705 / 5 = 141.0. Percentile index: ceil(5 x 90 / 100) - 1 = 4, value 300.0.</li><li><strong>Why it matters</strong> This is the same nearest-rank percentile idea used in exam-mark and delivery reports; a p90 of 300 minutes means about 9 of 10 deliveries were at least as fast (here 4 of 5 samples are below it).</li><li><strong>Answer</strong> The tool prints <code>count=5 mean=141.0 p90=300.0</code>, gives help text, and rejects bad input with exit code 2. (The <code>--help</code> layout may differ slightly between Python versions.)</li></ul>
+<p class="problem"><span class="pl">Problem 12.7.2</span> Run a child Python process, capture its output and exit code, and see what <code>check=True</code> does. Then use <code>sqlite3</code> (standard library database) from the same script to store and query results with <code>?</code> placeholders.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>subprocess.run</code> with a list and <code>capture_output=True</code>.</td></tr><tr><th>Step 2</th><td><code>check=True</code> raises <code>CalledProcessError</code> on a non-zero code.</td></tr><tr><th>Step 3</th><td>With a list, <code>"a; echo b"</code> is one harmless argument, not two commands.</td></tr><tr><th>Step 4</th><td><code>sqlite3</code> needs no server: <code>connect(":memory:")</code> makes a temporary database.</td></tr></table>
+<pre class="code lang-python"><code>import subprocess, sys, sqlite3
+
+r = subprocess.run([sys.executable, "-c", "print('hi from child'); import sys; sys.exit(3)"],
+                   capture_output=True, text=True)
+print(r.returncode, repr(r.stdout), repr(r.stderr))
+try:
+    subprocess.run([sys.executable, "-c", "raise SystemExit(2)"], check=True)
+except subprocess.CalledProcessError as e:
+    print("failed with", e.returncode)
+r = subprocess.run(["echo", "a; echo b"], capture_output=True, text=True)
+print(r.stdout.strip())
+
+con = sqlite3.connect(":memory:")
+con.row_factory = sqlite3.Row
+con.execute("CREATE TABLE req(id INTEGER PRIMARY KEY, url TEXT, ms REAL)")
+con.executemany("INSERT INTO req(url, ms) VALUES (?, ?)",
+                [("/a", 120.0), ("/a", 80.0), ("/b", 300.0), ("/b", 100.0), ("/a", 100.0)])
+con.commit()
+for row in con.execute("SELECT url, COUNT(*) n, AVG(ms) avg FROM req GROUP BY url ORDER BY url"):
+    print(dict(row))
+with con:
+    con.execute("UPDATE req SET ms = ms * 2 WHERE url = ?", ("/b",))
+print(con.execute("SELECT SUM(ms) FROM req").fetchone()[0])</code></pre>
+<pre class="code lang-text"><code>3 'hi from child\n' ''
+failed with 2
+a; echo b
+{'url': '/a', 'n': 3, 'avg': 100.0}
+{'url': '/b', 'n': 2, 'avg': 200.0}
+1100.0</code></pre>
+<ul><li><strong>Answer</strong> The child returned code 3 with its output captured. <code>check=True</code> turned code 2 into an exception. The <code>with con:</code> block committed the update. The sums check out: <code>/a</code> is 120+80+100 = 300, <code>/b</code> is (300+100) x 2 = 800, total 1100.</li></ul>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>CLI piece</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Positional argument</td><td><code>120 80 300</code></td><td>The input files or numbers</td></tr><tr><td>Option with default</td><td><code>-p 90</code></td><td><code>--date</code>, <code>--env prod</code> for ETL jobs</td></tr><tr><td>Flag</td><td><code>-v</code></td><td>Turn on debug logging</td></tr><tr><td>Exit code</td><td><code>0</code> or <code>2</code></td><td>Scheduler/CI decides pass or fail</td></tr></tbody></table></div>
+<p><strong>Predict, Run, Explain.</strong> Before you run it, what does <code>python3 s5.py abc</code> print and what is the exit code? Real output: <code>summ: error: argument numbers: invalid float value: 'abc'</code> and exit code 2. Line by line: <code>type=float</code> runs <code>float("abc")</code>, which fails, so <code>argparse</code> prints usage and calls <code>sys.exit(2)</code>. The typical wrong version skips <code>type=float</code> and then sorts strings: <code>sorted(["120", "80"])</code> gives <code>['120', '80']</code> (text order), so the percentile is wrong and no error appears. The fix is <code>type=float</code>.</p>
+<p>The shell injection warning has a real demonstration. With <code>shell=True</code>, <code>subprocess.run("echo hi; echo INJECTED", shell=True)</code> printed both <code>hi</code> and <code>INJECTED</code>: two commands ran from one string. If part of that string came from a user, they could run anything.</p>
+<h3>The picture</h3>
+<p>Read left to right: the shell passes words, <code>argparse</code> turns them into named values, <code>main</code> does the work, and the results leave through three channels.</p>
+<pre class="code lang-text"><code> shell:  summ 120 80 300 -p 90
+           |        |        |
+           v        v        v
+        argparse --&gt; Namespace(numbers=[...], percentile=90)
+                          |
+                       main() --&gt; stdout (results), stderr (logs), exit code</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>Every scheduled data job is a CLI: <code>python etl.py --date 2026-01-31</code>.</li><li>Docker containers and CI steps run commands, so exit codes decide pass or fail.</li><li><code>subprocess</code> glues Python to tools like <code>git</code>, <code>dbt</code> or <code>ffmpeg</code>.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> ETL entry points scheduled by cron or Airflow.</li><li><strong>Machine Learning / MLOps:</strong> <code>python train.py --config prod.yaml</code> inside a container.</li><li><strong>Data Analytics:</strong> a report generator that takes <code>--month 2026-01</code>.</li><li><strong>Testing and QA:</strong> a wrapper that runs an external test tool and summarises its results.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Building a shell command from user text with <code>shell=True</code> (for example <code>f"grep {term} file"</code>). A value like <code>x; rm -rf ~</code> becomes a second command. Pass a list of arguments instead.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What exit code means success? Answer: 0.</li><li>Why put the logic in <code>main(argv=None)</code>? Answer: So a test can call <code>main([...])</code> without a real shell.</li><li>Why does <code>?</code> matter in <code>sqlite3</code>? Answer: It passes values separately from the SQL text, preventing SQL injection (Chapter 13).</li></ol>
+<h2 id="s8-chapter-recap">Chapter recap</h2>
+<ul><li>HTTP is request (method, URL, headers, body) and response (status, headers, body). Status codes are part of the contract.</li><li>REST means nouns in URLs, methods as actions, JSON bodies and stateless calls.</li><li>GET, PUT and DELETE are idempotent. POST is not, so use an idempotency key when a repeat would hurt.</li><li>Always set a timeout, check the status, and retry only temporary errors with backoff.</li><li>FastAPI turns type hints and pydantic models into validation and automatic OpenAPI docs. Flask is smaller and needs more manual pieces.</li><li>Paginate big lists. Cursors are steadier than offsets for live data.</li><li>Authentication is "who", authorization is "what". A JWT is signed, not encrypted. Verify signature and expiry.</li><li>Scrape politely: API first, then robots.txt, terms, delays, a User-Agent, and no personal data without cause.</li><li>A good CLI has a <code>main(argv)</code> function, clear help, proper exit codes, and logs on stderr.</li><li>Pass argument lists to <code>subprocess</code>, and use <code>?</code> placeholders in SQL.</li></ul>
+<p><strong>Cheat sheet</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Task</th><th>Pattern</th></tr></thead><tbody><tr><td>Call an API safely</td><td><code>client.get(url, timeout=5)</code>, then <code>raise_for_status()</code></td></tr><tr><td>Retry</td><td>wait <code>base * 2**attempt</code>, only for temporary errors</td></tr><tr><td>Paginate</td><td>loop until <code>next_offset is None</code></td></tr><tr><td>Safe POST retry</td><td><code>Idempotency-Key</code> header</td></tr><tr><td>Sign a token</td><td><code>hmac.new(key, msg, sha256)</code>, verify with <code>compare_digest</code></td></tr><tr><td>Check robots</td><td><code>RobotFileParser().parse(lines)</code>, <code>can_fetch(ua, url)</code></td></tr><tr><td>CLI</td><td><code>argparse</code>, <code>main(argv=None)</code>, exit code 0 or non-zero</td></tr><tr><td>Run a program</td><td><code>subprocess.run([...], capture_output=True, text=True, check=True)</code></td></tr><tr><td>SQL values</td><td><code>execute("... WHERE x = ?", (value,))</code></td></tr></tbody></table></div>
+<h2 id="s9-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 12.P.1</span> (easy) Which status code for each: item created; item not found; rate limit hit; server crashed on a bug?</p>
+<p><strong>Answer:</strong> 201; 404; 429; 500.</p>
+<p class="problem"><span class="pl">Problem 12.P.2</span> (easy) What is the output type of <code>json.loads('{"a": [1, 2]}')["a"]</code>, and what is its value?</p>
+<p><strong>Answer:</strong> A Python <code>list</code>: <code>[1, 2]</code>.</p>
+<p class="problem"><span class="pl">Problem 12.P.3</span> (easy) Name the three parts of a JWT, in order.</p>
+<p><strong>Answer:</strong> Header, payload, signature, joined by dots.</p>
+<p class="problem"><span class="pl">Problem 12.P.4</span> (medium) An API has 95 records and you ask <code>limit=20</code>. How many requests, and how many items on the last page?</p>
+<p><strong>Answer:</strong> ceil(95 / 20) = 5 requests. The last page has 95 - 80 = 15 items.</p>
+<p class="problem"><span class="pl">Problem 12.P.5</span> (medium) Find the bug: <code>r = requests.get(url); data = r.json()</code> in a nightly job that sometimes hangs.</p>
+<p><strong>Answer:</strong> There is no <code>timeout=</code> and no <code>raise_for_status()</code>. Add <code>timeout=10</code> and <code>r.raise_for_status()</code>. Hanging comes from the missing timeout.</p>
+<p class="problem"><span class="pl">Problem 12.P.6</span> (medium) Using the 12.7 <code>summ</code> tool, what is <code>p50</code> for the numbers <code>10 20 30 40</code>?</p>
+<p><strong>Answer:</strong> Nearest rank: ceil(4 x 0.5) = 2, index 1 after sorting, value 20.0. (So <code>summ 10 20 30 40 -p 50</code> prints <code>count=4 mean=25.0 p50=20.0</code>.)</p>
+<p class="problem"><span class="pl">Problem 12.P.7</span> (medium) Your bot reads robots.txt with <code>Disallow: /admin/</code> and <code>Crawl-delay: 10</code>. You want 300 pages from allowed paths. What is the least time the crawl should take?</p>
+<p><strong>Answer:</strong> 300 x 10 = 3,000 seconds, which is 50 minutes, if you fetch one page at a time and respect the delay.</p>
+<p class="problem"><span class="pl">Problem 12.P.8</span> (medium, scenario) A mobile app retries <code>POST /orders</code> after a timeout, and customers get two orders. Give two fixes.</p>
+<p><strong>Answer:</strong> (1) Add an idempotency key header, and make the server return the first result for a repeated key. (2) Add a unique constraint on a client-generated order ID so the database refuses duplicates (and return 409 or the original order).</p>
+<p class="problem"><span class="pl">Problem 12.P.9</span> (hard, interview) Explain the difference between authentication and authorization with an API example, and say where a JWT fits.</p>
+<p><strong>Answer:</strong> Authentication verifies the identity (a valid login gives a token). Authorization decides actions: a "viewer" token can <code>GET</code> but not <code>DELETE</code>, so <code>DELETE</code> returns 403. A JWT carries identity and claims (like role and expiry) in a signed token, so the server can check them without a database lookup on each call. It is signed, not encrypted.</p>
+<p class="problem"><span class="pl">Problem 12.P.10</span> (hard, interview) Why is <code>subprocess.run(f"ls {user_input}", shell=True)</code> dangerous, and what is the fix?</p>
+<p><strong>Answer:</strong> The shell parses the string, so <code>user_input = "x; rm -rf ~"</code> runs a second command (command injection). Fix: <code>subprocess.run(["ls", user_input])</code>, which treats the input as one argument, and validate the input too.</p>
+<p class="problem"><span class="pl">Problem 12.P.11</span> (hard) Your offset-paged export misses some rows when new rows arrive during the export. Why, and how do you fix it?</p>
+<p><strong>Answer:</strong> New rows at the front shift every later row by one, so a row can fall between pages (missed) or appear twice. Use cursor (keyset) pagination, for example <code>WHERE id &gt; last_id ORDER BY id LIMIT 100</code>, or export from a snapshot.</p>
+<h2 id="s10-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data and AI roles, and English is my second language, so use simple English. Teach me "HTTP and REST API design" step by step: methods, status codes, headers, idempotency, and how REST naming habits work. Use small Python examples with the standard library, show real output, and relate each idea to everyday examples like ordering at a restaurant. After each part, ask me one check question and wait for my answer before continuing.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data and AI roles, and English is my second language. Give me 8 graded exercises (easy to hard) on calling APIs from Python with requests or httpx: timeouts, raise_for_status, Session reuse, retries with exponential backoff, pagination loops, and rate limiting (429). Do not give solutions. When I paste my answers, review them one by one and point out bugs and risks.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning Python for data and ML jobs, and English is my second language. Quiz me one question at a time on "authentication and authorization": API keys, bearer tokens, OAuth 2.0, OIDC, JWT structure, signature versus encryption, 401 versus 403, and token expiry. Start easy, increase difficulty, and explain every wrong answer simply before moving on. Keep score out of 10.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Review my work on a small FastAPI service with one database table and two endpoints. Check routing, pydantic validation, status codes, error handling, how the model or database connection is created, and test coverage. Be specific and kind, and list the top 5 improvements in order of importance. My code: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for Python and data engineering interviews, and English is my second language. Run a 30-minute mock interview on "APIs, scraping responsibly, and command-line tools in Python". Ask one question at a time, mixing concept questions (idempotency, pagination, JWT, robots.txt, argparse exit codes, subprocess safety) and a small coding task. After each answer give a score out of 5, a model answer, and one tip on how to say it clearly in English.</pre></div><div class="readbtn"><button class="btn" data-read="study:python:ch12">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch11.html">← Chapter 11: Concurrency and Performance</a><a class="btn" href="ch13.html">Chapter 13: Professional Practice: Clean Code, CI/CD →</a></div></div><script src="../../assets/study.js"></script></body></html>

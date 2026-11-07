@@ -1,0 +1,446 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 5: Subqueries and CTEs (Including Recursive CTEs)</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">SQL &amp; Databases Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 5</div><h1>Subqueries and CTEs (Including Recursive CTEs)</h1><p>Building a big answer from small steps: queries inside queries, named steps with WITH, and loops that walk through trees and graphs.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-5-1-subqueries-scalar-derived-table-correlated">5.1 Subqueries: Scalar, Derived Table, Correlated</a></li><li><a href="#s2-5-2-ctes-naming-your-steps-with-with">5.2 CTEs: Naming Your Steps with WITH</a></li><li><a href="#s3-5-3-recursive-ctes">5.3 Recursive CTEs</a></li><li><a href="#s4-5-4-choosing-the-right-tool-and-writing-readable-sql">5.4 Choosing the Right Tool, and Writing Readable SQL</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>Real questions have steps. "Which customers spent more than the average customer?" needs two answers: first the average, then the comparison. "Show the whole reporting chain under the CEO" needs a query that repeats until it reaches the bottom. SQL gives you three tools for this: <strong>subqueries</strong> (a query inside a query), <strong>CTEs</strong> (named steps written with <code>WITH</code>) and <strong>recursive CTEs</strong> (a step that feeds itself). After this chapter you can break any hard question into small readable steps, test each step alone, and handle trees such as org charts or category hierarchies.</p>
+<h2 id="s1-5-1-subqueries-scalar-derived-table-correlated">5.1 Subqueries: Scalar, Derived Table, Correlated</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">When you cook, you do not do everything at once. You first chop onions, then fry them. A subquery is "do this small job first, and use its result in the main job". The result can be one value (the average), a list (customer ids), or a whole small table.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Subquery</strong>: a <code>SELECT</code> written inside brackets inside another query.</li><li><strong>Scalar subquery</strong>: returns exactly <strong>one value</strong> (one row, one column). It can be used anywhere a number can.</li><li><strong>Derived table</strong>: a subquery in <code>FROM</code> that returns a table. It must have an alias.</li><li><strong>Correlated subquery</strong>: refers to a column of the outer query, so it is (conceptually) re-run for every outer row.</li><li><strong>Uncorrelated subquery</strong>: stands alone; it runs once.</li></ul>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Kind</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Scalar</td><td><code>price &gt; (SELECT AVG(price) FROM products)</code></td><td>compare each row with a global benchmark</td></tr><tr><td>Derived table</td><td><code>FROM (SELECT customer_id, SUM(...) ... GROUP BY ...) t</code></td><td>aggregate first, then filter or join</td></tr><tr><td><code>IN (subquery)</code></td><td><code>customer_id IN (SELECT ...)</code></td><td>audience lists</td></tr><tr><td>Correlated</td><td><code>price &gt; (SELECT AVG(price) ... WHERE category = p.category)</code></td><td>compare with the row's own group</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 5.1.1</span> (trivial) Products priced above the average product price. Predict: the average is <code>3450 / 6 = 575</code>. Which products exceed it?</p>
+<table class="steps"><tr><th>Step 1</th><td>The inner query returns one number: <code>SELECT AVG(price) FROM products</code>.</td></tr><tr><th>Step 2</th><td>The outer query compares each price to it.</td></tr></table>
+<pre class="code lang-sql"><code>SELECT name, price
+FROM products
+WHERE price &gt; (SELECT AVG(price) FROM products)
+ORDER BY price DESC;</code></pre>
+<pre class="code lang-text"><code>name       price
+---------  -----
+Keyboard   1500 
+Desk Lamp  900  
+Mouse      600</code></pre>
+<ul><li><strong>Check</strong> Prices: 1500, 600, 80, 120, 900, 250. Above 575: 1500, 600, 900.</li><li><strong>Answer</strong> Keyboard, Desk Lamp and Mouse.</li><li><strong>Meaning</strong> You never had to type the number 575. If prices change, the query adapts.</li></ul>
+<p class="problem"><span class="pl">Problem 5.1.2</span> (derived table) Which customers spent more than the <em>average paying customer</em>, counting paid orders only?</p>
+<table class="steps"><tr><th>Step 1</th><td>Inner query: total paid spend per customer. It returns a small table (5 customers have paid orders).</td></tr><tr><th>Step 2</th><td>Take the average of those totals: <code>12660 / 5 = 2532</code>.</td></tr><tr><th>Step 3</th><td>Keep customers above 2532.</td></tr></table>
+<pre class="code lang-sql"><code>SELECT t.customer_id, t.spent
+FROM (
+  SELECT o.customer_id, SUM(oi.qty * oi.unit_price) AS spent
+  FROM orders o JOIN order_items oi ON oi.order_id = o.order_id
+  WHERE o.status = 'paid'
+  GROUP BY o.customer_id
+) AS t
+WHERE t.spent &gt; (SELECT AVG(spent) FROM (
+                   SELECT SUM(oi.qty * oi.unit_price) AS spent
+                   FROM orders o JOIN order_items oi ON oi.order_id = o.order_id
+                   WHERE o.status = 'paid' GROUP BY o.customer_id))
+ORDER BY t.spent DESC;</code></pre>
+<pre class="code lang-text"><code>customer_id  spent
+-----------  -----
+1            4560 
+2            3600 
+4            3300</code></pre>
+<ul><li><strong>Compute</strong> Customer spends: 4560, 3600, 3300, 760, 440. Sum 12660. Average <code>12660 / 5 = 2532</code>.</li><li><strong>Check</strong> 4560, 3600 and 3300 are above 2532; 760 and 440 are not.</li><li><strong>Answer</strong> Customers 1, 2 and 4.</li><li><strong>Meaning</strong> The query repeats the same inner block twice. That hurts readability, and section 5.2 shows how a CTE fixes it.</li></ul>
+<p class="problem"><span class="pl">Problem 5.1.3</span> (correlated) Which products cost more than the average price of <strong>their own category</strong>?</p>
+<table class="steps"><tr><th>Step 1</th><td>For each product <code>p</code>, the inner query averages the prices where the category equals <code>p.category</code>. The link <code>p.category</code> is what makes it correlated.</td></tr><tr><th>Step 2</th><td>Compare.</td></tr></table>
+<pre class="code lang-sql"><code>SELECT p.name, p.category, p.price
+FROM products p
+WHERE p.price &gt; (SELECT AVG(p2.price) FROM products p2 WHERE p2.category = p.category)
+ORDER BY p.category;</code></pre>
+<pre class="code lang-text"><code>name       category     price
+---------  -----------  -----
+Keyboard   Electronics  1500 
+Desk Lamp  Home         900  
+Pen Pack   Stationery   120</code></pre>
+<ul><li><strong>Compute</strong> Electronics: <code>(1500 + 600) / 2 = 1050</code>, so the Keyboard (1500) is above. Stationery: <code>(80 + 120) / 2 = 100</code>, so the Pen Pack (120) is above. Home: <code>(900 + 250) / 2 = 575</code>, so the Desk Lamp (900) is above.</li><li><strong>Check</strong> Each category with two products has exactly one product above its average, which is always true for two different prices.</li><li><strong>Answer</strong> Keyboard, Pen Pack, Desk Lamp.</li><li><strong>Meaning</strong> Correlated subqueries are easy to read but, on huge tables, can be slow because they conceptually run once per row. Window functions (Chapter 8) often do the same job faster.</li></ul>
+<p class="problem"><span class="pl">Problem 5.1.4</span> <code>IN</code> versus <code>EXISTS</code>, and a scalar subquery in <code>SELECT</code>. Show each customer's name with their number of orders, using a scalar correlated subquery.</p>
+<pre class="code lang-sql"><code>SELECT c.name,
+       (SELECT COUNT(*) FROM orders o WHERE o.customer_id = c.customer_id) AS n_orders
+FROM customers c
+ORDER BY n_orders DESC, c.name;</code></pre>
+<pre class="code lang-text"><code>name   n_orders
+-----  --------
+Asha   4       
+Priya  3       
+Ravi   3       
+John   2       
+Kabir  1       
+Meena  1       
+Sana   0       
+Tom    0</code></pre>
+<ul><li><strong>Check</strong> 4, 3, 3, 2, 1, 1, 0, 0 add to 14 orders.</li><li><strong>Answer</strong> Asha 4; Priya and Ravi 3; John 2; Kabir and Meena 1; Sana and Tom 0.</li><li><strong>Meaning</strong> This gives zero for Sana and Tom without a <code>LEFT JOIN</code>. It is simple, but it runs the inner query for every customer.</li></ul>
+<h3>IN versus EXISTS: which one?</h3>
+<ul><li><code>IN (subquery)</code> is clear for a short list of values. The risk: <code>NOT IN</code> with NULLs (Chapter 2).</li><li><code>EXISTS (subquery)</code> stops at the first match and handles NULLs safely. Modern optimisers (PostgreSQL, SQL Server, MySQL 8) usually produce the same plan for both when they are logically equal. Use <code>EXISTS</code>/<code>NOT EXISTS</code> for "has / has no" questions, <code>IN</code> for readability with small lists.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> outer query:  SELECT ... FROM products p WHERE p.price &gt; ( ??? )
+                                                          |
+                          inner query runs, returns ONE number (575)
+                          ---------------------------------------
+ uncorrelated: runs once         -&gt; 575 for every row
+ correlated:   runs per outer row -&gt; 1050 for Electronics, 100 for Stationery, 575 for Home</code></pre>
+<h3>Connection to the real job</h3>
+<p>Comparing "each row with a benchmark" is everywhere: users above average spend, deliveries slower than the overall 95th percentile, products priced above category average. Interviews love the "second highest salary" question, which is a scalar subquery: <code>SELECT MAX(x) FROM t WHERE x &lt; (SELECT MAX(x) FROM t)</code>.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> compare segments with global or group benchmarks.</li><li><strong>Data Engineering:</strong> filtering a big table by a small list of keys (<code>IN</code>).</li><li><strong>Data Science:</strong> outlier detection with group averages.</li><li><strong>Logistics:</strong> find deliveries slower than the overall average.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">A scalar subquery that returns more than one row. PostgreSQL stops with <code>more than one row returned by a subquery used as an expression</code>. SQLite silently uses the first row. Always make sure the inner query returns a single value (an aggregate or a unique key).</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does "correlated" mean?</li></ol>
+<p>Answer: The inner query uses a column from the outer query.</p>
+<ol><li>Must a derived table have an alias?</li></ol>
+<p>Answer: Yes, in PostgreSQL and most databases.</p>
+<ol><li>What does a scalar subquery return?</li></ol>
+<p>Answer: One row and one column.</p>
+<h2 id="s2-5-2-ctes-naming-your-steps-with-with">5.2 CTEs: Naming Your Steps with WITH</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">In Problem 5.1.2 we copied the same inner query twice. It was hard to read. Imagine a recipe where steps are numbered and each step has a name: "Step 1: chopped_onions". A <strong>CTE</strong> (Common Table Expression) is exactly that: you give a query a name at the top, then use the name below like a table.</div></div>
+<h3>How it works</h3>
+<pre class="code lang-text"><code>WITH step1 AS ( SELECT ... ),
+     step2 AS ( SELECT ... FROM step1 ... )
+SELECT ... FROM step2 ...;</code></pre>
+<ul><li>The CTE exists only for that one statement. It is not stored.</li><li>A later CTE can use earlier ones (<strong>chained CTEs</strong>). Each step is a small query you can test on its own by running <code>SELECT * FROM step1</code>.</li><li>You can use one CTE several times in the main query (no copy-paste).</li><li>In PostgreSQL 12 and later, a CTE used once is normally inlined like a subquery; a CTE used twice may be computed once. You can force it with <code>MATERIALIZED</code> or <code>NOT MATERIALIZED</code>. In older versions every CTE was a "fence" computed once. This matters for speed, not for correctness.</li></ul>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Step name</th><th>What it holds</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>paid_lines</code></td><td>order lines of paid orders</td><td>cleaning step: filter bad rows first</td></tr><tr><td><code>customer_spend</code></td><td>one row per customer</td><td>aggregation step</td></tr><tr><td><code>final</code></td><td>ranking or share of total</td><td>presentation step</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 5.2.1</span> (trivial) Rewrite 5.1.2 with a CTE. Same answer, easier to read.</p>
+<pre class="code lang-sql"><code>WITH customer_spend AS (
+  SELECT o.customer_id, SUM(oi.qty * oi.unit_price) AS spent
+  FROM orders o JOIN order_items oi ON oi.order_id = o.order_id
+  WHERE o.status = 'paid'
+  GROUP BY o.customer_id
+)
+SELECT customer_id, spent
+FROM customer_spend
+WHERE spent &gt; (SELECT AVG(spent) FROM customer_spend)
+ORDER BY spent DESC;</code></pre>
+<pre class="code lang-text"><code>customer_id  spent
+-----------  -----
+1            4560 
+2            3600 
+4            3300</code></pre>
+<ul><li><strong>Check</strong> Same output as 5.1.2: customers 1, 2, 4 with 4560, 3600, 3300.</li><li><strong>Answer</strong> The CTE <code>customer_spend</code> is defined once and used twice.</li><li><strong>Meaning</strong> Same logic, half the text, and each step has a name that tells the reader what it is.</li></ul>
+<p class="problem"><span class="pl">Problem 5.2.2</span> (chained CTEs) For every paying customer show the customer's share of total paid revenue, in percent.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>paid_totals</code>: revenue per customer.</td></tr><tr><th>Step 2</th><td><code>grand</code>: the total across all customers.</td></tr><tr><th>Step 3</th><td>Divide: <code>spent / total × 100</code>.</td></tr></table>
+<pre class="code lang-sql"><code>WITH paid_totals AS (
+  SELECT o.customer_id, SUM(oi.qty * oi.unit_price) AS spent
+  FROM orders o JOIN order_items oi ON oi.order_id = o.order_id
+  WHERE o.status = 'paid'
+  GROUP BY o.customer_id
+),
+grand AS (
+  SELECT SUM(spent) AS total FROM paid_totals
+)
+SELECT p.customer_id, p.spent, g.total,
+       ROUND(100.0 * p.spent / g.total, 1) AS share_pct
+FROM paid_totals p CROSS JOIN grand g
+ORDER BY p.spent DESC;</code></pre>
+<pre class="code lang-text"><code>customer_id  spent  total  share_pct
+-----------  -----  -----  ---------
+1            4560   12660  36.0     
+2            3600   12660  28.4     
+4            3300   12660  26.1     
+5            760    12660  6.0      
+6            440    12660  3.5</code></pre>
+<ul><li><strong>Compute</strong> <code>4560 / 12660 = 0.3602</code>, so 36.0 percent. <code>3600 / 12660 = 28.4</code>. <code>3300 / 12660 = 26.1</code>. <code>760 / 12660 = 6.0</code>. <code>440 / 12660 = 3.5</code>.</li><li><strong>Check</strong> <code>36.0 + 28.4 + 26.1 + 6.0 + 3.5 = 100.0</code>.</li><li><strong>Answer</strong> Customer 1 36.0 percent, customer 2 28.4, customer 4 26.1, customer 5 6.0, customer 6 3.5.</li><li><strong>Meaning</strong> The top three customers bring about 90 percent of paid revenue. (In Chapter 8, <code>SUM() OVER ()</code> computes the same share in one step.)</li></ul>
+<p class="problem"><span class="pl">Problem 5.2.3</span> (combine ideas) The monthly revenue, and the month with the highest revenue. Use two CTEs and a filter on the max.</p>
+<pre class="code lang-sql"><code>WITH monthly AS (
+  SELECT substr(o.order_date,1,7) AS month, SUM(oi.qty * oi.unit_price) AS revenue
+  FROM orders o JOIN order_items oi ON oi.order_id = o.order_id
+  WHERE o.status = 'paid'
+  GROUP BY substr(o.order_date,1,7)
+)
+SELECT month, revenue
+FROM monthly
+WHERE revenue = (SELECT MAX(revenue) FROM monthly);</code></pre>
+<pre class="code lang-text"><code>month    revenue
+-------  -------
+2024-04  4900</code></pre>
+<ul><li><strong>Check</strong> From Chapter 3: paid revenue by month is 2260, 2520, 2980, 4900. The maximum is April's 4900.</li><li><strong>Answer</strong> 2024-04 with 4900.</li><li><strong>Meaning</strong> If two months tied for the max, both would appear, which is usually what you want.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> orders+items --&gt; [paid_totals] --&gt; [grand] --\
+                        |                     +--&gt; final SELECT
+                        +---------------------/
+ Each box is a named step. You can run SELECT * FROM &lt;box&gt; to test it alone.</code></pre>
+<h3>Connection to the real job</h3>
+<p>Production SQL (dbt models, dashboards) is written as long chains of CTEs: <code>source</code>, <code>cleaned</code>, <code>joined</code>, <code>aggregated</code>, <code>final</code>. Reviewers read top to bottom. Style rules used by many teams: lowercase keywords or uppercase, consistent; one CTE per idea; descriptive CTE names (<code>paid_orders</code>, not <code>a</code>, <code>b</code>); comments with <code>--</code> on non-obvious logic; and move repeated logic into a <strong>view</strong> (Chapter 9).</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> readable multi-step reports.</li><li><strong>Data Engineering:</strong> dbt models are chains of CTEs.</li><li><strong>Data Science:</strong> feature queries built step by step.</li><li><strong>Interviews:</strong> interviewers prefer CTEs to deeply nested subqueries because they are easier to explain.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Assuming a CTE is faster than a subquery. It is mainly a readability tool. Also, in some databases a CTE used many times can be recomputed each time. Check the plan (Chapter 10) if speed matters.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Can a CTE be used after the statement ends?</li></ol>
+<p>Answer: No. It lives for one statement only.</p>
+<ol><li>How do you test a middle step?</li></ol>
+<p>Answer: Replace the final select with <code>SELECT * FROM that_step</code>.</p>
+<ol><li>What is a chained CTE?</li></ol>
+<p>Answer: A CTE that uses an earlier CTE.</p>
+<h2 id="s3-5-3-recursive-ctes">5.3 Recursive CTEs</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">To list everyone under the CEO: first find the CEO. Then find the people who report to the CEO. Then find people who report to <em>those</em> people. Repeat until nobody new appears. That is a loop. Normal SQL has no loop, so SQL gives you the <strong>recursive CTE</strong>: a query that uses its own output as input in the next round.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Anchor member</strong> (base case): the starting rows. Runs once.</li><li><strong>Recursive member</strong>: refers to the CTE's own name; takes the rows from the previous round and produces new rows.</li><li><strong>Termination</strong>: the recursion ends when a round produces no new rows.</li><li><strong>Hierarchy / tree</strong>: rows pointing to a parent (employee to manager).</li><li><strong>Graph</strong>: nodes joined by edges; may contain cycles.</li></ul>
+<h3>Shape</h3>
+<pre class="code lang-text"><code>WITH RECURSIVE name(columns) AS (
+    &lt;anchor query&gt;                 -- starting rows
+    UNION ALL                      -- or UNION to remove duplicates
+    &lt;recursive query using name&gt;   -- builds the next layer
+)
+SELECT ... FROM name;</code></pre>
+<p><code>RECURSIVE</code> is required in PostgreSQL and MySQL; SQL Server writes just <code>WITH</code>. SQLite accepts <code>WITH RECURSIVE</code>.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Use</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Hierarchy</td><td>org chart, category tree</td><td>reporting lines, product categories</td></tr><tr><td>Date series</td><td>one row per day</td><td>calendar tables for gap-free charts</td></tr><tr><td>Graph traversal</td><td>routes, dependencies</td><td>lineage of tables in a data warehouse</td></tr><tr><td>Number series</td><td>1 to N</td><td>generating test data</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 5.3.1</span> (trivial) Count from 1 to 5, and also compute factorials, to see how rounds work.</p>
+<table class="steps"><tr><th>Step 1</th><td>Anchor: <code>n = 1, f = 1</code>.</td></tr><tr><th>Step 2</th><td>Recursive: <code>n + 1</code>, <code>f × (n + 1)</code>, while <code>n &lt; 5</code>. The <code>WHERE</code> is the stopping rule.</td></tr></table>
+<pre class="code lang-sql"><code>WITH RECURSIVE t(n, f) AS (
+  SELECT 1, 1
+  UNION ALL
+  SELECT n + 1, f * (n + 1) FROM t WHERE n &lt; 5
+)
+SELECT n, f FROM t;</code></pre>
+<pre class="code lang-text"><code>n  f  
+-  ---
+1  1  
+2  2  
+3  6  
+4  24 
+5  120</code></pre>
+<ul><li><strong>Check</strong> <code>1! = 1</code>, <code>2! = 2</code>, <code>3! = 6</code>, <code>4! = 24</code>, <code>5! = 120</code>.</li><li><strong>Answer</strong> Five rows, one per round.</li><li><strong>Meaning</strong> Round 0 gives (1,1). Round 1 reads that row and creates (2,2). It continues until the <code>WHERE</code> fails and no new row is created.</li></ul>
+<p class="problem"><span class="pl">Problem 5.3.2</span> (hierarchy) A small company. Show everyone under the CEO with their level and their full chain of command.</p>
+<table class="steps"><tr><th>Step 1</th><td>Create <code>staff</code> with <code>manager_id</code>. The CEO has NULL.</td></tr><tr><th>Step 2</th><td>Anchor: the row with <code>manager_id IS NULL</code>, level 0.</td></tr><tr><th>Step 3</th><td>Recursive: join staff to the previous layer where <code>s.manager_id = tree.id</code>, level + 1, and build a path string.</td></tr></table>
+<pre class="code lang-sql"><code>CREATE TABLE staff (id INTEGER PRIMARY KEY, name TEXT, manager_id INTEGER);
+INSERT INTO staff VALUES
+ (1,'Meera',NULL),(2,'Arun',1),(3,'Bina',1),
+ (4,'Chetan',2),(5,'Divya',2),(6,'Esha',3),(7,'Farid',4);
+
+WITH RECURSIVE tree(id, name, level, path) AS (
+  SELECT id, name, 0, name FROM staff WHERE manager_id IS NULL
+  UNION ALL
+  SELECT s.id, s.name, tree.level + 1, tree.path || ' &gt; ' || s.name
+  FROM staff s JOIN tree ON s.manager_id = tree.id
+)
+SELECT id, level, path FROM tree ORDER BY path;</code></pre>
+<pre class="code lang-text"><code>id  level  path                         
+--  -----  -----------------------------
+1   0      Meera                        
+2   1      Meera &gt; Arun                 
+4   2      Meera &gt; Arun &gt; Chetan        
+7   3      Meera &gt; Arun &gt; Chetan &gt; Farid
+5   2      Meera &gt; Arun &gt; Divya         
+3   1      Meera &gt; Bina                 
+6   2      Meera &gt; Bina &gt; Esha</code></pre>
+<ul><li><strong>Check</strong> Meera is level 0. Arun and Bina report to Meera: level 1. Chetan, Divya report to Arun and Esha to Bina: level 2. Farid reports to Chetan: level 3. Seven rows, as in <code>staff</code>.</li><li><strong>Answer</strong> Each person appears once, with the chain such as <code>Meera &gt; Arun &gt; Chetan &gt; Farid</code>.</li><li><strong>Meaning</strong> One query walked four levels deep, though we never said how many levels there were.</li></ul>
+<p class="problem"><span class="pl">Problem 5.3.3</span> (date series) A day-by-day count of orders for 5 to 11 March 2024, with zeros on empty days.</p>
+<table class="steps"><tr><th>Step 1</th><td>Generate 7 dates with recursion: <code>date(d, '+1 day')</code>.</td></tr><tr><th>Step 2</th><td><code>LEFT JOIN</code> orders by date and count.</td></tr></table>
+<pre class="code lang-sql"><code>WITH RECURSIVE days(d) AS (
+  SELECT '2024-03-05'
+  UNION ALL
+  SELECT date(d, '+1 day') FROM days WHERE d &lt; '2024-03-11'
+)
+SELECT days.d, COUNT(o.order_id) AS n_orders
+FROM days LEFT JOIN orders o ON o.order_date = days.d
+GROUP BY days.d
+ORDER BY days.d;</code></pre>
+<pre class="code lang-text"><code>d           n_orders
+----------  --------
+2024-03-05  1       
+2024-03-06  0       
+2024-03-07  1       
+2024-03-08  0       
+2024-03-09  0       
+2024-03-10  0       
+2024-03-11  0</code></pre>
+<ul><li><strong>Check</strong> Orders in this window: 106 on March 5 and 107 on March 7 (108 is on the 18th, outside). So counts are 1, 0, 1, 0, 0, 0, 0.</li><li><strong>Answer</strong> Seven rows; only March 5 and March 7 have an order.</li><li><strong>Meaning</strong> Without a date series, a chart would skip the empty days and mislead the viewer. This is the "date spine".</li></ul>
+<p>PostgreSQL has <code>generate_series('2024-03-05'::date, '2024-03-11'::date, interval '1 day')</code> for this, which is shorter:</p>
+<pre class="code lang-sql"><code>-- PostgreSQL syntax, not run here
+SELECT d::date
+FROM generate_series(DATE '2024-03-05', DATE '2024-03-11', INTERVAL '1 day') AS g(d);</code></pre>
+<p class="problem"><span class="pl">Problem 5.3.4</span> (graph with a cycle) A table of one-way links between four services: A to B, B to C, C to D, B to D, D to A. Which services can be reached from A? The graph has a cycle (A, B, C, D, A), so <code>UNION ALL</code> would never stop.</p>
+<table class="steps"><tr><th>Step 1</th><td>Use <code>UNION</code> (not <code>UNION ALL</code>). <code>UNION</code> removes duplicate rows, so a node already found is not added again, and the loop ends.</td></tr><tr><th>Step 2</th><td>Show the safer habit too: a depth limit.</td></tr></table>
+<pre class="code lang-sql"><code>CREATE TABLE links (src TEXT, dst TEXT);
+INSERT INTO links VALUES ('A','B'),('B','C'),('C','D'),('B','D'),('D','A');
+
+WITH RECURSIVE reach(node) AS (
+  SELECT 'A'
+  UNION
+  SELECT l.dst FROM links l JOIN reach r ON l.src = r.node
+)
+SELECT node FROM reach ORDER BY node;</code></pre>
+<pre class="code lang-text"><code>node
+----
+A   
+B   
+C   
+D</code></pre>
+<pre class="code lang-sql"><code>WITH RECURSIVE walk(node, depth) AS (
+  SELECT 'A', 0
+  UNION ALL
+  SELECT l.dst, w.depth + 1 FROM links l JOIN walk w ON l.src = w.node
+  WHERE w.depth &lt; 4
+)
+SELECT depth, node FROM walk ORDER BY depth, node;</code></pre>
+<pre class="code lang-text"><code>depth  node
+-----  ----
+0      A   
+1      B   
+2      C   
+2      D   
+3      A   
+3      D   
+4      A   
+4      B</code></pre>
+<ul><li><strong>Check</strong> From A you reach B, then C and D, then A again (already found). So the set is A, B, C, D.</li><li><strong>Answer</strong> All four nodes. The second query shows every walk of length up to 4 (the same node can repeat because routes differ), and the <code>depth &lt; 4</code> guard makes sure it stops.</li><li><strong>Meaning</strong> Always give recursion a stop: either <code>UNION</code> on a finite set, or a depth guard. PostgreSQL also has a <code>CYCLE</code> clause (version 14 and later) to detect loops.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> round 0 (anchor)   round 1            round 2          round 3
+ [Meera]  --------&gt;  [Arun, Bina] ---&gt;  [Chetan, Divya,  ---&gt; [Farid]
+                                         Esha]
+ Each round finds the children of the previous round. Stop when a round is empty.</code></pre>
+<h3>Connection to the real job</h3>
+<p>Data engineers use recursion for lineage ("which tables depend on this table?"), bill-of-materials explosions and category trees. Analysts use it to build date spines when no calendar table exists. For very large graphs, a graph database (Chapter 13) is better.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> category roll-ups, org-chart reports.</li><li><strong>Data Engineering:</strong> lineage and dependency graphs; calendar tables.</li><li><strong>Data Science:</strong> friend-of-friend features on small graphs.</li><li><strong>Operations:</strong> train-route chains (which station connects to which).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">No stop condition. The query loops until the database kills it. Always add <code>WHERE depth &lt; N</code> while developing, or use <code>UNION</code>. Another mistake: columns in the anchor and the recursive part with different types or order. They must match exactly.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What are the two parts of a recursive CTE?</li></ol>
+<p>Answer: The anchor (start) and the recursive member (next layer), joined by <code>UNION [ALL]</code>.</p>
+<ol><li>When does recursion stop?</li></ol>
+<p>Answer: When a round returns no new rows.</p>
+<ol><li>Why <code>UNION</code> in the cycle example?</li></ol>
+<p>Answer: It removes already-seen rows, so the cycle cannot grow forever.</p>
+<h2 id="s4-5-4-choosing-the-right-tool-and-writing-readable-sql">5.4 Choosing the Right Tool, and Writing Readable SQL</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">The same answer can be written five ways. A good engineer picks the way that the next reader (and you, six months later) can understand in one minute.</div></div>
+<h3>Decision table</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Situation</th><th>Best tool</th></tr></thead><tbody><tr><td>One number used as a filter</td><td>scalar subquery</td></tr><tr><td>"Has / has no" a match</td><td><code>EXISTS</code> / <code>NOT EXISTS</code></td></tr><tr><td>Several steps, or reuse one step twice</td><td>CTE</td></tr><tr><td>Per-row comparison with its group</td><td>window function (Chapter 8)</td></tr><tr><td>Tree, graph, date series</td><td>recursive CTE</td></tr><tr><td>Same logic needed by many queries</td><td>view (Chapter 9)</td></tr><tr><td>Very expensive step reused many times</td><td>temporary table (Chapter 9)</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 5.4.1</span> The "second highest price" interview question, three ways. Predict: the prices are 1500, 900, 600, 250, 120, 80, so the second highest is 900.</p>
+<pre class="code lang-sql"><code>SELECT MAX(price) AS second_highest
+FROM products
+WHERE price &lt; (SELECT MAX(price) FROM products);</code></pre>
+<pre class="code lang-text"><code>second_highest
+--------------
+900</code></pre>
+<pre class="code lang-sql"><code>SELECT price AS second_highest FROM products ORDER BY price DESC LIMIT 1 OFFSET 1;</code></pre>
+<pre class="code lang-text"><code>second_highest
+--------------
+900</code></pre>
+<pre class="code lang-sql"><code>WITH ranked AS (
+  SELECT price, DENSE_RANK() OVER (ORDER BY price DESC) AS r FROM products
+)
+SELECT price AS second_highest FROM ranked WHERE r = 2;</code></pre>
+<pre class="code lang-text"><code>second_highest
+--------------
+900</code></pre>
+<ul><li><strong>Check</strong> All three print 900.</li><li><strong>Answer</strong> 900, three ways.</li><li><strong>Meaning</strong> The <code>LIMIT/OFFSET</code> way breaks when prices tie (two products at 1500 would make the answer 1500). The <code>DENSE_RANK</code> way is correct with ties, and the subquery way as well.</li></ul>
+<p class="problem"><span class="pl">Problem 5.4.2</span> Style makeover. Here is hard-to-read SQL:</p>
+<pre class="code lang-sql"><code>select c.name,sum(oi.qty*oi.unit_price) s from customers c join orders o on o.customer_id=c.customer_id join order_items oi on oi.order_id=o.order_id where o.status='paid' group by c.name having sum(oi.qty*oi.unit_price)&gt;2000 order by s desc;</code></pre>
+<pre class="code lang-text"><code>name  s   
+----  ----
+Asha  4560
+Ravi  3600
+John  3300</code></pre>
+<p>And the same query, readable:</p>
+<pre class="code lang-sql"><code>-- Customers whose paid revenue is above 2000, biggest first
+SELECT
+    c.name,
+    SUM(oi.qty * oi.unit_price) AS paid_revenue
+FROM customers   AS c
+JOIN orders      AS o  ON o.customer_id = c.customer_id
+JOIN order_items AS oi ON oi.order_id   = o.order_id
+WHERE o.status = 'paid'
+GROUP BY c.name
+HAVING SUM(oi.qty * oi.unit_price) &gt; 2000
+ORDER BY paid_revenue DESC;</code></pre>
+<pre class="code lang-text"><code>name  paid_revenue
+----  ------------
+Asha  4560        
+Ravi  3600        
+John  3300</code></pre>
+<ul><li><strong>Check</strong> Customers with paid revenue above 2000: Asha 4560, Ravi 3600, John 3300.</li><li><strong>Answer</strong> Same result. The second is easier to read and review.</li><li><strong>Meaning</strong> Style rules: one clause per line, aligned joins, meaningful aliases, a comment that states the purpose, uppercase keywords (or consistently lowercase), <code>AS</code> for aliases, explicit <code>ON</code>.</li></ul>
+<h3>Connection to the real job</h3>
+<p>Code review of SQL is a real part of data teams. Clean SQL reduces bugs and onboarding time. Many companies use a formatter (such as <code>sqlfluff</code>) in their pipeline.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> reusable report queries other people can maintain.</li><li><strong>Data Engineering:</strong> version-controlled SQL models with review.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Writing 200-line queries with nested subqueries four levels deep. Break them into CTEs with names that explain each step.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why is <code>LIMIT 1 OFFSET 1</code> risky for "second highest"?</li></ol>
+<p>Answer: Ties: duplicates of the top value make the answer wrong.</p>
+<ol><li>Name two style rules for readable SQL.</li></ol>
+<p>Answer: Descriptive aliases and one clause per line (also comments, CTEs).</p>
+<ol><li>When prefer EXISTS over IN?</li></ol>
+<p>Answer: When asking has / has no a match, especially when NULLs are possible.</p>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>A subquery is a query inside brackets; scalar means one value, derived means a table, correlated means it uses the outer row.</li><li><code>IN</code> and <code>EXISTS</code> often behave the same; <code>NOT IN</code> is dangerous with NULLs.</li><li>A CTE names a step with <code>WITH</code>; chains read like a recipe.</li><li>A CTE is mostly about readability; check the plan for speed.</li><li>A recursive CTE has an anchor and a recursive member; it stops when no new rows appear.</li><li>Always give recursion a stop: <code>UNION</code>, or a depth limit.</li><li>Use recursion for trees, graphs and date series.</li><li>Prefer clear names, comments and one clause per line.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Need</th><th>Pattern</th></tr></thead><tbody><tr><td>Compare with a benchmark</td><td><code>WHERE x &gt; (SELECT AVG(x) FROM t)</code></td></tr><tr><td>Named steps</td><td><code>WITH a AS (...), b AS (... FROM a ...) SELECT ...</code></td></tr><tr><td>Hierarchy</td><td><code>WITH RECURSIVE t AS (anchor UNION ALL step) SELECT ...</code></td></tr><tr><td>Date series</td><td><code>WITH RECURSIVE d AS (SELECT date UNION ALL SELECT date(d,'+1 day') ... )</code></td></tr><tr><td>Second highest</td><td><code>WHERE x &lt; (SELECT MAX(x) FROM t)</code> or <code>DENSE_RANK</code></td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 5.P.1</span> (easy) Customers who signed up before the average signup date. Show names. (Dates are text, so compare using Julian day numbers.)</p>
+<pre class="code lang-sql"><code>SELECT name, signup_date FROM customers
+WHERE julianday(signup_date) &lt; (SELECT AVG(julianday(signup_date)) FROM customers)
+ORDER BY signup_date;</code></pre>
+<pre class="code lang-text"><code>name   signup_date
+-----  -----------
+Asha   2024-01-05 
+Ravi   2024-01-12 
+Meena  2024-01-20 
+John   2024-02-02</code></pre>
+<p><strong>Answer:</strong> Asha, Ravi, Meena and John. Counting days from 1 January: the signups are day 4, 11, 19, 32, 44, 60, 74 and 91. They add to 335, and <code>335 / 8 = 41.9</code>, which is about 11 February. Only the first four signed up before that. (PostgreSQL has no <code>julianday</code>; there you can average <code>EXTRACT(EPOCH FROM signup_date)</code>.)</p>
+<p class="problem"><span class="pl">Problem 5.P.2</span> (easy) Customers who have at least one cancelled or refunded order, using <code>IN</code>.</p>
+<pre class="code lang-sql"><code>SELECT name FROM customers
+WHERE customer_id IN (SELECT customer_id FROM orders WHERE status &lt;&gt; 'paid')
+ORDER BY name;</code></pre>
+<pre class="code lang-text"><code>name 
+-----
+Meena
+Priya</code></pre>
+<p><strong>Answer:</strong> Meena (order 104 cancelled) and Priya (order 109 refunded).</p>
+<p class="problem"><span class="pl">Problem 5.P.3</span> (what is the output?) What does this recursive query print?</p>
+<pre class="code lang-sql"><code>WITH RECURSIVE c(n) AS (SELECT 10 UNION ALL SELECT n - 3 FROM c WHERE n &gt; 0)
+SELECT n FROM c;</code></pre>
+<pre class="code lang-text"><code>n 
+--
+10
+7 
+4 
+1 
+-2</code></pre>
+<p><strong>Answer:</strong> 10, 7, 4, 1, -2. The test <code>n &gt; 0</code> is checked on the previous row: 1 is still above 0, so one more row (-2) is produced; then -2 fails the test and recursion stops.</p>
+<p class="problem"><span class="pl">Problem 5.P.4</span> (find the bug) A recursive query lists all descendants of a manager, but never ends. What is missing?</p>
+<pre class="code lang-sql"><code>-- buggy idea: UNION ALL on a table with a cycle, no depth limit</code></pre>
+<p><strong>Answer:</strong> Either a depth guard (<code>WHERE depth &lt; 10</code>) or <code>UNION</code> so repeated rows are dropped. Data with a manager cycle (A manages B, B manages A) loops forever otherwise.</p>
+<p class="problem"><span class="pl">Problem 5.P.5</span> Products never ordered, using <code>NOT EXISTS</code>.</p>
+<pre class="code lang-sql"><code>SELECT name FROM products p
+WHERE NOT EXISTS (SELECT 1 FROM order_items oi WHERE oi.product_id = p.product_id);</code></pre>
+<pre class="code lang-text"><code>name
+----
+Mug</code></pre>
+<p><strong>Answer:</strong> Mug.</p>
+<p class="problem"><span class="pl">Problem 5.P.6</span> For each customer with orders, the date of their first order, using a correlated subquery.</p>
+<pre class="code lang-sql"><code>SELECT c.name,
+       (SELECT MIN(o.order_date) FROM orders o WHERE o.customer_id = c.customer_id) AS first_order
+FROM customers c
+WHERE EXISTS (SELECT 1 FROM orders o WHERE o.customer_id = c.customer_id)
+ORDER BY first_order;</code></pre>
+<pre class="code lang-text"><code>name   first_order
+-----  -----------
+Asha   2024-01-10 
+Ravi   2024-01-15 
+Meena  2024-02-10 
+John   2024-02-20 
+Priya  2024-03-07 
+Kabir  2024-03-30</code></pre>
+<p><strong>Answer:</strong> Asha 2024-01-10, Ravi 2024-01-15, Meena 2024-02-10, John 2024-02-20, Priya 2024-03-07, Kabir 2024-03-30.</p>
+<p class="problem"><span class="pl">Problem 5.P.7</span> Number of employees at each level of the <code>staff</code> tree.</p>
+<pre class="code lang-sql"><code>WITH RECURSIVE tree(id, level) AS (
+  SELECT id, 0 FROM staff WHERE manager_id IS NULL
+  UNION ALL
+  SELECT s.id, t.level + 1 FROM staff s JOIN tree t ON s.manager_id = t.id
+)
+SELECT level, COUNT(*) AS headcount FROM tree GROUP BY level ORDER BY level;</code></pre>
+<pre class="code lang-text"><code>level  headcount
+-----  ---------
+0      1        
+1      2        
+2      3        
+3      1</code></pre>
+<p><strong>Answer:</strong> Level 0: 1, level 1: 2, level 2: 3, level 3: 1. Total 7.</p>
+<p class="problem"><span class="pl">Problem 5.P.8</span> (scenario) The CFO wants "revenue by month, with a column showing the previous month's revenue". Without window functions, how would you start? <strong>Answer:</strong> Build a CTE <code>monthly</code>, then self-join it on "month = previous month". Chapter 8 shows <code>LAG</code>, which is simpler. The CTE is the right first step in both approaches.</p>
+<p class="problem"><span class="pl">Problem 5.P.9</span> (interview) What is the difference between a subquery and a CTE? <strong>Answer:</strong> A CTE is a named subquery defined before the main query, which can be referenced several times and chained. Logically they give the same result. CTEs improve readability and are the only way to write recursion. Performance depends on the optimiser; do not assume a CTE is faster.</p>
+<p class="problem"><span class="pl">Problem 5.P.10</span> (interview) Explain how a recursive CTE works and how you prevent infinite loops. <strong>Answer:</strong> An anchor query produces the first rows. The recursive part joins the CTE to the base table to produce the next layer, repeated until a round returns nothing. Prevent infinite loops with a depth counter and <code>WHERE depth &lt; N</code>, with <code>UNION</code> instead of <code>UNION ALL</code>, or with PostgreSQL's <code>CYCLE</code> clause.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional in India moving into data roles, and English is my second language. Teach me Chapter 5 topic: "subqueries: scalar, correlated, derived tables, IN versus EXISTS". Use a small products and orders example. After each concept ask me to predict the result before you reveal it, and check my understanding with one question.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: CTEs (WITH) and chained CTEs. Give me 8 graded exercises where I must break one long question into named steps, without solutions at first. After I paste my answers, review the naming, readability, and correctness, and show a cleaner version.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. Teach me recursive CTEs step by step: anchor member, recursive member, termination, UNION versus UNION ALL, depth limits. I am a beginner. Use an org chart, a date series and a small graph with a cycle. Draw each round as a small table, and after each example ask me a check question.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a career changer preparing for analyst interviews. Review the SQL I paste below. Suggest how to restructure nested subqueries into CTEs, point out correlated subqueries that could be rewritten with joins or window functions, and fix style problems (aliases, formatting, comments). Explain every change in simple English. My SQL: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. Run a mock SQL interview for me on subqueries and CTEs: second highest value, rows above group average, customers with no orders, org-chart traversal, generating a date series. One question at a time, wait for my answer, grade out of 10, show a model answer and the common wrong answer.</pre></div><div class="readbtn"><button class="btn" data-read="study:sql:ch05">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch04.html">← Chapter 4: Joins</a><a class="btn" href="ch06.html">Chapter 6: CASE, Strings, Dates and Times, JSON and →</a></div></div><script src="../../assets/study.js"></script></body></html>

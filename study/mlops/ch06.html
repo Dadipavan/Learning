@@ -1,0 +1,206 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 6: Training Pipelines, Distributed Training and GPU Cost Control</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 6</div><h1>Training Pipelines, Distributed Training and GPU Cost Control</h1><p>From &quot;I ran a script by hand&quot; to &quot;the system retrains itself, safely, on a budget&quot;.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-6-1-training-pipelines-and-orchestration">6.1 Training Pipelines and Orchestration</a></li><li><a href="#s2-6-2-distributed-training-basics">6.2 Distributed Training Basics</a></li><li><a href="#s3-6-3-gpu-management-and-cost-control">6.3 GPU Management and Cost Control</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>Retraining a model is rarely one command. You extract data, validate it, build features, train, evaluate, and register. If any step fails at 2 a.m., somebody must know and the rerun must not corrupt anything. An <strong>orchestrator</strong> (Airflow, Kubeflow, Metaflow and friends) runs these steps in the right order, retries failures and keeps a history. And when the data or model is large, you need more than one GPU, which brings new problems: communication cost and a very real bill. This chapter teaches the orchestration ideas with a runnable dependency-graph example, the basics of distributed training with a numeric proof that data parallelism works, and the cost-control habits (checkpoints, spot instances, mixed precision) that keep experiments affordable. GPU and cluster code is <strong>not run here</strong>; this machine has no GPU, so we use arithmetic and small simulations.</p>
+<p>Words you need:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>DAG</td><td>Directed acyclic graph: tasks with arrows "A before B", and no loops.</td></tr><tr><td>Orchestrator</td><td>The program that runs a DAG: order, retries, schedules, logs.</td></tr><tr><td>Idempotent</td><td>Running it twice gives the same result as running it once.</td></tr><tr><td>Epoch</td><td>One full pass through the training data.</td></tr><tr><td>Checkpoint</td><td>A saved snapshot of training state so you can resume.</td></tr><tr><td>GPU</td><td>A chip with thousands of small cores, good at the matrix maths in deep learning.</td></tr><tr><td>Spot / preemptible</td><td>Cheap cloud machines that the provider may take back with short notice.</td></tr></tbody></table></div>
+<h2 id="s1-6-1-training-pipelines-and-orchestration">6.1 Training Pipelines and Orchestration</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A recipe with dependencies: you cannot ice a cake before baking it, and you cannot bake before mixing. The recipe's order is a DAG. A kitchen manager (the orchestrator) starts each step when its ingredients are ready, restarts a burned step, and writes down what happened.</div></div>
+<h3>The DAG and why it cannot have loops</h3>
+<p>Each <strong>task</strong> is a node; each dependency is an arrow. "Acyclic" means no cycle: if A needs B and B needs A, nothing could ever start. Python's standard library has <code>graphlib.TopologicalSorter</code> that finds a valid order, and detects cycles for us. Our churn retraining pipeline:</p>
+<pre class="code lang-text"><code>extract -&gt; validate -&gt; features -&gt; train -&gt; evaluate -&gt; register
+                                              \-&gt; report</code></pre>
+<h3>Predict, run, explain</h3>
+<p>Before you run it: in what order will the tasks run? And what happens if we accidentally make <code>extract</code> depend on <code>register</code>?</p>
+<pre class="code lang-python"><code>from graphlib import TopologicalSorter
+dag = {"extract": set(), "validate": {"extract"}, "features": {"validate"}, "train": {"features"},
+       "evaluate": {"train"}, "register": {"evaluate"}, "report": {"evaluate"}}
+print("run order:", list(TopologicalSorter(dag).static_order()))
+bad = dict(dag); bad["extract"] = {"register"}
+try: list(TopologicalSorter(bad).static_order())
+except Exception as e: print("cycle error:", type(e).__name__, e.args[1])</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>run order: ['extract', 'validate', 'features', 'train', 'evaluate', 'register', 'report']
+cycle error: CycleError ['extract', 'validate', 'features', 'train', 'evaluate', 'register', 'extract']</code></pre>
+<p><strong>Explain.</strong> The dictionary says "task: set of tasks it needs first". The sorter returns an order where every task comes after its needs. <code>register</code> and <code>report</code> both need only <code>evaluate</code>, so either could go first (or run in parallel in a real orchestrator). With the loop, Python raises <code>CycleError</code> and even shows the loop: extract, ..., register, back to extract. Real orchestrators reject such a DAG when you load it.</p>
+<h3>What a real orchestrator adds</h3>
+<p>Airflow, shown as text and <strong>not run here</strong> (Airflow is a large install; syntax varies slightly between major versions):</p>
+<pre class="code lang-python"><code>from airflow import DAG
+from airflow.operators.python import PythonOperator
+from datetime import datetime, timedelta
+with DAG("churn_retrain", start_date=datetime(2026, 1, 1), schedule="@weekly", catchup=False,
+         default_args={"retries": 2, "retry_delay": timedelta(minutes=5)}) as dag:
+    extract = PythonOperator(task_id="extract", python_callable=run_extract)
+    validate = PythonOperator(task_id="validate", python_callable=run_validate)
+    train = PythonOperator(task_id="train", python_callable=run_train)
+    extract &gt;&gt; validate &gt;&gt; train</code></pre>
+<div class="tablewrap"><table class="data"><thead><tr><th>Tool</th><th>Style</th><th>Good for</th><th>Think twice when</th></tr></thead><tbody><tr><td>Airflow</td><td>Python DAG files, mature scheduler</td><td>Data and ML pipelines with schedules</td><td>Heavy per-task container isolation without KubernetesPodOperator</td></tr><tr><td>Kubeflow Pipelines</td><td>Pipelines as Kubernetes steps</td><td>ML on Kubernetes</td><td>You have no Kubernetes</td></tr><tr><td>Argo Workflows</td><td>YAML DAGs on Kubernetes</td><td>General container workflows</td><td>You prefer Python-first</td></tr><tr><td>Metaflow</td><td>Python class with <code>@step</code></td><td>Data scientists, simple scale-out</td><td>Very custom scheduling</td></tr><tr><td>Dagster</td><td>Data assets and software-defined pipelines</td><td>Asset-centric teams</td><td>Existing Airflow estate</td></tr><tr><td>ZenML</td><td>Framework wrapping many back ends</td><td>Portability</td><td>Small, single-tool setups</td></tr><tr><td>Vertex Pipelines / SageMaker Pipelines</td><td>Managed cloud services</td><td>You are already on that cloud</td><td>You need multi-cloud portability</td></tr></tbody></table></div>
+<p>All do the same core job: order, schedule, retry, log, pass artifacts, and allow reruns.</p>
+<h3>Idempotency: the property that saves you at 2 a.m.</h3>
+<p>Orchestrators retry tasks. If a task appends rows each time it runs, a retry duplicates data. An <strong>idempotent</strong> task writes in a way that repeating it changes nothing. Compare:</p>
+<pre class="code lang-python"><code>import json, pathlib
+OUT = pathlib.Path("/tmp/lab/idem"); OUT.mkdir(exist_ok=True)
+def append_job(day, rows):             # NOT idempotent
+    with open(OUT/"append.jsonl", "a") as f:
+        for r in rows: f.write(json.dumps({"day": day, "v": r}) + "\n")
+def overwrite_job(day, rows):          # idempotent: one file per day, replaced whole
+    (OUT/f"day={day}.json").write_text(json.dumps(rows))
+for _ in range(2): append_job("2026-03-01", [1, 2, 3]); overwrite_job("2026-03-01", [1, 2, 3])
+print("append  rows after 2 runs:", len((OUT/"append.jsonl").read_text().splitlines()))
+print("overwrite rows after 2 runs:", len(json.loads((OUT/"day=2026-03-01.json").read_text())))</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>append  rows after 2 runs: 6
+overwrite rows after 2 runs: 3</code></pre>
+<p>The retry doubled the appended data (6 rows instead of 3) but left the overwrite version at 3. Rule: write results by partition (per date) and replace the whole partition.</p>
+<p class="problem"><span class="pl">Problem 6.1.1</span> A pipeline has 6 tasks. Task times in minutes: extract 10, validate 5, features 20, train 60, evaluate 10, register 1. They are in a line. What is the total time, and which task should you speed up first?</p>
+<table class="steps"><tr><th>Formula</th><td>total (sequential) = sum of task times</td></tr><tr><th>Plug in</th><td>10 + 5 + 20 + 60 + 10 + 1</td></tr><tr><th>Compute</th><td>10 + 5 = 15; + 20 = 35; + 60 = 95; + 10 = 105; + 1 = 106</td></tr><tr><th>Answer</th><td>106 minutes. <code>train</code> takes 60 of 106 minutes (56.6%), so it is the bottleneck; a 2x faster train saves 30 minutes.</td></tr><tr><th>Check</th><td>60 ÷ 106 = 0.566, so 56.6%; halving it saves 30, leaving 76 minutes.</td></tr><tr><th>Why it matters</th><td>Same bottleneck thinking as a restaurant kitchen: time each station (prep, grill, plating) and fix the slowest one first.</td></tr></table>
+<p class="problem"><span class="pl">Problem 6.1.2</span> <code>evaluate</code> fails 1 time in 20 because of a flaky network read. With 2 retries, what is the chance a run fails permanently, assuming independent failures?</p>
+<table class="steps"><tr><th>Formula</th><td>P(all attempts fail) = p^attempts, with attempts = 1 + retries</td></tr><tr><th>Plug in</th><td>(1/20)^3</td></tr><tr><th>Compute</th><td>0.05 × 0.05 × 0.05 = 0.000125</td></tr><tr><th>Answer</th><td>0.0125%, about 1 failure in 8,000 runs. Retries make flaky steps very reliable, as long as the step is idempotent.</td></tr><tr><th>Check</th><td>1 ÷ 8,000 = 0.000125.</td></tr><tr><th>Why it matters</th><td>Retries convert flakiness into reliability cheaply, but only if re-running is safe.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Scheduling triggers: time ("every Sunday"), data ("new files arrived") or event ("drift alert", see Chapter 10 and continuous training in Chapter 9). Each task should read inputs from versioned storage (Chapter 4) and write outputs plus a tracker entry (Chapter 3).</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering</strong>: Airflow or Dagster for ETL feeding the feature store.</li><li><strong>MLOps</strong>: scheduled retraining with evaluation gates.</li><li><strong>ML Platform</strong>: standard pipeline templates so every team gets retries, logs and lineage.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Writing tasks that are not idempotent, or that depend on the machine they ran on (local files). A retry on another worker then breaks or duplicates. Pass data through shared storage and write per-partition.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why must a DAG have no cycles?</li></ol>
+<p>Answer: With a cycle, no task could ever start first.</p>
+<ol><li>What is idempotency?</li></ol>
+<p>Answer: Running a task twice has the same effect as once.</p>
+<ol><li>Which pipeline step was the bottleneck in Problem 6.1.1?</li></ol>
+<p>Answer: Train, at 60 of 106 minutes.</p>
+<h2 id="s2-6-2-distributed-training-basics">6.2 Distributed Training Basics</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You must grade 800 exam papers. Hire 4 graders, give each 200 papers, and combine their totals at the end. That is <strong>data parallelism</strong>: same job, different slices of the data. If a single exam paper were so huge that one person could not hold it, you would split the paper itself between people. That is <strong>model parallelism</strong>.</div></div>
+<h3>Data parallel, with numbers</h3>
+<p>In <strong>data parallel training</strong> (PyTorch DDP, "DistributedDataParallel", is the standard form), each GPU holds a full copy of the model, processes its own slice of the batch, computes a gradient (the direction to change the weights), and then all GPUs <strong>average</strong> their gradients (an operation called all-reduce) so every copy takes the same step. Does averaging four smaller gradients really equal the gradient of the whole batch? We can prove it in code with a simple model:</p>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(0); X = rng.normal(size=(8, 3)); y = rng.normal(size=8); w = np.zeros(3)
+grad = lambda Xs, ys, w: 2 * Xs.T @ (Xs @ w - ys) / len(ys)       # gradient of mean squared error
+full = grad(X, y, w)
+shards = [grad(X[i*2:(i+1)*2], y[i*2:(i+1)*2], w) for i in range(4)]    # 4 workers, 2 rows each
+print("full-batch grad:", np.round(full, 4)); print("mean of 4 worker grads:", np.round(np.mean(shards, 0), 4))
+print("equal:", np.allclose(full, np.mean(shards, 0)))</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>full-batch grad: [-0.1305  0.3081 -0.4137]
+mean of 4 worker grads: [-0.1305  0.3081 -0.4137]
+equal: True</code></pre>
+<p><strong>Explain.</strong> The loss is a mean over rows. The gradient of a mean is the mean of the per-row gradients. Splitting 8 rows into 4 equal shards of 2 and averaging the 4 shard-means gives exactly the full mean (equal shard sizes are needed; with unequal shards you must weight). So 4 GPUs take the same step as 1 GPU with 4 times the batch. That is why data parallelism is mathematically safe.</p>
+<h3>Why 8 GPUs are not 8 times faster</h3>
+<p>Every step each GPU computes (parallel, divides by N) and then communicates (does not shrink). Suppose compute is 100 ms per step on one GPU and communication costs a fixed 8 ms when N &gt; 1 (an assumed number for illustration):</p>
+<pre class="code lang-python"><code>compute, comm = 100.0, 8.0
+for N in [1,2,4,8,16]:
+    t = compute/N + (comm if N&gt;1 else 0)
+    print(f"GPUs={N:&gt;2}  step={t:6.2f} ms  speedup={compute/t:5.2f}  efficiency={compute/t/N*100:5.1f}%")</code></pre>
+<pre class="code lang-text"><code>GPUs= 1  step=100.00 ms  speedup= 1.00  efficiency=100.0%
+GPUs= 2  step= 58.00 ms  speedup= 1.72  efficiency= 86.2%
+GPUs= 4  step= 33.00 ms  speedup= 3.03  efficiency= 75.8%
+GPUs= 8  step= 20.50 ms  speedup= 4.88  efficiency= 61.0%
+GPUs=16  step= 14.25 ms  speedup= 7.02  efficiency= 43.9%</code></pre>
+<p>Read it: speedup = old time ÷ new time; efficiency = speedup ÷ N. At 16 GPUs you pay for 16 and get 7. This is Amdahl's law in action (the part that does not scale limits the total), like a delivery company: adding trucks does not help if everything must still pass through one loading dock. Real systems overlap communication with compute to soften this.</p>
+<h3>Beyond data parallel (awareness level)</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Technique</th><th>Idea</th><th>When</th></tr></thead><tbody><tr><td>Data parallel (DDP, Horovod)</td><td>Full model copy per GPU, split data</td><td>Model fits on one GPU</td></tr><tr><td>Model / tensor / pipeline parallel</td><td>Split layers or matrices over GPUs</td><td>Model too big for one GPU</td></tr><tr><td>FSDP, DeepSpeed ZeRO</td><td>Shard weights, gradients and optimizer state across GPUs</td><td>Big models; saves memory</td></tr><tr><td>Ray Train</td><td>Distributed training as a service on a Ray cluster</td><td>Python-native scaling</td></tr><tr><td>Multi-node</td><td>Several machines linked by fast network</td><td>Larger jobs; network speed matters</td></tr></tbody></table></div>
+<p>Not run here; you need GPUs and a cluster to practise these. Learn the vocabulary now, the hands-on later.</p>
+<p class="problem"><span class="pl">Problem 6.2.1</span> Using the table above, at 8 GPUs the step time is 20.5 ms. Verify it, and state the speedup and efficiency.</p>
+<table class="steps"><tr><th>Formula</th><td>t = compute ÷ N + comm; speedup = compute ÷ t; efficiency = speedup ÷ N</td></tr><tr><th>Plug in</th><td>100 ÷ 8 + 8; then 100 ÷ 20.5; then that ÷ 8</td></tr><tr><th>Compute</th><td>12.5 + 8 = 20.5; 100 ÷ 20.5 = 4.878; 4.878 ÷ 8 = 0.6098</td></tr><tr><th>Answer</th><td>Step time 20.5 ms, speedup 4.88, efficiency 61%. You pay for 8 GPUs and get the work of about 4.9.</td></tr><tr><th>Check</th><td>The code printed exactly 20.50, 4.88 and 61.0%.</td></tr><tr><th>Why it matters</th><td>Cost per useful result rises with scale. Test small before you reserve 64 GPUs.</td></tr></table>
+<p class="problem"><span class="pl">Problem 6.2.2</span> A model has 7 billion parameters. How much GPU memory do the weights alone need in 16-bit and 32-bit formats?</p>
+<table class="steps"><tr><th>Formula</th><td>bytes = parameters × bytes per parameter (fp16 = 2, fp32 = 4)</td></tr><tr><th>Plug in</th><td>7,000,000,000 × 2 and × 4</td></tr><tr><th>Compute</th><td>14,000,000,000 bytes = 14 GB; 28,000,000,000 bytes = 28 GB</td></tr><tr><th>Answer</th><td>14 GB in fp16 and 28 GB in fp32 (code output: 14.00 and 28.00). Training also needs gradients and optimizer states, commonly several times more, which is why FSDP and DeepSpeed shard that state.</td></tr><tr><th>Check</th><td>7 × 2 = 14 and 7 × 4 = 28 (billions of bytes = GB).</td></tr><tr><th>Why it matters</th><td>This arithmetic tells you whether a model fits on one 24 GB or 80 GB GPU before you try.</td></tr></table>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> data  -&gt; [shard 1] -&gt; GPU 1 (model copy) -&gt; grad 1 --\
+       -&gt; [shard 2] -&gt; GPU 2 (model copy) -&gt; grad 2 ---+-&gt; average (all-reduce) -&gt; same update on every GPU
+       -&gt; [shard 3] -&gt; GPU 3 (model copy) -&gt; grad 3 --/</code></pre>
+<p>Each GPU reads its own shard (arrows from data), computes its own gradient, and then all gradients are averaged before every copy updates. All copies stay identical.</p>
+<h3>Connection to the real job</h3>
+<p>For many tabular models, a single machine is enough, so do not distribute prematurely. For deep learning and LLM fine-tuning, you will meet DDP first, FSDP and DeepSpeed next. A real DDP skeleton (not run here) launched with <code>torchrun --nproc_per_node=4 train.py</code>:</p>
+<pre class="code lang-python"><code># train.py (sketch, not run here)
+import torch, torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+dist.init_process_group("nccl")
+rank = dist.get_rank(); torch.cuda.set_device(rank)
+model = DDP(MyModel().cuda(rank), device_ids=[rank])
+# use DistributedSampler so each rank sees a different shard; call sampler.set_epoch(epoch) each epoch</code></pre>
+<h3>Applications</h3>
+<ul><li><strong>Deep Learning</strong>: multi-GPU training of vision and language models.</li><li><strong>GenAI</strong>: sharded fine-tuning with FSDP or DeepSpeed.</li><li><strong>ML Engineering</strong>: Ray Train or Horovod for scaling classical and deep models.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Assuming linear speedup and budgeting by "N times faster". Measure efficiency at 2, 4 and 8 GPUs; stop where the gain per extra GPU no longer pays.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>In data parallel training, what is averaged?</li></ol>
+<p>Answer: The gradients from each GPU.</p>
+<ol><li>Why is efficiency below 100%?</li></ol>
+<p>Answer: Communication does not shrink when you add GPUs.</p>
+<ol><li>When do you need model parallelism or FSDP?</li></ol>
+<p>Answer: When the model (weights, gradients, optimizer state) does not fit on one GPU.</p>
+<h2 id="s3-6-3-gpu-management-and-cost-control">6.3 GPU Management and Cost Control</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A taxi meter runs whether the car is moving or parked. A cloud GPU bills by the hour whether it is calculating or waiting for data. The goal is to keep it busy, make it cheaper, and make sure a crash does not waste the whole trip.</div></div>
+<h3>What to watch and tune</h3>
+<ul><li><strong>Utilization</strong>: the share of time the GPU is busy. On a machine with an NVIDIA GPU you check it with <code>nvidia-smi</code> (not run here). Low utilization usually means the <strong>input pipeline</strong> (reading and preparing data) is the bottleneck, not the model.</li><li><strong>Mixed precision</strong>: do most maths in 16-bit numbers to use less memory and run faster, while keeping key values in 32-bit.</li><li><strong>Batch size</strong>: larger batches use the GPU better until memory runs out; very large batches can hurt accuracy, so tune carefully.</li><li><strong>Efficient data loading</strong>: use binary columnar or sharded formats (Parquet, TFRecord, WebDataset), parallel workers and caching, instead of reading millions of small files or large CSVs.</li></ul>
+<h3>Mixed precision, in real numbers</h3>
+<p>16-bit floats save memory but have a small range and coarse precision. This is why frameworks keep a master copy in 32-bit and scale the loss.</p>
+<pre class="code lang-python"><code>import numpy as np
+print("float16 max:", np.finfo(np.float16).max, "float32 max:", np.finfo(np.float32).max)
+with np.errstate(over="ignore"):
+    print("60000 + 60000 in float16:", np.float16(60000) + np.float16(60000))
+print("1.0 + 0.0001 in float16:", np.float16(1.0) + np.float16(0.0001), "| in float32:", np.float32(1.0)+np.float32(0.0001))</code></pre>
+<pre class="code lang-text"><code>float16 max: 6.55e+04 float32 max: 3.4028235e+38
+60000 + 60000 in float16: inf
+1.0 + 0.0001 in float16: 1.0 | in float32: 1.0001</code></pre>
+<p><strong>Explain.</strong> float16 tops out near 65,500. Adding 60,000 + 60,000 overflows to <code>inf</code> (infinity). Also, adding a tiny <code>0.0001</code> to <code>1.0</code> is lost in float16 (result 1.0) but kept in float32 (1.0001). Tiny gradient updates can disappear. Mixed precision libraries handle this with loss scaling and 32-bit master weights.</p>
+<h3>Reading data: format matters</h3>
+<p>We wrote the same 500,000 rows by 20 float columns to CSV and timed a read:</p>
+<pre class="code lang-text"><code>csv: 196.3 MB, read 0.84s</code></pre>
+<p>(The columnar Parquet comparison could not be run because the Parquet library is not installed here. In general Parquet is smaller and faster to read selected columns, and you should measure it on your own data.) A text CSV of 196.3 MB for 10 million numbers is about 19.6 bytes per number, whereas 8 bytes would hold a float64 in binary form.</p>
+<h3>Spot instances and checkpoints, simulated</h3>
+<p><strong>Spot</strong> (AWS) or <strong>preemptible</strong> (Google Cloud, also called Spot VMs) machines are much cheaper, but the provider may stop them. If you <strong>checkpoint</strong> (save progress) regularly, a stop costs only the work since the last checkpoint. Let us simulate. Needed: 20 useful training hours. Prices are <strong>assumed</strong> for arithmetic: on-demand $3.00 per GPU-hour, spot $1.00. The simulation advances in 3-minute steps, preemption chance is 0.2 per hour, and each restart wastes 0.1 hour. The numbers come from one random seed, so treat the pattern, not the exact digits, as the result:</p>
+<pre class="code lang-python"><code>import random
+od, spot, need_h = 3.00, 1.00, 20.0
+def sim(ckpt_every_h, preempt_per_h=0.2, seed=1, restart_cost_h=0.1):
+    rng = random.Random(seed); done = 0.0; billed = 0.0; saved = 0.0; since = 0.0; step = 0.05
+    while saved &lt; need_h:
+        billed += step; done += step; since += step
+        if rng.random() &lt; preempt_per_h * step:      # preempted: lose work since last checkpoint
+            done = saved; since = 0.0; billed += restart_cost_h
+        elif since &gt;= ckpt_every_h: saved = done; since = 0.0
+        if done &gt;= need_h: saved = need_h
+    return billed
+print(f"on-demand: {need_h:.0f} h x ${od} = ${need_h*od:.2f}")
+for c in [0.25, 1, 4, 20]:
+    h = sim(c); print(f"spot, checkpoint every {c:&gt;5} h: billed {h:5.1f} GPU-h -&gt; ${h*spot:6.2f}")</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>on-demand: 20 h x $3.0 = $60.00
+spot, checkpoint every  0.25 h: billed  21.1 GPU-h -&gt; $ 21.05
+spot, checkpoint every     1 h: billed  22.8 GPU-h -&gt; $ 22.80
+spot, checkpoint every     4 h: billed  35.3 GPU-h -&gt; $ 35.25
+spot, checkpoint every    20 h: billed 652.5 GPU-h -&gt; $652.50</code></pre>
+<p><strong>Explain.</strong> Spot with frequent checkpoints costs about $21 to $23 versus $60 on-demand, a saving of about 63 to 65%. As checkpoints become rarer, each preemption throws away more work: at "every 4 hours" you pay $35, and at "never" (every 20 hours) the job can almost never finish between preemptions and costs $652, more than ten times on-demand. A checkpoint also costs time and disk, so it is a balance (a real checkpoint of a large model may take minutes).</p>
+<p class="problem"><span class="pl">Problem 6.3.1</span> From the simulation, what saving does spot with 1-hour checkpoints give compared with on-demand?</p>
+<table class="steps"><tr><th>Formula</th><td>saving % = (on-demand − spot) ÷ on-demand × 100</td></tr><tr><th>Plug in</th><td>(60.00 − 22.80) ÷ 60.00 × 100</td></tr><tr><th>Compute</th><td>37.20 ÷ 60.00 = 0.62; 0.62 × 100 = 62</td></tr><tr><th>Answer</th><td>62% cheaper, with the caveat that the exact figure depends on the assumed prices and one random seed.</td></tr><tr><th>Check</th><td>60 × (1 − 0.62) = 22.8, which is the spot cost.</td></tr><tr><th>Why it matters</th><td>Spot plus checkpoints is the standard way to cut training cost, but only if jobs are resumable.</td></tr></table>
+<p class="problem"><span class="pl">Problem 6.3.2</span> An experiment budget is $500. Each trial costs $12.50 on-demand. How many trials can you run, and how many if the spot cost is 35% of on-demand?</p>
+<table class="steps"><tr><th>Formula</th><td>trials = budget ÷ cost per trial</td></tr><tr><th>Plug in</th><td>500 ÷ 12.50; spot cost = 12.50 × 0.35 = 4.375; 500 ÷ 4.375</td></tr><tr><th>Compute</th><td>500 ÷ 12.5 = 40; 500 ÷ 4.375 = 114.28</td></tr><tr><th>Answer</th><td>40 trials on-demand, 114 on spot (rounding down).</td></tr><tr><th>Check</th><td>114 × 4.375 = 498.75, under the budget; 115 × 4.375 = 503.1, over it.</td></tr><tr><th>Why it matters</th><td>More trials in the same budget mean better models; cost control is a modelling advantage.</td></tr></table>
+<h3>Cost-control checklist</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Habit</th><th>Why</th></tr></thead><tbody><tr><td>Right-size the GPU (do not rent 80 GB for a 4 GB model)</td><td>Pay for what you use</td></tr><tr><td>Check GPU utilization; fix input bottlenecks</td><td>Idle GPU is wasted money</td></tr><tr><td>Spot or preemptible plus checkpoints</td><td>60 to 70% cheaper, resumable</td></tr><tr><td>Early stopping of trials</td><td>Kill losers early (Chapter 3)</td></tr><tr><td>Experiment budgets and tags</td><td>Cost visible per project and person</td></tr><tr><td>Auto-shutdown of idle notebooks and clusters</td><td>Forgotten GPUs cost real money</td></tr><tr><td>Smaller experiments first</td><td>Debug on 1% of data before scaling</td></tr></tbody></table></div>
+<h3>Connection to the real job</h3>
+<p>A common interview scenario is "your training bill doubled, find out why". Start with tags and billing breakdown, then check utilization, forgotten instances and failed jobs restarting from scratch. FinOps (cost management practice) appears again in Chapter 12.</p>
+<h3>Applications</h3>
+<ul><li><strong>Deep Learning</strong>: mixed precision and spot training.</li><li><strong>GenAI</strong>: fine-tuning budgets, quantized and parameter-efficient methods.</li><li><strong>MLOps</strong>: scheduled shutdowns, quotas and budget alerts.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using spot instances without checkpointing, or checkpointing to the instance's local disk (which disappears with the instance). Save checkpoints to durable storage such as an object store.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does low GPU utilization usually point to?</li></ol>
+<p>Answer: A slow input pipeline or CPU bottleneck rather than the model.</p>
+<ol><li>Why does a checkpoint matter on spot instances?</li></ol>
+<p>Answer: A preemption then loses only the work since the last checkpoint.</p>
+<ol><li>What happened to 60,000 + 60,000 in float16?</li></ol>
+<p>Answer: It overflowed to <code>inf</code>, because float16 maxes out near 65,500.</p>
+<h2 id="s4-chapter-recap">Chapter recap</h2>
+<ul><li>Orchestrators run a DAG: ordering, scheduling, retries, logging; tasks must be idempotent.</li><li>Retries make flaky steps reliable: three attempts at 5% failure each fail together only 0.0125% of the time.</li><li>Data parallel training averages gradients; we proved the average equals the full-batch gradient.</li><li>Scaling is not linear: at 8 GPUs we got 4.88 times speedup (61% efficiency) in our model.</li><li>Check memory with arithmetic: 7 billion parameters is 14 GB in fp16.</li><li>Mixed precision saves memory but needs care (float16 overflows near 65,500).</li><li>Spot instances plus frequent checkpoints cut our simulated cost from $60 to about $22.</li><li>Utilization, data loading format, early stopping, budgets and auto-shutdown control cost.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / Pattern</th><th>Meaning</th></tr></thead><tbody><tr><td><code>P(fail all) = p^(1+retries)</code></td><td>Retry reliability</td></tr><tr><td><code>speedup = t₁ ÷ tₙ</code>; <code>efficiency = speedup ÷ N</code></td><td>Scaling quality</td></tr><tr><td><code>GB = params × bytes ÷ 1e9</code></td><td>Weight memory</td></tr><tr><td><code>saving % = (old − new) ÷ old × 100</code></td><td>Cost saving</td></tr><tr><td><code>TopologicalSorter(dag).static_order()</code></td><td>Valid task order</td></tr><tr><td><code>torchrun --nproc_per_node=N train.py</code></td><td>Launch DDP (not run here)</td></tr></tbody></table></div>
+<h2 id="s5-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 6.1</span> Order these tasks: train, extract, evaluate, features. <strong>Answer:</strong> extract, features, train, evaluate.</p>
+<p class="problem"><span class="pl">Problem 6.2</span> A task fails 10% of the time; 3 retries. Chance of permanent failure? <strong>Answer:</strong> 0.1⁴ = 0.0001, or 0.01%.</p>
+<p class="problem"><span class="pl">Problem 6.3</span> What is the output? <code>list(TopologicalSorter({"b": {"a"}, "a": set()}).static_order())</code> <strong>Answer:</strong> <code>['a', 'b']</code>.</p>
+<p class="problem"><span class="pl">Problem 6.4</span> 1B parameters in fp32: memory for weights? <strong>Answer:</strong> 1,000,000,000 × 4 = 4 GB.</p>
+<p class="problem"><span class="pl">Problem 6.5</span> Find the bug: a daily job appends yesterday's rows to a table; the scheduler retried it after a timeout and the table has duplicates. <strong>Answer:</strong> The task is not idempotent. Write per-date partitions with overwrite, or use an upsert on a key.</p>
+<p class="problem"><span class="pl">Problem 6.6</span> Compute step time at 4 GPUs with compute 100 ms and communication 8 ms. <strong>Answer:</strong> 100 ÷ 4 + 8 = 33 ms; speedup 3.03; efficiency 75.8%.</p>
+<p class="problem"><span class="pl">Problem 6.7</span> Why can spot training be cheaper yet cost more in the worst case? <strong>Answer:</strong> Without frequent checkpoints, each preemption discards a lot of work, and repeated restarts can multiply the billed hours (we saw $652 against $60).</p>
+<p class="problem"><span class="pl">Problem 6.8</span> GPU utilization is 25%. The model is small. List two likely fixes. <strong>Answer:</strong> Speed up data loading (parallel workers, columnar or sharded formats, caching) and increase batch size.</p>
+<p class="problem"><span class="pl">Problem 6.9 (interview)</span> "How would you automate retraining?" <strong>Answer:</strong> An orchestrated DAG (extract, validate, features, train, evaluate, register) triggered by schedule, new data or drift alerts; idempotent tasks; evaluation against the champion with a margin; human approval for risky models; all runs tracked and data versioned.</p>
+<p class="problem"><span class="pl">Problem 6.10 (interview)</span> "Training cost doubled this month. How do you investigate?" <strong>Answer:</strong> Use cost tags to find the project, then check forgotten instances, low utilization, failed jobs restarting from scratch without checkpoints, larger trial counts, and a change in instance type. Then set budgets, alerts and auto-shutdown.</p>
+<h2 id="s6-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps, and English is my second language. Explain ML training pipelines and orchestration: DAGs, retries, idempotency and scheduling. Use a recipe analogy, then walk through an Airflow DAG for retraining a churn model line by line. Ask me one check question after each part.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Compare Airflow, Kubeflow Pipelines, Argo Workflows, Metaflow, Dagster, ZenML, Vertex Pipelines and SageMaker Pipelines in a table: style, strengths, and when NOT to use each. Keep claims general so they do not go stale, and then give me 8 graded exercises without solutions.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Teach distributed training basics: data parallel (DDP), model parallel, FSDP, DeepSpeed, Horovod, Ray Train. Use exam-grading analogies, show with small numbers why averaged gradients equal the full-batch gradient, and explain why scaling efficiency drops. Quiz me one question at a time.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Review my plan to control GPU training cost: spot instances, checkpoint frequency, mixed precision, data loading, budgets and idle shutdown. Point out risks and missing steps, and do cost arithmetic with my numbers. My plan and numbers: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Run a mock interview on training pipelines, orchestration, distributed training and GPU cost control. Ask one question at a time, grade each answer out of 10, show a model answer, and end with my weakest topics and a one-week plan.</pre></div><div class="readbtn"><button class="btn" data-read="study:mlops:ch06">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch05.html">← Chapter 5: Feature Stores and Data Validation for M</a><a class="btn" href="ch07.html">Chapter 7: Model Serving →</a></div></div><script src="../../assets/study.js"></script></body></html>

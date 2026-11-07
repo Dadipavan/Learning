@@ -1,0 +1,391 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 12: Hard Data Situations</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Machine Learning Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 12</div><h1>Hard Data Situations</h1><p>Imbalanced classes, tiny and noisy data, missing values, high-cardinality categories, and data that changes over time.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-12-1-imbalanced-classes">12.1 Imbalanced Classes</a></li><li><a href="#s2-12-2-small-data-noisy-labels-and-more-features-than-rows">12.2 Small Data, Noisy Labels, and More Features Than Rows</a></li><li><a href="#s3-12-3-missing-data-and-messy-features">12.3 Missing Data and Messy Features</a></li><li><a href="#s4-12-4-high-cardinality-categorical-features">12.4 High-Cardinality Categorical Features</a></li><li><a href="#s5-12-5-distribution-shift-and-non-stationarity">12.5 Distribution Shift and Non-Stationarity</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p>Textbook datasets are clean, balanced, big and fully labelled. Real data is none of these. A bank has 1 fraudulent payment in 100. A hospital has 60 patients in a rare-disease study. A survey leaves the income field blank for one customer in four. A delivery table has 800 postcodes, most with only a handful of rows. Last summer's sales data does not describe this summer. A large part of applied ML skill is knowing what to do in each of these situations, and what <em>not</em> to do (for example, fixing imbalance in a way that quietly leaks test data). By the end of this chapter you will be able to pick the right metric and fix for imbalance, trust (or distrust) a score from 60 rows, handle three kinds of missing data, encode a column with 800 categories without leaking, and detect that the world has changed.</p>
+<p>Each section uses its own small dataset with a fixed seed and real output (numpy, pandas, scikit-learn 1.9.1, scipy). The learner's Math PDF covers probability and loss functions; Chapter 10 covered leakage and slicing, Chapter 11 tuning. Two libraries we would normally use, <code>imbalanced-learn</code> (SMOTE) and <code>cleanlab</code>, are not installed here, so their code is described and marked "not run here".</p>
+<h2 id="s1-12-1-imbalanced-classes">12.1 Imbalanced Classes</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A security guard watches 1,000 visitors a day and one is a thief. A guard who waves everyone through is "99.9% accurate" and completely useless. With rare events, accuracy rewards doing nothing. We need scores that look only at the rare class, and tricks to make the model care about it.</div></div>
+<h3>The data</h3>
+<p>20,000 payments, 10 numeric features, about 1.3% fraud (<code>make_classification</code> with seed 0). Split 70/30 with stratification (the same fraud rate in both parts). Test set: 6,000 rows with 78 frauds.</p>
+<pre class="code lang-python"><code>import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+from sklearn.dummy import DummyClassifier
+from sklearn.metrics import *
+
+X, y = make_classification(n_samples=20000, n_features=10, n_informative=5, n_redundant=0,
+        weights=[0.99], flip_y=0.005, class_sep=0.8, random_state=0)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0, stratify=y)
+print("positives train/test", ytr.sum(), yte.sum(), "rate", y.mean().round(4))
+d = DummyClassifier(strategy='most_frequent').fit(Xtr, ytr)
+print("always-negative acc", round(accuracy_score(yte, d.predict(Xte)), 4),
+      "recall", recall_score(yte, d.predict(Xte)))</code></pre>
+<pre class="code lang-text"><code>positives train/test 182 78 rate 0.013
+always-negative acc 0.987 recall 0.0</code></pre>
+<p>"Always say not fraud" is 98.7% accurate and catches nothing. Any model must be judged against this.</p>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th></tr></thead><tbody><tr><td>Precision</td><td>Of the items the model flags, the share that are truly positive: <code>TP / (TP + FP)</code></td></tr><tr><td>Recall</td><td>Of all truly positive items, the share the model flags: <code>TP / (TP + FN)</code></td></tr><tr><td>PR-AUC</td><td>Area under the precision-recall curve (scikit-learn: <code>average_precision_score</code>); focuses on the positive class</td></tr><tr><td>ROC-AUC</td><td>Ranking quality; hardly changes with the class balance, so it can look good even when precision is poor</td></tr><tr><td>Class weight</td><td>Making each rare-class row count more in the loss</td></tr><tr><td>Resampling</td><td>Changing the training set: copy rare rows (oversample) or drop common rows (undersample)</td></tr><tr><td>Threshold</td><td>The probability above which we say "positive" (default 0.5)</td></tr></tbody></table></div>
+<h3>Step 1: the right metrics and a plain model</h3>
+<pre class="code lang-python"><code>def rep(name, m, thr=0.5, p=None):
+    p = m.predict_proba(Xte)[:, 1] if p is None else p; pr = (p &gt;= thr).astype(int)
+    print(f"{name:22s} acc {accuracy_score(yte,pr):.4f} prec {precision_score(yte,pr,zero_division=0):.3f} "
+          f"rec {recall_score(yte,pr):.3f} ROC {roc_auc_score(yte,p):.3f} PR {average_precision_score(yte,p):.3f} meanp {p.mean():.4f}")
+mk = lambda **k: make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000, **k))
+lr = mk().fit(Xtr, ytr); rep("plain thr0.5", lr)</code></pre>
+<pre class="code lang-text"><code>plain thr0.5           acc 0.9908 prec 0.960 rec 0.308 ROC 0.830 PR 0.534 meanp 0.0134</code></pre>
+<p class="problem"><span class="pl">Problem 12.1.1</span> Recover the confusion matrix from these numbers: 78 true frauds, recall 0.308, precision 0.960, 6,000 rows.</p>
+<table class="steps"><tr><th>Formula</th><td><code>recall = TP / 78</code>, <code>precision = TP / (TP + FP)</code>.</td></tr><tr><th>Plug in</th><td>TP = 0.308 × 78 = 24.0. Then 0.960 = 24 / (24 + FP), so 24 + FP = 25.</td></tr><tr><th>Compute</th><td>FP = 1, FN = 78 − 24 = 54, TN = 5,922 − 1 = 5,921 (non-frauds are 6,000 − 78 = 5,922).</td></tr><tr><th>Answer</th><td>TP 24, FP 1, FN 54, TN 5,921. The model is almost never wrong when it speaks (24 of 25 flags are real), but it stays silent on 54 of 78 frauds.</td></tr><tr><th>Check</th><td>Accuracy = (24 + 5,921) / 6,000 = 0.9908, matching the printed 0.9908.</td></tr></table>
+<p>The mean predicted probability, 0.0134, equals the fraud rate (1.3%). The plain model is <strong>calibrated</strong>: its probabilities match reality. Keep that in mind.</p>
+<h3>Step 2: threshold moving</h3>
+<p>The default 0.5 is arbitrary. Choose a threshold from <em>training</em> predictions made by cross-validation (never from the test set), maximising F1 (<code>2·P·R / (P + R)</code>).</p>
+<pre class="code lang-python"><code>from sklearn.model_selection import cross_val_predict, StratifiedKFold
+pc = cross_val_predict(mk(), Xtr, ytr, cv=StratifiedKFold(5, shuffle=True, random_state=0),
+                       method='predict_proba')[:, 1]
+ps, rs, ts = precision_recall_curve(ytr, pc); f1 = 2*ps*rs/(ps+rs+1e-12)
+t = ts[np.argmax(f1[:-1])]; print("best F1 thr from CV", round(t, 4))
+rep("threshold moved", lr, thr=t)</code></pre>
+<pre class="code lang-text"><code>best F1 thr from CV 0.2112
+threshold moved        acc 0.9912 prec 0.791 rec 0.436 ROC 0.830 PR 0.534 meanp 0.0134</code></pre>
+<p>Recall rose from 0.308 to 0.436 (34 of 78 frauds) and precision fell from 0.960 to 0.791 (34 of 43 flags). ROC and PR AUC did not change at all, because the <em>ranking</em> is the same; only the cut changed. This is the cheapest fix and often enough.</p>
+<h3>Step 3: class weights and resampling</h3>
+<pre class="code lang-python"><code>lw = mk(class_weight='balanced').fit(Xtr, ytr); rep("class_weight balanced", lw)
+rng = np.random.default_rng(0); pos = np.where(ytr == 1)[0]; neg = np.where(ytr == 0)[0]
+idx = np.concatenate([neg, rng.choice(pos, len(neg), replace=True)])      # oversample positives
+lo = mk().fit(Xtr[idx], ytr[idx]); rep("random oversample", lo)
+idx = np.concatenate([pos, rng.choice(neg, len(pos)*10, replace=False)])  # undersample negatives 10:1
+lu = mk().fit(Xtr[idx], ytr[idx]); rep("undersample 10:1", lu)</code></pre>
+<pre class="code lang-text"><code>class_weight balanced  acc 0.8227 prec 0.055 rec 0.782 ROC 0.857 PR 0.470 meanp 0.3139
+random oversample      acc 0.8237 prec 0.055 rec 0.782 ROC 0.855 PR 0.474 meanp 0.3145
+undersample 10:1       acc 0.9897 prec 0.633 rec 0.487 ROC 0.847 PR 0.513 meanp 0.0629</code></pre>
+<p>Read the table carefully. <code>class_weight='balanced'</code> and random oversampling give almost the same result (they are mathematically near-identical for this model): recall jumps to 0.782 (61 of 78), but precision collapses to 0.055: about 1,100 flags for 61 real frauds (61 / 0.055 ≈ 1,109), so more than 1,000 false alarms. Accuracy fell to 82%. Note the <strong>PR-AUC went down</strong> (0.534 to 0.470): reweighting did not make the model <em>rank</em> better, it only moved the operating point. The mean predicted probability is 0.314 where reality is 0.013: the probabilities are now wrong.</p>
+<p class="problem"><span class="pl">Problem 12.1.2</span> Fix the probabilities after undersampling. The model was trained with all 182 frauds and 1,820 non-frauds, out of 13,818 non-frauds in the training set. It says <code>p = 0.50</code> for a payment. What is the true probability?</p>
+<table class="steps"><tr><th>Formula</th><td><code>odds_true = odds_model × (kept negatives / all negatives)</code>, where <code>odds = p / (1 − p)</code>, then <code>p = odds / (1 + odds)</code>.</td></tr><tr><th>Plug in</th><td>kept fraction w = 1,820 / 13,818 = 0.1317. <code>odds_model = 0.5 / 0.5 = 1</code>.</td></tr><tr><th>Compute</th><td><code>odds_true = 1 × 0.1317 = 0.1317</code>; <code>p = 0.1317 / 1.1317 = 0.1164</code>.</td></tr><tr><th>Answer</th><td>The real fraud probability is about 11.6%, not 50%.</td></tr><tr><th>Check</th><td>In the code, applying this to all test rows brings the mean predicted probability from 0.0629 to 0.0120, close to the true 0.013.</td></tr><tr><th>Why it matters</th><td>If you use probabilities for money decisions (expected loss = probability × amount), an uncorrected resampled model overstates risk by a large factor.</td></tr></table>
+<pre class="code lang-python"><code>w = (len(pos)*10) / len(neg); pu = lu.predict_proba(Xte)[:, 1]
+pcor = w*pu / (w*pu + (1 - pu)); rep("undersample corrected", lu, p=pcor)
+pw = lw.predict_proba(Xte)[:, 1]; w2 = len(pos)/len(neg); pw2 = w2*pw/(w2*pw + (1 - pw))
+for nm, pp in [('plain', lr.predict_proba(Xte)[:, 1]), ('class_weight', pw), ('class_weight corrected', pw2)]:
+    print(nm, 'brier', round(brier_score_loss(yte, pp), 4))</code></pre>
+<pre class="code lang-text"><code>undersample corrected  acc 0.9895 prec 0.941 rec 0.205 ROC 0.847 PR 0.513 meanp 0.0120
+plain brier 0.0082
+class_weight brier 0.1334
+class_weight corrected brier 0.0107</code></pre>
+<p>The Brier score (mean squared error of the probabilities; lower is better) shows the damage: 0.0082 for the plain model, 0.1334 after weighting, and 0.0107 after the correction. Note the corrected model at threshold 0.5 now has low recall again; the correction restores honest probabilities, and you then choose a threshold by cost.</p>
+<h3>Step 4: the leak that fools everyone</h3>
+<p>Oversampling copies rows. If you oversample <em>before</em> cross-validation, the copies land in both training and validation folds, and the model "predicts" rows it has seen.</p>
+<pre class="code lang-python"><code>from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import cross_val_score
+Xo = np.vstack([Xtr, Xtr[ytr == 1].repeat(9, axis=0)])
+yo = np.concatenate([ytr, np.ones((ytr == 1).sum()*9, int)])
+c5 = StratifiedKFold(5, shuffle=True, random_state=0)
+bad  = cross_val_score(RandomForestClassifier(100, random_state=0, n_jobs=-1), Xo, yo, cv=c5, scoring='average_precision')
+good = cross_val_score(RandomForestClassifier(100, random_state=0, n_jobs=-1), Xtr, ytr, cv=c5, scoring='average_precision')
+print("oversample BEFORE cv PR-AUC", bad.mean().round(3), "honest cv PR-AUC", good.mean().round(3))</code></pre>
+<pre class="code lang-text"><code>oversample BEFORE cv PR-AUC 1.0 honest cv PR-AUC 0.512</code></pre>
+<p>A PR-AUC of 1.0 against an honest 0.512: pure leakage. The rule: <strong>resample only the training part of each fold</strong>, ideally inside a pipeline (the <code>imbalanced-learn</code> library has a pipeline that does this; not run here). SMOTE (Synthetic Minority Over-sampling Technique) makes <em>new</em> rare rows by interpolating between a rare row and one of its nearest rare neighbours; the same rule applies, and it can create unrealistic points when classes overlap. In many tabular problems, plain class weights or threshold moving work as well.</p>
+<h3>Which fix, when</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Situation</th><th>First choice</th></tr></thead><tbody><tr><td>You only need a ranked list (top 100 to investigate)</td><td>Do nothing; evaluate with PR-AUC and precision at 100</td></tr><tr><td>You need a yes/no decision</td><td>Train normally, move the threshold by cost</td></tr><tr><td>The model ignores the rare class (trees, boosting)</td><td>Class weights (<code>scale_pos_weight</code> in XGBoost)</td></tr><tr><td>Training is too slow with a huge majority class</td><td>Undersample, then correct the probabilities</td></tr><tr><td>Extremely rare (1 in 100,000), no labels</td><td>An anomaly-detection method instead of classification</td></tr><tr><td>You use probabilities for expected cost</td><td>Calibrate after any resampling</td></tr></tbody></table></div>
+<figure><img src="images/ch12_roc_vs_pr.png" alt="ROC curve versus precision-recall curve on the fraud data" loading="lazy"/><figcaption>ROC curve versus precision-recall curve on the fraud data</figcaption></figure>
+<p><em>Left: ROC curve, x-axis false positive rate, y-axis recall; it bends nicely towards the top-left corner. Right: precision-recall curve, x-axis recall, y-axis precision; the dashed line at 0.013 is what a random model would score. At recall 0.5 the precision is far below 1. The ROC plot hides this because the false positive rate divides by the huge number of negatives.</em></p>
+<p class="problem"><span class="pl">Problem 12.1.3</span> Recall at fixed precision. The business accepts that at least 30% of flagged payments must be real fraud. What recall does the plain model reach on the test set?</p>
+<pre class="code lang-python"><code>ps, rs, ts = precision_recall_curve(yte, lr.predict_proba(Xte)[:, 1])
+print("recall at precision&gt;=0.30:", rs[ps &gt;= 0.30].max().round(3))</code></pre>
+<pre class="code lang-text"><code>recall at precision&gt;=0.30: 0.564</code></pre>
+<ul><li><strong>Step 1</strong> Walk along the PR curve; keep points with precision at least 0.30.</li><li><strong>Step 2</strong> Take the largest recall among them.</li><li><strong>Answer</strong> 56.4% of frauds (44 of 78) can be caught while at least 30% of the flags are real.</li><li><strong>Check</strong> 0.564 × 78 = 44.0, an integer, as it must be.</li><li><strong>Why it matters</strong> "Recall at a fixed precision" turns a vague PR curve into a number a manager can agree to.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Science:</strong> fraud, churn, defect detection, disease screening.</li><li><strong>Machine Learning:</strong> <code>class_weight</code>, <code>scale_pos_weight</code>, focal loss for deep models.</li><li><strong>Healthcare:</strong> rare-disease screening, where recall is tuned to clinical cost.</li><li><strong>Operations:</strong> predictive maintenance, where failures are rare and false alarms cost technician hours.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Resampling before splitting or before cross-validation. Always split first, resample only the training fold.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reporting accuracy or ROC-AUC alone on rare-event data. Add PR-AUC, and precision and recall at your operating threshold.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>2 in 1,000 are positive. What accuracy does "always negative" get? Answer: 99.8%.</li><li>Does moving the threshold change ROC-AUC? Answer: No; it only changes the operating point.</li><li>Why calibrate after resampling? Answer: Resampling changes the class ratio the model sees, so its probabilities no longer match reality.</li></ol>
+<h2 id="s2-12-2-small-data-noisy-labels-and-more-features-than-rows">12.2 Small Data, Noisy Labels, and More Features Than Rows</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Judging a restaurant from 3 meals is risky: one bad evening ruins the average. Small data makes every estimate shaky, flexible models memorise the few examples, and noisy labels are like a few reviews written by mistake. The tools are: simple models, strong regularization, repeated evaluation, and a healthy suspicion of lucky scores.</div></div>
+<h3>Small data: the score itself is noisy</h3>
+<p>60 rows, 5 features, two features carry signal. We also generate 5,000 fresh rows from the same recipe as a "big test set", something you never have in real life but which reveals the truth.</p>
+<pre class="code lang-python"><code>from sklearn.model_selection import RepeatedStratifiedKFold
+rng = np.random.default_rng(1)
+n = 60; Xs = rng.normal(size=(n, 5)); ys = (Xs[:, 0] + 0.8*Xs[:, 1] + rng.normal(0, 1, n) &gt; 0).astype(int)
+Xs_t = rng.normal(size=(5000, 5)); ys_t = (Xs_t[:, 0] + 0.8*Xs_t[:, 1] + rng.normal(0, 1, 5000) &gt; 0).astype(int)
+for nm, m in [('logreg', mk()), ('forest', RandomForestClassifier(200, random_state=0))]:
+    m.fit(Xs, ys)
+    cvv = cross_val_score(m, Xs, ys, cv=RepeatedStratifiedKFold(n_splits=5, n_repeats=20, random_state=0), scoring='roc_auc')
+    print(nm, "repeated-cv", cvv.mean().round(3), "+-", cvv.std().round(3),
+          "big-test", round(roc_auc_score(ys_t, m.predict_proba(Xs_t)[:, 1]), 3),
+          "train", round(roc_auc_score(ys, m.predict_proba(Xs)[:, 1]), 3))
+single = [cross_val_score(mk(), Xs, ys, cv=StratifiedKFold(5, shuffle=True, random_state=s), scoring='roc_auc').mean() for s in range(10)]
+print("single 5-fold across 10 seeds", np.round(single, 3), "range", round(max(single) - min(single), 3))</code></pre>
+<pre class="code lang-text"><code>small n=60 logreg repeated-cv 0.813 +- 0.104 big-test 0.824 train 0.869
+small n=60 forest repeated-cv 0.714 +- 0.146 big-test 0.775 train 1.0
+single 5-fold across 10 seeds [0.808 0.797 0.77  0.803 0.821 0.832 0.813 0.745 0.765 0.804] range 0.087</code></pre>
+<p>Read it.</p>
+<ul><li>The simple logistic regression has repeated-CV AUC 0.813, and the big test confirms 0.824. Repeated CV (100 scores) was an honest guide.</li><li>The forest memorises: training AUC 1.0, but 0.775 on new data.</li><li>A single 5-fold CV changes by up to 0.087 AUC (0.745 to 0.832) just by changing the shuffle seed. <strong>With 60 rows, a single CV number is partly luck.</strong> Use repeated CV and report the spread (± 0.104 per fold).</li></ul>
+<p class="problem"><span class="pl">Problem 12.2.1</span> Why does the standard deviation of the 100 fold scores (0.104) overstate the uncertainty of the <em>mean</em> score?</p>
+<table class="steps"><tr><th>Formula</th><td>Standard error of a mean = sd / √(number of scores) for independent scores.</td></tr><tr><th>Plug in</th><td>0.104 / √100 = 0.0104.</td></tr><tr><th>Compute</th><td>The mean is therefore known to about ± 0.01 <em>if the scores were independent</em>. They are not (the folds overlap), so the true uncertainty is larger, but still far below 0.104.</td></tr><tr><th>Answer</th><td>The per-fold sd (0.104) says how much one 12-row test fold swings. The mean over many repeats is more stable, but it is still estimated from the same 60 rows, so it cannot be more accurate than those 60 rows allow.</td></tr><tr><th>Check</th><td>Single 5-fold means across seeds ranged 0.745 to 0.832, i.e. about ± 0.04, which is between the two numbers.</td></tr><tr><th>Why it matters</th><td>Know which uncertainty you are quoting: fold-to-fold swing, estimation error of the mean, or error from having only 60 rows.</td></tr></table>
+<h3>What to do with small data</h3>
+<ul><li>Prefer simple, regularized models (Chapter 3), and strong baselines.</li><li>Use repeated or leave-one-out CV; report spreads.</li><li>Use domain knowledge to build a few strong features rather than many weak ones.</li><li>Reuse knowledge: transfer learning, pretrained embeddings, data augmentation, or Bayesian priors.</li><li>Collect more data if you can (check the learning curve, Chapter 10.2).</li></ul>
+<h3>Noisy labels</h3>
+<p>Labels are noisy when humans mislabel, systems log wrong values, or the outcome is truly random. We use a clean problem (3,000 rows) and then flip a share of the <em>training</em> labels at random; the test labels stay clean.</p>
+<pre class="code lang-python"><code>from sklearn.tree import DecisionTreeClassifier
+Xn, yn = make_classification(n_samples=3000, n_features=10, n_informative=5, random_state=0, class_sep=1.0, flip_y=0)
+Xa, Xb, ya, yb = train_test_split(Xn, yn, test_size=0.4, random_state=0)
+for noise in [0, 0.2, 0.4]:
+    r = np.random.default_rng(0); yf = np.where(r.random(len(ya)) &lt; noise, 1 - ya, ya); out = []
+    for nm, m in [('logreg', mk()), ('deep tree', DecisionTreeClassifier(random_state=0)),
+                  ('forest leaf10', RandomForestClassifier(200, min_samples_leaf=10, random_state=0, n_jobs=-1))]:
+        m.fit(Xa, yf); out.append(f"{nm} {accuracy_score(yb, m.predict(Xb)):.3f}")
+    print("noise", noise, out)</code></pre>
+<pre class="code lang-text"><code>noise 0 ['logreg 0.876', 'deep tree 0.884', 'forest leaf10 0.903']
+noise 0.2 ['logreg 0.872', 'deep tree 0.718', 'forest leaf10 0.913']
+noise 0.4 ['logreg 0.858', 'deep tree 0.591', 'forest leaf10 0.802']</code></pre>
+<p>Read: the unpruned deep tree is destroyed by label noise (0.884 to 0.718 to 0.591), because it memorises every wrong label. Logistic regression barely moves (0.876 to 0.858). The forest with <code>min_samples_leaf=10</code> stays strong until noise is very high. <strong>Models that average (linear models, forests with large leaves, strong regularization) tolerate noise; models that memorise do not.</strong> Other defences are robust losses (for example MAE or Huber for regression), label smoothing, and cleaning.</p>
+<p><strong>Label cleaning by hand (the idea behind <code>cleanlab</code>):</strong> train with cross-validation, then look at rows where the <em>out-of-fold</em> prediction strongly disagrees with the label.</p>
+<pre class="code lang-python"><code>from sklearn.model_selection import cross_val_predict
+r = np.random.default_rng(0); yf = np.where(r.random(len(ya)) &lt; 0.2, 1 - ya, ya); flipped = (yf != ya)
+oof = cross_val_predict(mk(), Xa, yf, cv=5, method='predict_proba')[:, 1]
+top = np.argsort(-np.abs(oof - yf))[:100]
+print("flagged top100: truly flipped", flipped[top].sum(), "base rate", flipped.mean().round(3))</code></pre>
+<pre class="code lang-text"><code>flagged top100: truly flipped 94 base rate 0.202</code></pre>
+<p>Of the 100 most "suspicious" rows, 94 really had flipped labels, against a base rate of 20%. A human reviewer who checks 100 rows instead of 1,800 finds 94 errors. <code>cleanlab</code> (confident learning) does this more carefully; not run here.</p>
+<h3>More features than rows (p ≫ n)</h3>
+<p>60 rows, 500 features, only 3 matter. With 500 columns and 60 rows, a model can fit the training labels perfectly with pure noise.</p>
+<pre class="code lang-python"><code>rng = np.random.default_rng(2); n, p_ = 60, 500
+Xh = rng.normal(size=(n, p_)); yh = (Xh[:, 0] + Xh[:, 1] - Xh[:, 2] + rng.normal(0, 0.5, n) &gt; 0).astype(int)
+Xh_t = rng.normal(size=(5000, p_)); yh_t = (Xh_t[:, 0] + Xh_t[:, 1] - Xh_t[:, 2] + rng.normal(0, 0.5, 5000) &gt; 0).astype(int)
+for nm, m in [('weak reg C=1e6', LogisticRegression(C=1e6, max_iter=5000)),
+              ('L2 C=0.05', LogisticRegression(C=0.05, max_iter=5000)),
+              ('L1 C=0.3', LogisticRegression(penalty='l1', solver='liblinear', C=0.3))]:
+    m.fit(Xh, yh); print(nm, "train acc", round(m.score(Xh, yh), 3), "test acc", round(m.score(Xh_t, yh_t), 3),
+                         "nonzero", int((m.coef_ != 0).sum()))</code></pre>
+<pre class="code lang-text"><code>weak reg C=1e6 train acc 1.0 test acc 0.602 nonzero 500
+L2 C=0.05 train acc 1.0 test acc 0.603 nonzero 500
+L1 C=0.3 train acc 1.0 test acc 0.862 nonzero 19</code></pre>
+<p>All three models reach 100% training accuracy. Test accuracy: 0.602 for the two dense models (nearly coin-flip: they spread weight over 500 noise columns), but <strong>0.862 for the L1 model</strong>, which keeps only 19 non-zero weights and so finds the real signal. L1 (Chapter 3) works as a feature selector. For p ≫ n, use regularization (especially L1 or elastic net), feature selection inside the CV loop, or dimensionality reduction (Chapter 13).</p>
+<h3>Applications</h3>
+<ul><li><strong>Healthcare and genomics:</strong> thousands of measurements for under 100 patients.</li><li><strong>Industrial ML:</strong> a new machine with 80 labelled failures.</li><li><strong>Surveys and research:</strong> small samples where the spread matters more than the mean.</li><li><strong>Annotation projects:</strong> noisy crowd labels, cleaned by consensus or confident learning.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Selecting the "best 20 features" using all the data and then cross-validating. The selection already saw the validation rows. Put selection inside the pipeline.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Trusting one CV number on tiny data. Repeat CV with different seeds and show the range.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>With 60 rows, why is a forest with training score 1.0 a warning? Answer: It memorised the rows; the honest score is lower (here 0.775).</li><li>Which handles label noise better, a deep unpruned tree or logistic regression? Answer: Logistic regression.</li><li>Why is L1 useful when p ≫ n? Answer: It sets most weights to zero, which acts as feature selection.</li></ol>
+<h2 id="s3-12-3-missing-data-and-messy-features">12.3 Missing Data and Messy Features</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A survey form with a blank field means different things. If the clerk spilled coffee on a random sheet, the blanks are harmless noise. If older people skip the field more often, the blank says something about age. If rich people refuse to state their income, the blank says something about the very number that is missing. The correct fix depends on <em>why</em> it is missing.</div></div>
+<h3>The three mechanisms</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Meaning</th><th>Example</th><th>Consequence</th></tr></thead><tbody><tr><td>MCAR (missing completely at random)</td><td>Missingness is unrelated to anything</td><td>A random sensor dropout</td><td>Dropping rows is unbiased (but wastes data)</td></tr><tr><td>MAR (missing at random)</td><td>Missingness depends on <em>other observed</em> columns</td><td>Older customers skip the income field</td><td>Fixable by using the other columns</td></tr><tr><td>MNAR (missing not at random)</td><td>Missingness depends on the missing value itself</td><td>High earners hide their income</td><td>Cannot be fully fixed from the data; model the process or add an indicator</td></tr></tbody></table></div>
+<h3>The data</h3>
+<p>5,000 shop customers: <code>age</code>, <code>income</code> (rises with age) and <code>spend</code> (monthly spend, the target). We then hide income in three ways.</p>
+<pre class="code lang-python"><code>import pandas as pd
+rng = np.random.default_rng(0); n = 5000
+age = rng.integers(20, 70, n); income = np.exp(rng.normal(10.5, 0.4, n)) + 800*(age - 20)
+spend = 0.02*income + 30*np.sin(age/10) + rng.normal(0, 200, n)
+df = pd.DataFrame(dict(age=age, income=income, spend=spend))
+def make_missing(kind):
+    d = df.copy(); r = np.random.default_rng(1)
+    if kind == 'MCAR': m = r.random(n) &lt; 0.3
+    elif kind == 'MAR': m = r.random(n) &lt; np.where(d.age &gt; 50, 0.55, 0.05)
+    else: m = r.random(n) &lt; 1/(1 + np.exp(-(d.income - 78000)/6000))
+    d.loc[m, 'income'] = np.nan; return d, m
+for kind in ['MCAR', 'MAR', 'MNAR']:
+    d, m = make_missing(kind)
+    print(kind, "missing", m.mean().round(3), "| true mean", df.income.mean().round(0),
+          "| mean of observed", d.income.mean().round(0), "| true mean of missing rows", df.income[m].mean().round(0))</code></pre>
+<pre class="code lang-text"><code>MCAR missing 0.304 | true mean income of all 59208.0 | mean of observed 59001.0 | true mean of missing rows 59681.0
+MAR missing 0.241 | true mean income of all 59208.0 | mean of observed 56046.0 | true mean of missing rows 69143.0
+MNAR missing 0.194 | true mean income of all 59208.0 | mean of observed 52592.0 | true mean of missing rows 86692.0</code></pre>
+<p>Read it. Under MCAR, the observed mean (59,001) is close to the truth (59,208): the missing rows look like the rest. Under MAR, the observed mean is 56,046 (3,162 too low) because the missing rows are older and richer. Under MNAR, the observed mean is 52,592 (6,616 too low), and the people with a blank earn on average 86,692. Simple averaging of what you see misleads whenever missingness is not random.</p>
+<p class="problem"><span class="pl">Problem 12.3.1</span> Compute the bias of the observed mean under MAR in percent.</p>
+<table class="steps"><tr><th>Formula</th><td>bias % = (observed − true) / true × 100.</td></tr><tr><th>Plug in</th><td>(56,046 − 59,208) / 59,208 × 100.</td></tr><tr><th>Compute</th><td>−3,162 / 59,208 = −0.0534; × 100 = −5.3.</td></tr><tr><th>Answer</th><td>The observed mean income is 5.3% too low. Filling blanks with this mean would put a too-low value on exactly the customers who are richer than average.</td></tr><tr><th>Check</th><td>Missing share 24.1% at a mean of 69,143 and observed share 75.9% at 56,046: 0.241 × 69,143 + 0.759 × 56,046 = 16,664 + 42,538 = 59,202, which matches 59,208 within rounding.</td></tr></table>
+<h3>Imputation methods compared (MAR case)</h3>
+<p><strong>Imputation</strong> means filling a missing value with a guess. Options: a constant (mean, median, most common), <strong>KNN</strong> (average of the most similar rows), <strong>iterative / MICE</strong> (predict each column from the others, repeating), a <strong>missing indicator</strong> (an extra 0/1 column saying "this was blank"), or a model that handles NaN natively (histogram gradient boosting sends missing values down the better branch of each split).</p>
+<pre class="code lang-python"><code>from sklearn.impute import SimpleImputer, KNNImputer
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import IterativeImputer
+from sklearn.linear_model import LinearRegression
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import mean_squared_error
+d, m = make_missing('MAR'); tr, te = train_test_split(np.arange(n), test_size=0.3, random_state=0)
+Xd = d[['age', 'income']]
+def fitscore(pipe):
+    pipe.fit(Xd.iloc[tr], d.spend.iloc[tr]); return mean_squared_error(d.spend.iloc[te], pipe.predict(Xd.iloc[te]))**0.5
+print("baseline sd of spend", d.spend.iloc[te].std().round(1))
+print("oracle (no missing) RMSE", round(mean_squared_error(df.spend.iloc[te], LinearRegression().fit(df[['age','income']].iloc[tr], df.spend.iloc[tr]).predict(df[['age','income']].iloc[te]))**0.5, 1))
+print("mean impute", round(fitscore(make_pipeline(SimpleImputer(strategy='mean'), LinearRegression())), 1))
+print("mean impute + indicator", round(fitscore(make_pipeline(ColumnTransformer([('i', SimpleImputer(strategy='mean', add_indicator=True), ['age', 'income'])]), LinearRegression())), 1))
+print("KNN impute", round(fitscore(make_pipeline(StandardScaler(), KNNImputer(n_neighbors=10), LinearRegression())), 1))
+print("iterative impute", round(fitscore(make_pipeline(IterativeImputer(random_state=0, max_iter=10), LinearRegression())), 1))
+print("HistGB native NaN", round(fitscore(HistGradientBoostingRegressor(random_state=0, max_iter=100, learning_rate=0.05)), 1))</code></pre>
+<pre class="code lang-text"><code>baseline sd of spend 448.1
+oracle (no missing) RMSE 198.8
+mean impute 278.9
+mean impute + indicator 267.9
+KNN impute 255.9
+iterative impute 254.2
+HistGB native NaN 260.5</code></pre>
+<p>RMSE is the typical error in currency units; lower is better. With no missing values, a linear model reaches 198.8. With 24% of the income field blank, mean imputation costs 80 units of error (278.9). The indicator helps a little (267.9). KNN, iterative imputation and the native-NaN boosting model all land around 254 to 261, recovering about 25 of the lost 80 units. <strong>No method recovers the full loss</strong>: information that was never recorded is gone. Dropping rows with missing income is no better: it keeps 2,636 of 3,500 training rows and cannot make a prediction for the customers who matter most (those with blanks) at serving time.</p>
+<p class="problem"><span class="pl">Problem 12.3.2</span> How much of the damage did the best imputation recover?</p>
+<table class="steps"><tr><th>Formula</th><td>recovered share = (mean-impute error − best error) / (mean-impute error − oracle error).</td></tr><tr><th>Plug in</th><td>(278.9 − 254.2) / (278.9 − 198.8).</td></tr><tr><th>Compute</th><td>24.7 / 80.1 = 0.308.</td></tr><tr><th>Answer</th><td>Iterative imputation recovered about 31% of the loss from using mean imputation.</td></tr><tr><th>Check</th><td>198.8 + 0.692 × 80.1 = 254.2.</td></tr><tr><th>Why it matters</th><td>Imputation reduces harm but never replaces data collection; fix the form or the sensor when you can.</td></tr></table>
+<h3>Rules for missing data</h3>
+<ol><li><strong>Never impute with test data.</strong> Put the imputer inside a <code>Pipeline</code> so it is fit on training rows only (Chapter 10 on leakage).</li><li><strong>Add a missing-indicator</strong> when the blank itself may carry signal (MNAR).</li><li><strong>Report the missing rate per column</strong> and per segment; a column 60% blank may be better dropped.</li><li>At serving time the pipeline needs the <em>same</em> handling for blanks, including blanks in columns that had none in training.</li><li><strong>Mixed types</strong> (numbers, categories, text) are handled with <code>ColumnTransformer</code>: numeric columns get imputer + scaler, categorical columns get imputer + encoder, text gets a vectorizer. One pipeline, one <code>fit</code>, one <code>predict</code>.</li></ol>
+<pre class="code lang-python"><code>from sklearn.preprocessing import OneHotEncoder
+pre = ColumnTransformer([
+    ('num', make_pipeline(SimpleImputer(strategy='median'), StandardScaler()), ['age', 'income']),
+    ('cat', make_pipeline(SimpleImputer(strategy='most_frequent'), OneHotEncoder(handle_unknown='ignore')), ['plan']),
+])  # 'plan' is an illustrative categorical column; this block only defines the pipeline and is not run here</code></pre>
+<h3>Applications</h3>
+<ul><li><strong>Healthcare:</strong> lab tests are missing because a doctor chose not to order them (MNAR; the blank is informative).</li><li><strong>Surveys:</strong> income and age questions skipped, usually MAR or MNAR.</li><li><strong>Sensors and IoT:</strong> dropouts are usually MCAR; stuck values are another problem.</li><li><strong>Finance:</strong> missing credit history often means "new customer", an informative blank.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Filling blanks with 0. For income, zero is a real value that changes the meaning. Use an indicator and a neutral fill.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Fitting the imputer on the whole dataset before splitting. The test rows leak their averages into training.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Older customers skip the income question more often. Which mechanism? Answer: MAR (depends on an observed column, age).</li><li>Why add a missing indicator? Answer: The fact of being blank may predict the target (especially under MNAR).</li><li>Which model families accept NaN directly? Answer: Histogram gradient boosting in scikit-learn, XGBoost, LightGBM and CatBoost (details vary by library and version).</li></ol>
+<h2 id="s4-12-4-high-cardinality-categorical-features">12.4 High-Cardinality Categorical Features</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A courier company has 800 postcodes. One-hot encoding (one 0/1 column per postcode) creates 800 columns, with about 7 rows each. The model must learn 800 separate facts from 4,200 training rows. The alternative is to replace each postcode with one number, such as its average lateness. This is powerful, but dangerous: the postcode's own rows are used to compute its number, so the model sees the answer. This is <strong>target leakage in disguise</strong> and must be handled carefully.</div></div>
+<p><em>Cardinality</em> means the number of distinct values in a column.</p>
+<h3>The data</h3>
+<p>6,000 deliveries, 800 postcodes (average 7.5 rows each; 52 postcodes have 3 rows or fewer), a distance, and a 0/1 target "late". Each postcode has a true hidden effect on lateness.</p>
+<pre class="code lang-python"><code>from sklearn.preprocessing import TargetEncoder
+rng = np.random.default_rng(0); n = 6000; K = 800
+code = rng.integers(0, K, n); eff = rng.normal(0, 1.0, K)
+dist = rng.normal(5, 2, n); z = -0.5 + eff[code] + 0.15*(dist - 5)
+y = (rng.random(n) &lt; 1/(1 + np.exp(-z))).astype(int)
+D = pd.DataFrame(dict(code=code.astype(str), dist=dist))
+print("unique codes", D.code.nunique(), "rows per code mean", round(n/K, 1), "rare codes (&lt;=3 rows)", int((D.code.value_counts() &lt;= 3).sum()))
+Dtr, Dte, ytr, yte = train_test_split(D, y, test_size=0.3, random_state=0)
+def ev(pre, name, model=None):
+    m = make_pipeline(pre, model or LogisticRegression(max_iter=2000)).fit(Dtr, ytr)
+    print(f"{name:34s} test AUC {roc_auc_score(yte, m.predict_proba(Dte)[:, 1]):.3f}  train AUC {roc_auc_score(ytr, m.predict_proba(Dtr)[:, 1]):.3f}")
+ev(ColumnTransformer([('n', StandardScaler(), ['dist'])]), "distance only")
+ev(ColumnTransformer([('c', OneHotEncoder(handle_unknown='ignore'), ['code']), ('n', StandardScaler(), ['dist'])]), "one-hot (800 cols), C=1")
+ev(ColumnTransformer([('c', OneHotEncoder(handle_unknown='ignore'), ['code']), ('n', StandardScaler(), ['dist'])]), "one-hot, C=0.3", LogisticRegression(C=0.3, max_iter=2000))</code></pre>
+<pre class="code lang-text"><code>unique codes 800 rows per code mean 7.5 rare codes (&lt;=3 rows) 52
+distance only                      test AUC 0.577  train AUC 0.568
+one-hot (800 cols), C=1            test AUC 0.684  train AUC 0.841
+one-hot, C=0.3                     test AUC 0.680  train AUC 0.815</code></pre>
+<p>Distance alone gives 0.577. Adding the postcode through one-hot lifts it to 0.684, but the training AUC is 0.841: a large gap (0.157), the sign of overfitting on rarely seen postcodes.</p>
+<h3>Target encoding: the right and the wrong way</h3>
+<p><strong>Target encoding</strong> replaces each category with the mean of the target in that category. The naive version computes it on the training rows and also uses those same rows to train the model.</p>
+<pre class="code lang-python"><code>te_map = pd.Series(ytr, index=Dtr.index).groupby(Dtr.code).mean(); gm = ytr.mean()
+Dtr_n = Dtr.copy(); Dtr_n['te'] = Dtr.code.map(te_map)
+Dte_n = Dte.copy(); Dte_n['te'] = Dte.code.map(te_map).fillna(gm)
+m = LogisticRegression(max_iter=2000).fit(Dtr_n[['te', 'dist']], ytr)
+print("naive target encoding   test", round(roc_auc_score(yte, m.predict_proba(Dte_n[['te', 'dist']])[:, 1]), 3),
+      " train", round(roc_auc_score(ytr, m.predict_proba(Dtr_n[['te', 'dist']])[:, 1]), 3))
+ev(ColumnTransformer([('c', TargetEncoder(random_state=0), ['code']), ('n', 'passthrough', ['dist'])]), "sklearn TargetEncoder (cross-fit)")</code></pre>
+<pre class="code lang-text"><code>naive target encoding              test AUC 0.671  train AUC 0.847
+sklearn TargetEncoder (cross-fit)  test AUC 0.679  train AUC 0.838</code></pre>
+<p><strong>Why the naive way is flawed.</strong> A postcode with 2 rows, both late, gets the value 1.0: the row's own label is inside its feature. On training rows this looks perfect; on new rows it is noise. The model learns to trust the encoded column too much (train 0.847 versus test 0.671). scikit-learn's <code>TargetEncoder</code> fixes this with <strong>cross-fitting</strong> during <code>fit_transform</code>: each row is encoded using statistics from the <em>other</em> folds, and the estimates are <strong>shrunk</strong> (pulled) towards the global mean for rare categories. The result: the test score is a bit better (0.679 versus 0.671) and the training score is honest.</p>
+<p class="problem"><span class="pl">Problem 12.4.1</span> Shrinkage by hand. The global late rate is 0.40. A postcode has 2 rows, both late (rate 1.0). Using a smoothing weight of 10 pseudo-rows at the global rate, what is the encoded value?</p>
+<table class="steps"><tr><th>Formula</th><td><code>encoded = (n × category_mean + s × global_mean) / (n + s)</code>, with s = 10.</td></tr><tr><th>Plug in</th><td><code>(2 × 1.0 + 10 × 0.40) / (2 + 10)</code>.</td></tr><tr><th>Compute</th><td>(2 + 4) / 12 = 0.5.</td></tr><tr><th>Answer</th><td>The encoded value is 0.50, not 1.0: with only 2 observations we move only a little away from the global 0.40.</td></tr><tr><th>Check</th><td>A postcode with 200 rows at rate 1.0 gives (200 + 4) / 210 = 0.971, so a well-observed postcode keeps its own rate.</td></tr><tr><th>Why it matters</th><td>Shrinkage is the principled way to treat "I have seen this category twice". (Scikit-learn's own default smoothing is chosen automatically; the formula above is the idea, with <code>s</code> as an example value.)</td></tr></table>
+<h3>Other encodings and the serving problem</h3>
+<pre class="code lang-python"><code>fm = Dtr.code.value_counts()
+Dtr_f = Dtr.assign(freq=Dtr.code.map(fm)); Dte_f = Dte.assign(freq=Dte.code.map(fm).fillna(1))
+m = LogisticRegression(max_iter=2000).fit(Dtr_f[['freq', 'dist']], ytr)
+print("frequency encoding", round(roc_auc_score(yte, m.predict_proba(Dte_f[['freq', 'dist']])[:, 1]), 3))
+from sklearn.feature_extraction import FeatureHasher
+import scipy.sparse as sp
+h = FeatureHasher(n_features=64, input_type='string')
+Htr = h.transform([[c] for c in Dtr.code]); Hte = h.transform([[c] for c in Dte.code])
+m = LogisticRegression(max_iter=2000).fit(sp.hstack([Htr, Dtr[['dist']].values]), ytr)
+print("hashing 64 buckets", round(roc_auc_score(yte, m.predict_proba(sp.hstack([Hte, Dte[['dist']].values]))[:, 1]), 3))
+print("test rows with unseen code", int((~Dte.code.isin(Dtr.code)).sum()), "of", len(Dte))</code></pre>
+<pre class="code lang-text"><code>frequency encoding test AUC 0.579
+hashing 64 buckets test AUC 0.570
+test rows with unseen code 14 of 1800</code></pre>
+<div class="tablewrap"><table class="data"><thead><tr><th>Encoding</th><th>Idea</th><th>Result here</th><th>When it fits</th></tr></thead><tbody><tr><td>One-hot</td><td>1 column per value</td><td>0.684 (overfits rare codes)</td><td>Low cardinality (under about 50)</td></tr><tr><td>Target (cross-fit, shrunk)</td><td>category mean of target</td><td>0.679</td><td>Many categories, trees or linear models</td></tr><tr><td>Frequency</td><td>how often the value appears</td><td>0.579</td><td>When popularity itself is informative (here it is not)</td></tr><tr><td>Hashing</td><td>hash value into n buckets</td><td>0.570 with 64 buckets</td><td>Huge or open-ended vocabularies, memory limits; collisions lose information</td></tr><tr><td>Embeddings</td><td>learned dense vector per value</td><td>not run here</td><td>Neural networks with many categories</td></tr><tr><td>Native categorical (CatBoost, LightGBM)</td><td>the library handles it</td><td>not run here</td><td>Gradient boosting</td></tr></tbody></table></div>
+<p>Frequency encoding and 64-bucket hashing score near distance-only (0.577) because lateness here depends on <em>which</em> postcode, not on how common it is, and 64 buckets mix about 12 postcodes each. Honest lesson: there is no best encoding in general; test several inside the CV pipeline.</p>
+<p><strong>Unseen and rare categories.</strong> 14 of 1,800 test rows (0.8%) have a postcode never seen in training; at serving time new postcodes will keep appearing. <code>OneHotEncoder(handle_unknown='ignore')</code> encodes them as all zeros; target encoders fall back to the global mean (in our code <code>fillna(gm)</code>). Group rare values into an "other" bucket (for example, fewer than 5 rows) on purpose.</p>
+<h3>Applications</h3>
+<ul><li><strong>E-commerce:</strong> product ID, seller ID, search query.</li><li><strong>Advertising and recommendation:</strong> user and item IDs (embeddings).</li><li><strong>Logistics:</strong> postcodes, warehouse and route codes.</li><li><strong>Healthcare:</strong> diagnosis and procedure codes (thousands of values).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Computing target encoding on all data before splitting or before CV. The encoding contains the answer. Fit it inside the pipeline, with cross-fitting.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">One-hot encoding an ID column with 100,000 values. The model memorises; use encoding or embeddings.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why is naive target encoding leaky? Answer: Each row's own label is part of its feature value, especially for rare categories.</li><li>A new postcode appears at serving time. What should happen? Answer: Use a fallback (global mean or an "other" bucket) instead of crashing.</li><li>Which encoding suits 5 categories? Answer: One-hot.</li></ol>
+<h2 id="s5-12-5-distribution-shift-and-non-stationarity">12.5 Distribution Shift and Non-Stationarity</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A model is trained like a student who studied last year's exam. If this year's exam has the same questions in a different mix, the student does fine if the knowledge is solid. If the examiner changed what the right answers are, no amount of last year's study helps. We separate "the inputs look different" from "the rules changed".</div></div>
+<h3>Three kinds of shift</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Type</th><th>What changes</th><th>Example</th><th>Typical effect</th></tr></thead><tbody><tr><td>Covariate shift</td><td>The input distribution <code>P(x)</code> changes; the rule <code>x → y</code> is the same</td><td>A shop's customers are now younger</td><td>Hurts if the model is wrong or cannot extrapolate in the new region</td></tr><tr><td>Label shift (prior shift)</td><td>The class balance <code>P(y)</code> changes</td><td>Fraud rate doubles during a holiday</td><td>Probabilities and thresholds go out of date</td></tr><tr><td>Concept drift</td><td>The rule <code>P(y given x)</code> changes</td><td>Customers now react differently to a discount</td><td>Predictions are wrong everywhere; retraining is required</td></tr></tbody></table></div>
+<h3>The data</h3>
+<p>An ice-cream shop predicts daily <code>orders</code> from <code>temp</code> (temperature) and <code>promo</code> (a 0/1 promotion flag). The true rule: orders = 50 + slope × (temp − 15) + 20 × promo + noise. Period A (training): average temperature 12, slope 2. Period B (hot summer): average 22, same slope (covariate shift). Period C: average 22, slope 0.5 (concept drift: people are tired of ice cream).</p>
+<pre class="code lang-python"><code>from sklearn.ensemble import GradientBoostingRegressor
+rng = np.random.default_rng(0)
+def gen(n, temp_mu, slope):
+    t = rng.normal(temp_mu, 4, n); promo = rng.integers(0, 2, n)
+    return pd.DataFrame(dict(temp=t, promo=promo, orders=50 + slope*(t - 15) + 20*promo + rng.normal(0, 8, n)))
+A = gen(3000, 12, 2.0); B = gen(3000, 22, 2.0); C = gen(3000, 22, 0.5)
+for nm, mdl in [('linear', LinearRegression()), ('boosting', GradientBoostingRegressor(random_state=0))]:
+    mdl.fit(A[['temp', 'promo']], A.orders)
+    r = lambda Dd: mean_squared_error(Dd.orders, mdl.predict(Dd[['temp', 'promo']]))**0.5
+    print(nm, "RMSE same period", round(r(gen(1000, 12, 2.0)), 2), "| covariate shift", round(r(B), 2), "| concept drift", round(r(C), 2))</code></pre>
+<pre class="code lang-text"><code>linear RMSE same period 8.19 | covariate shift 7.99 | concept drift 14.8
+boosting RMSE same period 8.12 | covariate shift 8.76 | concept drift 14.24</code></pre>
+<p>Predict first: which model suffers from covariate shift? Read: the <strong>linear</strong> model does not suffer at all (8.19 to 7.99): its rule (a straight line) is correct everywhere, so new temperatures are no problem. The <strong>boosting</strong> model gets worse (8.12 to 8.76), because trees predict a constant beyond the training range (they cannot extrapolate; this is the weakness noted for trees in earlier chapters). Under <strong>concept drift</strong> both models fail (14.8 and 14.2, almost twice the usual error), as no model trained on A knows the new slope. <strong>Covariate shift hurts only models that are wrong or cannot extrapolate in the new region; concept drift hurts every model.</strong></p>
+<h3>Detecting shift</h3>
+<p><strong>PSI (Population Stability Index)</strong> compares the share of rows in each bin, between a reference sample and a new sample: <code>PSI = Σ (new% − ref%) × ln(new% / ref%)</code>. A common rule of thumb: below 0.1 stable, 0.1 to 0.25 moderate shift, above 0.25 large shift. <strong>KS test (Kolmogorov-Smirnov)</strong> measures the largest gap between two cumulative distributions, with a p-value. <strong>Adversarial validation</strong> trains a classifier to tell old rows from new rows; if it can (AUC well above 0.5), the data differ, and its feature importances show <em>which</em> feature drifted.</p>
+<p class="problem"><span class="pl">Problem 12.5.1</span> Compute PSI by hand for a feature split into two bins. Reference shares: 50% / 50%. New shares: 70% / 30%.</p>
+<table class="steps"><tr><th>Formula</th><td><code>PSI = Σ (new − ref) × ln(new / ref)</code>.</td></tr><tr><th>Plug in</th><td>Bin 1: (0.70 − 0.50) × ln(0.70 / 0.50); Bin 2: (0.30 − 0.50) × ln(0.30 / 0.50).</td></tr><tr><th>Compute</th><td>Bin 1: 0.20 × ln(1.4) = 0.20 × 0.3365 = 0.0673. Bin 2: (−0.20) × ln(0.6) = (−0.20) × (−0.5108) = 0.1022. Sum = 0.1695.</td></tr><tr><th>Answer</th><td>PSI = 0.17: a moderate shift.</td></tr><tr><th>Check</th><td>Both terms are positive, as they must be (each term has the same sign for the difference and the log).</td></tr><tr><th>Why it matters</th><td>Both bins contribute positively; PSI is never negative and is zero only when the shares are equal.</td></tr></table>
+<pre class="code lang-python"><code>from scipy import stats
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+def psi(a, b, bins=10):
+    e = np.quantile(a, np.linspace(0, 1, bins + 1)); e[0] = -np.inf; e[-1] = np.inf
+    pa = np.clip(np.histogram(a, e)[0]/len(a), 1e-4, None); pb = np.clip(np.histogram(b, e)[0]/len(b), 1e-4, None)
+    return np.sum((pb - pa)*np.log(pb/pa))
+print("PSI temp A vs fresh A", round(psi(A.temp, gen(3000, 12, 2).temp), 3), "A vs B", round(psi(A.temp, B.temp), 3))
+print("KS temp A vs B", stats.ks_2samp(A.temp, B.temp).statistic.round(3))
+def adv(P, Q):
+    Z = pd.concat([P[['temp', 'promo']], Q[['temp', 'promo']]]); lab = np.r_[np.zeros(len(P)), np.ones(len(Q))]
+    return cross_val_score(RandomForestClassifier(100, random_state=0, min_samples_leaf=5), Z, lab,
+                           cv=StratifiedKFold(5, shuffle=True, random_state=0), scoring='roc_auc').mean()
+print("adversarial AUC A vs fresh A", round(adv(A, gen(3000, 12, 2)), 3), "A vs B", round(adv(A, B), 3))</code></pre>
+<pre class="code lang-text"><code>PSI temp A vs fresh A 0.008 A vs B 4.754
+KS temp A vs B 0.797
+adversarial AUC A vs fresh A 0.495 A vs B 0.952</code></pre>
+<p>Read: PSI for a fresh sample from the same period is 0.008 (no shift); for summer it is 4.754, far above 0.25. KS says 79.7% of the probability mass differs at the worst point. The adversarial classifier gets AUC 0.495 (coin flip) when the periods are the same and 0.952 when different, and its feature importances were <code>temp</code> 0.999 and <code>promo</code> 0.001: it points straight at the temperature. <strong>Detection tools see covariate shift (inputs) but cannot see concept drift</strong>, because the inputs of C look the same as B. For concept drift you need labels: watch the model's error over time.</p>
+<h3>Responding</h3>
+<p>For concept drift we have 3,000 old rows (A) and the first 600 rows of the new regime (C). We test on 1,000 fresh rows of C. Compare four training choices for a linear model.</p>
+<pre class="code lang-python"><code>Ctest = gen(1000, 22, 0.5); mixed = pd.concat([A, C.iloc[:600]]); wts = np.r_[np.ones(3000), np.full(600, 5.0)]
+for nm, (Dd, w) in {'old only': (A, None), 'old+600 new': (mixed, None),
+                    'old+600 new weighted x5': (mixed, wts), 'new 600 only': (C.iloc[:600], None)}.items():
+    mm = LinearRegression().fit(Dd[['temp', 'promo']], Dd.orders, sample_weight=w)
+    print(nm, "RMSE on new regime", round(mean_squared_error(Ctest.orders, mm.predict(Ctest[['temp', 'promo']]))**0.5, 2))</code></pre>
+<pre class="code lang-text"><code>old only RMSE on new regime 15.1
+old+600 new RMSE on new regime 9.52
+old+600 new weighted x5 RMSE on new regime 8.26
+new 600 only RMSE on new regime 7.91</code></pre>
+<p>Old data alone: error 15.1. Adding 600 new rows: 9.52. Giving the new rows 5 times the weight (<strong>recency weighting</strong>): 8.26. Using only the 600 new rows: 7.91, the best here, because the old rule is simply wrong. The noise floor is 8 (the noise sd we generated), so 7.91 is essentially perfect. <strong>When the rule changes, recent data beats a large pile of old data.</strong> If the change is gradual and you are unsure, weight recent data more, or retrain on a sliding window.</p>
+<p><strong>Other responses</strong> (details in the MLOps material): scheduled retraining; monitoring input PSI and the live error rate; online or incremental learners such as <code>river</code> (not run here); robust features that do not depend on the drifting quantity; and a fallback rule when drift alarms fire.</p>
+<h3>Applications</h3>
+<ul><li><strong>Retail and demand forecasting:</strong> seasons, promotions, new products change the inputs and rules.</li><li><strong>Credit and fraud:</strong> fraudsters adapt, so the rule <code>x → y</code> itself drifts.</li><li><strong>Healthcare:</strong> a new device or hospital changes input distributions.</li><li><strong>GenAI:</strong> user questions change over time; evaluation sets go stale.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Monitoring only the inputs. Input checks miss concept drift; you also need delayed labels and the live error rate.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Randomly shuffling time-ordered data for validation. The future leaks into training. Validate on later data (Chapter 10, out-of-time validation).</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Inputs shift but the rule stays; the model is a straight line that fits the rule. Will it fail? Answer: No; the correct rule extrapolates.</li><li>Why can a tree model fail under covariate shift? Answer: It predicts constants outside the training range.</li><li>PSI below 0.1 means? Answer: Stable, no meaningful shift.</li></ol>
+<h2 id="s6-chapter-recap">Chapter recap</h2>
+<ul><li>Rare classes: accuracy is meaningless; use precision, recall, PR-AUC and recall at a fixed precision.</li><li>Threshold moving is the cheapest fix (recall 0.308 to 0.436 with no retraining); class weights and resampling change the operating point and distort probabilities; correct them with the odds formula.</li><li>Resample only inside training folds: oversampling before CV gave a fake PR-AUC of 1.0 versus an honest 0.512.</li><li>Small data: repeated CV with spreads; a single 5-fold swung by 0.087 AUC; simple models beat memorising ones (0.824 versus 0.775 on big test).</li><li>Noisy labels: averaging models tolerate them, deep trees memorise them; out-of-fold disagreement flags bad labels (94 of 100 flagged were truly wrong).</li><li>p ≫ n: L1 regularization kept 19 of 500 features and reached 0.862 test accuracy; dense models got 0.60.</li><li>Missing data: know MCAR/MAR/MNAR; impute inside the pipeline; add indicators; imputation recovers part of the loss, never all.</li><li>High-cardinality categories: use cross-fitted, shrunk target encoding, handle unseen values, test several encodings; naive target encoding leaks.</li><li>Shift: covariate shift hurts models that cannot extrapolate; concept drift hurts all; PSI, KS and adversarial validation detect input shift; recency weighting responds.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Topic</th><th>Command / formula</th></tr></thead><tbody><tr><td>Metrics for rare classes</td><td><code>average_precision_score</code>, <code>precision_recall_curve</code></td></tr><tr><td>Class weights</td><td><code>LogisticRegression(class_weight='balanced')</code></td></tr><tr><td>Probability correction</td><td><code>odds_true = odds_model × (kept / all negatives)</code>, then <code>p = odds / (1 + odds)</code></td></tr><tr><td>Repeated CV</td><td><code>RepeatedStratifiedKFold(n_splits=5, n_repeats=20)</code></td></tr><tr><td>Imputers</td><td><code>SimpleImputer(add_indicator=True)</code>, <code>KNNImputer</code>, <code>IterativeImputer</code></td></tr><tr><td>Target encoding</td><td><code>TargetEncoder()</code> (cross-fits inside <code>fit_transform</code>)</td></tr><tr><td>Shrunk mean</td><td><code>(n·mean_cat + s·mean_global) / (n + s)</code></td></tr><tr><td>PSI</td><td><code>Σ (new% − ref%) × ln(new% / ref%)</code></td></tr><tr><td>Adversarial validation</td><td>classifier old vs new rows; AUC near 0.5 means no shift</td></tr></tbody></table></div>
+<h2 id="s7-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 12.P.1 (easy)</span> 10,000 transactions, 50 fraud. A model flags 40 payments, of which 30 are fraud. Compute precision and recall.</p>
+<p><strong>Answer:</strong> Precision = 30 / 40 = 0.75. Recall = 30 / 50 = 0.60.</p>
+<p class="problem"><span class="pl">Problem 12.P.2 (easy)</span> What does "always predict negative" score in accuracy for P.1?</p>
+<p><strong>Answer:</strong> 9,950 / 10,000 = 99.5%.</p>
+<p class="problem"><span class="pl">Problem 12.P.3 (easy)</span> Classify: "Patients with severe illness skip the follow-up visit, so their blood test is blank."</p>
+<p><strong>Answer:</strong> MNAR (missingness depends on the missing value's meaning, severity).</p>
+<p class="problem"><span class="pl">Problem 12.P.4 (what is the output?)</span> PSI of bins ref (0.8, 0.2) and new (0.8, 0.2)?</p>
+<p><strong>Answer:</strong> 0, since every difference is 0.</p>
+<p class="problem"><span class="pl">Problem 12.P.5 (medium)</span> After undersampling negatives to 20% (keeping 20% of them), the model says p = 0.40. True probability?</p>
+<p><strong>Answer:</strong> Odds = 0.4 / 0.6 = 0.667. Multiply by 0.2: 0.1333. p = 0.1333 / 1.1333 = 0.1176, about 11.8%.</p>
+<p class="problem"><span class="pl">Problem 12.P.6 (medium)</span> Shrunk target encoding with s = 5, global rate 0.2, a category with n = 10 and mean 0.6.</p>
+<p><strong>Answer:</strong> (10 × 0.6 + 5 × 0.2) / 15 = (6 + 1) / 15 = 0.4667.</p>
+<p class="problem"><span class="pl">Problem 12.P.7 (find the bug)</span> <code>X_imp = SimpleImputer().fit_transform(X)</code> and then <code>cross_val_score(model, X_imp, y)</code>.</p>
+<p><strong>Answer:</strong> The imputer was fit on all rows, so each validation fold's information (its column means) leaked into training. Put the imputer in a <code>Pipeline</code> and pass the raw X to <code>cross_val_score</code>.</p>
+<p class="problem"><span class="pl">Problem 12.P.8 (find the bug)</span> A team applies SMOTE to the full dataset and then runs 5-fold CV, getting AUC 0.97. Live AUC is 0.71. Why?</p>
+<p><strong>Answer:</strong> Synthetic points built from validation rows leaked into the training folds, as we saw with copies. Resample inside each training fold only.</p>
+<p class="problem"><span class="pl">Problem 12.P.9 (scenario)</span> A demand model trained in winter fails in summer. A boosting model errs on high temperatures; a linear model does not. Explain, and say what you monitor.</p>
+<p><strong>Answer:</strong> Covariate shift: summer temperatures are outside the trees' training range, and trees predict constants there; a linear rule extrapolates. Monitor the PSI of key inputs and the live error against delayed labels; retrain with recent data if the error rises.</p>
+<p class="problem"><span class="pl">Problem 12.P.10 (interview)</span> "How do you handle a dataset with 0.5% positives?"</p>
+<p><strong>Answer:</strong> Stratified split; metrics PR-AUC and precision/recall at the operating point, not accuracy; start with a baseline model and moving the threshold using cost; try class weights; calibrate if I need probabilities; resample only inside folds; if the rate is extremely low, consider anomaly detection.</p>
+<p class="problem"><span class="pl">Problem 12.P.11 (interview)</span> "Why not just one-hot encode a user ID with 1 million values?"</p>
+<p><strong>Answer:</strong> It creates a million sparse columns, the model memorises rare users, and new users at serving time are unseen. Use target encoding with cross-fitting and shrinkage, hashing, or learned embeddings, plus a fallback for unseen IDs.</p>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me how to handle imbalanced classes in machine learning: why accuracy fails, precision, recall, PR-AUC, threshold moving, class weights, and resampling. Use a small numeric confusion-matrix example and compute every number with me step by step, including how to correct probabilities after undersampling. Then quiz me with three questions, one at a time, and wait for my answers.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Explain how to work with small datasets and noisy labels: repeated cross-validation, why one CV number is unreliable on 60 rows, simple models versus memorising models, regularization when there are more features than rows, and label-noise detection with out-of-fold predictions. Give me 8 graded exercises with different numbers, no solutions until I ask.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me missing data: MCAR, MAR, MNAR, how each biases simple averages, and how mean, KNN and iterative imputation, missing indicators and NaN-friendly models differ. Explain why imputers must live inside a pipeline. Then review my own approach to a messy dataset: [PASTE HERE]. Tell me what could leak and what to try next.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me how to encode categorical columns with hundreds or thousands of values: one-hot, frequency, target encoding with cross-fitting and shrinkage, hashing and embeddings. Show me by hand why naive target encoding leaks the label, and how to handle unseen categories at serving time. Check my understanding with a short quiz, one question at a time.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles and preparing for ML interviews. Run a mock interview on distribution shift and hard data situations: covariate shift versus label shift versus concept drift, PSI, KS tests, adversarial validation, retraining and recency weighting, imbalance, missing data, and leakage. Ask one question at a time, wait for my answer, then correct me kindly and give a short model answer in simple English. Ten questions, harder each time.</pre></div><div class="readbtn"><button class="btn" data-read="study:ml:ch12">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch11.html">← Chapter 11: Hyperparameter Tuning, Optimization, and</a><a class="btn" href="ch13.html">Chapter 13: Unsupervised Learning →</a></div></div><script src="../../assets/study.js"></script></body></html>

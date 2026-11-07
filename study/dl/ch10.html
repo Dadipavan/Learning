@@ -1,0 +1,327 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 10: Sequence Models: RNN, LSTM, GRU, Seq2Seq and Attention</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Deep Learning &amp; Computer Vision</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 10</div><h1>Sequence Models: RNN, LSTM, GRU, Seq2Seq and Attention</h1><p>Models that read data in order, with hand-worked steps, NumPy cells, and the story of why attention replaced recurrence.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-10-1-sequences-and-the-recurrent-neural-network">10.1 Sequences and the Recurrent Neural Network</a></li><li><a href="#s2-10-2-lstm-gru-bidirectional-and-stacked-rnns">10.2 LSTM, GRU, Bidirectional and Stacked RNNs</a></li><li><a href="#s3-10-3-seq2seq-encoder-decoder-teacher-forcing-and-beam-search">10.3 Seq2Seq: Encoder-Decoder, Teacher Forcing and Beam Search</a></li><li><a href="#s4-10-4-attention-and-why-transformers-won">10.4 Attention, and Why Transformers Won</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>Much real data comes in order: daily orders in a shop, temperature readings every hour, the words of a sentence, the sound of a voice. The meaning of one item depends on what came before it. A normal network (Chapter 1) sees a fixed-size input and has no memory. Recurrent neural networks (RNNs) add a memory that is updated one item at a time. This chapter builds an RNN cell by hand with real numbers, trains one in NumPy with a verified gradient (backpropagation through time), shows exactly why plain RNNs forget, and then opens up the LSTM and GRU gates that fix this. We then meet seq2seq (translate one sequence into another), teacher forcing, beam search and attention, and finish with the reasons transformers took over. You will be able to explain each model on a whiteboard and compute its steps. We build on Chapter 2 (backpropagation and gradient checking), Chapter 4 (vanishing and exploding gradients, clipping) and Chapter 6 (1D convolutions as an alternative for sequences). Transformers themselves are the next chapter, and language-model usage is in <code>study/genai/</code>.</p>
+<div class="callout blue"><div class="lab">PROFESSOR'S NOTE</div><div class="txt">PyTorch is not installed where this chapter was written, so every number here comes from NumPy code that I ran (each snippet needs <code>import numpy as np</code> at the top; some listings leave it out to save space). The few PyTorch lines are marked "not run here". Our cells use one or two hidden units so you can check every step on paper.</div></div>
+<h2 id="s1-10-1-sequences-and-the-recurrent-neural-network">10.1 Sequences and the Recurrent Neural Network</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You read a sentence one word at a time and keep a running understanding in your head. After "The bank was closed because the river...", your running understanding changes how you read "bank". An RNN does exactly this: it reads one item, updates a small memory vector, reads the next item with the updated memory, and so on. The same rule (the same weights) is used at every step, like a shop clerk who handles every order with the same procedure but keeps a notepad of what has happened so far.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Sequence</td><td>An ordered list of items: <code>x₁, x₂, ..., x_T</code></td></tr><tr><td>Time step</td><td>One position in the sequence (it does not have to be time: it can be a word position)</td></tr><tr><td>Hidden state <code>hₜ</code></td><td>The memory vector after reading item <code>t</code></td></tr><tr><td>Cell</td><td>The small function that turns <code>(xₜ, hₜ₋₁)</code> into <code>hₜ</code></td></tr><tr><td>Unrolling</td><td>Drawing the loop as a chain of copies, one per step</td></tr><tr><td>BPTT</td><td>Backpropagation through time: ordinary backpropagation on the unrolled chain</td></tr></tbody></table></div>
+<h3>The recurrent update</h3>
+<pre class="code lang-text"><code>hₜ = tanh(Wx · xₜ + Wh · hₜ₋₁ + b)       h₀ = 0</code></pre>
+<p><code>Wx</code> turns the new input into the hidden space, <code>Wh</code> turns the old memory into the hidden space, <code>b</code> is a bias, and <code>tanh</code> squashes values into −1 to 1 (Chapter 1). The same <code>Wx</code>, <code>Wh</code>, <code>b</code> are used at every step: that is <strong>weight sharing over time</strong>, just as a CNN shares a kernel over space (Chapter 6). The number of parameters does not depend on the sequence length.</p>
+<figure><img src="images/rnn_unrolled.svg" alt="An RNN unrolled over three steps with shared weights" loading="lazy"/><figcaption>An RNN unrolled over three steps with shared weights</figcaption></figure>
+<p>How to read it: each blue box is the same cell. Inputs <code>x₁, x₂, x₃</code> enter from below. The arrows going right carry the hidden state to the next step. Each step also produces <code>hₜ</code> upwards, which can be used for an output. For a sentence-level answer (positive or negative review) you use only the last <code>h</code>. For a tagging task you use every <code>hₜ</code>.</p>
+<p class="problem"><span class="pl">Problem 10.1.1</span> An RNN has 1 input and 2 hidden units. <code>Wx = [0.5, −0.3]ᵀ</code>, <code>Wh = [[0.1, 0.4], [0.2, −0.1]]</code>, <code>b = [0, 0.1]</code>. Read the sequence <code>1.0, 2.0, −1.0</code>.</p>
+<table class="steps"><tr><th>Formula</th><td><code>hₜ = tanh(Wx·xₜ + Wh·hₜ₋₁ + b)</code>, <code>h₀ = [0, 0]</code>.</td></tr><tr><th>Step 1 (t = 1, x = 1.0)</th><td><code>Wh·h₀ = [0, 0]</code>. First unit: <code>0.5 × 1.0 + 0 + 0 = 0.5</code>. Second unit: <code>−0.3 × 1.0 + 0 + 0.1 = −0.2</code>. Apply <code>tanh</code>: <code>h₁ = [tanh(0.5), tanh(−0.2)] = [0.4621, −0.1974]</code>.</td></tr><tr><th>Step 2 (t = 2, x = 2.0)</th><td><code>Wh·h₁</code>: first <code>0.1 × 0.4621 + 0.4 × (−0.1974) = 0.04621 − 0.07896 = −0.03275</code>; second <code>0.2 × 0.4621 − 0.1 × (−0.1974) = 0.09242 + 0.01974 = 0.11216</code>. Add <code>Wx·x</code>: first <code>0.5 × 2.0 = 1.0</code>, so <code>a₁ = 1.0 − 0.03275 = 0.96725</code>; second <code>−0.3 × 2.0 + 0.11216 + 0.1 = −0.38784</code>. Then <code>h₂ = [tanh(0.96725), tanh(−0.38784)] = [0.7475, −0.3695]</code>.</td></tr><tr><th>Step 3 (t = 3, x = −1.0)</th><td><code>a = [−0.573, 0.5864]</code>, so <code>h₃ = [−0.5176, 0.5273]</code>.</td></tr><tr><th>Answer</th><td>The memory after the whole sequence is <code>h₃ = [−0.5176, 0.5273]</code>.</td></tr><tr><th>Check</th><td>The code below prints the same <code>a</code> and <code>h</code> at each step. Also, all values stay between −1 and 1 because of <code>tanh</code>.</td></tr><tr><th>Interpretation</th><td>The last memory depends on all three inputs. The third input (−1.0) pushed the first unit negative even though the first two inputs pushed it up: the cell mixes the new input with what it remembered. The order matters: reading <code>−1.0, 1.0, 2.0</code> would give a different <code>h₃</code>.</td></tr></table>
+<p>Before you run it, predict: will the sign of <code>h₃[0]</code> match the sign of the last input?</p>
+<pre class="code lang-python"><code>import numpy as np
+# A tiny RNN: 1 input number, 2 hidden numbers.  h_t = tanh(Wx*x_t + Wh@h_{t-1} + b)
+Wx = np.array([[0.5], [-0.3]])             # shape (2,1)
+Wh = np.array([[0.1, 0.4], [0.2, -0.1]])   # shape (2,2)
+b  = np.array([0.0, 0.1])
+xs = [1.0, 2.0, -1.0]                      # a sequence of 3 inputs
+h = np.zeros(2)
+for t, x in enumerate(xs, 1):
+    a = Wx[:, 0] * x + Wh @ h + b          # pre-activation
+    h = np.tanh(a)
+    print(f"t={t} x={x:5.1f}  a={a.round(4)}  h={h.round(4)}")</code></pre>
+<pre class="code lang-text"><code>t=1 x=  1.0  a=[ 0.5 -0.2]  h=[ 0.4621 -0.1974]
+t=2 x=  2.0  a=[ 0.9673 -0.3878]  h=[ 0.7475 -0.3695]
+t=3 x= -1.0  a=[-0.573   0.5864]  h=[-0.5176  0.5273]</code></pre>
+<p><strong>Line by line.</strong> <code>h = np.zeros(2)</code> is the empty memory. Inside the loop, <code>Wx[:, 0] * x</code> is the input's contribution, <code>Wh @ h</code> is the old memory's contribution, and <code>np.tanh</code> squashes. The same variables <code>Wx</code>, <code>Wh</code>, <code>b</code> are reused each step. (Answer to the prediction: yes here, the sign is negative like the last input, but with a longer, stronger earlier history it might not be.)</p>
+<h3>Turning a series into training samples</h3>
+<p>For forecasting you slide a window over the series: the last <code>T</code> values are the input, the next value is the label. Shapes matter: sequence layers in PyTorch expect <code>(batch, time, features)</code> when <code>batch_first=True</code>.</p>
+<pre class="code lang-python"><code>series = np.array([10, 12, 13, 15, 14, 16, 18, 17, 19, 21.])   # e.g. daily orders in a small shop
+T = 4                                                          # look at 4 days, predict day 5
+X = np.array([series[i:i+T] for i in range(len(series) - T)])  # shape (N, T)
+y = series[T:]
+print("X shape", X.shape, "y shape", y.shape)
+print(X[0], "-&gt;", y[0]); print(X[1], "-&gt;", y[1]); print(X[-1], "-&gt;", y[-1])
+print("model input shape (batch, time, features):", X[:, :, None].shape)</code></pre>
+<pre class="code lang-text"><code>X shape (6, 4) y shape (6,)
+[10. 12. 13. 15.] -&gt; 14.0
+[12. 13. 15. 14.] -&gt; 16.0
+[16. 18. 17. 19.] -&gt; 21.0
+model input shape (batch, time, features): (6, 4, 1)</code></pre>
+<p>Ten values and a window of 4 give <code>10 − 4 = 6</code> samples. Each input has shape <code>(4,)</code>; adding a feature axis makes <code>(6, 4, 1)</code>: 6 samples, 4 time steps, 1 feature (orders per day). With more measurements per step (orders and price) the last number would be 2. <strong>Important:</strong> split train and test <em>by time</em> (train on the past, test on the future), never randomly, or the model peeks at the future.</p>
+<h3>Backpropagation through time and why RNNs forget</h3>
+<p>BPTT applies the chain rule (see the learner's Math PDF, the backpropagation pillar) along the unrolled chain. The gradient reaching step <code>t − 1</code> from step <code>t</code> is multiplied by the factor <code>diag(1 − hₜ²) · Wh</code>. The gradient from the last step back to the first is a <strong>product of <code>T</code> such factors</strong>. A product of many numbers below 1 goes to zero (<em>vanishing gradient</em>); a product of many numbers above 1 blows up (<em>exploding gradient</em>). This is the same disease you met in Chapter 4, but here the "depth" is the sequence length, so it hits RNNs hard.</p>
+<p class="problem"><span class="pl">Problem 10.1.2</span> Measure how strongly the first memory <code>h₀</code> still influences <code>h_T</code> for a 16-unit RNN whose <code>Wh</code> has all singular values equal to <code>scale</code> (a rotation times <code>scale</code>).</p>
+<table class="steps"><tr><th>Formula</th><td><code>∂h_T/∂h₀ = Π diag(1 − hₜ²) · Wh</code>; we report its largest singular value (the matrix 2-norm).</td></tr><tr><th>Step 1</th><td>If the derivative of <code>tanh</code> were exactly 1, the norm after <code>T</code> steps would be <code>scaleᵀ</code>: for 0.9 and 50 steps <code>0.9⁵⁰ = 0.0052</code>.</td></tr><tr><th>Step 2</th><td><code>tanh'</code> is at most 1 and usually smaller, so the real value is even smaller. The code multiplies the true Jacobians.</td></tr><tr><th>Answer</th><td>For <code>scale = 0.9</code> the influence shrinks to <code>4.3e-03</code> after 50 steps and <code>2.2e-05</code> after 100. For <code>scale = 1.5</code> it grows to <code>162</code> and <code>2964</code>. Even at <code>scale = 1.0</code> it falls to <code>0.26</code>, because <code>tanh</code> squashes.</td></tr><tr><th>Check</th><td>The <code>0.9⁵⁰ = 0.0052</code> estimate is close to the measured <code>4.3e-03</code>.</td></tr><tr><th>Interpretation</th><td>A plain RNN cannot learn that "the word 50 steps ago decides the answer", because the learning signal from step 50 is about 0.004 of its original size (or enormous). Exploding gradients are repaired with gradient clipping (below). Vanishing gradients are not: this is why LSTM and GRU were invented (Section 10.2).</td></tr></table>
+<pre class="code lang-python"><code># How much does the first input still influence the last hidden state?  Measure |d h_T / d h_0|
+rng = np.random.default_rng(0)
+def grad_norm(scale, T, n=16):
+    Q, _ = np.linalg.qr(rng.normal(size=(n, n)))
+    Wh = Q * scale                          # every singular value equals `scale`
+    h = rng.normal(size=n) * 0.5; J = np.eye(n)
+    for t in range(T):
+        a = Wh @ h; h = np.tanh(a)
+        J = np.diag(1 - h**2) @ Wh @ J      # chain rule: dh_t/dh_0 = diag(1-h^2) Wh dh_{t-1}/dh_0
+    return np.linalg.norm(J, 2)
+print("steps   scale 0.9      scale 1.0      scale 1.5")
+for T in (1, 5, 10, 20, 50, 100):
+    print(f"{T:5d}   " + "   ".join(f"{grad_norm(s, T):12.3e}" for s in (0.9, 1.0, 1.5)))</code></pre>
+<pre class="code lang-text"><code>steps   scale 0.9      scale 1.0      scale 1.5
+    1      8.992e-01      9.990e-01      1.500e+00
+    5      4.809e-01      7.872e-01      3.310e+00
+   10      2.991e-01      6.636e-01      5.795e+00
+   20      9.257e-02      4.845e-01      1.173e+01
+   50      4.308e-03      2.762e-01      1.619e+02
+  100      2.183e-05      2.630e-01      2.964e+03</code></pre>
+<h3>Train an RNN in NumPy, with a gradient check</h3>
+<p>We train a 6-unit RNN to read 8 random numbers and say whether their <strong>sum is positive</strong>. Code highlights: the forward loop, a backward loop that walks from the last step to the first (<code>dh = Wh.T @ da</code> hands the gradient to the previous step), a numerical gradient check as in Chapter 2, and <strong>gradient clipping</strong>: if the gradient norm exceeds 1, scale it down to 1.</p>
+<p>Before you run it, predict: will the gradient check pass (error below <code>1e-6</code>)? And will the accuracy reach 100%?</p>
+<pre class="code lang-python"><code># Train a small RNN (hidden 6) to say whether the sum of 8 numbers is positive.  Backprop through time + gradient check.
+rng = np.random.default_rng(0)
+H, T = 6, 8
+P = {"Wx": rng.normal(0, 0.5, (H, 1)), "Wh": rng.normal(0, 0.5, (H, H)) / np.sqrt(H), "b": np.zeros(H),
+     "Wo": rng.normal(0, 0.5, (1, H)), "bo": np.zeros(1)}
+sig = lambda a: 1 / (1 + np.exp(-a))
+def forward(P, x):                                   # x: (T,)
+    hs = [np.zeros(H)]
+    for t in range(T): hs.append(np.tanh(P["Wx"][:, 0] * x[t] + P["Wh"] @ hs[-1] + P["b"]))
+    return hs, sig(P["Wo"] @ hs[-1] + P["bo"])[0]
+def loss_grad(P, x, y):
+    hs, p = forward(P, x)
+    loss = -(y * np.log(p) + (1 - y) * np.log(1 - p))
+    g = {k: np.zeros_like(v) for k, v in P.items()}
+    d = p - y                                        # dL/d(output score) for sigmoid + cross-entropy
+    g["Wo"] += d * hs[-1][None, :]; g["bo"] += d
+    dh = d * P["Wo"][0]
+    for t in range(T, 0, -1):                        # go backwards through time
+        da = dh * (1 - hs[t] ** 2)
+        g["Wx"][:, 0] += da * x[t - 1]; g["Wh"] += np.outer(da, hs[t - 1]); g["b"] += da
+        dh = P["Wh"].T @ da                          # pass the gradient to the previous step
+    return loss, g
+# gradient check on one example
+x0 = rng.normal(size=T); y0 = float(x0.sum() &gt; 0)
+_, g = loss_grad(P, x0, y0); worst = 0
+for k in P:
+    for idx in np.ndindex(*P[k].shape):
+        old = P[k][idx]; P[k][idx] = old + 1e-6; lp = loss_grad(P, x0, y0)[0]
+        P[k][idx] = old - 1e-6; lm = loss_grad(P, x0, y0)[0]; P[k][idx] = old
+        num = (lp - lm) / 2e-6; worst = max(worst, abs(num - g[k][idx]) / (abs(num) + abs(g[k][idx]) + 1e-12))
+print("gradient check, worst relative error:", f"{worst:.2e}")
+X = rng.normal(size=(600, T)); Y = (X.sum(1) &gt; 0).astype(float)
+Xte = rng.normal(size=(300, T)); Yte = (Xte.sum(1) &gt; 0).astype(float)
+acc = lambda X, Y: np.mean([(forward(P, x)[1] &gt; 0.5) == y for x, y in zip(X, Y)])
+print("before training: test accuracy", round(float(acc(Xte, Yte)), 3))
+lr = 0.02
+def clip(g, m=1.0):                              # gradient clipping by global norm
+    n = np.sqrt(sum((v ** 2).sum() for v in g.values()))
+    return g if n &lt;= m else {k: v * m / n for k, v in g.items()}
+for epoch in range(1, 31):
+    tot = 0
+    for i in rng.permutation(len(X)):
+        l, g = loss_grad(P, X[i], Y[i]); g = clip(g); tot += l
+        for k in P: P[k] -= lr * g[k]
+    if epoch in (1, 5, 10, 20, 30): print(f"epoch {epoch:2d}  mean loss {tot/len(X):.4f}  test accuracy {acc(Xte, Yte):.3f}")</code></pre>
+<pre class="code lang-text"><code>gradient check, worst relative error: 2.86e-08
+before training: test accuracy 0.737
+epoch  1  mean loss 0.4434  test accuracy 0.870
+epoch  5  mean loss 0.3024  test accuracy 0.907
+epoch 10  mean loss 0.2548  test accuracy 0.933
+epoch 20  mean loss 0.2187  test accuracy 0.940
+epoch 30  mean loss 0.2075  test accuracy 0.937</code></pre>
+<p><strong>Reading the result.</strong> The worst relative error of <code>2.86e-08</code> between our analytic BPTT gradient and the numerical gradient means the backward code is correct for all parameters. Test accuracy rises from 0.737 to about 0.94. It does not reach 100% because sums close to zero are genuinely hard to call (a sum of 0.05 versus −0.05 needs very precise arithmetic from a squashing network). Also note that the accuracy before training was already 0.737 because the random hidden units still respond to large positive and negative inputs; "before training" accuracy is not zero knowledge. <strong>Gradient clipping</strong> (<code>clip</code>) kept the updates stable. In my first attempt, with a larger learning rate (0.1) and no clipping, accuracy bounced between 0.5 and 0.77 and never settled. For long sequences, clipping is standard.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Hidden state <code>h</code></td><td>a vector of 64 to 512 numbers</td><td>The "memory" passed forward, also used as a summary of the sequence</td></tr><tr><td>Window shape <code>(N, T, 1)</code></td><td><code>(6, 4, 1)</code></td><td>Preparing time-series data (demand, sensors, prices)</td></tr><tr><td>Time-ordered split</td><td>train on days 1 to 300, test on 301 to 365</td><td>Avoiding leakage in forecasting</td></tr><tr><td>Gradient clipping at 1.0</td><td><code>clip_grad_norm_(params, 1.0)</code></td><td>A standard line in recurrent and transformer training code (not run here)</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Data Science / forecasting:</strong> hourly demand, energy use, sensor readings, weather readings.</li><li><strong>Speech:</strong> frames of a spectrogram in, characters out (with CTC; see Chapter 9 for the loss idea).</li><li><strong>Older NLP:</strong> tagging, sentiment, language modelling (before 2017).</li><li><strong>Healthcare:</strong> patient vital-sign sequences, ECG signals.</li><li><strong>Machine Learning in general:</strong> a baseline for any ordered data; also 1D CNNs (Chapter 6) and gradient-boosted models on lag features often compete well.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Randomly shuffling time-series samples before splitting into train and test. Neighbouring windows overlap, so a test window is almost identical to a training window and the score is falsely high. Split by time. Another mistake: feeding <code>(batch, features, time)</code> to a layer that expects <code>(batch, time, features)</code>; the code runs and gives nonsense.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>How many parameters does the RNN cell above have? Answer: <code>Wx</code> 2 + <code>Wh</code> 4 + <code>b</code> 2 = 8 (they do not depend on the sequence length).</li><li>Why does <code>scale = 0.9</code> make the gradient vanish? Answer: it is multiplied by about 0.9 at each step, and <code>0.9ⁿ</code> goes to zero for large <code>n</code>.</li><li>What does gradient clipping fix, vanishing or exploding gradients? Answer: exploding only.</li></ol>
+<h2 id="s2-10-2-lstm-gru-bidirectional-and-stacked-rnns">10.2 LSTM, GRU, Bidirectional and Stacked RNNs</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">The plain RNN rewrites its whole notepad at every step, so old notes get smudged away. An LSTM (long short-term memory) keeps a separate <strong>conveyor belt</strong> (the cell state <code>c</code>) running through time. At each step it makes three decisions: how much of the belt's old content to keep (forget gate), how much of the new information to put on the belt (input gate), and how much of the belt to show to the outside (output gate). Because the belt is mostly copied forward, the gradient can travel back along it without shrinking. It is the same idea as the residual connection in Chapter 6, applied across time.</div></div>
+<h3>The LSTM cell</h3>
+<p>For input <code>xₜ</code>, previous hidden <code>hₜ₋₁</code> and previous cell <code>cₜ₋₁</code>:</p>
+<pre class="code lang-text"><code>f = σ(Wf·[x, h] + bf)        forget gate   (0 = erase, 1 = keep)
+i = σ(Wi·[x, h] + bi)        input gate    (0 = ignore new info, 1 = write it)
+o = σ(Wo·[x, h] + bo)        output gate   (how much memory to reveal)
+g = tanh(Wg·[x, h] + bg)     candidate     (the new content, between -1 and 1)
+c = f ⊙ cₜ₋₁ + i ⊙ g          new cell state (⊙ means element-wise multiply)
+h = o ⊙ tanh(c)              new hidden state</code></pre>
+<p><code>σ</code> is the sigmoid (output between 0 and 1: it acts like a dimmer switch). <code>[x, h]</code> means the two vectors joined into one.</p>
+<p class="problem"><span class="pl">Problem 10.2.1</span> One LSTM unit with one input. Weights (on <code>x</code>, on <code>h</code>, bias): forget <code>(0.6, 0.4, 0.5)</code>, input <code>(0.3, 0.2, 0.0)</code>, output <code>(0.5, 0.1, 0.0)</code>, candidate <code>(0.7, 0.1, −0.2)</code>. Take <code>x = 1.0</code>, <code>hₜ₋₁ = 0.5</code>, <code>cₜ₋₁ = 0.8</code>. Compute <code>c</code> and <code>h</code>.</p>
+<table class="steps"><tr><th>Step 1 (pre-activations)</th><td>forget <code>0.6·1 + 0.4·0.5 + 0.5 = 1.3</code>; input <code>0.3 + 0.1 + 0 = 0.4</code>; output <code>0.5 + 0.05 + 0 = 0.55</code>; candidate <code>0.7 + 0.05 − 0.2 = 0.55</code>.</td></tr><tr><th>Step 2 (gates)</th><td><code>f = σ(1.3) = 0.7858</code>, <code>i = σ(0.4) = 0.5987</code>, <code>o = σ(0.55) = 0.6341</code>, <code>g = tanh(0.55) = 0.5005</code>.</td></tr><tr><th>Step 3 (cell)</th><td><code>c = 0.7858 × 0.8 + 0.5987 × 0.5005 = 0.6286 + 0.2997 = 0.9283</code>.</td></tr><tr><th>Step 4 (hidden)</th><td><code>h = 0.6341 × tanh(0.9283) = 0.6341 × 0.7298 = 0.4628</code>.</td></tr><tr><th>Answer</th><td>The new cell state is <code>0.9283</code> and the new hidden state is <code>0.4628</code>.</td></tr><tr><th>Check</th><td>The code prints the same gate values. Sanity checks: all gates are between 0 and 1, <code>g</code> between −1 and 1, and <code>|h| &lt; |c|</code> is typical because <code>o &lt; 1</code> and <code>tanh</code> shrinks.</td></tr><tr><th>Interpretation</th><td>The forget gate (0.79) kept 79% of the old memory (0.8 became 0.63), and the input gate let in 60% of the candidate (0.50 became 0.30). The memory grew from 0.8 to 0.93 because the new information was positive and nearly as large as what was kept. The output gate then showed 63% of <code>tanh(c)</code> to the next layer.</td></tr></table>
+<pre class="code lang-python"><code>sig = lambda a: 1 / (1 + np.exp(-a))
+# One LSTM unit with one input number.  Each gate: weight on x, weight on h_prev, bias.
+W = {"f": (0.6, 0.4, 0.5), "i": (0.3, 0.2, 0.0), "o": (0.5, 0.1, 0.0), "g": (0.7, 0.1, -0.2)}
+x, h_prev, c_prev = 1.0, 0.5, 0.8
+pre = {k: wx * x + wh * h_prev + b for k, (wx, wh, b) in W.items()}
+f, i, o = sig(pre["f"]), sig(pre["i"]), sig(pre["o"]); g = np.tanh(pre["g"])
+c = f * c_prev + i * g          # forget part of the old memory, add part of the new candidate
+h = o * np.tanh(c)              # the output is a filtered view of the memory
+for k, v in pre.items(): print(f"pre-activation {k}: {v:.3f}")
+print(f"forget f={f:.4f}  input i={i:.4f}  output o={o:.4f}  candidate g={g:.4f}")
+print(f"new cell c = {f:.4f}*{c_prev} + {i:.4f}*{g:.4f} = {c:.4f}")
+print(f"new hidden h = {o:.4f} * tanh({c:.4f}) = {h:.4f}")</code></pre>
+<pre class="code lang-text"><code>pre-activation f: 1.300
+pre-activation i: 0.400
+pre-activation o: 0.550
+pre-activation g: 0.550
+forget f=0.7858  input i=0.5987  output o=0.6341  candidate g=0.5005
+new cell c = 0.7858*0.8 + 0.5987*0.5005 = 0.9283
+new hidden h = 0.6341 * tanh(0.9283) = 0.4628</code></pre>
+<p><strong>Why this fixes the vanishing gradient.</strong> Look at the cell equation: <code>c = f ⊙ cₜ₋₁ + i ⊙ g</code>. The derivative of <code>cₜ</code> with respect to <code>cₜ₋₁</code> along this path is just <code>f</code> (the forget gate), not a weight matrix times a squashing derivative. (The gates also depend on <code>hₜ₋₁</code>, which adds smaller side paths; the cell path is the dominant one.) So the gradient along the cell path over <code>T</code> steps is the <strong>product of the forget gates</strong>. If the network learns to set <code>f</code> close to 1 for information it wants to remember, that product stays large.</p>
+<p class="problem"><span class="pl">Problem 10.2.2</span> Compare the surviving gradient along the cell path for different forget gates.</p>
+<table class="steps"><tr><th>Formula</th><td><code>∂c_T/∂c₀ = f^T</code> (if the gate is constant).</td></tr><tr><th>Compute</th><td>For <code>f = 0.95</code>: <code>0.95¹⁰ = 0.5987</code>, <code>0.95⁵⁰ = 0.0769</code>, <code>0.95¹⁰⁰ = 0.0059</code>. For <code>f = 0.99</code>: <code>0.99¹⁰⁰ = 0.366</code>. For <code>f = 0.5</code>: <code>0.5⁵⁰ = 8.9 × 10⁻¹⁶</code>.</td></tr><tr><th>Answer</th><td>With <code>f = 0.99</code>, over 100 steps 37% of the learning signal survives; with <code>f = 0.5</code> essentially none.</td></tr><tr><th>Check</th><td>The code prints these values.</td></tr><tr><th>Interpretation</th><td>The LSTM <em>can</em> remember for a very long time, but it must learn to keep <code>f</code> near 1, and it is not guaranteed. A common trick is to initialise the forget-gate bias to about 1 so training starts with <code>f ≈ 0.73</code> instead of 0.5.</td></tr></table>
+<p>Compare with the plain RNN table of 10.1: there, a <code>scale</code> of 0.9 gave <code>4.3e-03</code> after 50 steps; a forget gate of 0.9 gives <code>5.2e-03</code>, nearly the same. The difference is that the LSTM can learn 0.99 for what matters and 0.1 for what does not, separately for each unit, while the RNN has one fixed matrix.</p>
+<pre class="code lang-python"><code># LSTM memory path: dc_T/dc_0 is the product of the forget gates along the way
+for f in (0.5, 0.9, 0.95, 0.99):
+    print(f"forget gate {f}: after 10 steps {f**10:.4f}   after 50 steps {f**50:.3e}   after 100 steps {f**100:.3e}")
+# Parameter counts: n_gates * (hidden*(input+hidden) + hidden)
+d, h = 10, 20
+for name, gates in (("plain RNN", 1), ("GRU", 3), ("LSTM", 4)):
+    print(f"{name:9s} input {d}, hidden {h}: {gates * (h * (d + h) + h)} parameters")
+print("bidirectional LSTM:", 2 * 4 * (h * (d + h) + h), " 2-layer LSTM (layer 2 input is h):", 4 * (h * (d + h) + h) + 4 * (h * (h + h) + h))</code></pre>
+<pre class="code lang-text"><code>forget gate 0.5: after 10 steps 0.0010   after 50 steps 8.882e-16   after 100 steps 7.889e-31
+forget gate 0.9: after 10 steps 0.3487   after 50 steps 5.154e-03   after 100 steps 2.656e-05
+forget gate 0.95: after 10 steps 0.5987   after 50 steps 7.694e-02   after 100 steps 5.921e-03
+forget gate 0.99: after 10 steps 0.9044   after 50 steps 6.050e-01   after 100 steps 3.660e-01
+plain RNN input 10, hidden 20: 620 parameters
+GRU       input 10, hidden 20: 1860 parameters
+LSTM      input 10, hidden 20: 2480 parameters
+bidirectional LSTM: 4960  2-layer LSTM (layer 2 input is h): 5760</code></pre>
+<h3>The GRU: a lighter alternative</h3>
+<p>The <strong>gated recurrent unit (GRU)</strong> merges the cell and hidden state into one and uses two gates:</p>
+<pre class="code lang-text"><code>z = σ(Wz·[x, h] + bz)          update gate: how much old memory to keep
+r = σ(Wr·[x, h] + br)          reset gate: how much old memory to use when forming the candidate
+n = tanh(Wn·[x, r ⊙ h] + bn)   candidate
+h = (1 − z) ⊙ n + z ⊙ hₜ₋₁      blend</code></pre>
+<p class="problem"><span class="pl">Problem 10.2.3</span> One GRU unit with weights (on <code>x</code>, on <code>h</code>, bias): update <code>(0.4, 0.3, 0)</code>, reset <code>(0.5, 0.2, 0.1)</code>, candidate <code>(0.8, 0.6, 0)</code>. Take <code>x = 1.0</code>, <code>hₜ₋₁ = 0.5</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>z = σ(0.4 + 0.15) = σ(0.55) = 0.6341</code>. <code>r = σ(0.5 + 0.1 + 0.1) = σ(0.7) = 0.6682</code>.</td></tr><tr><th>Step 2</th><td>Candidate uses the reset memory <code>r·h = 0.6682 × 0.5 = 0.3341</code>: <code>n = tanh(0.8 + 0.6 × 0.3341) = tanh(1.0005) = 0.7618</code>.</td></tr><tr><th>Step 3</th><td><code>h = (1 − 0.6341) × 0.7618 + 0.6341 × 0.5 = 0.2787 + 0.3171 = 0.5958</code>.</td></tr><tr><th>Answer</th><td>The new hidden state is <code>0.5958</code>.</td></tr><tr><th>Check</th><td>The new <code>h</code> lies between the old memory (0.5) and the candidate (0.7618), as a blend must. The code prints <code>0.5958</code>.</td></tr><tr><th>Interpretation</th><td>The update gate (0.63) decided to keep 63% of the old memory. If <code>z</code> were 1 the cell would copy its memory unchanged, the same "conveyor belt" idea as the LSTM with fewer parts.</td></tr></table>
+<pre class="code lang-python"><code>sig = lambda a: 1 / (1 + np.exp(-a))
+# One GRU unit, same style: (weight on x, weight on h_prev, bias)
+W = {"z": (0.4, 0.3, 0.0), "r": (0.5, 0.2, 0.1), "n": (0.8, 0.6, 0.0)}
+x, h_prev = 1.0, 0.5
+z = sig(W["z"][0] * x + W["z"][1] * h_prev + W["z"][2])          # update gate
+r = sig(W["r"][0] * x + W["r"][1] * h_prev + W["r"][2])          # reset gate
+n = np.tanh(W["n"][0] * x + W["n"][1] * (r * h_prev) + W["n"][2])  # candidate uses the reset memory
+h = (1 - z) * n + z * h_prev                                       # blend new candidate with old memory
+print(f"update z={z:.4f}  reset r={r:.4f}  candidate n={n:.4f}")
+print(f"new hidden h = (1-{z:.4f})*{n:.4f} + {z:.4f}*{h_prev} = {h:.4f}")</code></pre>
+<pre class="code lang-text"><code>update z=0.6341  reset r=0.6682  candidate n=0.7618
+new hidden h = (1-0.6341)*0.7618 + 0.6341*0.5 = 0.5958</code></pre>
+<h3>Counting parameters, stacking and reading both ways</h3>
+<p>A recurrent layer with <code>d</code> inputs and <code>h</code> hidden units has <code>gates × (h·(d + h) + h)</code> parameters: 1 gate for the plain RNN, 3 for the GRU, 4 for the LSTM. (PyTorch stores two bias vectors per gate, so its counts are <code>h</code> larger per gate; check with <code>sum(p.numel() for p in model.parameters())</code>, not run here.) For <code>d = 10</code>, <code>h = 20</code> the code printed 620 (RNN), 1,860 (GRU) and 2,480 (LSTM). So a GRU is 25% smaller than an LSTM and often performs about the same.</p>
+<ul><li><strong>Stacked (multi-layer):</strong> the hidden states of layer 1 become the inputs of layer 2. Layer 2 then has <code>d = h</code>, so a 2-layer LSTM with <code>d = 10</code>, <code>h = 20</code> has <code>2,480 + 4·(20·40 + 20) = 2,480 + 3,280 = 5,760</code> parameters (printed above). Depth lets the model build more abstract features, but training is slower and needs care (dropout between layers).</li><li><strong>Bidirectional:</strong> run one RNN left to right and another right to left, and join their states at each position. Each position then knows both past and future context. The parameters double (4,960 for our LSTM). It suits tasks where the whole sequence is available (tagging, classification), but <strong>not</strong> forecasting or generation, where the future does not exist yet.</li></ul>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Forget gate near 1</td><td><code>f ≈ 0.99</code></td><td>Long-range memory in a trained LSTM</td></tr><tr><td><code>nn.LSTM(10, 20, num_layers=2, bidirectional=True, batch_first=True)</code></td><td>not run here</td><td>Typical PyTorch layer for forecasting and tagging</td></tr><tr><td>GRU versus LSTM</td><td>1,860 versus 2,480 parameters</td><td>Choose GRU when you want a smaller, faster model</td></tr><tr><td>Output of the last <code>h</code></td><td>one vector per sequence</td><td>Input to a classifier head</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Forecasting:</strong> LSTM or GRU on lag windows (demand, load, sensor data).</li><li><strong>Speech and audio:</strong> acoustic models and wake-word detection on devices (small GRUs run well on edge hardware).</li><li><strong>Healthcare and finance:</strong> patient histories and transaction sequences for risk and anomaly detection.</li><li><strong>Older NLP:</strong> named entity recognition with bidirectional LSTMs (before BERT).</li><li><strong>Edge AI:</strong> small recurrent models remain useful where a transformer is too heavy.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using a bidirectional RNN for forecasting. The backward half reads the future, so training scores look wonderful and deployment fails (the future is not available). Also forgetting that padded sequences of different lengths need packing or masking, or the model learns from padding zeros.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does the forget gate do? Answer: it decides how much of the old cell state to keep (0 erase, 1 keep).</li><li>Why is the gradient along the LSTM cell path easier than along the RNN hidden path? Answer: it is multiplied only by forget gates (which can be near 1), not by a weight matrix and a squashing derivative at every step.</li><li>When is a bidirectional RNN not allowed? Answer: when predicting the future or generating step by step.</li></ol>
+<h2 id="s3-10-3-seq2seq-encoder-decoder-teacher-forcing-and-beam-search">10.3 Seq2Seq: Encoder-Decoder, Teacher Forcing and Beam Search</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A human interpreter listens to a whole sentence first, forms an understanding, and then speaks the translation word by word, each word depending on what has already been said. A seq2seq model has the same two parts: the <strong>encoder</strong> reads the input sequence and compresses it into a summary vector; the <strong>decoder</strong> starts from that summary and writes the output sequence one item at a time. Input and output can have different lengths (a 7-word English sentence may become 6 words in Hindi).</div></div>
+<h3>How it works</h3>
+<pre class="code lang-text"><code>Encoder:  x1 -&gt; [RNN] -&gt; h1 -&gt; [RNN] -&gt; h2 -&gt; [RNN] -&gt; h3 = summary vector s
+Decoder:  s, &lt;start&gt; -&gt; [RNN] -&gt; y1 ; y1 -&gt; [RNN] -&gt; y2 ; y2 -&gt; [RNN] -&gt; y3 ; ... until &lt;end&gt;</code></pre>
+<p>At each decoder step a softmax over the vocabulary gives the probability of every possible next item, and the model picks one. Seq2seq was used for translation, summarisation, speech recognition and chatbots before transformers. Two practical questions arise: how to train it, and how to pick the output sequence.</p>
+<h3>Teacher forcing</h3>
+<p>During training the decoder input at step <code>t</code> could be (a) the model's own previous guess or (b) the true previous item. Option (a) means one early mistake derails the rest, so learning is slow and unstable. <strong>Teacher forcing</strong> uses (b): feed the true previous item. It is like a teacher correcting every word of a student's essay as the student writes, instead of letting errors pile up.</p>
+<pre class="code lang-text"><code>Target:                                      I      like   tea   &lt;end&gt;
+Decoder input (training, teacher forcing):   &lt;start&gt; I      like  tea
+Decoder input (inference):                   &lt;start&gt; + the model's own previous predictions</code></pre>
+<p>The cost is <strong>exposure bias</strong>: at test time the model sees its own, sometimes wrong, previous words, which it never saw in training. Remedies include scheduled sampling (sometimes feed the model's own guess during training).</p>
+<h3>Greedy decoding versus beam search</h3>
+<p><strong>Greedy decoding</strong> picks the most probable item at each step. It is fast but short-sighted: a locally best first word can lead to a poor sentence. <strong>Beam search</strong> keeps the best <code>k</code> partial sequences (the <em>beam width</em>) at each step, extends each, and keeps the best <code>k</code> again. With <code>k = 1</code> it is greedy.</p>
+<p class="problem"><span class="pl">Problem 10.3.1</span> A toy decoder gives <code>P(A) = 0.6</code>, <code>P(B) = 0.4</code> for the first token. After <code>A</code>, the next token probabilities are <code>C 0.34, D 0.33, E 0.33</code>. After <code>B</code>: <code>F 0.9, G 0.1</code>. Find the best 2-token sequence with greedy and with beam width 2.</p>
+<table class="steps"><tr><th>Step 1 (greedy)</th><td>First token: <code>A</code> (0.6). Then the best after <code>A</code> is <code>C</code> (0.34). Sequence <code>AC</code>, probability <code>0.6 × 0.34 = 0.204</code>.</td></tr><tr><th>Step 2 (beam 2, step 1)</th><td>Keep both <code>A (0.6)</code> and <code>B (0.4)</code>.</td></tr><tr><th>Step 3 (beam 2, step 2)</th><td>Extend both: <code>AC 0.204</code>, <code>AD 0.198</code>, <code>AE 0.198</code>, <code>BF 0.4 × 0.9 = 0.36</code>, <code>BG 0.04</code>. Best two: <code>BF (0.36)</code> and <code>AC (0.204)</code>.</td></tr><tr><th>Answer</th><td>Greedy returns <code>AC</code> with probability 0.204; beam search with width 2 finds <code>BF</code> with probability 0.36.</td></tr><tr><th>Check</th><td>The code prints both results. The beam answer has the higher probability, so it is truly better under the model.</td></tr><tr><th>Interpretation</th><td>Greedy committed to <code>A</code> because it looked best at step 1, but <code>A</code> led only to uncertain continuations. Beam search kept <code>B</code> alive long enough to discover its confident continuation. Larger beams give better sequences up to a point but cost more time; beams can also produce dull, repetitive text, which is why modern text generation often uses sampling (temperature, top-p) instead; see <code>study/genai/</code>. In practice probabilities are added as logs, and long sequences are length-normalised so that short ones are not unfairly favoured.</td></tr></table>
+<pre class="code lang-python"><code># Next-token probabilities P(next | previous) for a toy decoder. "&lt;s&gt;" starts, every path ends after 2 tokens.
+P = {"&lt;s&gt;": {"A": 0.6, "B": 0.4},
+     "A": {"C": 0.34, "D": 0.33, "E": 0.33},
+     "B": {"F": 0.9, "G": 0.1}}
+def greedy():
+    seq, p, tok = [], 1.0, "&lt;s&gt;"
+    for _ in range(2):
+        tok, q = max(P[tok].items(), key=lambda kv: kv[1]); seq.append(tok); p *= q
+    return seq, p
+def beam(width):
+    beams = [([], 1.0, "&lt;s&gt;")]
+    for step in range(2):
+        cand = [(s + [t], p * q, t) for s, p, last in beams for t, q in P[last].items()]
+        beams = sorted(cand, key=lambda b: -b[1])[:width]
+        print(f"  width {width}, step {step+1} keeps:", [("".join(s), round(p, 3)) for s, p, _ in beams])
+    return beams[0][0], beams[0][1]
+print("greedy:", greedy())
+print("beam 1:", beam(1)); print("beam 2:", beam(2))</code></pre>
+<pre class="code lang-text"><code>greedy: (['A', 'C'], 0.20400000000000001)
+  width 1, step 1 keeps: [('A', 0.6)]
+  width 1, step 2 keeps: [('AC', 0.204)]
+beam 1: (['A', 'C'], 0.20400000000000001)
+  width 2, step 1 keeps: [('A', 0.6), ('B', 0.4)]
+  width 2, step 2 keeps: [('BF', 0.36), ('AC', 0.204)]
+beam 2: (['B', 'F'], 0.36000000000000004)</code></pre>
+<h3>The bottleneck problem</h3>
+<p>The encoder squeezes the whole input into <strong>one</strong> summary vector <code>s</code>. For a short sentence this works; for a 60-word sentence a single vector of 256 numbers must hold everything, and early words fade (the vanishing-gradient and memory problem again). Translation quality of plain seq2seq fell as sentences grew longer. The fix is attention.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Encoder and decoder</td><td>two RNNs</td><td>Translation, summarisation, speech-to-text</td></tr><tr><td>Teacher forcing</td><td>feed true previous token</td><td>Training any step-by-step generator, including GPT-style models</td></tr><tr><td>Beam width</td><td>4 to 5</td><td>Translation and speech decoding</td></tr><tr><td><code>&lt;start&gt;</code> / <code>&lt;end&gt;</code> tokens</td><td>special symbols</td><td>Telling the decoder when to begin and stop</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Translation and summarisation (historical):</strong> classic neural machine translation.</li><li><strong>Speech recognition and OCR:</strong> encoder-decoder or CTC models turn audio frames or image strips into text (Chapter 9).</li><li><strong>Code and SQL generation (modern analogue):</strong> the decoder part of transformers (see <code>study/genai/</code>).</li><li><strong>Time series:</strong> multi-step forecasting with an encoder-decoder.</li><li><strong>Chatbots:</strong> early dialogue systems.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Evaluating a teacher-forced model by feeding it the true previous words. That gives unrealistically good scores. At evaluation time the decoder must run on its own outputs, exactly like deployment.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does teacher forcing feed the decoder during training? Answer: the true previous item, not its own guess.</li><li>What is beam width 1 equal to? Answer: greedy decoding.</li><li>What is the weakness of a single summary vector? Answer: it must hold the whole input, so long inputs are forgotten.</li></ol>
+<h2 id="s4-10-4-attention-and-why-transformers-won">10.4 Attention, and Why Transformers Won</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Instead of memorising a whole page before answering, you keep the page open and <strong>look back at the relevant lines</strong> when you need them. Attention lets the decoder do this: at each output step it scores every input position by how relevant it is, turns the scores into weights that sum to 1, and takes a weighted average of the input states. The summary is rebuilt freshly for each output word, so no single vector is a bottleneck.</div></div>
+<h3>How it works</h3>
+<p>Given encoder states <code>h₁, ..., h_T</code> (one per input item) and the decoder's current state <code>q</code> (the <strong>query</strong>):</p>
+<ol><li>Score each position: <code>scoreⱼ = q · hⱼ</code> (a dot product: large when the two vectors point the same way). Bahdanau-style attention uses a small neural network for the score instead; the dot form is Luong-style.</li><li>Normalise with softmax: <code>weightⱼ = exp(scoreⱼ) / Σ exp(score)</code>. Weights are positive and add to 1.</li><li>Context vector: <code>context = Σ weightⱼ · hⱼ</code>.</li><li>The decoder uses <code>context</code> along with its own state to predict the next item.</li></ol>
+<p>The weights can be drawn as a grid (output word by input word), which also lets you <em>see</em> what the model looked at: a useful bit of interpretability.</p>
+<p class="problem"><span class="pl">Problem 10.4.1</span> Three source words have encoder states <code>h₁ = [1, 0]</code>, <code>h₂ = [0, 1]</code>, <code>h₃ = [1, 1]</code>. The decoder query is <code>q = [2, 0]</code>. Compute the attention weights and the context vector.</p>
+<table class="steps"><tr><th>Step 1 (scores)</th><td><code>q·h₁ = 2×1 + 0×0 = 2</code>; <code>q·h₂ = 0</code>; <code>q·h₃ = 2×1 + 0×1 = 2</code>.</td></tr><tr><th>Step 2 (softmax)</th><td><code>exp(2) = 7.389</code>, <code>exp(0) = 1</code>, <code>exp(2) = 7.389</code>. Sum <code>= 15.778</code>. Weights <code>= [0.4683, 0.0634, 0.4683]</code>.</td></tr><tr><th>Step 3 (context)</th><td><code>0.4683 × [1,0] + 0.0634 × [0,1] + 0.4683 × [1,1] = [0.4683 + 0.4683, 0.0634 + 0.4683] = [0.9366, 0.5317]</code>.</td></tr><tr><th>Answer</th><td>Weights <code>[0.468, 0.063, 0.468]</code>; context <code>[0.937, 0.532]</code>.</td></tr><tr><th>Check</th><td>The weights add up to <code>0.4683 + 0.0634 + 0.4683 = 1.0</code>. The context lies inside the region spanned by the three states, as any weighted average must.</td></tr><tr><th>Interpretation</th><td>The query points along the first axis, so the two states with a first component of 1 (words 1 and 3) get almost all of the attention, and word 2 gets 6%. The model has chosen which words to read.</td></tr><tr><th>Scaled version</th><td>Dividing the scores by <code>√d</code> (here <code>√2 = 1.414</code>) before the softmax gives weights <code>[0.446, 0.108, 0.446]</code>, flatter. Large vectors produce large dot products and a spiky softmax, so scaling keeps the weights reasonable. This <em>scaled dot-product attention</em> is exactly the form used in transformers.</td></tr></table>
+<pre class="code lang-python"><code>enc = np.array([[1., 0.], [0., 1.], [1., 1.]])        # encoder states for 3 source words (2 numbers each)
+q = np.array([2., 0.])                                # decoder state asking "what should I look at now?"
+scores = enc @ q
+def softmax(v): e = np.exp(v - v.max()); return e / e.sum()
+w = softmax(scores); context = w @ enc
+print("scores", scores, "-&gt; weights", w.round(4), "sum", w.sum().round(4))
+print("context vector", context.round(4))
+ws = softmax(scores / np.sqrt(2))                     # scaled by sqrt(d), d = 2
+print("scaled weights", ws.round(4), "context", (ws @ enc).round(4))</code></pre>
+<pre class="code lang-text"><code>scores [2. 0. 2.] -&gt; weights [0.4683 0.0634 0.4683] sum 1.0
+context vector [0.9366 0.5317]
+scaled weights [0.4458 0.1084 0.4458] context [0.8916 0.5542]</code></pre>
+<p>Attention first improved translation of long sentences a lot (2014 to 2015). Soon after, the paper "Attention Is All You Need" (2017) asked: if attention does the heavy work, why keep the recurrence at all? Chapter 11 builds that answer: <strong>self-attention</strong>, where every position attends to every other position in the same sequence.</p>
+<h3>Why transformers won</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Property</th><th>RNN / LSTM / GRU</th><th>Transformer (self-attention)</th></tr></thead><tbody><tr><td>Computation order</td><td>Step <code>t</code> must wait for step <code>t − 1</code> (sequential)</td><td>All positions computed at once (parallel)</td></tr><tr><td>Steps that cannot be parallelised, for length <code>T</code></td><td><code>T</code></td><td>1 (per layer)</td></tr><tr><td>Distance between item 1 and item <code>T</code></td><td><code>T</code> steps of multiplication</td><td>1 attention step</td></tr><tr><td>Memory of the whole input</td><td>Squeezed into <code>h</code> (lossy)</td><td>Every position stays directly available</td></tr><tr><td>Cost per layer</td><td>grows linearly with <code>T</code></td><td>grows with <code>T²</code> (all pairs)</td></tr><tr><td>Hardware fit</td><td>Poor: GPUs are wasted on sequential steps</td><td>Excellent: big matrix multiplies</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 10.4.2</span> For a sequence of <code>T = 1,000</code> items, compare the number of unavoidable sequential steps and the size of the pairwise score table.</p>
+<table class="steps"><tr><th>Step 1</th><td>An RNN needs <code>T = 1,000</code> sequential steps; each depends on the previous one, so even 1,000 GPUs could not shorten the chain.</td></tr><tr><th>Step 2</th><td>Self-attention computes all pairs at once: <code>T × T = 1,000,000</code> scores (one matrix multiply), a depth of 1 step.</td></tr><tr><th>Step 3</th><td>For <code>T = 10,000</code> the table is <code>10⁸</code> scores per head per layer: the quadratic cost, which is why long context needs tricks (efficient attention such as FlashAttention is covered in Chapter 11).</td></tr><tr><th>Answer</th><td>RNN: 1,000 sequential steps, tiny memory. Attention: 1 step of depth but 1,000,000 scores.</td></tr><tr><th>Check</th><td><code>1,000² = 1,000,000</code>, and <code>10,000² = 100,000,000</code>.</td></tr><tr><th>Interpretation</th><td>Transformers trade memory (quadratic) for speed of training (parallel) and for a direct path between any two positions. Parallel training meant that models could be trained on far more data in the same hardware time, and more data plus scale gave the leap in quality. That, not a single clever trick, is the reason transformers won. Recurrent ideas are not dead: state-space models such as Mamba (awareness only) bring back a fixed-size memory with cheap, long-range sequence processing.</td></tr></table>
+<h3>Where recurrent models are still reasonable</h3>
+<ul><li>Small devices with a tight memory budget (a small GRU for keyword spotting).</li><li>Streaming data that must be processed one item at a time with a constant memory footprint.</li><li>Small datasets of simple time series, where an LSTM or even a 1D CNN or gradient-boosted model on lag features is quick and good enough.</li><li>Understanding older code bases and papers (many production speech and forecasting systems still contain them).</li></ul>
+<pre class="code lang-python"><code># PyTorch equivalents (not run here)
+import torch.nn as nn
+lstm = nn.LSTM(input_size=10, hidden_size=20, num_layers=2, batch_first=True, bidirectional=False)
+# input (batch, time, 10) -&gt; output (batch, time, 20), (h_n, c_n)
+gru = nn.GRU(10, 20, batch_first=True)
+# clip gradients before the optimizer step:
+# torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)</code></pre>
+<p>Not run here. Note PyTorch's recurrent layers expect <code>(time, batch, features)</code> unless you pass <code>batch_first=True</code>, a frequent shape bug.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Attention weights</td><td><code>[0.468, 0.063, 0.468]</code></td><td>Explaining which input a prediction relied on</td></tr><tr><td>Scaled dot product</td><td>divide by <code>√d</code></td><td>The core formula inside every transformer layer (Chapter 11)</td></tr><tr><td>Quadratic score table</td><td><code>T² = 1,000,000</code></td><td>Why long context windows are expensive (see <code>study/genai/</code>)</td></tr><tr><td>Parallel training</td><td>whole sequence at once</td><td>Why GPUs and large datasets work so well with transformers</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>NLP and GenAI:</strong> every modern language model uses attention (see <code>study/genai/</code>).</li><li><strong>Vision:</strong> attention across image patches (Vision Transformers, Chapter 12).</li><li><strong>Speech:</strong> attention-based encoder-decoder models for transcription.</li><li><strong>Time series:</strong> transformer and attention hybrids for long-horizon forecasting.</li><li><strong>Interpretability:</strong> attention maps as a first (imperfect) look at what a model used.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Treating attention weights as a full explanation of why a model decided something. They show where the model looked, not necessarily what caused the output. Use them as a hint and confirm with other methods. Another mistake is saying "RNNs are obsolete": for small, streaming or low-memory settings they still make sense.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What do attention weights sum to? Answer: 1 (they come from a softmax).</li><li>Why scale the dot product by <code>√d</code>? Answer: to stop large vectors from making the softmax too sharp.</li><li>Name two reasons transformers replaced RNNs. Answer: they train in parallel over the sequence, and any two positions are connected in one step.</li></ol>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>A sequence model reads items in order and keeps a hidden state <code>h</code> as memory; the same weights are used at every step, so the parameter count does not depend on length.</li><li>The RNN update is <code>h = tanh(Wx·x + Wh·h + b)</code>; we computed three steps by hand and in NumPy, and trained an RNN with a gradient check error of <code>2.86e-08</code>.</li><li>BPTT multiplies a factor per step, so gradients vanish (scale 0.9: <code>4.3e-03</code> after 50 steps) or explode (scale 1.5: 162). Clipping fixes explosion only.</li><li>The LSTM adds a cell state with forget, input and output gates; its memory path is multiplied only by forget gates, so it can remember for a long time if <code>f</code> stays near 1.</li><li>The GRU has two gates and fewer parameters (1,860 versus 2,480 in our example) and often performs similarly.</li><li>Stacked RNNs add depth; bidirectional RNNs read both ways and cannot be used where the future is unavailable.</li><li>Seq2seq uses an encoder and a decoder; train with teacher forcing; decode with beam search (width 2 found 0.36 where greedy found 0.204).</li><li>Attention rebuilds a context vector per output step as a weighted average of encoder states (weights from a softmax of scaled dot products), removing the single-vector bottleneck.</li><li>Transformers won because they train in parallel and connect any two positions in one step, at the cost of <code>T²</code> memory.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / command / pattern</th><th>Meaning</th></tr></thead><tbody><tr><td><code>hₜ = tanh(Wx·xₜ + Wh·hₜ₋₁ + b)</code></td><td>RNN cell</td></tr><tr><td><code>c = f⊙c₀ + i⊙g</code>, <code>h = o⊙tanh(c)</code></td><td>LSTM state update</td></tr><tr><td><code>h = (1−z)⊙n + z⊙h₀</code></td><td>GRU update</td></tr><tr><td><code>params = gates × (h·(d+h) + h)</code></td><td>gates: RNN 1, GRU 3, LSTM 4</td></tr><tr><td><code>∂c_T/∂c₀ = Π fₜ</code></td><td>LSTM memory path</td></tr><tr><td><code>softmax(q·hⱼ/√d)</code> then <code>Σ wⱼ hⱼ</code></td><td>scaled dot-product attention</td></tr><tr><td><code>clip_grad_norm_(params, 1.0)</code></td><td>gradient clipping (not run here)</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p><strong>1.</strong> (easy) One RNN unit, <code>Wx = 1</code>, <code>Wh = 0.5</code>, <code>b = 0</code>, <code>h₀ = 0</code>, inputs <code>1, 1</code>. Find <code>h₂</code>. <strong>Answer:</strong> <code>h₁ = tanh(1) = 0.7616</code>; <code>h₂ = tanh(1 + 0.5 × 0.7616) = tanh(1.3808) = 0.8811</code>.</p>
+<p><strong>2.</strong> (easy) How many parameters does a GRU with <code>d = 8</code>, <code>h = 16</code> have (using the formula in this chapter)? <strong>Answer:</strong> <code>3 × (16 × 24 + 16) = 3 × 400 = 1,200</code>.</p>
+<p><strong>3.</strong> (easy) Softmax of the scores <code>[0, 0, 0]</code>. <strong>Answer:</strong> each weight is <code>1/3</code>: equal attention.</p>
+<p><strong>4.</strong> (medium) An LSTM forget gate stays at 0.9 for 20 steps. Fraction of the cell-path gradient that survives? <strong>Answer:</strong> <code>0.9²⁰ = 0.1216</code>, about 12%.</p>
+<p><strong>5.</strong> (medium) LSTM unit with <code>f = 0.5</code>, <code>i = 0.5</code>, <code>g = 1.0</code>, <code>c₀ = 2.0</code>. New <code>c</code>? <strong>Answer:</strong> <code>0.5 × 2.0 + 0.5 × 1.0 = 1.5</code>.</p>
+<p><strong>6.</strong> (medium) What is the output shape of <code>X[:, :, None]</code> when <code>X</code> has shape <code>(100, 7)</code>? <strong>Answer:</strong> <code>(100, 7, 1)</code>: 100 samples, 7 time steps, 1 feature.</p>
+<p><strong>7.</strong> (medium) Find the bug: a bidirectional LSTM predicts tomorrow's sales and gets 98% R² on the test set but fails in production. <strong>Answer:</strong> the backward direction reads the future values inside the window (or the split is random and leaks neighbouring windows), so the model effectively sees the answer. Use a unidirectional model and a time-ordered split.</p>
+<p><strong>8.</strong> (medium) Attention: scores <code>[1, 1]</code>, states <code>[2, 0]</code> and <code>[0, 4]</code>. Context vector? <strong>Answer:</strong> weights <code>[0.5, 0.5]</code>; context <code>= 0.5 × [2,0] + 0.5 × [0,4] = [1, 2]</code>.</p>
+<p><strong>9.</strong> (hard) A 2-layer bidirectional LSTM with <code>d = 10</code>, <code>h = 20</code> (formula in this chapter). Parameters? (Layer 2 input is <code>2h = 40</code> because it reads both directions.) <strong>Answer:</strong> layer 1: <code>2 × 2,480 = 4,960</code>. Layer 2: each direction <code>4 × (20 × (40 + 20) + 20) = 4 × 1,220 = 4,880</code>, two directions <code>9,760</code>. Total <code>14,720</code>.</p>
+<p><strong>10.</strong> (hard) Beam search with width 2: step 1 has <code>A 0.5, B 0.3, C 0.2</code>. After <code>A</code>: <code>X 0.5, Y 0.5</code>. After <code>B</code>: <code>X 0.9, Y 0.1</code>. Best two sequences after step 2? <strong>Answer:</strong> with width 2, <code>C</code> is cut at step 1. Candidates: <code>AX 0.25</code>, <code>AY 0.25</code>, <code>BX 0.27</code>, <code>BY 0.03</code>. Best two: <code>BX (0.27)</code> and <code>AX</code> or <code>AY</code> (tie at 0.25).</p>
+<p><strong>11.</strong> (interview) "Why do LSTMs handle long-range dependencies better than plain RNNs?" <strong>Answer:</strong> the cell state is updated additively, <code>c = f·c₀ + i·g</code>, so the gradient along that path is multiplied only by the forget gate, which can stay near 1, instead of by a weight matrix and a squashing derivative at every step. The gates also learn what to keep and what to drop.</p>
+<p><strong>12.</strong> (interview) "Why did transformers replace RNNs for language models?" <strong>Answer:</strong> self-attention processes all positions in parallel, which makes training on huge datasets fast on GPUs, and it connects any two positions in a single step so long-range dependencies are easier to learn. The cost is <code>T²</code> memory for attention scores, which is addressed by efficient attention implementations and long-context tricks. RNNs remain useful where memory and streaming constraints dominate.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me "the recurrent neural network and backpropagation through time". Use a tiny RNN with 2 hidden units and 3 input steps and real numbers. Ask me to compute each hidden state before you show it. Then show with numbers why gradients vanish or explode over many steps, and finish with 3 check questions.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning deep learning, and English is not my first language. Explain "LSTM gates and the cell state" step by step, using one unit with one input and real weights. Compute the forget, input, output and candidate values with me, then the new cell and hidden state. Explain why the forget gate protects the gradient. Then compare with the GRU and ask me to compute one GRU step myself.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Give me 8 graded exercises on "RNN, LSTM, GRU parameter counts, tensor shapes (batch, time, features), bidirectional and stacked layers, and sliding windows for time series". Do not show solutions yet. Wait for my answers and then correct them one by one and explain any mistake in simple English.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, with English as my second language. Teach me "seq2seq, teacher forcing, beam search and attention". Use a toy decoder with a small probability table so I can compute greedy and beam results by hand, and use 3 encoder states with 2 numbers each to compute attention weights and the context vector. Review my own working if I paste it here: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for deep learning interviews, and English is my second language. Run a mock interview on "sequence models and why transformers replaced them": vanishing gradients, LSTM and GRU, bidirectional RNNs, teacher forcing, beam search, attention, and the trade-offs between RNNs and transformers. Ask 8 questions one at a time, grade each answer out of 10, give the ideal short answer, then ask a harder follow-up.</pre></div><div class="readbtn"><button class="btn" data-read="study:dl:ch10">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch09.html">← Chapter 9: Object Detection, Segmentation and OCR</a><a class="btn" href="ch11.html">Chapter 11: Transformers from Scratch →</a></div></div><script src="../../assets/study.js"></script></body></html>

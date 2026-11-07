@@ -1,0 +1,391 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 7: Set Operations, Pivot and Unpivot, GROUPING SETS, ROLLUP and CUBE</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#2b4fd6"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">SQL &amp; Databases Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 7</div><h1>Set Operations, Pivot and Unpivot, GROUPING SETS, ROLLUP and CUBE</h1><p>Stacking result sets, comparing them, turning rows into columns (and back), and producing subtotals in one query.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-7-1-union-union-all-intersect-except">7.1 UNION, UNION ALL, INTERSECT, EXCEPT</a></li><li><a href="#s2-7-2-pivot-and-unpivot">7.2 Pivot and Unpivot</a></li><li><a href="#s3-7-3-grouping-sets-rollup-and-cube">7.3 GROUPING SETS, ROLLUP and CUBE</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>Joins put tables side by side. This chapter is about the other directions. How do you stack two lists into one? How do you find who is in list A but not in list B (churn, missing data)? How do you turn a long table (one row per month and category) into the wide table that managers love (months as columns)? And how do you add subtotal and grand-total rows to a report without writing five queries? After this chapter you can do all four, and you will know where SQLite stops and PostgreSQL continues.</p>
+<h2 id="s1-7-1-union-union-all-intersect-except">7.1 UNION, UNION ALL, INTERSECT, EXCEPT</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of two attendance sheets for two classes. Put both sheets in one pile: that is <strong>UNION ALL</strong>. Put them in one pile but write each name only once: <strong>UNION</strong>. Names that appear on both sheets: <strong>INTERSECT</strong>. Names on the first sheet but not on the second: <strong>EXCEPT</strong> (called <code>MINUS</code> in Oracle).</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Set operation</strong>: combines the <em>rows</em> of two queries (not the columns, as a join does).</li><li><strong>Compatible</strong>: both queries must return the same number of columns, with compatible types, in the same order.</li><li><strong>Duplicate-free</strong>: <code>UNION</code>, <code>INTERSECT</code> and <code>EXCEPT</code> remove duplicate rows from the result; <code>UNION ALL</code> does not.</li></ul>
+<h3>Definitions</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Operator</th><th>Result</th><th>Removes duplicates?</th><th>Speed note</th></tr></thead><tbody><tr><td><code>A UNION ALL B</code></td><td>all rows of A, then all rows of B</td><td>no</td><td>fastest</td></tr><tr><td><code>A UNION B</code></td><td>rows in A or B</td><td>yes</td><td>needs a sort or hash</td></tr><tr><td><code>A INTERSECT B</code></td><td>rows in both</td><td>yes</td><td></td></tr><tr><td><code>A EXCEPT B</code></td><td>rows in A that are not in B</td><td>yes</td><td>order matters</td></tr></tbody></table></div>
+<p>Rules: column <strong>names</strong> come from the first query. <code>ORDER BY</code> goes once, at the very end. <code>NULL</code>s are treated as equal to each other when removing duplicates (unlike <code>=</code>). PostgreSQL also has <code>INTERSECT ALL</code> and <code>EXCEPT ALL</code>, which keep duplicate counts.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Operation</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>UNION ALL</code></td><td>stack <code>sales_2023</code> and <code>sales_2024</code></td><td>combining monthly tables or sharded tables</td></tr><tr><td><code>UNION</code></td><td>unique email list from two sources</td><td>de-duplicated mailing list</td></tr><tr><td><code>INTERSECT</code></td><td>users active in both months</td><td>retained users</td></tr><tr><td><code>EXCEPT</code></td><td>users active in Feb but not April</td><td>churned users; reconciliation gaps</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p>We will compare <strong>February buyers</strong> with <strong>April buyers</strong>. From the data: February orders are 103 (customer 1), 104 (customer 3) and 105 (customer 4). April orders are 111 (customer 1), 112 (customer 4), 113 (customer 5) and 114 (customer 2).</p>
+<p class="problem"><span class="pl">Problem 7.1.1</span> (trivial) Stack two tiny lists with and without duplicates. Predict: how many rows does <code>UNION</code> give, and how many does <code>UNION ALL</code> give, for <code>{1,2,2}</code> and <code>{2,3}</code>?</p>
+<pre class="code lang-sql"><code>SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 2
+UNION ALL
+SELECT 2 UNION ALL SELECT 3;</code></pre>
+<pre class="code lang-text"><code>n
+-
+1
+2
+2
+2
+3</code></pre>
+<pre class="code lang-sql"><code>SELECT 1 AS n UNION SELECT 2 UNION SELECT 2
+UNION
+SELECT 2 UNION SELECT 3;</code></pre>
+<pre class="code lang-text"><code>n
+-
+1
+2
+3</code></pre>
+<ul><li><strong>Check</strong> Five values go in (1, 2, 2, 2, 3). <code>UNION ALL</code> keeps all 5. <code>UNION</code> keeps distinct values: 1, 2, 3.</li><li><strong>Answer</strong> 5 rows with <code>UNION ALL</code>, 3 with <code>UNION</code>.</li><li><strong>Meaning</strong> <code>UNION</code> quietly deletes duplicates. If you meant to keep every record (for example, stacking two transaction tables), <code>UNION</code> loses data. Use <code>UNION ALL</code> unless you want duplicates removed.</li></ul>
+<p class="problem"><span class="pl">Problem 7.1.2</span> Compare the two groups of buyers with the four operators.</p>
+<table class="steps"><tr><th>Step 1</th><td>Define each group with a query on <code>orders</code>.</td></tr><tr><th>Step 2</th><td>Combine.</td></tr></table>
+<pre class="code lang-sql"><code>-- February buyers
+SELECT DISTINCT customer_id FROM orders WHERE order_date LIKE '2024-02%'
+INTERSECT
+-- April buyers
+SELECT DISTINCT customer_id FROM orders WHERE order_date LIKE '2024-04%';</code></pre>
+<pre class="code lang-text"><code>customer_id
+-----------
+1          
+4</code></pre>
+<pre class="code lang-sql"><code>SELECT DISTINCT customer_id FROM orders WHERE order_date LIKE '2024-02%'
+EXCEPT
+SELECT DISTINCT customer_id FROM orders WHERE order_date LIKE '2024-04%';</code></pre>
+<pre class="code lang-text"><code>customer_id
+-----------
+3</code></pre>
+<pre class="code lang-sql"><code>SELECT DISTINCT customer_id FROM orders WHERE order_date LIKE '2024-04%'
+EXCEPT
+SELECT DISTINCT customer_id FROM orders WHERE order_date LIKE '2024-02%';</code></pre>
+<pre class="code lang-text"><code>customer_id
+-----------
+2          
+5</code></pre>
+<pre class="code lang-sql"><code>SELECT customer_id FROM orders WHERE order_date LIKE '2024-02%'
+UNION
+SELECT customer_id FROM orders WHERE order_date LIKE '2024-04%'
+ORDER BY customer_id;</code></pre>
+<pre class="code lang-text"><code>customer_id
+-----------
+1          
+2          
+3          
+4          
+5</code></pre>
+<ul><li><strong>Compute</strong> February set <code>A = {1, 3, 4}</code>. April set <code>B = {1, 4, 5, 2}</code>. Intersection <code>A ∩ B = {1, 4}</code>. <code>A − B = {3}</code>. <code>B − A = {2, 5}</code>. Union <code>A ∪ B = {1, 2, 3, 4, 5}</code>.</li><li><strong>Check</strong> Sizes: <code>|A ∪ B| = |A| + |B| − |A ∩ B| = 3 + 4 − 2 = 5</code>.</li><li><strong>Answer</strong> Retained: customers 1 and 4. Lost after February: customer 3 (Meena). New or returning in April: customers 2 and 5.</li><li><strong>Meaning</strong> <code>EXCEPT</code> is not symmetric: <code>A EXCEPT B</code> and <code>B EXCEPT A</code> answer different questions. This is a simple retention analysis. Chapter 12 builds a full cohort table.</li></ul>
+<p class="problem"><span class="pl">Problem 7.1.3</span> <code>UNION ALL</code> to stack different sources and tag each row with its origin. Combine customers' cities and product categories into one "labels" list with a <code>source</code> column.</p>
+<pre class="code lang-sql"><code>SELECT 'customer_city' AS source, city AS label FROM customers
+UNION ALL
+SELECT 'product_category', category FROM products
+ORDER BY source, label
+LIMIT 6;</code></pre>
+<pre class="code lang-text"><code>source         label    
+-------------  ---------
+customer_city  Bengaluru
+customer_city  Delhi    
+customer_city  Delhi    
+customer_city  Mumbai   
+customer_city  Mumbai   
+customer_city  Pune</code></pre>
+<ul><li><strong>Check</strong> The customer cities are Bengaluru, Delhi, Delhi, Mumbai, Mumbai, Pune, Pune, Pune (8 rows). Sorted, the first six rows are <code>customer_city</code> rows: Bengaluru, Delhi, Delhi, Mumbai, Mumbai, Pune.</li><li><strong>Answer</strong> The <code>source</code> literal column records where each row came from.</li><li><strong>Meaning</strong> Adding a literal "source" column is a standard habit when stacking tables.</li></ul>
+<p class="problem"><span class="pl">Problem 7.1.4</span> Reconciliation with <code>EXCEPT</code> in both directions. Two lists of train stops, <code>scheduled</code> and <code>arrived</code> (from Chapter 4, created again here).</p>
+<pre class="code lang-sql"><code>CREATE TABLE scheduled (stop TEXT);
+CREATE TABLE arrived (stop TEXT);
+INSERT INTO scheduled VALUES ('Pune'),('Lonavala'),('Kalyan'),('Thane');
+INSERT INTO arrived VALUES ('Pune'),('Lonavala'),('Kalyan'),('Dadar');
+
+SELECT 'scheduled_not_visited' AS issue, stop FROM (SELECT stop FROM scheduled EXCEPT SELECT stop FROM arrived)
+UNION ALL
+SELECT 'visited_not_scheduled', stop FROM (SELECT stop FROM arrived EXCEPT SELECT stop FROM scheduled);</code></pre>
+<pre class="code lang-text"><code>issue                  stop 
+---------------------  -----
+scheduled_not_visited  Thane
+visited_not_scheduled  Dadar</code></pre>
+<ul><li><strong>Check</strong> <code>Thane</code> is only in <code>scheduled</code>; <code>Dadar</code> is only in <code>arrived</code>.</li><li><strong>Answer</strong> Two issue rows.</li><li><strong>Meaning</strong> The same job as a <code>FULL JOIN</code> (Chapter 4). <code>EXCEPT</code> compares <em>whole rows</em> and treats NULLs as equal, which is handy when comparing two tables column for column.</li></ul>
+<p class="problem"><span class="pl">Problem 7.1.5</span> A precedence trap. In standard SQL (and PostgreSQL) <code>INTERSECT</code> binds tighter than <code>UNION</code>. What does the following give? Predict with the standard rule, then see what SQLite does.</p>
+<pre class="code lang-sql"><code>SELECT 1 AS n UNION SELECT 2 INTERSECT SELECT 2;</code></pre>
+<pre class="code lang-text"><code>n
+-
+2</code></pre>
+<ul><li><strong>Compute</strong> Standard rule: <code>1 UNION (2 INTERSECT 2)</code> is <code>{1} ∪ {2} = {1, 2}</code>. Left-to-right rule: <code>(1 UNION 2) INTERSECT 2</code> is <code>{1, 2} ∩ {2} = {2}</code>.</li><li><strong>Check</strong> The printed answer shows which rule SQLite follows.</li><li><strong>Answer</strong> SQLite evaluates compound operators from left to right with equal priority, so the result is <code>2</code>. PostgreSQL would return 1 and 2.</li><li><strong>Meaning</strong> Always use brackets (or CTEs) when mixing set operators, so the result does not depend on the database.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code>   A (Feb buyers)     B (April buyers)
+   +-----------+-----------+
+   |  3        | 1  4      |  5   2
+   |           |           |
+   +-----------+-----------+
+    A EXCEPT B   INTERSECT   B EXCEPT A
+       {3}        {1,4}       {2,5}
+   UNION = everything inside either circle = {1,2,3,4,5}</code></pre>
+<h3>Connection to the real job</h3>
+<p><code>UNION ALL</code> is how you combine partitioned or monthly tables. <code>EXCEPT</code> and <code>INTERSECT</code> are standard tools for data validation: "rows in the source but not in the warehouse", "keys in both systems". In performance work: "endpoints that appear in the old test but not in the new one".</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> retained vs lost vs new customers; overlap between campaigns.</li><li><strong>Data Engineering:</strong> reconciliation between source and target; combining sharded tables.</li><li><strong>Data Science:</strong> removing test-set rows from a candidate training set (<code>EXCEPT</code>).</li><li><strong>Operations:</strong> diff of product codes or delivery areas between two weekly stock lists.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using <code>UNION</code> when <code>UNION ALL</code> is meant (silently loses duplicate records and is slower), and assuming columns are matched by name. They are matched by <strong>position</strong>, so keep the same column order in every query.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which operator removes duplicates, <code>UNION</code> or <code>UNION ALL</code>?</li></ol>
+<p>Answer: <code>UNION</code>.</p>
+<ol><li>Is <code>A EXCEPT B</code> the same as <code>B EXCEPT A</code>?</li></ol>
+<p>Answer: No.</p>
+<ol><li>Are columns matched by name or by position?</li></ol>
+<p>Answer: By position.</p>
+<h2 id="s2-7-2-pivot-and-unpivot">7.2 Pivot and Unpivot</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A <strong>long</strong> table is like a ledger: one line per fact (Electronics, January, 2100). A <strong>wide</strong> table is like a report card: one line per subject, with one column per month. People read wide tables; databases store and analyse long tables. <strong>Pivot</strong> converts long to wide. <strong>Unpivot</strong> converts wide to long.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Long format</strong> (tidy): one row per observation; few columns (category, month, revenue).</li><li><strong>Wide format</strong>: one column per value of a category (jan, feb, mar, apr).</li><li><strong>Pivot key</strong>: the column whose values become new column headers (month).</li></ul>
+<h3>How: standard SQL has no PIVOT keyword</h3>
+<p>The portable method is the conditional aggregation you know from Chapters 3 and 6: one <code>SUM(CASE WHEN ... THEN value END)</code> per new column. Note: you must <strong>know the column values in advance</strong>. SQL cannot create columns whose names depend on the data in a plain query. (Dynamic pivots need generated SQL or a tool such as pandas <code>pivot_table</code>.)</p>
+<p>Native keywords exist in some products: SQL Server and Oracle and Snowflake have <code>PIVOT</code>/<code>UNPIVOT</code>; PostgreSQL has the <code>crosstab</code> function in the <code>tablefunc</code> extension; BigQuery has <code>PIVOT</code>.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Shape</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Long</td><td>(category, month, revenue)</td><td>warehouse fact tables, ML training data</td></tr><tr><td>Wide</td><td>category x four month columns</td><td>Excel and dashboard layouts</td></tr><tr><td>Unpivot</td><td>wide survey columns to rows</td><td>cleaning spreadsheet exports</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 7.2.1</span> Build a wide table: paid revenue by category (rows) and month (columns).</p>
+<table class="steps"><tr><th>Step 1</th><td>Join <code>order_items</code>, <code>orders</code> and <code>products</code>; keep paid orders.</td></tr><tr><th>Step 2</th><td>One conditional sum per month, wrapped in <code>COALESCE(..., 0)</code> so empty cells show 0 instead of NULL.</td></tr><tr><th>Step 3</th><td>Add a row total as another column.</td></tr></table>
+<pre class="code lang-sql"><code>CREATE TABLE cat_month AS
+SELECT p.category,
+       COALESCE(SUM(CASE WHEN substr(o.order_date,1,7) = '2024-01' THEN oi.qty*oi.unit_price END), 0) AS jan,
+       COALESCE(SUM(CASE WHEN substr(o.order_date,1,7) = '2024-02' THEN oi.qty*oi.unit_price END), 0) AS feb,
+       COALESCE(SUM(CASE WHEN substr(o.order_date,1,7) = '2024-03' THEN oi.qty*oi.unit_price END), 0) AS mar,
+       COALESCE(SUM(CASE WHEN substr(o.order_date,1,7) = '2024-04' THEN oi.qty*oi.unit_price END), 0) AS apr,
+       SUM(oi.qty*oi.unit_price) AS total
+FROM order_items oi
+JOIN orders o   ON o.order_id = oi.order_id AND o.status = 'paid'
+JOIN products p ON p.product_id = oi.product_id
+GROUP BY p.category;
+
+SELECT * FROM cat_month ORDER BY category;</code></pre>
+<pre class="code lang-text"><code>category     jan   feb   mar   apr   total
+-----------  ----  ----  ----  ----  -----
+Electronics  2100  1500  1200  2700  7500 
+Home         0     900   900   1800  3600 
+Stationery   160   120   880   400   1560</code></pre>
+<ul><li><strong>Compute</strong> Electronics: Jan <code>1500 + 600 = 2100</code> (orders 101 and 102), Feb <code>1500</code> (order 105), Mar <code>1200</code> (order 106; order 109 is refunded so excluded), Apr <code>600 + 1500 + 600 = 2700</code> (orders 111 and 114). Row total <code>2100 + 1500 + 1200 + 2700 = 7500</code>.</li><li><strong>Check</strong> Column totals <code>2260, 2520, 2980, 4900</code> and grand total 12660 match the paid revenue found in Chapter 3. The row totals are 7500 + 3600 + 1560 = 12660.</li><li><strong>Answer</strong> Electronics 2100 / 1500 / 1200 / 2700 (7500); Home 0 / 900 / 900 / 1800 (3600); Stationery 160 / 120 / 880 / 400 (1560).</li><li><strong>Meaning</strong> Home had no paid sales in January, and the table says so with a 0. This is the table a manager can read at a glance.</li></ul>
+<p class="problem"><span class="pl">Problem 7.2.2</span> Unpivot: take <code>cat_month</code> back to long format. Predict: 3 categories x 4 months give 12 rows.</p>
+<table class="steps"><tr><th>Step 1</th><td>For each month column, write a <code>SELECT category, 'month label', that_column</code>.</td></tr><tr><th>Step 2</th><td>Stack them with <code>UNION ALL</code>.</td></tr></table>
+<pre class="code lang-sql"><code>SELECT category, '2024-01' AS month, jan AS revenue FROM cat_month
+UNION ALL SELECT category, '2024-02', feb FROM cat_month
+UNION ALL SELECT category, '2024-03', mar FROM cat_month
+UNION ALL SELECT category, '2024-04', apr FROM cat_month
+ORDER BY category, month;</code></pre>
+<pre class="code lang-text"><code>category     month    revenue
+-----------  -------  -------
+Electronics  2024-01  2100   
+Electronics  2024-02  1500   
+Electronics  2024-03  1200   
+Electronics  2024-04  2700   
+Home         2024-01  0      
+Home         2024-02  900    
+Home         2024-03  900    
+Home         2024-04  1800   
+Stationery   2024-01  160    
+Stationery   2024-02  120    
+Stationery   2024-03  880    
+Stationery   2024-04  400</code></pre>
+<ul><li><strong>Check</strong> The output has <code>3 × 4 = 12</code> rows. For Electronics the four revenues are the first row's values read in order.</li><li><strong>Answer</strong> Twelve rows in long format.</li><li><strong>Meaning</strong> Long format is what charting libraries, <code>GROUP BY</code> and ML pipelines want. In PostgreSQL the shorter form is a <code>CROSS JOIN LATERAL (VALUES ...)</code>, shown below.</li></ul>
+<p class="problem"><span class="pl">Problem 7.2.3</span> Pivot with <code>FILTER</code> (PostgreSQL and SQLite 3.30+) and a PostgreSQL native alternative. Count orders per status, one column per status, for the whole shop.</p>
+<pre class="code lang-sql"><code>SELECT COUNT(*) FILTER (WHERE status = 'paid')      AS paid,
+       COUNT(*) FILTER (WHERE status = 'cancelled') AS cancelled,
+       COUNT(*) FILTER (WHERE status = 'refunded')  AS refunded
+FROM orders;</code></pre>
+<pre class="code lang-text"><code>paid  cancelled  refunded
+----  ---------  --------
+12    1          1</code></pre>
+<ul><li><strong>Check</strong> 12 + 1 + 1 = 14 orders.</li><li><strong>Answer</strong> paid 12, cancelled 1, refunded 1.</li><li><strong>Meaning</strong> <code>FILTER</code> is shorter than <code>CASE</code>, but the idea is the same.</li></ul>
+<pre class="code lang-sql"><code>-- PostgreSQL syntax, not run here
+-- Unpivot in PostgreSQL with VALUES + LATERAL
+SELECT c.category, v.month, v.revenue
+FROM cat_month c
+CROSS JOIN LATERAL (VALUES ('2024-01', c.jan), ('2024-02', c.feb),
+                           ('2024-03', c.mar), ('2024-04', c.apr)) AS v(month, revenue);
+
+-- SQL Server / Snowflake / Oracle native PIVOT (not PostgreSQL):
+-- SELECT * FROM (SELECT category, month, revenue FROM long_table)
+-- PIVOT (SUM(revenue) FOR month IN ('2024-01','2024-02','2024-03','2024-04'));
+
+-- PostgreSQL crosstab (needs: CREATE EXTENSION tablefunc;)
+-- SELECT * FROM crosstab('SELECT category, month, revenue FROM long_table ORDER BY 1,2')
+--   AS ct(category text, jan numeric, feb numeric, mar numeric, apr numeric);</code></pre>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> LONG (unpivoted)                         WIDE (pivoted)
+ category     month    revenue            category     jan   feb   mar   apr
+ Electronics  2024-01  2100     --PIVOT--&gt;  Electronics  2100  1500  1200  2700
+ Electronics  2024-02  1500     &lt;-UNPIVOT-- Home            0   900   900  1800
+ Electronics  2024-03  1200                 Stationery    160   120   880   400
+ Electronics  2024-04  2700
+ ... (12 rows)                              (3 rows)</code></pre>
+<h3>Connection to the real job</h3>
+<p>Analysts pivot for reports and export to Excel or Power BI. Data engineers and scientists unpivot because tidy long data is easy to group and feed to models. Many "weird" Excel exports have one column per month; unpivoting is the first cleaning step.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> cross-tab reports, month columns, status columns.</li><li><strong>Data Engineering:</strong> normalising wide exports into fact tables.</li><li><strong>Data Science and ML:</strong> reshaping to tidy format, creating one feature column per category (one-hot style).</li><li><strong>Education:</strong> students as rows, one column per subject (maths, science, English) in a mark sheet.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Hard-coding months in the pivot, then forgetting to add the new month next quarter. Rows from months not listed vanish silently. Check that the pivot's grand total equals the unpivoted total (here 12660).</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What replaces the missing <code>PIVOT</code> keyword in portable SQL?</li></ol>
+<p>Answer: Conditional aggregation (<code>SUM(CASE WHEN ...)</code>).</p>
+<ol><li>Which format is better for charting libraries and GROUP BY?</li></ol>
+<p>Answer: Long format.</p>
+<ol><li>How do you unpivot with plain SQL?</li></ol>
+<p>Answer: One <code>SELECT</code> per column, joined with <code>UNION ALL</code>.</p>
+<h2 id="s3-7-3-grouping-sets-rollup-and-cube">7.3 GROUPING SETS, ROLLUP and CUBE</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A finance report shows revenue per product, a subtotal per category, and a grand total at the bottom. Without special syntax you would write three queries and stack them. <code>ROLLUP</code> does it in one. <code>GROUPING SETS</code> lets you pick exactly which groupings you want. <code>CUBE</code> gives all combinations.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Grouping set</strong>: one particular <code>GROUP BY</code> list, such as <code>(category, product)</code> or <code>(category)</code> or <code>()</code>.</li><li><strong>Subtotal row</strong>: a row that summarises a group; the grouped-out columns appear as NULL.</li><li><strong>Grand total</strong>: the grouping set <code>()</code>, which has no columns, so everything is one group.</li></ul>
+<h3>Definitions (PostgreSQL, SQL Server, MySQL 8, Oracle, Snowflake, BigQuery; <strong>not SQLite</strong>)</h3>
+<ul><li><code>GROUP BY GROUPING SETS ((a, b), (a), ())</code> computes each listed grouping.</li><li><code>GROUP BY ROLLUP (a, b)</code> is shorthand for <code>GROUPING SETS ((a, b), (a), ())</code>. It rolls up from the right: n columns give n + 1 sets.</li><li><code>GROUP BY CUBE (a, b)</code> is shorthand for <code>GROUPING SETS ((a, b), (a), (b), ())</code>: all combinations, 2 to the power n sets.</li><li>The function <code>GROUPING(col)</code> returns 1 when the column was rolled up in this row and 0 otherwise. Use it to tell a rolled-up NULL from a real NULL in the data.</li></ul>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Feature</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>ROLLUP (category, product)</code></td><td>product rows, category subtotals, grand total</td><td>finance and sales reports</td></tr><tr><td><code>CUBE (region, product)</code></td><td>totals for every slice</td><td>OLAP cubes, pivot-like analysis</td></tr><tr><td><code>GROUPING SETS</code></td><td>only the slices you ask for</td><td>dashboards with several summary levels</td></tr></tbody></table></div>
+<h3>Worked examples</h3>
+<p>SQLite does not have these three, but we can <strong>prove what they mean</strong> by writing the same thing with <code>UNION ALL</code> (which SQLite runs), and then show the standard syntax.</p>
+<p class="problem"><span class="pl">Problem 7.3.1</span> (the long way) Revenue by category and product, with category subtotals and a grand total, using <code>UNION ALL</code>. All orders count here.</p>
+<table class="steps"><tr><th>Step 1</th><td>Detail rows: group by <code>(category, product)</code>.</td></tr><tr><th>Step 2</th><td>Subtotals: group by <code>(category)</code>, with product shown as <code>'ALL'</code>.</td></tr><tr><th>Step 3</th><td>Grand total: no grouping, with both labels <code>'ALL'</code>.</td></tr></table>
+<pre class="code lang-sql"><code>SELECT p.category, p.name AS product, SUM(oi.qty*oi.unit_price) AS revenue
+FROM order_items oi JOIN products p ON p.product_id = oi.product_id
+GROUP BY p.category, p.name
+UNION ALL
+SELECT p.category, 'ALL', SUM(oi.qty*oi.unit_price)
+FROM order_items oi JOIN products p ON p.product_id = oi.product_id
+GROUP BY p.category
+UNION ALL
+SELECT 'ALL', 'ALL', SUM(oi.qty*oi.unit_price)
+FROM order_items oi
+ORDER BY 1, 2;</code></pre>
+<pre class="code lang-text"><code>category     product    revenue
+-----------  ---------  -------
+ALL          ALL        14560  
+Electronics  ALL        9000   
+Electronics  Keyboard   6000   
+Electronics  Mouse      3000   
+Home         ALL        3600   
+Home         Desk Lamp  3600   
+Stationery   ALL        1960   
+Stationery   Notebook   1120   
+Stationery   Pen Pack   840</code></pre>
+<ul><li><strong>Compute</strong> Electronics: Keyboard 6000 and Mouse 3000, subtotal 9000. Home: Desk Lamp 3600, subtotal 3600 (the Mug never sold). Stationery: Notebook 1120 and Pen Pack 840, subtotal 1960. Grand total <code>9000 + 3600 + 1960 = 14560</code>.</li><li><strong>Check</strong> The grand total equals the total revenue from Chapter 3 (14560).</li><li><strong>Answer</strong> Nine rows in all: 5 detail rows, 3 subtotal rows and 1 grand-total row.</li><li><strong>Meaning</strong> Three scans of the data. In a big table, <code>ROLLUP</code> does it in one pass, which is why it exists.</li></ul>
+<p>The same result in PostgreSQL, one query:</p>
+<pre class="code lang-sql"><code>-- PostgreSQL syntax, not run here
+SELECT COALESCE(p.category, 'ALL')                 AS category,
+       COALESCE(p.name, 'ALL')                      AS product,
+       SUM(oi.qty * oi.unit_price)                  AS revenue,
+       GROUPING(p.category, p.name)                 AS grouping_level
+FROM order_items oi JOIN products p ON p.product_id = oi.product_id
+GROUP BY ROLLUP (p.category, p.name)
+ORDER BY p.category NULLS LAST, p.name NULLS LAST;</code></pre>
+<p><code>GROUPING(p.category, p.name)</code> is a bit mask: 0 means detail row, 1 means product rolled up (category subtotal), 3 means both rolled up (grand total).</p>
+<p class="problem"><span class="pl">Problem 7.3.2</span> <code>GROUPING SETS</code> and <code>CUBE</code>, counted by hand. How many result rows do we expect for <code>CUBE (category, month)</code> on our data? There are 3 categories and 4 months.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>CUBE</code> has 4 grouping sets: <code>(category, month)</code>, <code>(category)</code>, <code>(month)</code>, <code>()</code>.</td></tr><tr><th>Step 2</th><td>Rows per set: <code>3 × 4 = 12</code> (only combinations that exist; with all 12 present), 3, 4, and 1.</td></tr><tr><th>Step 3</th><td>If every (category, month) pair exists, the total is <code>12 + 3 + 4 + 1 = 20</code>. Let us see whether that holds.</td></tr></table>
+<pre class="code lang-sql"><code>-- PostgreSQL syntax, not run here
+SELECT p.category, substr(o.order_date::text, 1, 7) AS month, SUM(oi.qty*oi.unit_price) AS revenue
+FROM order_items oi
+JOIN orders o   ON o.order_id = oi.order_id AND o.status = 'paid'
+JOIN products p ON p.product_id = oi.product_id
+GROUP BY CUBE (p.category, substr(o.order_date::text, 1, 7));</code></pre>
+<p>We can verify the count of 20 by running the four pieces in SQLite and counting them:</p>
+<pre class="code lang-sql"><code>SELECT COUNT(*) AS cube_rows FROM (
+  SELECT p.category, substr(o.order_date,1,7) AS m FROM order_items oi
+    JOIN orders o ON o.order_id = oi.order_id AND o.status='paid'
+    JOIN products p ON p.product_id = oi.product_id GROUP BY 1,2
+  UNION ALL
+  SELECT p.category, NULL FROM order_items oi
+    JOIN orders o ON o.order_id = oi.order_id AND o.status='paid'
+    JOIN products p ON p.product_id = oi.product_id GROUP BY 1
+  UNION ALL
+  SELECT NULL, substr(o.order_date,1,7) FROM order_items oi
+    JOIN orders o ON o.order_id = oi.order_id AND o.status='paid'
+    GROUP BY 2
+  UNION ALL
+  SELECT NULL, NULL
+);</code></pre>
+<pre class="code lang-text"><code>cube_rows
+---------
+19</code></pre>
+<ul><li><strong>Check</strong> The detail set has fewer than 12 rows if a (category, month) pair has no paid sales. Home has no paid sales in January, so the detail set has 11 rows. Total: <code>11 + 3 + 4 + 1 = 19</code>.</li><li><strong>Answer</strong> 19 rows on our data (not 20), because the combination (Home, January) does not exist and <code>GROUP BY</code> only creates groups that occur in the data. The printed count agrees with this.</li><li><strong>Meaning</strong> <code>CUBE</code> and <code>ROLLUP</code> never invent empty groups. If you need empty combinations to appear as zero, build a grid with a <code>CROSS JOIN</code> first (Chapter 4).</li></ul>
+<p class="problem"><span class="pl">Problem 7.3.3</span> Which one to pick?</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Goal</th><th>Use</th></tr></thead><tbody><tr><td>Hierarchy: product, category, grand total</td><td><code>ROLLUP (category, product)</code></td></tr><tr><td>Totals for every combination of two or three dimensions</td><td><code>CUBE</code></td></tr><tr><td>Only specific summary levels, e.g. by city and by category separately</td><td><code>GROUPING SETS ((city), (category))</code></td></tr></tbody></table></div>
+<ul><li><strong>Answer</strong> The table above.</li><li><strong>Meaning</strong> <code>GROUPING SETS</code> is the general form, the other two are shorthand. For three columns, <code>CUBE</code> gives 8 sets; list only what you need to avoid wasted work.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> ROLLUP (category, product)               grouping sets produced
+ --------------------------------------   ----------------------
+ Electronics | Keyboard | 6000             (category, product)
+ Electronics | Mouse    | 3000             (category, product)
+ Electronics | ALL      | 9000      &lt;----  (category)           subtotal
+ Home        | Desk Lamp| 3600             (category, product)
+ Home        | ALL      | 3600      &lt;----  (category)           subtotal
+ ...                                                            ...
+ ALL         | ALL      | 14560     &lt;----  ()                   grand total</code></pre>
+<h3>Connection to the real job</h3>
+<p>Management reports always have subtotals. BI tools (Power BI, Tableau) compute these on their own, but in a warehouse you often produce them in SQL. <code>CUBE</code> and <code>ROLLUP</code> are the SQL idea behind OLAP (Chapter 11).</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> financial statements, sales by region with subtotals.</li><li><strong>Data Engineering:</strong> pre-aggregated summary tables for dashboards.</li><li><strong>Retail:</strong> sales by store, by region, and overall in one result set.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Mistaking a subtotal NULL for a real NULL. If a product name can be NULL in the data, <code>GROUP BY ROLLUP</code> shows two kinds of NULLs. Use <code>GROUPING(col)</code> to tell them apart. Also, trying <code>ROLLUP</code> in SQLite or older MySQL (<code>WITH ROLLUP</code> is the MySQL form) will fail; check your database.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>How many grouping sets does <code>ROLLUP (a, b, c)</code> produce?</li></ol>
+<p>Answer: 4: (a,b,c), (a,b), (a), ().</p>
+<ol><li>How many does <code>CUBE (a, b, c)</code> produce?</li></ol>
+<p>Answer: 8.</p>
+<ol><li>What does <code>GROUPING(col) = 1</code> mean?</li></ol>
+<p>Answer: The column was rolled up in this row, so it is a subtotal NULL.</p>
+<h2 id="s4-chapter-recap">Chapter recap</h2>
+<ul><li><code>UNION ALL</code> stacks all rows; <code>UNION</code> also removes duplicates; use <code>UNION ALL</code> unless you need de-duplication.</li><li><code>INTERSECT</code> finds rows in both; <code>EXCEPT</code> finds rows in the first but not the second, and order matters.</li><li>Set operations match columns by position and need compatible types; <code>ORDER BY</code> goes at the end.</li><li>Use brackets when mixing set operators; databases differ in precedence.</li><li>Pivot (long to wide) is <code>SUM(CASE WHEN ...)</code> per output column; the values must be known in advance.</li><li>Unpivot (wide to long) is one <code>SELECT</code> per column joined by <code>UNION ALL</code>, or <code>LATERAL (VALUES ...)</code>.</li><li><code>GROUPING SETS</code>, <code>ROLLUP</code> and <code>CUBE</code> make subtotals in one pass; SQLite lacks them, emulate with <code>UNION ALL</code>.</li><li><code>CUBE</code> and <code>ROLLUP</code> never create empty groups.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Need</th><th>Pattern</th></tr></thead><tbody><tr><td>Stack tables</td><td><code>SELECT ... UNION ALL SELECT ...</code></td></tr><tr><td>Who is in A not B</td><td><code>A EXCEPT B</code> or anti-join</td></tr><tr><td>Who is in both</td><td><code>A INTERSECT B</code></td></tr><tr><td>Wide report</td><td><code>SUM(CASE WHEN m='2024-01' THEN v END) AS jan</code></td></tr><tr><td>Long format</td><td><code>SELECT k,'jan',jan FROM t UNION ALL SELECT k,'feb',feb FROM t</code></td></tr><tr><td>Subtotals</td><td><code>GROUP BY ROLLUP (a, b)</code></td></tr></tbody></table></div>
+<h2 id="s5-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 7.P.1</span> (easy) How many rows: <code>SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1</code>?</p>
+<pre class="code lang-sql"><code>SELECT 1 UNION ALL SELECT 1 UNION ALL SELECT 1;</code></pre>
+<pre class="code lang-text"><code>1
+-
+1
+1
+1</code></pre>
+<p><strong>Answer:</strong> 3. With <code>UNION</code> it would be 1.</p>
+<p class="problem"><span class="pl">Problem 7.P.2</span> (easy) Customers in Pune who also ordered in March, using <code>INTERSECT</code>.</p>
+<pre class="code lang-sql"><code>SELECT customer_id FROM customers WHERE city = 'Pune'
+INTERSECT
+SELECT customer_id FROM orders WHERE order_date LIKE '2024-03%';</code></pre>
+<pre class="code lang-text"><code>customer_id
+-----------
+1</code></pre>
+<p><strong>Answer:</strong> Customer 1 (Asha, order 106). Pune customers are 1, 3, 8; March buyers are 1, 5, 2, 6.</p>
+<p class="problem"><span class="pl">Problem 7.P.3</span> (what is the output?) What does this return?</p>
+<pre class="code lang-sql"><code>SELECT customer_id FROM customers
+EXCEPT
+SELECT customer_id FROM orders
+ORDER BY customer_id;</code></pre>
+<pre class="code lang-text"><code>customer_id
+-----------
+7          
+8</code></pre>
+<p><strong>Answer:</strong> 7 and 8, customers who never ordered (an anti-join written with <code>EXCEPT</code>).</p>
+<p class="problem"><span class="pl">Problem 7.P.4</span> (find the bug) A pivot query shows revenue for months 2024-01 to 2024-03 only, and the grand total is 10,000 lower than the source. What is likely wrong? <strong>Answer:</strong> A month is missing from the pivot columns, so its rows are dropped (here April). Reconcile the pivot grand total with <code>SELECT SUM(revenue)</code> from the long table, and add the missing column.</p>
+<p class="problem"><span class="pl">Problem 7.P.5</span> Pivot: number of orders per customer city, one column per city.</p>
+<pre class="code lang-sql"><code>SELECT COUNT(*) FILTER (WHERE c.city = 'Pune')      AS pune,
+       COUNT(*) FILTER (WHERE c.city = 'Mumbai')    AS mumbai,
+       COUNT(*) FILTER (WHERE c.city = 'Delhi')     AS delhi,
+       COUNT(*) FILTER (WHERE c.city = 'Bengaluru') AS bengaluru
+FROM orders o JOIN customers c ON c.customer_id = o.customer_id;</code></pre>
+<pre class="code lang-text"><code>pune  mumbai  delhi  bengaluru
+----  ------  -----  ---------
+5     4       2      3</code></pre>
+<p><strong>Answer:</strong> Pune 5 (Asha 4 + Meena 1), Mumbai 4 (Ravi 3 + Kabir 1), Delhi 2 (John), Bengaluru 3 (Priya). Total 14.</p>
+<p class="problem"><span class="pl">Problem 7.P.6</span> Unpivot <code>cat_month</code> for one category (Home) to a three-column long table, using <code>UNION ALL</code>, for March and April only.</p>
+<pre class="code lang-sql"><code>SELECT category, 'mar' AS month, mar AS revenue FROM cat_month WHERE category = 'Home'
+UNION ALL
+SELECT category, 'apr', apr FROM cat_month WHERE category = 'Home';</code></pre>
+<pre class="code lang-text"><code>category  month  revenue
+--------  -----  -------
+Home      mar    900    
+Home      apr    1800</code></pre>
+<p><strong>Answer:</strong> (Home, mar, 900) and (Home, apr, 1800).</p>
+<p class="problem"><span class="pl">Problem 7.P.7</span> Report: revenue per category with a grand total row, written with <code>UNION ALL</code> (so it runs in SQLite). All orders count.</p>
+<pre class="code lang-sql"><code>SELECT p.category, SUM(oi.qty*oi.unit_price) AS revenue
+FROM order_items oi JOIN products p ON p.product_id = oi.product_id
+GROUP BY p.category
+UNION ALL
+SELECT 'TOTAL', SUM(qty*unit_price) FROM order_items
+ORDER BY revenue;</code></pre>
+<pre class="code lang-text"><code>category     revenue
+-----------  -------
+Stationery   1960   
+Home         3600   
+Electronics  9000   
+TOTAL        14560</code></pre>
+<p><strong>Answer:</strong> Stationery 1960, Home 3600, Electronics 9000, TOTAL 14560.</p>
+<p class="problem"><span class="pl">Problem 7.P.8</span> (scenario) You must compare the list of customer ids in last quarter's mailing with this quarter's, and report who dropped off, who is new, and who stayed. Which operators? <strong>Answer:</strong> <code>last EXCEPT this</code> for dropped, <code>this EXCEPT last</code> for new, <code>last INTERSECT this</code> for stayed. Or a <code>FULL JOIN</code> with <code>IS NULL</code> tests.</p>
+<p class="problem"><span class="pl">Problem 7.P.9</span> (interview) <code>UNION</code> versus <code>UNION ALL</code>: differences and when to prefer each. <strong>Answer:</strong> <code>UNION</code> removes duplicate rows (it needs sorting or hashing, so it is slower); <code>UNION ALL</code> keeps everything and is faster. Prefer <code>UNION ALL</code> unless you need unique rows, and when you know the inputs cannot overlap, use <code>UNION ALL</code> for speed.</p>
+<p class="problem"><span class="pl">Problem 7.P.10</span> (interview) Explain <code>ROLLUP</code> versus <code>CUBE</code> with an example for <code>(year, region)</code>. <strong>Answer:</strong> <code>ROLLUP (year, region)</code> gives rows for (year, region), (year), and grand total: a hierarchy. <code>CUBE (year, region)</code> also adds (region): all combinations. For 2 columns: ROLLUP has 3 grouping sets, CUBE has 4.</p>
+<h2 id="s6-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional in India moving into data roles, and English is my second language. Teach me Chapter 7 topic: "SQL set operations: UNION, UNION ALL, INTERSECT, EXCEPT". Use two small customer lists and draw the result of each operator. After each operator ask me to predict the output, then check my answer.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am learning SQL. Topic: pivot and unpivot using conditional aggregation and UNION ALL, with PostgreSQL crosstab and SQL Server PIVOT as extras. Give me 8 graded exercises that convert between long and wide tables on a sales dataset, with no solutions at first. Review my answers when I paste them and check that grand totals reconcile.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. Explain GROUPING SETS, ROLLUP and CUBE to a beginner. Use a sales table by region and product. Show how many grouping sets each produces, how the GROUPING function works, and the equivalent UNION ALL query. Ask me one check question after each idea and wait for my answer.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am preparing for analyst interviews. Review my SQL below for set operation mistakes (UNION versus UNION ALL, column order, brackets with INTERSECT) and for pivot mistakes (missing categories, wrong totals). Explain every problem simply and give a corrected query. My SQL: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. Run a mock SQL interview on retention-style set logic and reshaping: customers active in both months, customers lost, wide report from a long table, subtotals with ROLLUP. One question at a time, grade me out of 10, show the model solution in PostgreSQL, and give one common mistake to avoid.</pre></div><div class="readbtn"><button class="btn" data-read="study:sql:ch07">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch06.html">← Chapter 6: CASE, Strings, Dates and Times, JSON and</a><a class="btn" href="ch08.html">Chapter 8: Window Functions in Depth →</a></div></div><script src="../../assets/study.js"></script></body></html>

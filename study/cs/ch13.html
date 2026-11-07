@@ -1,0 +1,282 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 13: Computer Architecture and Compute for ML, plus a Java Primer</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#2b4fd6"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Linux, Git, Algorithms &amp; CS Foundations</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 13</div><h1>Computer Architecture and Compute for ML, plus a Java Primer</h1><p>Why a GPU trains models faster than a CPU, how to tell if a model fits in memory, and enough Java to read the tools of the data world.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-13-1-cpu-gpu-and-tpu">13.1 CPU, GPU and TPU</a></li><li><a href="#s2-13-2-the-memory-hierarchy">13.2 The Memory Hierarchy</a></li><li><a href="#s3-13-3-memory-bound-versus-compute-bound">13.3 Memory-bound versus Compute-bound</a></li><li><a href="#s4-13-4-reading-gpu-specs-will-the-model-fit">13.4 Reading GPU Specs: Will the Model Fit?</a></li><li><a href="#s5-13-5-the-cost-of-compute">13.5 The Cost of Compute</a></li><li><a href="#s6-13-6-java-for-data-people-a-short-primer">13.6 Java for Data People: A Short Primer</a></li><li><a href="#s7-chapter-recap">Chapter recap</a></li><li><a href="#s8-practice-set">Practice set</a></li><li><a href="#s9-prompt-pack">Prompt pack</a></li></ol></details><p>Imagine your team wants to run a 7-billion-parameter language model, and someone asks: "Will it fit on this GPU? How much will it cost to fine-tune?" Or imagine your numpy code is slow and you do not know why. The answers sit in a few hardware facts: where data lives (the memory hierarchy), how many numbers the chip can process at once (parallelism), and how fast data can be moved (bandwidth). In this chapter you learn these facts with real timings from this machine, then do the VRAM arithmetic that every ML engineer does on paper. At the end, a short Java primer lets you read JVM-based tools such as Spark, Kafka and Elasticsearch. The running example is one question: <em>how many seconds does it take to do a sum over 2 million numbers, and why do the answers differ so much?</em></p>
+<h2 id="s1-13-1-cpu-gpu-and-tpu">13.1 CPU, GPU and TPU</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A CPU is a small team of very clever chefs. Each can cook any dish, fast, one after another. A GPU is a kitchen with thousands of cooks who each only know how to chop. For one tricky dish, the clever chef wins. For chopping ten million onions, the thousands of choppers win. Training neural networks is mostly "chopping": the same simple multiply-and-add, repeated billions of times.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Core</td><td>one independent processing unit inside a chip</td></tr><tr><td>FLOP</td><td>one floating-point operation (one add or one multiply of decimal numbers)</td></tr><tr><td>FLOPS</td><td>FLOPs per second (TFLOPS = 10¹² per second)</td></tr><tr><td>Matrix multiplication</td><td>the core operation of neural networks: many multiply-and-add steps</td></tr><tr><td>Parallelism</td><td>doing many operations at the same time</td></tr></tbody></table></div>
+<h3>The three chips</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Chip</th><th>Cores</th><th>Strength</th><th>Weakness</th><th>Typical use</th></tr></thead><tbody><tr><td>CPU</td><td>a few to a few dozen, complex</td><td>flexible, low latency, good at branching logic</td><td>low parallel throughput for matrices</td><td>data cleaning, web servers, small models</td></tr><tr><td>GPU</td><td>thousands, simple</td><td>huge parallel throughput for matrix maths</td><td>needs big batches, separate memory, less flexible</td><td>training and serving deep learning</td></tr><tr><td>TPU (Tensor Processing Unit)</td><td>specialised matrix units</td><td>very efficient on large matrix workloads</td><td>limited flexibility, tied to a vendor stack</td><td>large training and inference on cloud</td></tr></tbody></table></div>
+<p>Why are GPUs good at matrix maths? A matrix multiplication of two 1000 x 1000 matrices has a million independent output cells. Each cell is a separate dot product, so a million small workers can compute them at the same time. That is called <em>data parallelism</em>.</p>
+<h3>Predict, Run, Explain: vectorization</h3>
+<p><em>Vectorization</em> means replacing a Python loop with one operation on a whole array, done in fast compiled code (often using <em>SIMD</em>, "single instruction, multiple data": the CPU applies one instruction to 4, 8 or more numbers at once). Predict: how much faster is numpy than a Python loop for summing 2 million squares: 2x, 20x, or 200x?</p>
+<pre class="code lang-python"><code>import time, numpy as np
+
+# 1. Python loop versus numpy (vectorization)
+n = 2_000_000
+xs = list(range(n))
+a = np.arange(n, dtype=np.float64)
+t = time.perf_counter(); s1 = sum(x * x for x in xs); t1 = time.perf_counter() - t
+t = time.perf_counter(); s2 = float((a * a).sum()); t2 = time.perf_counter() - t
+print("python loop:", s1)
+print("numpy      :", s2)
+print(f"loop {t1*1000:.1f} ms, numpy {t2*1000:.1f} ms, speedup about {t1/t2:.0f}x")
+
+# 2. Memory access pattern: copy a matrix in order vs transposed (strided reads)
+m = np.random.rand(6000, 6000)
+t = time.perf_counter(); m.copy(); c1 = time.perf_counter() - t
+t = time.perf_counter(); np.ascontiguousarray(m.T); c2 = time.perf_counter() - t
+print(f"in-order copy {c1*1000:.0f} ms, transposed copy {c2*1000:.0f} ms, ratio {c2/c1:.1f}x")
+
+# 3. Memory-bound (add) vs compute-bound (matmul)
+x = np.random.rand(3000, 3000).astype(np.float32)
+t = time.perf_counter(); y = x + x; ta = time.perf_counter() - t
+t = time.perf_counter(); z = x @ x; tm = time.perf_counter() - t
+bytes_add = 3 * x.nbytes          # read x twice (conservatively) + write y
+print(f"add   : {ta*1000:.1f} ms, {x.size/ta/1e9:.2f} GFLOP/s, about {bytes_add/ta/1e9:.0f} GB/s moved")
+print(f"matmul: {tm*1000:.1f} ms, {2*3000**3/tm/1e9:.0f} GFLOP/s")
+print("FLOPs per byte  add:", round(x.size/bytes_add, 3), " matmul:", round(2*3000**3/(3*x.nbytes), 1))</code></pre>
+<p>Real output (run on an Apple M3 Pro laptop, 12 cores, 18 GB; your numbers will differ and vary between runs):</p>
+<pre class="code lang-text"><code>python loop: 2666664666667000000
+numpy      : 2.6666646666670003e+18
+loop 54.6 ms, numpy 2.1 ms, speedup about 26x
+in-order copy 50 ms, transposed copy 92 ms, ratio 1.8x
+add   : 3.1 ms, 2.94 GFLOP/s, about 35 GB/s moved
+matmul: 46.3 ms, 1167 GFLOP/s
+FLOPs per byte  add: 0.083  matmul: 500.0</code></pre>
+<p>Line by line (first part): the Python loop visits each number as a Python object and runs interpreted bytecode, taking about 55 ms. <code>a * a</code> and <code>.sum()</code> run in compiled loops over contiguous raw numbers, about 2 ms, around 26x faster here. Both give the same sum (the float form is the same value in different notation). The wrong version, a Python <code>for</code> loop over a numpy array, is often even slower than a plain list. The fix is always: use whole-array operations.</p>
+<p class="problem"><span class="pl">Problem 13.1.1</span> The loop took 54.6 ms and numpy 2.1 ms. What is the speedup, and how long would the loop take for 200 million numbers at the same speed?</p>
+<table class="steps"><tr><th>Formula</th><td>speedup = slow time / fast time; scaled time = time x (new n / old n)</td></tr><tr><th>Plug in</th><td>54.6 / 2.1; and 54.6 ms x (200,000,000 / 2,000,000)</td></tr><tr><th>Compute</th><td>54.6 / 2.1 = 26.0; 54.6 x 100 = 5,460 ms</td></tr><tr><th>Answer</th><td>The speedup is 26x. For 200 million numbers the loop would need about 5.5 seconds, numpy about 0.21 seconds.</td></tr><tr><th>Check</th><td>2.1 x 26 = 54.6. Correct. (Linear scaling is an assumption: memory limits matter at large sizes.)</td></tr><tr><th>Why it matters</th><td>This is why you write pandas and numpy code, not loops.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.1.2</span> A GPU does 20 TFLOPS in float32. A forward pass over a batch needs 4 x 10¹² FLOPs. Ideal time?</p>
+<table class="steps"><tr><th>Formula</th><td>time = FLOPs / FLOPS</td></tr><tr><th>Plug in</th><td>4 x 10¹² / (20 x 10¹²)</td></tr><tr><th>Compute</th><td>4 / 20 = 0.2 s</td></tr><tr><th>Answer</th><td>At best 0.2 seconds. Real time is longer because chips rarely reach their peak.</td></tr><tr><th>Check</th><td>20 TFLOPS x 0.2 s = 4 TFLOP. Correct.</td></tr><tr><th>Why it matters</th><td>"Peak FLOPS" is a ceiling, not a promise. Use it for quick estimates only.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Deep learning libraries (PyTorch, TensorFlow) send matrix work to the GPU. In your daily work, "use the GPU" often means: make batches big enough to keep it busy, and avoid copying data between CPU and GPU too often.</p>
+<h3>Applications</h3>
+<ul><li>Deep Learning: training CNNs and Transformers on GPUs or TPUs.</li><li>GenAI: serving LLMs, where the batch size and memory decide cost per request.</li><li>Data Science: classic ML (scikit-learn, XGBoost trees) mostly runs fine on CPU.</li><li>Data Engineering: Spark workers are mostly CPU and memory machines; GPU Spark exists but is a special case.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Assuming a GPU speeds up everything. Small data, lots of branching logic, or constant CPU-GPU copying can be slower on GPU than on CPU. Measure first.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why does a GPU suit neural networks? Answer: The work is huge numbers of independent multiply-adds, which thousands of simple cores do in parallel.</li><li>What does vectorization mean? Answer: Operating on whole arrays in compiled code, not item by item in a Python loop.</li><li>Is peak FLOPS what you will get? Answer: No, it is an upper limit.</li></ol>
+<h2 id="s2-13-2-the-memory-hierarchy">13.2 The Memory Hierarchy</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You are cooking. Spices you use every minute sit on the counter (cache). Rice and vegetables are in the kitchen cupboard (RAM). Bulk grain is in the store room downstairs (SSD). A rare ingredient needs a trip to the market (network). The closer the item, the faster you get it, but the counter is small. A good cook keeps what she needs next on the counter.</div></div>
+<p>The <em>memory hierarchy</em> is this ladder of storage: small and fast at the top, large and slow at the bottom.</p>
+<figure><img src="images/ch13_memory_hierarchy.svg" alt="The memory hierarchy as a pyramid, from registers at the top to network storage at the bottom" loading="lazy"/><figcaption>The memory hierarchy as a pyramid, from registers at the top to network storage at the bottom</figcaption></figure>
+<p>How to read it: each layer is wider (bigger capacity) and lower (slower, cheaper per byte). Registers sit inside the CPU core. Caches (L1, L2, L3) are small memories next to the core. RAM is the main memory. SSD is permanent storage. The bottom is anything over a network.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Layer</th><th>Rough latency (orders of magnitude)</th><th>Typical size</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>L1 cache</td><td>about 1 ns</td><td>tens of KB</td><td>tight loops in numpy</td></tr><tr><td>RAM</td><td>about 100 ns</td><td>GBs</td><td>pandas DataFrames, model weights on CPU</td></tr><tr><td>SSD</td><td>about 100 microseconds</td><td>hundreds of GB to TB</td><td>datasets on disk, checkpoints</td></tr><tr><td>Network (same data centre)</td><td>about 0.5 ms</td><td>unlimited</td><td>S3 reads, database calls</td></tr><tr><td>Network (cross continent)</td><td>about 100 ms</td><td>unlimited</td><td>calls to a remote API</td></tr></tbody></table></div>
+<p>These latencies are rough, vary by hardware and generation, and are only meant to show the <em>ratios</em>: each step down is often 10 to 1,000 times slower.</p>
+<p><em>Locality</em> is the idea that makes caches work. <em>Spatial locality</em>: when you read one number, the chip also loads its neighbours (a cache line, commonly 64 bytes), so reading neighbours next is cheap. <em>Temporal locality</em>: data you used just now is likely to be used again soon.</p>
+<h3>Predict, Run, Explain: locality in action</h3>
+<p>Our test in the code above copied a 6000 x 6000 matrix in memory order, then copied its transpose, which reads with large jumps (strided reads). Predict which is slower. The output earlier showed in-order copy 50 ms and transposed copy 92 ms: about 1.8x slower, only because of access order. The data and the work are the same.</p>
+<p class="problem"><span class="pl">Problem 13.2.1</span> A float64 matrix of 6000 x 6000 is used above. How many MB is it?</p>
+<table class="steps"><tr><th>Formula</th><td>bytes = rows x columns x bytes per number</td></tr><tr><th>Plug in</th><td>6000 x 6000 x 8</td></tr><tr><th>Compute</th><td>36,000,000 x 8 = 288,000,000 bytes = 288 MB</td></tr><tr><th>Answer</th><td>288 MB (decimal megabytes), larger than the cache of any normal CPU, so it lives in RAM.</td></tr><tr><th>Check</th><td>Python: <code>np.zeros((6000,6000)).nbytes</code> printed 288000000 when we ran it. (Arithmetic checked by hand: 6 x 6 = 36, with six zeros, times 8.)</td></tr><tr><th>Why it matters</th><td>Whether data fits in cache or RAM decides speed. This is also why a 20 GB DataFrame on a 16 GB laptop thrashes (see Chapter 5, swapping).</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.2.2</span> If one RAM access takes 100 ns and one L1 access 1 ns, and 95% of accesses hit L1, what is the average access time?</p>
+<table class="steps"><tr><th>Formula</th><td>average = hit rate x fast time + miss rate x slow time</td></tr><tr><th>Plug in</th><td>0.95 x 1 + 0.05 x 100</td></tr><tr><th>Compute</th><td>0.95 + 5.0 = 5.95 ns</td></tr><tr><th>Answer</th><td>About 5.95 ns. Even a 5% miss rate makes the average about 6 times slower than the fast case.</td></tr><tr><th>Check</th><td>If the hit rate were 100%, the result is 1 ns, and at 0% it is 100 ns, so 5.95 lies in between. Reasonable.</td></tr><tr><th>Why it matters</th><td>Misses dominate. This is the same logic as a library where most requests are served from the desk shelf (a hit) and only a few need the far warehouse (a miss).</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Reading data from disk or the network is thousands of times slower than from RAM. That is why Spark caches data in memory, databases keep hot pages in a buffer pool, and ML training loops use data loaders that prefetch the next batch while the GPU works. On a GPU, the same ladder exists: fast on-chip memory, then VRAM, then the CPU RAM across a slower link.</p>
+<h3>Applications</h3>
+<ul><li>Data Engineering: columnar formats (Parquet) read only needed columns; partitioned data reduces I/O.</li><li>Machine Learning: keep the training data in a fast format; use batches that fit memory.</li><li>MLOps: model loading time from network storage is part of "cold start" latency.</li><li>Systems work: cache hit ratio and page cache analysis.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Looping over a matrix column by column in a language that stores rows contiguously (numpy default is row-major, "C order"). Jumping across rows ruins spatial locality. Traverse in memory order or use vectorized operations.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which is faster, RAM or SSD? Answer: RAM, by a factor of hundreds to a thousand.</li><li>What is spatial locality? Answer: Nearby data gets loaded together, so reading neighbours is cheap.</li><li>8-byte numbers, 1,000 x 1,000 matrix: how many MB? Answer: 8 MB (10⁶ x 8 bytes).</li></ol>
+<h2 id="s3-13-3-memory-bound-versus-compute-bound">13.3 Memory-bound versus Compute-bound</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A factory can be slow for two reasons. Either the machines are too slow (compute-bound), or the trucks bringing material are too slow (memory-bound). Buying faster machines does nothing if the trucks are the problem.</div></div>
+<p>A workload is <em>compute-bound</em> when the chip's arithmetic is the limit. It is <em>memory-bound</em> when moving data in and out of memory is the limit. The measure that decides this is <strong>arithmetic intensity</strong>: FLOPs done per byte moved.</p>
+<p><code>arithmetic intensity = FLOPs / bytes moved</code></p>
+<p>Each chip has a <em>ridge point</em> = peak FLOPS / memory bandwidth. Below the ridge, you are memory-bound; above it, compute-bound. This picture is the <em>roofline model</em>.</p>
+<pre class="code lang-text"><code> speed (FLOPS)
+   ^            ______________  &lt;- compute ceiling (peak FLOPS)
+   |          /
+   |        /    slope = memory bandwidth
+   |      /
+   |    /
+   +--/------------|-------------&gt; arithmetic intensity (FLOPs/byte)
+                ridge point
+   left of ridge: memory-bound    right of ridge: compute-bound</code></pre>
+<p>How to read it: the x axis is how much work you do per byte fetched. At low intensity, your speed is limited by the slope (bandwidth x intensity). Once intensity is high enough, you hit the flat ceiling set by the chip's arithmetic.</p>
+<h3>Predict, Run, Explain</h3>
+<p>In the earlier script we added two 3000 x 3000 float32 matrices (<code>x + x</code>) and multiplied them (<code>x @ x</code>). Predict: which will use the chip's FLOPS better?</p>
+<p>Output from above: <code>add</code> ran at 2.94 GFLOP/s but moved about 35 GB/s, far below its arithmetic speed, so the data movement (not the arithmetic) is what limits it. <code>matmul</code> ran at 1167 GFLOP/s (it uses all cores and optimised libraries), about 400 times the add. Intensities: add 0.083 FLOPs per byte, matmul 500 FLOPs per byte.</p>
+<p class="problem"><span class="pl">Problem 13.3.1</span> For <code>x + x</code> with 3000 x 3000 float32 numbers, compute the arithmetic intensity.</p>
+<table class="steps"><tr><th>Formula</th><td>intensity = FLOPs / bytes moved</td></tr><tr><th>Plug in</th><td>FLOPs = 9,000,000 additions. Bytes = 3 x 9,000,000 x 4 (we counted two reads and one write, 4 bytes each)</td></tr><tr><th>Compute</th><td>bytes = 108,000,000. Intensity = 9,000,000 / 108,000,000 = 0.0833</td></tr><tr><th>Answer</th><td>About 0.083 FLOPs per byte, very low: this operation is memory-bound.</td></tr><tr><th>Check</th><td>The script printed 0.083. Count: one add per element, 12 bytes per element, so 1/12 = 0.0833.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.3.2</span> For <code>x @ x</code> (n = 3000), FLOPs = 2 n³, and bytes moved is at best 3 n² x 4 (read two matrices, write one, each once). Intensity?</p>
+<table class="steps"><tr><th>Formula</th><td>intensity = 2n³ / (12 n²) = n / 6</td></tr><tr><th>Plug in</th><td>n = 3000</td></tr><tr><th>Compute</th><td>3000 / 6 = 500</td></tr><tr><th>Answer</th><td>500 FLOPs per byte, well above any ridge point: compute-bound.</td></tr><tr><th>Check</th><td>The script printed 500.0. Notice intensity grows with n: bigger matrices reuse each loaded number more times.</td></tr><tr><th>Why it matters</th><td>Big matrix multiplications are why GPUs shine. Elementwise operations (add, ReLU, layer norm) are memory-bound and gain little from more FLOPS.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.3.3</span> A GPU has 100 TFLOPS and 1 TB/s of memory bandwidth (example numbers). Find the ridge point and decide whether <code>x + x</code> (0.083 FLOPs/byte) is limited by memory.</p>
+<table class="steps"><tr><th>Formula</th><td>ridge = peak FLOPS / bandwidth</td></tr><tr><th>Plug in</th><td>100 x 10¹² / (1 x 10¹²)</td></tr><tr><th>Compute</th><td>100 FLOPs per byte</td></tr><tr><th>Answer</th><td>The ridge is at 100 FLOPs per byte. 0.083 is far left of it, so addition is memory-bound, running at bandwidth x intensity = 1 TB/s x 0.083 = 83 GFLOPS, which is 0.083% of peak.</td></tr><tr><th>Check</th><td>83 GFLOPS / 100,000 GFLOPS = 0.00083. Right.</td></tr><tr><th>Why it matters</th><td>This explains why LLM text generation (token by token) is memory-bound: every new token reads all the weights once, for just a few FLOPs per byte.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>When someone says "the GPU is only 30% utilised", the first question is: is the workload memory-bound or is the data pipeline starving the GPU? It is like a restaurant with slow service: first find whether the kitchen, the waiters or the supply of ingredients is the bottleneck before hiring more cooks.</p>
+<h3>Applications</h3>
+<ul><li>Deep Learning: fused kernels and mixed precision reduce memory traffic.</li><li>GenAI: LLM serving speed depends on memory bandwidth (decode) and compute (prefill).</li><li>Data Engineering: Spark jobs are usually I/O-bound, not CPU-bound.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Quoting FLOPS to compare chips for every workload. For memory-bound work, bandwidth matters more than FLOPS.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is arithmetic intensity? Answer: FLOPs performed per byte moved from memory.</li><li>Is a big matrix multiply memory-bound or compute-bound? Answer: Compute-bound, because intensity is high.</li><li>Ridge point formula? Answer: Peak FLOPS divided by memory bandwidth.</li></ol>
+<h2 id="s4-13-4-reading-gpu-specs-will-the-model-fit">13.4 Reading GPU Specs: Will the Model Fit?</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A GPU's VRAM (its own memory) is a suitcase. Before a trip you add up what you must pack. If the sum is bigger than the suitcase, the lid will not close, however strong the GPU is.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>VRAM</td><td>video RAM, the GPU's own memory, where weights and activations live</td></tr><tr><td>Parameter</td><td>one learned number in the model</td></tr><tr><td>Precision</td><td>how many bytes store one number: float32 = 4, float16/bfloat16 = 2, int8 = 1, 4-bit = 0.5</td></tr><tr><td>Quantization</td><td>storing numbers with fewer bits to save memory</td></tr><tr><td>KV cache</td><td>memory a language model uses to remember earlier tokens while generating</td></tr><tr><td>Bandwidth</td><td>bytes per second the memory can deliver</td></tr></tbody></table></div>
+<h3>What a spec sheet tells you</h3>
+<p>A GPU spec sheet lists: VRAM (GB), memory bandwidth (GB/s or TB/s), peak FLOPS for each precision, number of cores, and power. For "does it fit", you need VRAM. For "how fast", you need bandwidth and FLOPS.</p>
+<h3>Rules of thumb</h3>
+<ul><li><strong>Inference weights:</strong> <code>memory = parameters x bytes per parameter</code>.</li><li><strong>Training with Adam in mixed precision:</strong> about 16 bytes per parameter (weights, gradients, and optimiser states), before activations. This is a rule of thumb, and varies with the setup.</li><li><strong>KV cache per sequence:</strong> <code>2 x layers x KV heads x head size x bytes x tokens</code> (the 2 is for keys and values).</li><li>Add a safety margin of 10 to 20% for activations, framework overhead and fragmentation.</li></ul>
+<h3>Predict, Run, Explain</h3>
+<p>Predict the weight size of a 7-billion-parameter model in float16 (2 bytes per parameter).</p>
+<pre class="code lang-python"><code>def gb(x): return x/1e9
+def fit(params_b, bytes_per_param, name):
+    w=params_b*1e9*bytes_per_param
+    print(f"{name}: weights = {params_b}B x {bytes_per_param} bytes = {gb(w):.1f} GB")
+    return w
+for p in (7,13,70):
+    fit(p,2,f"{p}B fp16"); fit(p,0.5,f"{p}B 4-bit")
+# training with Adam, mixed precision rule of thumb: ~16 bytes per param
+for p in (1,7):
+    print(f"train {p}B params, ~16 B/param: {p*16} GB (before activations)")
+# KV cache: 2 * layers * kv_heads * head_dim * bytes * tokens
+layers,kvh,hd,tok,b=32,8,128,4096,2
+kv=2*layers*kvh*hd*b*tok
+print(f"KV cache example (32 layers, 8 KV heads, dim 128, 4096 tokens, fp16): {kv/1e9:.2f} GB per sequence")
+# arithmetic intensity roofline
+peak=100e12; bw=1e12
+print("ridge point FLOPs/byte for 100 TFLOPS, 1 TB/s:",peak/bw)
+print("decode speed upper bound for 14 GB weights at 1 TB/s:",round(bw/14e9,1),"tokens/s")
+# cost
+hours=20
+for name,rate in (("on-demand",1.00),("spot (assume 60% off)",0.40)):
+    print(f"{name}: {hours}h x rate {rate:.2f} units/h = {hours*rate:.2f} units")</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>7B fp16: weights = 7B x 2 bytes = 14.0 GB
+7B 4-bit: weights = 7B x 0.5 bytes = 3.5 GB
+13B fp16: weights = 13B x 2 bytes = 26.0 GB
+13B 4-bit: weights = 13B x 0.5 bytes = 6.5 GB
+70B fp16: weights = 70B x 2 bytes = 140.0 GB
+70B 4-bit: weights = 70B x 0.5 bytes = 35.0 GB
+train 1B params, ~16 B/param: 16 GB (before activations)
+train 7B params, ~16 B/param: 112 GB (before activations)
+KV cache example (32 layers, 8 KV heads, dim 128, 4096 tokens, fp16): 0.54 GB per sequence
+ridge point FLOPs/byte for 100 TFLOPS, 1 TB/s: 100.0
+decode speed upper bound for 14 GB weights at 1 TB/s: 71.4 tokens/s
+on-demand: 20h x rate 1.00 units/h = 20.00 units
+spot (assume 60% off): 20h x rate 0.40 units/h = 8.00 units</code></pre>
+<p>Line by line: <code>fit</code> multiplies parameters by bytes per parameter. 7 billion x 2 bytes = 14.0 GB. In 4-bit form (0.5 bytes) it is 3.5 GB. A 70B model needs 140 GB in float16, more than any single common GPU, so it needs several GPUs or 4-bit compression (35 GB). The training line says a 7B model needs about 112 GB before activations. The KV cache example (a made-up but typical shape) needs 0.54 GB per sequence, so serving 20 users at once needs about 10.8 GB more. The last decode line: if each token must read all 14 GB of weights, and bandwidth is 1 TB/s, the ceiling is 1,000 / 14 = 71.4 tokens per second for one sequence. The example GPU numbers (100 TFLOPS, 1 TB/s) are illustrative, not a real product.</p>
+<p class="problem"><span class="pl">Problem 13.4.1</span> Will a 13-billion-parameter model in float16 fit on a GPU with 24 GB of VRAM for inference?</p>
+<table class="steps"><tr><th>Formula</th><td>weights = parameters x bytes per parameter</td></tr><tr><th>Plug in</th><td>13 x 10⁹ x 2</td></tr><tr><th>Compute</th><td>26 x 10⁹ bytes = 26 GB</td></tr><tr><th>Answer</th><td>No. 26 GB exceeds 24 GB even before the KV cache. In 4-bit form, it is 13 x 10⁹ x 0.5 = 6.5 GB, which fits with room for the KV cache.</td></tr><tr><th>Check</th><td>The script printed 26.0 GB and 6.5 GB. Sanity: halving the bytes per parameter four times (2 to 0.5) divides 26 by 4 = 6.5.</td></tr><tr><th>Why it matters</th><td>Quantization decides whether a model runs on cheap hardware. The cost is some loss in quality, which you must measure on your task.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.4.2</span> You serve a model with a 14 GB weight file on a 24 GB GPU. Each user's KV cache is 0.54 GB. Keeping a 15% safety margin, how many concurrent sequences fit?</p>
+<table class="steps"><tr><th>Formula</th><td>usable = VRAM x (1 - margin); sequences = (usable - weights) / KV per sequence</td></tr><tr><th>Plug in</th><td>usable = 24 x 0.85 = 20.4 GB; (20.4 - 14) / 0.54</td></tr><tr><th>Compute</th><td>6.4 / 0.54 = 11.85, rounded down to 11</td></tr><tr><th>Answer</th><td>About 11 concurrent sequences of 4,096 tokens.</td></tr><tr><th>Check</th><td>11 x 0.54 = 5.94 GB, plus 14 = 19.94 GB, under 20.4. Twelve sequences would need 6.48 + 14 = 20.48 GB, over the limit. Correct.</td></tr><tr><th>Why it matters</th><td>Concurrency is limited by memory, not only compute. This is capacity planning, like finding the largest number of diners a restaurant can seat.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.4.3</span> A 1-billion-parameter model is trained with about 16 bytes per parameter. How much memory before activations, and does it fit in 16 GB?</p>
+<table class="steps"><tr><th>Formula</th><td>memory = parameters x 16</td></tr><tr><th>Plug in</th><td>1 x 10⁹ x 16</td></tr><tr><th>Compute</th><td>16 x 10⁹ bytes = 16 GB</td></tr><tr><th>Answer</th><td>16 GB, exactly the whole card with nothing left for activations. It will not fit in practice. Reduce the model, use gradient checkpointing, a smaller batch, or fine-tune with LoRA (training only small added layers).</td></tr><tr><th>Check</th><td>The script printed 16 GB for 1B parameters.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>"Out of memory" (OOM) is the most common GPU error you will see. A paper napkin estimate (like above) tells you in a minute what to try. Also, bandwidth explains why newer GPUs with the same FLOPS can serve LLMs faster.</p>
+<h3>Applications</h3>
+<ul><li>GenAI: choose the model size and quantization for a given GPU.</li><li>Machine Learning: choose batch size and precision.</li><li>MLOps: size GPU nodes in a cluster and set the number of replicas.</li><li>Cost control: pick the smallest hardware that fits.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Counting only the weights. Activations (training), the optimiser state, and the KV cache (inference) can double or triple the need. Always add them and a safety margin.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Weights of a 3B model in int8? Answer: 3 GB (3 x 10⁹ x 1 byte).</li><li>What does the KV cache depend on? Answer: Layers, KV heads, head size, bytes, and number of tokens, per sequence.</li><li>Why is training memory so much bigger than inference? Answer: It also stores gradients and optimiser states (about 16 bytes per parameter in total).</li></ol>
+<h2 id="s5-13-5-the-cost-of-compute">13.5 The Cost of Compute</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Hardware is like renting a car. A taxi on demand costs the most but is there right now. A pre-booked ride on a quiet day costs less but may be cancelled (spot). A free loaner from the company (free tier) is cheap but limited in time and choice.</div></div>
+<h3>The three buying styles</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Option</th><th>What it is</th><th>Good for</th><th>Risk</th></tr></thead><tbody><tr><td>On-demand</td><td>pay by the hour, no commitment, always available</td><td>production serving, urgent jobs</td><td>highest hourly rate</td></tr><tr><td>Spot (preemptible)</td><td>spare capacity at a large discount, can be taken back with short notice</td><td>training with checkpoints, batch jobs</td><td>interruption</td></tr><tr><td>Reserved or committed</td><td>commit for 1 to 3 years for a lower rate</td><td>steady, predictable load</td><td>paying for unused time</td></tr><tr><td>Free tiers (Colab, Kaggle)</td><td>free GPU time with limits</td><td>learning, small experiments</td><td>session limits, no guarantee of a GPU, slower</td></tr></tbody></table></div>
+<p>Do not rely on any price or free-tier limit written in a book. They change. Check the provider's page when you plan a budget.</p>
+<h3>Budgeting formula</h3>
+<p><code>cost = hours x number of GPUs x price per GPU-hour</code></p>
+<p>Add storage, data transfer out (egress), and the cost of failed or repeated runs. A common beginner error is forgetting that experiments are run many times.</p>
+<p class="problem"><span class="pl">Problem 13.5.1</span> Using the assumed units from our script: on-demand 1.00 units per hour, spot 0.40 units per hour (assumed 60% off). A 20-hour job costs how much each way, and what do you save?</p>
+<table class="steps"><tr><th>Formula</th><td>cost = hours x rate</td></tr><tr><th>Plug in</th><td>20 x 1.00 and 20 x 0.40</td></tr><tr><th>Compute</th><td>20.00 units and 8.00 units, saving 12.00 units</td></tr><tr><th>Answer</th><td>Spot costs 8 units against 20 on-demand, a 60% saving, if you can tolerate interruptions.</td></tr><tr><th>Check</th><td>The script printed 20.00 and 8.00. And 12 / 20 = 0.6. Correct.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.5.2</span> The spot job gets interrupted once, and you lose the work since the last checkpoint. The job checkpoints every 30 minutes. At most how much work do you lose, and what is the worst-case cost of one interruption in this example?</p>
+<table class="steps"><tr><th>Step 1</th><td>Worst case, the interruption happens just before the next checkpoint: 0.5 hours lost.</td></tr><tr><th>Step 2</th><td>Cost of redoing that work on spot: 0.5 x 0.40 = 0.20 units.</td></tr><tr><th>Answer</th><td>At most 30 minutes of work, 0.20 units. Even with several interruptions, spot (8 units plus small losses) stays far below on-demand (20 units).</td></tr><tr><th>Check</th><td>To beat spot, on-demand savings would need 12 / 0.2 = 60 interruptions. Very unlikely.</td></tr><tr><th>Why it matters</th><td>Checkpointing makes spot safe. Without checkpoints, one interruption could lose the whole job.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>ML engineers are judged on results per cost. Practical habits: debug on a small sample on CPU or a free tier, use spot with checkpoints for long training, shut down idle GPU instances (the most common waste), and tag resources by project so costs can be tracked.</p>
+<h3>Applications</h3>
+<ul><li>GenAI: pick quantized smaller models to cut serving cost.</li><li>MLOps: autoscale GPU replicas; use spot for batch inference.</li><li>Data Engineering: use spot or preemptible workers for Spark; keep drivers on-demand.</li><li>Learning: Colab and Kaggle free tiers for projects (not run here; their limits change).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Leaving a GPU notebook running overnight. Set auto-shutdown and a budget alert.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>When is spot a good choice? Answer: For interruptible work that checkpoints, such as training or batch jobs.</li><li>What else adds to cost besides GPU hours? Answer: Storage, data transfer, and repeated runs.</li><li>Cost of 4 GPUs for 10 hours at 2 units per GPU-hour? Answer: 80 units (4 x 10 x 2).</li></ol>
+<h2 id="s6-13-6-java-for-data-people-a-short-primer">13.6 Java for Data People: A Short Primer</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Java is the language many data tools are written in, like the engine under a car. You may never build an engine, but when something breaks (or you need to tweak a Java-based data tool) you must be able to open the bonnet and read.</div></div>
+<h3>Why it matters</h3>
+<ul><li><strong>Spark, Kafka, Hadoop, Flink, Cassandra, Elasticsearch</strong> are written in Java or Scala, which both run on the JVM. When a Spark job fails, the error is a Java stack trace.</li><li><strong>Many other tools</strong> (Elasticsearch, Neo4j, Jenkins, IDEs) are Java applications with JVM settings such as heap size. Understanding GC pauses helps you tune them.</li><li>Many enterprise data jobs in large companies need to read Java code.</li></ul>
+<h3>JVM basics</h3>
+<p>Java source (<code>.java</code>) is compiled by <code>javac</code> into <em>bytecode</em> (<code>.class</code>), which the <em>JVM</em> (Java Virtual Machine) runs. The JVM manages memory: objects live on the <em>heap</em>, and a <em>garbage collector</em> (GC) frees objects nobody uses. GC can cause pause times, which show up as latency spikes. Key flags: <code>-Xms</code> and <code>-Xmx</code> set initial and maximum heap size.</p>
+<h3>Syntax and OOP in a table</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Idea</th><th>Java</th><th>Python equivalent</th></tr></thead><tbody><tr><td>Typed variable</td><td><code>int n = 5;</code> <code>String s = "hi";</code></td><td><code>n = 5</code></td></tr><tr><td>Class</td><td><code>class Order { double amount; }</code></td><td><code>class Order:</code></td></tr><tr><td>Record (data holder)</td><td><code>record Order(String user, double amount) {}</code></td><td><code>@dataclass</code></td></tr><tr><td>List</td><td><code>List&lt;String&gt; xs = new ArrayList&lt;&gt;();</code></td><td><code>xs = []</code></td></tr><tr><td>Map</td><td><code>Map&lt;String, Integer&gt; m = new HashMap&lt;&gt;();</code></td><td><code>m = {}</code></td></tr><tr><td>Loop</td><td><code>for (int i = 0; i &lt; 3; i++) {}</code></td><td><code>for i in range(3):</code></td></tr><tr><td>Exception</td><td><code>try { } catch (Exception e) { }</code></td><td><code>try: ... except:</code></td></tr></tbody></table></div>
+<p>Java is <em>statically typed</em>: every variable has a declared type that the compiler checks. <em>Generics</em> (<code>List&lt;String&gt;</code>) tell the compiler what a collection holds. A <em>stream</em> is a pipeline over a collection (filter, map, group), similar to pandas or list comprehensions.</p>
+<h3>Collections you should know</h3>
+<p><code>ArrayList</code> (dynamic array), <code>HashMap</code> (hash table), <code>HashSet</code>, <code>TreeMap</code> (sorted keys), <code>ArrayDeque</code> (queue and stack), <code>PriorityQueue</code> (heap). These map to the structures you studied in Chapters 7 to 10.</p>
+<h3>Concurrency</h3>
+<p>Java has threads, and <code>ExecutorService</code> thread pools that run tasks and return a <code>Future</code>. Shared data needs care (locks, <code>synchronized</code>, concurrent collections), as in Chapter 5.</p>
+<h3>Build tools</h3>
+<p><strong>Maven</strong> (<code>pom.xml</code>) and <strong>Gradle</strong> (<code>build.gradle</code>) download dependencies and build projects. A typical command is <code>mvn package</code>. Both produce a <em>jar</em> (a zip of classes) that you run with <code>java -jar</code>.</p>
+<h3>Predict, Run, Explain</h3>
+<p><code>java</code> and <code>javac</code> (OpenJDK 21) were installed on this machine, so we ran this program. It sums order amounts per user with a stream, uses a generic method, catches an exception, and runs tasks in a thread pool. Predict what each of the four printed lines will be.</p>
+<pre class="code lang-java"><code>import java.util.*;
+import java.util.stream.*;
+public class Demo {
+    record Order(String user, double amount) {}
+    static &lt;T extends Comparable&lt;T&gt;&gt; T maxOf(List&lt;T&gt; xs) {
+        T best = xs.get(0);
+        for (T x : xs) if (x.compareTo(best) &gt; 0) best = x;
+        return best;
+    }
+    public static void main(String[] args) throws Exception {
+        List&lt;Order&gt; orders = List.of(new Order("asha", 120.5), new Order("ravi", 80),
+                                     new Order("asha", 40), new Order("meena", 200));
+        Map&lt;String, Double&gt; totals = orders.stream()
+            .collect(Collectors.groupingBy(Order::user, TreeMap::new, Collectors.summingDouble(Order::amount)));
+        System.out.println(totals);
+        System.out.println(maxOf(List.of(3, 9, 4)));
+        try { Integer.parseInt("abc"); }
+        catch (NumberFormatException e) { System.out.println("caught: " + e.getMessage()); }
+        var pool = java.util.concurrent.Executors.newFixedThreadPool(4);
+        List&lt;java.util.concurrent.Future&lt;Integer&gt;&gt; fs = new ArrayList&lt;&gt;();
+        for (int i = 1; i &lt;= 3; i++) { final int n = i; fs.add(pool.submit(() -&gt; n * n)); }
+        int sum = 0; for (var f : fs) sum += f.get();
+        pool.shutdown();
+        System.out.println("sum of squares via threads: " + sum);
+    }
+}</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>{asha=160.5, meena=200.0, ravi=80.0}
+9
+caught: For input string: "abc"
+sum of squares via threads: 14</code></pre>
+<p>Compile and run with <code>javac Demo.java</code> then <code>java Demo</code>. Line by line: the <code>record Order</code> stores user and amount. The stream groups orders by user into a sorted <code>TreeMap</code>, so you see <code>asha=160.5</code> (120.5 + 40), <code>meena=200.0</code>, <code>ravi=80.0</code>. <code>maxOf</code> is a generic method that works for any type that can be compared; it printed 9. <code>Integer.parseInt("abc")</code> throws <code>NumberFormatException</code>, and we catch it and print its message. The thread pool computes 1, 4 and 9 in parallel, and the sum is 14.</p>
+<p>A typical wrong version: calling <code>maxOf</code> with an empty list throws <code>IndexOutOfBoundsException</code> at <code>xs.get(0)</code> (not run here; standard Java behaviour). The fix is to check <code>xs.isEmpty()</code> first.</p>
+<p class="problem"><span class="pl">Problem 13.6.1</span> Predict the value of <code>totals</code> for these orders: asha 120.5, ravi 80, asha 40, meena 200.</p>
+<table class="steps"><tr><th>Formula</th><td>group by user, then sum amounts</td></tr><tr><th>Plug in</th><td>asha: 120.5 + 40; ravi: 80; meena: 200</td></tr><tr><th>Compute</th><td>asha = 160.5</td></tr><tr><th>Answer</th><td><code>{asha=160.5, meena=200.0, ravi=80.0}</code>, sorted by name because of <code>TreeMap</code>.</td></tr><tr><th>Check</th><td>The program printed exactly this. Total of all = 440.5, and 160.5 + 200 + 80 = 440.5.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.6.2</span> A Java data tool with a 1 GB heap shows 400 ms pauses every minute while the CPU and the disk are fine. What do you suspect and do?</p>
+<table class="steps"><tr><th>Step 1</th><td>Long pauses on a Java process point to garbage collection with a heap that is too small or too full.</td></tr><tr><th>Step 2</th><td>Raise <code>-Xmx</code> (and set <code>-Xms</code> equal), check GC logs, and reduce what the program keeps in memory (for example, caches or lists that keep all results).</td></tr><tr><th>Answer</th><td>Suspect GC pauses: the program freezes while it cleans memory, which shows up as latency spikes. Fix the heap and what is kept in memory, then re-measure.</td></tr><tr><th>Check</th><td>If the spikes disappear when the heap is larger or the in-memory lists are trimmed, the guess was right.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>You will rarely write large Java programs as a data person. You will read stack traces, set JVM memory for Spark executors, and use Maven or Gradle to build a plugin. Python (PySpark) hides most of the Java, but the memory and GC issues remain.</p>
+<h3>Applications</h3>
+<ul><li>Data Engineering: Spark executor memory settings, Kafka broker tuning, Flink jobs.</li><li>MLOps: JVM-based model servers and feature services.</li><li>Operations: JVM heap settings, GC logs, thread dumps.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Giving a Spark executor or any Java service all of the machine's memory. The operating system and other processes need some, and a huge heap means long GC pauses. Leave headroom.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does the JVM run? Answer: Bytecode compiled from Java (or Scala, Kotlin) source.</li><li>What is a generic type like <code>List&lt;String&gt;</code>? Answer: A collection whose element type is checked by the compiler.</li><li>Why can a JVM cause latency spikes? Answer: Garbage collection pauses.</li></ol>
+<h2 id="s7-chapter-recap">Chapter recap</h2>
+<ul><li>CPUs are few and flexible; GPUs have thousands of simple cores for parallel matrix maths; TPUs are specialised for it.</li><li>Vectorized numpy beat a Python loop by about 26x in our run, because the work runs in compiled code over contiguous memory.</li><li>The memory hierarchy goes from registers and cache to RAM, SSD and network. Each step down is far slower and far larger.</li><li>Access order matters: a transposed copy was about 1.8x slower than an in-order copy of the same data.</li><li>Arithmetic intensity (FLOPs per byte) tells you if work is memory-bound or compute-bound. Matrix multiply is compute-bound, elementwise add is memory-bound.</li><li>VRAM arithmetic: weights = parameters x bytes per parameter. A 7B model is 14 GB in float16 and 3.5 GB in 4-bit.</li><li>Training needs about 16 bytes per parameter before activations. The KV cache adds memory per sequence for inference.</li><li>Compute cost is hours x GPUs x rate. Spot is cheaper with checkpoints; free tiers are for learning.</li><li>Java runs on the JVM, which Spark, Kafka and Elasticsearch use. Read stack traces and watch heap and GC.</li></ul>
+<p><strong>Cheat sheet</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Topic</th><th>Formula or rule</th><th>Example</th></tr></thead><tbody><tr><td>Time from FLOPS</td><td>time = FLOPs / FLOPS</td><td>4 TFLOP / 20 TFLOPS = 0.2 s</td></tr><tr><td>Arithmetic intensity</td><td>FLOPs / bytes moved</td><td>add 0.083, matmul n/6 = 500</td></tr><tr><td>Ridge point</td><td>peak FLOPS / bandwidth</td><td>100 TFLOPS / 1 TB/s = 100</td></tr><tr><td>Inference weights</td><td>params x bytes</td><td>7B x 2 = 14 GB</td></tr><tr><td>Training memory</td><td>about 16 bytes x params</td><td>7B gives 112 GB</td></tr><tr><td>KV cache</td><td>2 x layers x KV heads x head dim x bytes x tokens</td><td>0.54 GB</td></tr><tr><td>Decode ceiling</td><td>bandwidth / weight bytes</td><td>1 TB/s / 14 GB = 71 tokens/s</td></tr><tr><td>Cost</td><td>hours x GPUs x rate</td><td>20 x 1 x 0.4 = 8</td></tr><tr><td>Java build</td><td><code>javac Demo.java</code>, <code>java Demo</code>, <code>mvn package</code></td><td></td></tr></tbody></table></div>
+<h2 id="s8-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 13.7.1</span> (easy) How many GB is a 3-billion-parameter model stored in float16?</p>
+<p><strong>Answer:</strong> 3 x 10⁹ x 2 bytes = 6 GB.</p>
+<p class="problem"><span class="pl">Problem 13.7.2</span> (easy) Name the two reasons a workload can be slow on a fast chip.</p>
+<p><strong>Answer:</strong> It is compute-bound (arithmetic is the limit) or memory-bound (moving data is the limit).</p>
+<p class="problem"><span class="pl">Problem 13.7.3</span> (computation) 1,000 x 1,000 float32 matrix: size in MB?</p>
+<p><strong>Answer:</strong> 10⁶ x 4 bytes = 4 MB.</p>
+<p class="problem"><span class="pl">Problem 13.7.4</span> (what is the output) In the Java demo, what does <code>maxOf(List.of(3, 9, 4))</code> print?</p>
+<p><strong>Answer:</strong> <code>9</code>. (Real output of the run above.)</p>
+<p class="problem"><span class="pl">Problem 13.7.5</span> (computation) Arithmetic intensity of adding two float64 vectors of length n (read 2, write 1)?</p>
+<p><strong>Answer:</strong> FLOPs = n. Bytes = 3 x 8 x n = 24n. Intensity = 1/24 = 0.042 FLOPs per byte: memory-bound.</p>
+<p class="problem"><span class="pl">Problem 13.7.6</span> (computation) Weights of a 70B model in 4-bit, and the minimum number of 24 GB GPUs just for weights?</p>
+<p><strong>Answer:</strong> 70 x 10⁹ x 0.5 = 35 GB. 35 / 24 = 1.46, so at least 2 GPUs, and in practice more because of the KV cache and overhead.</p>
+<p class="problem"><span class="pl">Problem 13.7.7</span> (find the bug) A student loops <code>for i in range(len(a)): total += a[i] * a[i]</code> over a numpy array of 10 million items and says "numpy is slow". What is wrong?</p>
+<p><strong>Answer:</strong> The loop runs in Python item by item, losing the benefit of vectorization (and numpy item access is slow). Use <code>(a * a).sum()</code> or <code>np.dot(a, a)</code>.</p>
+<p class="problem"><span class="pl">Problem 13.7.8</span> (find the bug) A team estimates serving memory for a 13B float16 model as "13 GB" and buys a 16 GB GPU. What went wrong?</p>
+<p><strong>Answer:</strong> They forgot 2 bytes per parameter. The weights alone are 26 GB. They also forgot the KV cache. They need 4-bit quantization (6.5 GB) with room for the cache, or a bigger GPU.</p>
+<p class="problem"><span class="pl">Problem 13.7.9</span> (scenario) A 12-hour fine-tune on 4 GPUs at an assumed 1.50 units per GPU-hour on-demand. Spot is 50% cheaper and the job checkpoints every hour. Compute both costs.</p>
+<p><strong>Answer:</strong> On-demand: 12 x 4 x 1.50 = 72 units. Spot: 12 x 4 x 0.75 = 36 units, plus at most 1 hour lost per interruption (4 x 0.75 = 3 units each). Spot is far cheaper even after a few interruptions.</p>
+<p class="problem"><span class="pl">Problem 13.7.10</span> (interview) Why is LLM text generation (decode) usually memory-bound?</p>
+<p><strong>Answer:</strong> For each new token, the GPU reads all the model weights from memory but does only a few FLOPs per weight (low arithmetic intensity). So speed is limited by memory bandwidth: tokens per second is at most about bandwidth / weight bytes. Batching several requests together raises intensity.</p>
+<p class="problem"><span class="pl">Problem 13.7.11</span> (interview) A Java service on your machine shows rising latency spikes but low CPU. Name two JVM-related checks.</p>
+<p><strong>Answer:</strong> Check GC logs for long pauses and heap usage (raise <code>-Xmx</code>, reduce what is kept in memory). Also check thread count and whether the machine is swapping.</p>
+<h2 id="s9-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data and AI roles, and English is my second language. Teach me the difference between CPU, GPU and TPU and why GPUs suit matrix multiplication, using the kitchen analogy and small numbers. Explain step by step in simple English, then ask me three questions one at a time to check my understanding.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data and AI roles, and English is my second language. My topic is the memory hierarchy (registers, cache, RAM, SSD, network), locality, and arithmetic intensity (memory-bound versus compute-bound, the roofline model). Give me 8 graded exercises with real numbers, without solutions. After I answer, correct my work and explain my mistakes simply.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for ML engineering roles. My topic is estimating whether a model fits in GPU memory: weights by precision, quantization, training memory with Adam, and the KV cache. Quiz me one question at a time with different model sizes and GPU sizes. Show the arithmetic of the correct answer after each response and keep score.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data and AI roles. My topic is the cost of compute: on-demand versus spot versus free tiers, budgeting a training run, and checkpointing. Review my budget plan: [PASTE HERE: model size, GPU type, hours, number of experiments]. Point out missing costs and risks, and suggest cheaper options, in simple English.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional who wants to read Java in data tools. My topic is a Java primer for data people: syntax compared with Python, collections, generics, streams, exceptions, concurrency, JVM memory and garbage collection, and Maven or Gradle. Give me a small Java program to read, ask me to predict its output, then explain line by line, and finish with a mini mock interview of 5 questions.</pre></div><div class="readbtn"><button class="btn" data-read="study:cs:ch13">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch12.html">← Chapter 12: Distributed Systems Fundamentals</a><a class="btn" href="ch14.html">Chapter 14: Interview Patterns Bank →</a></div></div><script src="../../assets/study.js"></script></body></html>

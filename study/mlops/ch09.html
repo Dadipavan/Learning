@@ -1,0 +1,225 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 9: CI/CD for Machine Learning</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#357a70"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 9</div><h1>CI/CD for Machine Learning</h1><p>How to let a machine check every change to code, data and models, so that releases become boring.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-9-1-continuous-integration-for-ml">9.1 Continuous Integration for ML</a></li><li><a href="#s2-9-2-model-tests-testing-behaviour-not-just-accuracy">9.2 Model Tests: Testing Behaviour, Not Just Accuracy</a></li><li><a href="#s3-9-3-promotion-gates-and-continuous-delivery">9.3 Promotion Gates and Continuous Delivery</a></li><li><a href="#s4-9-4-continuous-training-and-mlops-maturity">9.4 Continuous Training and MLOps Maturity</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>Imagine a teammate edits a feature function on Friday at 6 p.m. and merges it. On Monday the model's predictions are strange, and nobody knows which commit did it. In normal software, automated tests catch most of this. In ML the same tests are needed, plus new ones for data and for the model itself. In this chapter you will build the safety net: a GitHub Actions workflow that runs on every pull request, model tests that check <em>behaviour</em> (not just accuracy), a promotion gate that decides if a challenger may replace the champion, and continuous training that retrains when the world changes. You will run the tests and the gate, and see one test fail on purpose so you know what a failure looks like. Think of a factory quality gate: a car that fails the brake check does not leave the factory. A latency check in the pipeline can fail the build when p95 gets worse, and here we add the same kind of gate for models.</p>
+<p>Words you need in this chapter:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>CI (continuous integration)</td><td>Automatically build and test every change as soon as it is pushed.</td></tr><tr><td>CD (continuous delivery/deployment)</td><td>Automatically package and release changes that passed CI.</td></tr><tr><td>Pipeline / workflow</td><td>The list of automated steps, written in a file kept in the repository.</td></tr><tr><td>Runner</td><td>The machine that executes the steps (GitHub provides hosted ones).</td></tr><tr><td>Gate</td><td>A rule that must pass before a change moves forward.</td></tr><tr><td>CT (continuous training)</td><td>Automatically retraining the model when a trigger fires.</td></tr><tr><td>Artifact</td><td>A file produced by a step (a model, a report) that later steps use.</td></tr></tbody></table></div>
+<p>Running example: the churn model repository from Chapter 1 and the registry from Chapter 3. For the model tests I use a small credit-risk model (income and debt ratio) because its expected behaviour is easy to state: more debt must never lower the default risk.</p>
+<h2 id="s1-9-1-continuous-integration-for-ml">9.1 Continuous Integration for ML</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">CI is a strict but fair examiner who marks every homework the minute it is handed in. Cheap checks run first (spelling, formatting), then deeper ones (unit tests, data tests, model tests). If any fails, the work is returned with a reason, and nobody else sees it until it is fixed.</div></div>
+<h3>What CI checks in an ML repository</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Layer</th><th>Example tool</th><th>What it catches</th><th>Typical time</th></tr></thead><tbody><tr><td>Lint and format</td><td>ruff, black</td><td>Style errors, unused imports</td><td>seconds</td></tr><tr><td>Type check</td><td>mypy</td><td>Wrong argument types, <code>None</code> bugs</td><td>seconds</td></tr><tr><td>Unit tests</td><td>pytest</td><td>A broken feature function (Chapter 1)</td><td>seconds</td></tr><tr><td>Data tests</td><td>pytest plus Great Expectations or hand checks (Chapter 5)</td><td>Schema change, nulls, out-of-range values in a small sample</td><td>seconds to minutes</td></tr><tr><td>Model tests</td><td>pytest</td><td>Behaviour and quality regressions (9.2)</td><td>minutes</td></tr><tr><td>Security scan</td><td>pip-audit, trivy (container)</td><td>Vulnerable libraries, bad images</td><td>minutes</td></tr></tbody></table></div>
+<p>Order matters: run the cheapest checks first, so a typo fails in 10 seconds instead of after a 20-minute training run. Run the <em>expensive</em> training in the scheduled training pipeline (Chapter 6), not on every pull request. CI should train only on a tiny sample for a smoke test, or load a stored model.</p>
+<h3>A GitHub Actions workflow</h3>
+<p><strong>GitHub Actions</strong> runs workflows defined in YAML files under <code>.github/workflows/</code>. YAML is a text format where indentation shows structure. Key words: <code>on</code> (what starts it), <code>jobs</code> (groups of steps, each on a fresh runner), <code>steps</code> (commands or reusable actions). This file is real and standard; GitHub itself could not run it here, so I parsed it with PyYAML to check the structure (8 steps, triggers <code>pull_request</code> and <code>push</code>).</p>
+<pre class="code lang-yaml"><code>name: ml-ci
+on:
+  pull_request:
+    paths: ["src/**", "tests/**", "configs/**"]
+  push:
+    branches: [main]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - run: pip install -r requirements.lock
+      - run: ruff check src tests
+      - run: mypy src
+      - run: pytest tests/unit tests/data -q
+      - run: pytest tests/model -q
+      - run: python scripts/eval_gate.py --candidate runs/latest.json --champion registry/champion.json</code></pre>
+<p>Walk through it:</p>
+<ul><li><code>on: pull_request</code> with <code>paths</code>: run only when code, tests or configs change (not for a README edit). <code>push</code> to <code>main</code> runs it again after the merge.</li><li><code>runs-on: ubuntu-latest</code>: a clean virtual machine. Clean is the point: "works on my machine" cannot hide here.</li><li><code>timeout-minutes: 20</code>: a stuck job must not burn money for hours.</li><li><code>actions/checkout@v4</code> copies the repository. <code>actions/setup-python@v5</code> installs Python and caches pip downloads. (Action version numbers change; check the current ones.)</li><li><code>pip install -r requirements.lock</code> uses the <strong>locked</strong> file from Chapter 2, so the runner uses the same library versions as your laptop. This is reproducibility in action.</li><li>Each <code>run:</code> is a shell command. If any command exits with a non-zero code, the job stops and the pull request shows a red cross. That exit code is the whole mechanism: <strong>a test fails by exiting non-zero</strong>.</li><li>The last step runs the promotion gate script from 9.3.</li></ul>
+<p>A gotcha: when I parsed this file with PyYAML, the key <code>on</code> came back as the Python value <code>True</code>, because YAML 1.1 treats <code>on</code> as a boolean. GitHub reads it correctly as a trigger. It is a classic source of confusion when you load workflow files in your own tools.</p>
+<p class="problem"><span class="pl">Problem 9.1.1</span> A workflow has five steps with these durations: lint 5 s, types 8 s, unit tests 40 s, model tests 5 min, full training 20 min. A developer leaves an unused import in a file. Only the lint step notices it. How long until they see red if lint runs first, and if lint runs last (order: training, model tests, unit tests, types, lint)?</p>
+<table class="steps"><tr><th>Formula</th><td>time to failure = sum of the durations of all steps up to and including the failing step</td></tr><tr><th>Plug in</th><td>Lint first: 5 s. Lint last: 20 min + 5 min + 40 s + 8 s + 5 s.</td></tr><tr><th>Compute</th><td>In seconds: 1,200 + 300 + 40 + 8 + 5 = 1,553 s = 25.9 minutes</td></tr><tr><th>Answer</th><td>With lint first the developer sees red after 5 seconds. With lint last they wait about 26 minutes for the same one-line mistake.</td></tr><tr><th>Check</th><td>When everything passes, both orders take the same 1,553 s; only the <em>failure</em> time changes.</td></tr><tr><th>Why it matters</th><td>CI is a feedback loop. Faster feedback means more fixes per hour and a smaller cloud bill.</td></tr></table>
+<h3>Pre-commit hooks and branch protection</h3>
+<p>A <strong>pre-commit hook</strong> runs ruff and a secrets scanner on your laptop before a commit is created, so you catch problems earlier than CI. <strong>Branch protection</strong> is a setting that says "main cannot be merged unless CI is green and one person reviewed it". Together they make the pipeline impossible to skip.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Putting full model training in the pull-request workflow. It makes CI slow, expensive and flaky (training is random), so developers learn to ignore red builds. Keep PR checks fast and deterministic. Train in the training pipeline and test the <em>resulting</em> model.</div></div>
+<h3>Connection to the real job</h3>
+<p>Most ML teams start with CI because it pays off immediately. In interviews you are asked "what do you run on every PR?" Your answer: lint, types, unit tests, data tests on a sample, model behaviour tests on a stored candidate, a security scan, and a gate.</p>
+<h3>Applications</h3>
+<ul><li><strong>ML engineering</strong>: unit tests for feature code so a refactor cannot cause training-serving skew.</li><li><strong>Data engineering</strong>: schema and null checks on a sample from every pipeline change.</li><li><strong>MLOps</strong>: container image scan before an image can be pushed to the registry.</li><li><strong>GenAI</strong>: prompt regression suites run in CI (Chapter 13).</li></ul>
+<p><strong>Check yourself</strong></p>
+<ol><li>How does a CI step signal failure? Answer: It exits with a non-zero code.</li><li>Why use a lock file in CI? Answer: So the runner has exactly the same library versions as development and production.</li><li>Which checks run first and why? Answer: The cheapest ones (lint, types), for the fastest feedback.</li></ol>
+<h2 id="s2-9-2-model-tests-testing-behaviour-not-just-accuracy">9.2 Model Tests: Testing Behaviour, Not Just Accuracy</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A single accuracy number is like judging a car only by its top speed. It says nothing about whether the brakes work. <strong>Behavioural tests</strong> check specific, sensible properties: "more debt must not make the loan look safer", "a tiny change in income must not flip the decision". They catch broken models that still have a good average score.</div></div>
+<h3>Four kinds of model test</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Test type</th><th>Idea</th><th>Example for the credit model</th></tr></thead><tbody><tr><td>Directional</td><td>Increasing one feature must move the output in a known direction</td><td>More debt ratio gives higher default risk</td></tr><tr><td>Invariance</td><td>A change that should not matter must not change the output much</td><td>Income 50.0 versus 50.1 gives almost the same score</td></tr><tr><td>Range / sanity</td><td>Outputs stay valid even for odd inputs</td><td>Probability stays between 0 and 1 for income 0 or 500</td></tr><tr><td>Performance floor</td><td>A minimum quality on a fixed test set</td><td>Accuracy above 0.60</td></tr></tbody></table></div>
+<p>A fifth kind, <strong>slice tests</strong>, checks the metric on important groups (a region, an age band), because an overall average can hide a group the model fails. This is also how you test for unfair behaviour (fairness testing): compute the same metric per group and set a maximum allowed gap.</p>
+<h3>Predict, run, explain</h3>
+<p>The program <code>ch9_tests.py</code> trains a logistic regression on 3,000 synthetic customers (features: income in thousands and debt ratio; label 1 means default) and defines tests as plain functions. I also added one test that is <em>deliberately wrong</em>, to see a failure. Before you run it: which test do you expect to fail, and why?</p>
+<pre class="code lang-python"><code>def test_directional_debt():   # more debt must not LOWER default risk
+    assert p([50, 0.8]) &gt; p([50, 0.2])
+def test_directional_income():  # more income must not RAISE default risk
+    assert p([80, 0.5]) &lt; p([30, 0.5])
+def test_invariance_noise():   # tiny change of income barely moves the score
+    assert abs(p([50.0, 0.5]) - p([50.1, 0.5])) &lt; 0.01
+def test_range():
+    for row in [[0, 0], [500, 1], [50, 0.5]]: assert 0 &lt;= p(row) &lt;= 1
+def test_performance_floor():
+    acc = model.score((X - mu) / sd, y); assert acc &gt; 0.60, acc
+def test_broken_example():
+    assert p([50, 0.2]) &gt; p([50, 0.8])   # deliberately wrong test</code></pre>
+<p>Here <code>p(row)</code> returns the predicted default probability for one customer. Real output (pytest is not installed here, so a 6-line loop calls each function, which is what pytest does, with nicer reports):</p>
+<pre class="code lang-text"><code>PASS test_directional_debt
+PASS test_directional_income
+PASS test_invariance_noise
+PASS test_range
+PASS test_performance_floor
+FAIL test_broken_example
+acc 0.729</code></pre>
+<p>Line by line:</p>
+<ul><li>The first five pass: the model behaves sensibly (debt raises risk, income lowers it, small noise is harmless, probabilities stay valid, accuracy 0.729 is above the 0.60 floor).</li><li><code>test_broken_example</code> fails because it claims that <em>low</em> debt gives higher risk, which contradicts the data. An <code>assert</code> that is false raises <code>AssertionError</code>; the runner records a failure and exits non-zero, which turns the CI check red.</li></ul>
+<p>The pytest version of the same file is identical in shape. Run with <code>pytest tests/model -q</code>; pytest prints which assertion failed and the values compared (not run here).</p>
+<p class="problem"><span class="pl">Problem 9.2.1</span> Why use a performance floor of 0.60 when the model scores 0.729?</p>
+<table class="steps"><tr><th>Formula</th><td>floor = a value that a healthy model clearly beats, but that a broken model fails</td></tr><tr><th>Plug in</th><td>A model that predicts the majority class only: if 40% of customers default, it scores 0.60. A random-guess model scores about 0.50.</td></tr><tr><th>Compute</th><td>Margin = 0.729 − 0.60 = 0.129. A floor too close to 0.729 would fail on normal run-to-run variation.</td></tr><tr><th>Answer</th><td>0.60 catches a model that is no better than a trivial guess, yet leaves a safe margin so normal retraining noise does not fail every build.</td></tr><tr><th>Check</th><td>The directional and range tests would not detect a model that is merely weak; the floor does.</td></tr><tr><th>Why it matters</th><td>A floor is a smoke alarm, not a quality target. The real "is it better than the champion?" question is the gate in 9.3.</td></tr></table>
+<p class="problem"><span class="pl">Problem 9.2.2</span> Write a directional test for the churn model: "more complaints in the last 30 days must not lower churn probability". What can go wrong with this test?</p>
+<table class="steps"><tr><th>Step 1</th><td>Pick a base customer: <code>base = {...}</code> with <code>complaints_30d = 0</code>. Build a second row identical except <code>complaints_30d = 3</code>.</td></tr><tr><th>Step 2</th><td>Assert <code>predict(row_with_3) &gt;= predict(base)</code>.</td></tr><tr><th>Step 3</th><td>Repeat for several base customers (young, old, long tenure) so the test does not rely on one lucky customer.</td></tr><tr><th>Answer</th><td>The test is <code>assert predict(more_complaints) &gt;= predict(base)</code> over 20 base customers. It can fail legitimately for tree models, which are not forced to be monotone; then either use a monotonic constraint when training (supported by gradient boosting libraries) or allow a small tolerance.</td></tr><tr><th>Check</th><td>If the test never fails even for a deliberately broken model, it is too weak. Break the model on purpose once to see it go red.</td></tr><tr><th>Why it matters</th><td>A test you have never seen fail is a test you cannot trust.</td></tr></table>
+<h3>Testing data and pipelines</h3>
+<p>Data tests (Chapter 5) go in the same CI stage: a sample of the newest data must pass schema, null and range checks. <strong>Integration tests</strong> run a tiny pipeline end to end (read sample, build features, train for 10 seconds, save, load in the service from Chapter 7, send one request and check the response). That test would have caught a pickle-version mismatch, a missing file in the Docker image and a wrong feature order.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Writing tests that only repeat the training metric. A model can have the same accuracy as before and still have a broken feature order, an exploded probability for rare inputs or a missing group. Behavioural and slice tests catch what the average hides.</div></div>
+<h3>Connection to the real job</h3>
+<p>In regulated areas (banking, insurance, healthcare) these tests become the audit trail: "we tested that risk rises with debt, and the report is attached to model version 7". Chapter 3's model card can list them.</p>
+<h3>Applications</h3>
+<ul><li><strong>Finance</strong>: monotonicity tests on credit models as a model-risk requirement.</li><li><strong>Machine learning</strong>: invariance tests for NLP (changing a name must not change sentiment).</li><li><strong>Fairness</strong>: metric gap per group below a limit.</li><li><strong>GenAI</strong>: behavioural suites for assistants (refuses unsafe requests, keeps the format).</li></ul>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does an invariance test check? Answer: That a change that should not matter does not change the output much.</li><li>Why break a test on purpose once? Answer: To prove the test can fail and so can be trusted.</li><li>What is a slice test? Answer: The same metric computed on a subgroup, to find groups where the model is weak.</li></ol>
+<h2 id="s3-9-3-promotion-gates-and-continuous-delivery">9.3 Promotion Gates and Continuous Delivery</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">An airport has gates: ticket, passport, security. Each answers one narrow question and has a clear pass/fail rule. A <strong>promotion gate</strong> is the same for models: it decides, by rule, whether a challenger may replace the champion. The rule is written down, run by a script and logged, so it is not a matter of mood or hurry.</div></div>
+<h3>A gate in code</h3>
+<p>The Chapter 3 registry holds champion and challenger. The gate compares them. Here is <code>ch9_gate.py</code>: the challenger must beat the champion's AUC (a quality score from 0.5 to 1.0; higher is better) by at least 0.005 <em>and</em> have p95 latency at most 100 ms.</p>
+<pre class="code lang-python"><code>def gate(champ, cand, p95_ms, min_gain=0.005, max_p95=100):
+    reasons = []
+    if cand["auc"] &lt; champ["auc"] + min_gain:
+        reasons.append(f"AUC gain {cand['auc']-champ['auc']:+.3f} &lt; {min_gain}")
+    if p95_ms &gt; max_p95:
+        reasons.append(f"p95 {p95_ms} ms &gt; {max_p95} ms")
+    return reasons          # empty list means PASS</code></pre>
+<p>Three candidates against a champion with AUC 0.840. Predict each result first. Real output:</p>
+<pre class="code lang-text"><code>{'auc': 0.842} 80 -&gt; BLOCK: AUC gain +0.002 &lt; 0.005
+{'auc': 0.85} 80 -&gt; PASS
+{'auc': 0.851} 140 -&gt; BLOCK: p95 140 ms &gt; 100 ms</code></pre>
+<p class="problem"><span class="pl">Problem 9.3.1</span> Explain each result.</p>
+<table class="steps"><tr><th>Step 1</th><td>Candidate 1: gain = 0.842 − 0.840 = 0.002, below 0.005. Blocked for too little gain, even though latency is fine.</td></tr><tr><th>Step 2</th><td>Candidate 2: gain = 0.850 − 0.840 = 0.010, at least 0.005, and 80 ms is at most 100 ms. Pass.</td></tr><tr><th>Step 3</th><td>Candidate 3: gain = 0.011 is enough, but 140 ms exceeds 100 ms. Blocked for latency despite the best AUC.</td></tr><tr><th>Answer</th><td>Only candidate 2 passes. A gate has multiple conditions and lists <em>all</em> reasons it blocks, so the owner knows what to fix.</td></tr><tr><th>Check</th><td>The reasons list is empty exactly when both conditions hold.</td></tr><tr><th>Why it matters</th><td>Quality alone is not enough. A model that is 1% better but 40% slower can break the latency promise (Chapter 1 requirements).</td></tr></table>
+<h3>Is the gain real? Add noise awareness</h3>
+<p>A gain of 0.010 on a small test set may be luck. Same lesson as the canary in Chapter 8: measure the noise. I generated a test set of 600 rows with a champion and a slightly better candidate, then <strong>bootstrapped</strong> the gain: resample the 600 rows with replacement 2,000 times, recompute both AUCs each time, and look at the spread of gains. Real output:</p>
+<pre class="code lang-text"><code>n 600  AUC champion 0.721  candidate 0.731  gain 0.01
+bootstrap 95% CI of gain: -0.006 to 0.027  -&gt; gate BLOCK (CI includes 0)</code></pre>
+<p>The observed gain of 0.010 looks fine, but the 95% confidence interval runs from −0.006 to +0.027. It includes zero, so we cannot claim improvement; a stricter gate blocks it. The remedy is more test data, or accept that the models are equivalent and decide on cost or latency instead.</p>
+<p class="problem"><span class="pl">Problem 9.3.2</span> Read the interval and decide.</p>
+<table class="steps"><tr><th>Formula</th><td>Rule: promote only if the lower end of the 95% interval of the gain is above the minimum gain you care about.</td></tr><tr><th>Plug in</th><td>Lower end = −0.006; minimum gain, say, 0.005.</td></tr><tr><th>Compute</th><td>−0.006 &lt; 0.005</td></tr><tr><th>Answer</th><td>Block. The data cannot rule out that the candidate is slightly <em>worse</em>.</td></tr><tr><th>Check</th><td>If the interval were 0.008 to 0.030, the lower end 0.008 is above 0.005 and the gate would pass.</td></tr><tr><th>Why it matters</th><td>Models are evaluated on finite samples. Gates built on single numbers promote noise.</td></tr></table>
+<h3>Continuous delivery: from registry to production</h3>
+<p>CD takes a model that passed the gate and moves it through <strong>environments</strong>: dev (experiments, anything goes), staging (a copy of production for final checks) and prod (real users). Each move is automatic where safe and manual where risk is high.</p>
+<pre class="code lang-text"><code> PR merged
+    |
+    v
+ CI green --&gt; train/evaluate --&gt; gate PASS --&gt; registry: version 8, alias "staging"
+                                                 |
+                                   auto deploy to staging + integration + load test
+                                                 |
+                                   human approval (model owner)  &lt;-- manual gate
+                                                 |
+                              registry alias "champion" --&gt; canary release (Chapter 8)</code></pre>
+<p>A deployment workflow, shown as text (not run here). <code>environment: production</code> is a GitHub feature: you can require a named reviewer to approve before the job proceeds, which is the manual gate.</p>
+<pre class="code lang-yaml"><code>name: ml-deploy
+on:
+  workflow_dispatch:
+    inputs:
+      model_version: {description: "Registry version", required: true}
+jobs:
+  staging:
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - uses: actions/checkout@v4
+      - run: python scripts/deploy.py --env staging --version ${{ inputs.model_version }}
+      - run: python scripts/smoke_test.py --env staging
+      - run: python scripts/load_test.py --env staging --max-p95-ms 100
+  production:
+    needs: staging
+    runs-on: ubuntu-latest
+    environment: production        # requires approval by a named reviewer
+    steps:
+      - uses: actions/checkout@v4
+      - run: python scripts/deploy.py --env production --version ${{ inputs.model_version }} --canary 5</code></pre>
+<p>Notes: <code>needs: staging</code> makes production wait for staging. Secrets (cloud credentials) are stored in GitHub encrypted secrets and read as <code>${{ secrets.NAME }}</code>; never put them in the file. Prefer short-lived credentials through OIDC federation over long-lived keys (Chapter 12).</p>
+<h3>Related tools</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Tool</th><th>Role</th></tr></thead><tbody><tr><td>GitLab CI, Jenkins</td><td>Alternatives to GitHub Actions; same ideas, different syntax</td></tr><tr><td>Argo CD</td><td><strong>GitOps</strong>: the desired state of the cluster lives in a Git repository, and Argo CD makes the cluster match it. A deploy is a Git commit; a rollback is a revert.</td></tr><tr><td>Terraform</td><td><strong>Infrastructure as code</strong>: describe cloud resources in files and apply them with a reviewed plan (Chapter 12)</td></tr><tr><td>CML (Continuous Machine Learning)</td><td>Posts model metrics and plots as a comment on the pull request</td></tr><tr><td>DVC / registry hooks</td><td>Trigger pipelines when data or model versions change (Chapter 4)</td></tr></tbody></table></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">A gate with only a quality threshold and no baseline. "AUC above 0.80" lets a model that is <em>worse</em> than the champion (0.85) replace it. Always compare to the current champion, add latency and fairness guardrails, and add a noise margin.</div></div>
+<h3>Connection to the real job</h3>
+<p>You will be asked to "add a quality gate to the pipeline". The whole answer is: a script that reads two metrics files, applies rules, prints reasons and exits 1 on failure, called from the workflow as in 9.1. The hard work is choosing sensible rules with the data scientists.</p>
+<h3>Applications</h3>
+<ul><li><strong>MLOps</strong>: staged promotion dev, staging, prod with approvals.</li><li><strong>Finance</strong>: change-management approvals tied to model-risk sign-off.</li><li><strong>Platform</strong>: GitOps for all model deployments across teams.</li><li><strong>GenAI</strong>: gate a new prompt or model on an evaluation suite score and cost per request.</li></ul>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why list all reasons a gate blocks? Answer: So the owner can fix everything in one go.</li><li>What does a bootstrap interval that includes zero say about the gain? Answer: The data cannot rule out no improvement (or a loss), so do not promote.</li><li>What is GitOps in one sentence? Answer: Git holds the desired state, and a controller keeps the cluster equal to it.</li></ol>
+<h2 id="s4-9-4-continuous-training-and-mlops-maturity">9.4 Continuous Training and MLOps Maturity</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A shop restocks shelves on a schedule (every Monday) and also when something runs out (a trigger). <strong>Continuous training (CT)</strong> retrains models automatically, on a schedule or when a trigger fires, then sends the new model through the same tests and gates as any other change.</div></div>
+<h3>Triggers</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Trigger</th><th>Fires when</th><th>Strength</th><th>Weakness</th></tr></thead><tbody><tr><td>Schedule</td><td>Every N days</td><td>Simple, predictable</td><td>Retrains when not needed; too slow if the world changes fast</td></tr><tr><td>New data</td><td>Enough new labelled rows arrive</td><td>Cheap to reason about</td><td>More data is not always better data</td></tr><tr><td>Drift</td><td>A monitored input drift metric passes a limit (Chapter 10)</td><td>Reacts to change</td><td>Drift does not always hurt accuracy</td></tr><tr><td>Performance</td><td>Live metric (when labels arrive) falls</td><td>Directly tied to value</td><td>Labels are delayed</td></tr><tr><td>Manual</td><td>A person starts it</td><td>Safe</td><td>Slow</td></tr></tbody></table></div>
+<h3>A trigger function</h3>
+<p><code>should_retrain</code> combines four triggers and <em>returns the reasons</em>, which go into the pipeline log. Real output for four situations:</p>
+<pre class="code lang-python"><code>def should_retrain(days_since, psi, new_rows, live_acc, base_acc):
+    reasons = []
+    if days_since &gt;= 30: reasons.append(f"schedule ({days_since} days)")
+    if psi &gt; 0.2: reasons.append(f"drift (PSI {psi})")
+    if new_rows &gt;= 50_000: reasons.append(f"data volume ({new_rows} new rows)")
+    if live_acc is not None and base_acc - live_acc &gt; 0.03:
+        reasons.append(f"performance drop ({base_acc-live_acc:.3f})")
+    return reasons</code></pre>
+<pre class="code lang-text"><code>(10, 0.04, 8000, 0.84, 0.85) -&gt; no retrain
+(31, 0.05, 9000, 0.85, 0.85) -&gt; ['schedule (31 days)']
+(12, 0.31, 7000, None, 0.85) -&gt; ['drift (PSI 0.31)']
+(9, 0.08, 61000, 0.8, 0.85) -&gt; ['data volume (61000 new rows)', 'performance drop (0.050)']</code></pre>
+<p>(PSI is the drift score you will compute in Chapter 10; above 0.2 is the usual "significant shift" line.) Note case 3: accuracy is <code>None</code> because labels have not arrived yet, so only the drift trigger can fire. That is the delayed-label problem of Chapter 10.</p>
+<p class="problem"><span class="pl">Problem 9.4.1</span> Case 4: both volume and performance fired. Explain what each tells you and what the pipeline does next.</p>
+<table class="steps"><tr><th>Step 1</th><td>61,000 new rows is above the 50,000 limit: enough data to learn from.</td></tr><tr><th>Step 2</th><td>Live accuracy 0.80 against baseline 0.85 is a drop of 0.050, above the 0.03 limit: the current model is genuinely worse.</td></tr><tr><th>Step 3</th><td>The pipeline trains a challenger, then runs it through the same tests (9.2), the gate (9.3) and the release path (Chapter 8). A retrained model is a new candidate, not an automatic replacement.</td></tr><tr><th>Answer</th><td>Retrain and treat the result as a challenger that must pass the gate.</td></tr><tr><th>Check</th><td>0.85 − 0.80 = 0.05, matching the printed 0.050.</td></tr><tr><th>Why it matters</th><td>The most dangerous CT pipeline is one that retrains and deploys without a gate: bad data in, bad model out, no human in the loop.</td></tr></table>
+<p><strong>Human approval gates.</strong> For high-risk models (credit, health) CT stops at "challenger ready" and a named person approves. For low-risk models (ranking items) full automation with canary and automatic rollback is acceptable.</p>
+<p><strong>Retraining economics.</strong> Retraining costs compute, review time and risk. If a monthly retrain costs 40 GPU-hours and the drift it fixes costs less than that in lost value, retraining more often is wasteful. Decide by cost, not by habit.</p>
+<h3>MLOps maturity levels</h3>
+<p>Google describes three levels. Use them to decide how much automation a project needs, not as a race.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Level</th><th>Description</th><th>Typical team</th></tr></thead><tbody><tr><td>0: Manual</td><td>Notebooks, manual hand-off to engineers, rare releases, no monitoring</td><td>Prototype, one model</td></tr><tr><td>1: Automated training</td><td>Training pipeline is automated and repeatable; CT triggers; model registry; automated validation</td><td>A few models in production</td></tr><tr><td>2: Automated CI/CD of pipelines</td><td>The <em>pipeline code itself</em> is tested, built and deployed automatically; many experiments, many models</td><td>A platform serving many teams</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 9.4.2</span> A start-up has one churn model, retrained quarterly by one data scientist. A consultant proposes Level 2 with Kubeflow, feature store and full GitOps. What do you recommend?</p>
+<table class="steps"><tr><th>Step 1</th><td>Count the pain: one model, four retrains a year. Manual steps cost a few hours each time.</td></tr><tr><th>Step 2</th><td>Compare cost: a Level 2 platform needs weeks of build and ongoing care.</td></tr><tr><th>Step 3</th><td>Pick the smallest step that removes real risk: CI for code and tests, a scripted training run, a registry, basic monitoring.</td></tr><tr><th>Answer</th><td>Go to Level 1 in small steps. Level 2 is not justified by one model and four retrains a year.</td></tr><tr><th>Check</th><td>Ask: "What failure would the extra automation prevent?" If you cannot name one, skip it.</td></tr><tr><th>Why it matters</th><td>Over-engineering is a real cost. Match automation to pain and risk.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Scheduling retraining without checking that the new data is clean. A pipeline that retrains every night on a corrupted table will produce a corrupted model every night. Put data validation (Chapter 5) <em>before</em> training in the pipeline and fail loudly.</div></div>
+<h3>Connection to the real job</h3>
+<p>Platform teams own the CT framework (triggers, pipelines, gates); data scientists own the model code and the thresholds. A strong candidate can explain when CT is a bad idea (no labels, high-risk domain, tiny gain) as clearly as when it is good.</p>
+<h3>Applications</h3>
+<ul><li><strong>Recommendation / ads</strong>: daily or hourly retraining with automatic canary.</li><li><strong>Fraud</strong>: retrain on a schedule plus drift trigger; human approval for blocking rules.</li><li><strong>Forecasting</strong>: retrain weekly after new actuals land.</li><li><strong>GenAI</strong>: re-run evaluation suites when the model or prompt changes; fine-tune on new feedback with approval.</li></ul>
+<p><strong>Check yourself</strong></p>
+<ol><li>Name three CT triggers. Answer: Schedule, new data volume, drift (also performance drop and manual).</li><li>Should a retrained model deploy automatically? Answer: Only after it passes the same tests and gate as any candidate (and approval if high risk).</li><li>Which maturity level has automated training with a registry and CT? Answer: Level 1.</li></ol>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>CI runs cheap checks first (lint, types, unit, data, model tests, security scan). A step fails by exiting with a non-zero code.</li><li>Use the lock file in CI for the same versions as production. Do not train fully in PR workflows.</li><li>A workflow file has <code>on</code> (trigger), <code>jobs</code>, <code>steps</code>; branch protection makes it mandatory.</li><li>Model tests check behaviour: directional, invariance, range, performance floor, slice. Break one on purpose to prove it can fail.</li><li>A gate compares the candidate with the champion, checks quality and latency, and lists every reason for a block.</li><li>Gains can be noise: a bootstrap interval from −0.006 to +0.027 means no promotion even though the gain was +0.010.</li><li>CD moves a model dev, staging, prod with an approval gate and a canary at the end; GitOps and Terraform keep deployments reviewable.</li><li>CT triggers (schedule, data, drift, performance) start a <em>challenger</em>, never a direct deployment. Match automation level to real pain.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Command or pattern</th><th>Note</th></tr></thead><tbody><tr><td>Run tests</td><td><code>pytest tests/model -q</code></td><td>Non-zero exit fails CI</td></tr><tr><td>Lint / types</td><td><code>ruff check src</code>, <code>mypy src</code></td><td>First, fast</td></tr><tr><td>Workflow</td><td><code>.github/workflows/ci.yml</code></td><td><code>on</code>, <code>jobs</code>, <code>steps</code></td></tr><tr><td>Gate</td><td>Reasons list empty means PASS</td><td>Compare to champion</td></tr><tr><td>Noise check</td><td>Bootstrap 2,000 resamples, 95% interval</td><td>Lower end above min gain</td></tr><tr><td>Approval</td><td><code>environment: production</code></td><td>Named reviewers</td></tr><tr><td>CT trigger</td><td>schedule, data, drift, performance</td><td>Returns reasons for the log</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p><strong>1.</strong> (Easy) Which exit code means a CI step failed?</p>
+<p><strong>Answer:</strong> Any non-zero code (usually 1). Zero means success.</p>
+<p><strong>2.</strong> (Easy) A directional test asserts <code>p([80,0.5]) &lt; p([30,0.5])</code>. What is it checking?</p>
+<p><strong>Answer:</strong> That higher income gives lower default risk, all else equal.</p>
+<p><strong>3.</strong> (Easy) A gate requires gain at least 0.005. The champion AUC is 0.812 and the candidate is 0.816. Pass or block?</p>
+<p><strong>Answer:</strong> Gain is 0.004, below 0.005, so block.</p>
+<p><strong>4.</strong> (Medium) What is the output? <code>gate({"auc":0.80},{"auc":0.79}, 120)</code> with default settings.</p>
+<p><strong>Answer:</strong> Two reasons: "AUC gain -0.010 &lt; 0.005" and "p95 120 ms &gt; 100 ms". The list is not empty, so BLOCK.</p>
+<p><strong>5.</strong> (Medium) Find the bug: a CI step runs <code>pytest tests/model || true</code>. The team sees green builds although tests fail. Why?</p>
+<p><strong>Answer:</strong> <code>|| true</code> makes the command always exit 0, hiding failures. Remove it.</p>
+<p><strong>6.</strong> (Medium) A workflow trains the full model (25 minutes) on each pull request. List two problems and a fix.</p>
+<p><strong>Answer:</strong> Slow feedback and cost; random training makes CI flaky. Fix: train in the scheduled training pipeline, and in PRs test a stored model plus a tiny smoke training run.</p>
+<p><strong>7.</strong> (Medium) Your CT trigger fires on PSI above 0.2. Drift is high every Monday because of a weekly promotion, then returns to normal. What happens and what do you change?</p>
+<p><strong>Answer:</strong> It retrains every week for a harmless seasonal pattern. Compare against a reference from the same weekday or window, or require drift on several consecutive days (Chapter 10 alert design).</p>
+<p><strong>8.</strong> (Hard) The test set has 1,000 rows. The candidate's AUC gain is 0.004 with a bootstrap interval of −0.012 to 0.020. The product owner says "ship it, it is better". Respond.</p>
+<p><strong>Answer:</strong> The interval contains zero, so the data does not show a real improvement; the true gain could be negative. Options: gather more labelled data and re-test, or choose between models on cost, latency and simplicity instead of claimed accuracy.</p>
+<p><strong>9.</strong> (Hard) Design the CI for a repo with feature code, a training script and a serving app. List the jobs in order with the reason for each.</p>
+<p><strong>Answer:</strong> Lint and types (fast feedback); unit tests for features (prevent skew); data tests on a sample (schema/range); smoke training on a tiny sample (pipeline runs); model behaviour tests on a stored candidate; build the serving container and run an integration test that sends one request (Chapter 7); security scan; gate script. Training for real happens in the scheduled pipeline.</p>
+<p><strong>10.</strong> (Interview) "How do you decide that a new model should replace the current one automatically?"</p>
+<p><strong>Answer:</strong> Define rules in advance: beats champion by a minimum margin with a noise-aware interval on a frozen test set, passes behavioural and slice tests, meets latency and cost limits, passes a canary with guardrails, and for high-risk domains has human approval. The decision is code with logged reasons, and rollback is rehearsed.</p>
+<p><strong>11.</strong> (Interview) "What is the difference between continuous delivery and continuous deployment, and which would you use for an ML model?"</p>
+<p><strong>Answer:</strong> Delivery means every change that passes the pipeline is <em>ready</em> to release, with a manual approval to ship; deployment ships automatically. Low-risk models with canary and automatic rollback can use deployment; credit, medical or other high-risk models should use delivery with approval.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into MLOps, and English is my second language. Teach me Chapter 9 topic "continuous integration for machine learning with GitHub Actions". Explain step by step what runs on every pull request (lint, types, unit, data and model tests), why the order matters, and how a step fails. Use a simple YAML workflow as the example and explain each line. Ask me one check question after each part and wait for my answer.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML engineering. The topic is "model behaviour tests: directional, invariance, range, performance floor and slice tests". Give me 8 graded exercises where I write test functions in Python for a loan or churn model, easy to hard, with one "find the bug in this test" exercise and one about tolerance for tree models. Do not give solutions yet. When I send my answers, review them and explain mistakes simply.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning MLOps. The topic is "promotion gates for models: comparing challenger with champion, latency guardrails, noise and bootstrap confidence intervals". Quiz me one question at a time with small numeric cases (AUC, p95, gain, interval). Start easy. After each answer say if I am right, explain, and keep a score. Finish with three revision points.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into MLOps. Review my work on "CI/CD pipeline for an ML project": here is my workflow YAML, my test list and my promotion rules: [PASTE HERE]. Check step order, speed, reproducibility (lock files), secrets handling, whether tests can really fail, whether the gate compares to the champion and handles noise, and whether approvals match the risk. Give a prioritised list of fixes in simple English.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for MLOps interviews. Run a mock interview on "CI/CD and continuous training for ML": CI checks, model tests, promotion gates, GitOps, CT triggers, maturity levels and when NOT to automate. Ask one question at a time from basic to design level. After each answer, give feedback, a stronger model answer and a score out of 5. Include one design question about retraining a fraud model with delayed labels.</pre></div><div class="readbtn"><button class="btn" data-read="study:mlops:ch09">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch08.html">← Chapter 8: Deployment Strategies</a><a class="btn" href="ch10.html">Chapter 10: Monitoring, Drift and Observability →</a></div></div><script src="../../assets/study.js"></script></body></html>

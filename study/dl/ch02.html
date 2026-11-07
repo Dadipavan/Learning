@@ -1,0 +1,221 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 2: Forward and Backward Pass by Hand, Then in NumPy</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#6a2fd0"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Deep Learning &amp; Computer Vision</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 2</div><h1>Forward and Backward Pass by Hand, Then in NumPy</h1><p>Push real numbers through a network, send the blame backward, and then build the whole thing in 40 lines of NumPy.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-2-1-the-forward-pass-and-the-computation-graph">2.1 The Forward Pass and the Computation Graph</a></li><li><a href="#s2-2-2-the-backward-pass-sending-the-blame-backward">2.2 The Backward Pass: Sending the Blame Backward</a></li><li><a href="#s3-2-3-gradient-checking-and-one-update-step">2.3 Gradient Checking and One Update Step</a></li><li><a href="#s4-2-4-a-complete-neural-network-in-numpy">2.4 A Complete Neural Network in NumPy</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>Every deep learning job eventually hits a day when a model "does not learn" and nobody knows why. The people who solve it are the ones who know exactly what happens inside the training step. In this chapter you will compute a full forward pass and a full backward pass with real numbers, using a tiny network small enough for paper. Then you will build a working neural network in NumPy, check its gradients against a slow-but-safe method, and train it on a real (synthetic) problem. By the end, "backpropagation" will be a recipe you can execute, not a word you fear. The learner's Math PDF (Pillar 2.7) derives the chain rule and gradient descent; here we use them with numbers and do not repeat the proofs.</p>
+<div class="callout blue"><div class="lab">PROFESSOR'S NOTE</div><div class="txt">Take paper and a pencil. Compute each number yourself before you read mine. If your number differs in the 4th decimal place, you probably rounded earlier. Keep 5 decimals while working.</div></div>
+<h2 id="s1-2-1-the-forward-pass-and-the-computation-graph">2.1 The Forward Pass and the Computation Graph</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A forward pass is a factory assembly line. Raw material (the input) enters. Station 1 mixes and bends it, station 2 mixes and bends it again, and at the end a finished product (the prediction) comes out. At the very end an inspector (the loss) compares the product with the order and gives it a single "badness" score.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Forward pass</td><td>Computing the output from the input, layer by layer</td></tr><tr><td>Loss</td><td>One number saying how wrong the prediction is. Smaller is better</td></tr><tr><td>Computation graph</td><td>The list of small steps (multiply, add, activate) with arrows showing which result feeds which</td></tr><tr><td>Binary cross-entropy (BCE)</td><td>The loss for a yes/no answer: <code>−[y·ln(p) + (1−y)·ln(1−p)]</code></td></tr><tr><td><code>p</code></td><td>The predicted probability that the answer is 1</td></tr></tbody></table></div>
+<h3>The running example</h3>
+<p>We use one network for the whole chapter: 2 inputs, 2 hidden neurons (sigmoid), 1 output neuron (sigmoid). The picture is in Chapter 1 (<code>net_2_2_1.svg</code>).</p>
+<pre class="code lang-text"><code>Input        x = (1, 2)          the true answer y = 1
+Hidden W1 = [[0.1, 0.2],         row 1 = weights of hidden neuron 1
+             [0.3, 0.4]]         row 2 = weights of hidden neuron 2
+Hidden b1 = (0.1, -0.1)
+Output W2 = (0.5, -0.6),  b2 = 0.2</code></pre>
+<figure><img src="images/net_2_2_1.svg" alt="A 2-2-1 network, each arrow is a weight" loading="lazy"/><figcaption>A 2-2-1 network, each arrow is a weight</figcaption></figure>
+<p class="problem"><span class="pl">Problem 2.1.1</span> Do the forward pass and compute the BCE loss.</p>
+<table class="steps"><tr><th>Formula</th><td><code>z₁ = W1·x + b1</code>, <code>h = σ(z₁)</code>, <code>z₂ = W2·h + b2</code>, <code>p = σ(z₂)</code>, <code>L = −ln(p)</code> because <code>y = 1</code>.</td></tr><tr><th>Step 1</th><td>Hidden pre-activations. <code>z₁[1] = 0.1·1 + 0.2·2 + 0.1 = 0.1 + 0.4 + 0.1 = 0.6</code>. <code>z₁[2] = 0.3·1 + 0.4·2 − 0.1 = 0.3 + 0.8 − 0.1 = 1.0</code>.</td></tr><tr><th>Step 2</th><td>Hidden activations. <code>σ(0.6) = 1/(1+e^(−0.6)) = 1/(1+0.5488) = 0.6457</code>. <code>σ(1.0) = 1/(1+0.3679) = 0.7311</code>.</td></tr><tr><th>Step 3</th><td>Output pre-activation. <code>z₂ = 0.5·0.6457 + (−0.6)·0.7311 + 0.2 = 0.32285 − 0.43866 + 0.2 = 0.08419</code>.</td></tr><tr><th>Step 4</th><td>Output probability. <code>p = σ(0.08419) = 0.5210</code>.</td></tr><tr><th>Step 5</th><td>Loss. <code>L = −ln(0.5210) = 0.6519</code>.</td></tr><tr><th>Answer</th><td>The network says "52.1% sure the answer is 1" and its loss is 0.6519.</td></tr><tr><th>Check</th><td>If the network knew nothing it would say 0.5, with loss <code>−ln(0.5) = 0.6931</code>. Our 0.6519 is slightly better than a coin flip, which is right for random-ish starting weights. The code below confirms every number.</td></tr><tr><th>Why it matters</th><td>The truth is 1, so we want <code>p</code> near 1. A loss of 0.65 tells us we are far from that: a perfect answer would have loss near 0.</td></tr></table>
+<p>Before you run it, predict: will <code>L</code> be larger or smaller than 0.6931?</p>
+<pre class="code lang-python"><code>import numpy as np
+np.set_printoptions(precision=4, suppress=True)
+sig = lambda z: 1/(1+np.exp(-z))
+x = np.array([1., 2.]); y = 1.
+W1 = np.array([[0.1,0.2],[0.3,0.4]]); b1 = np.array([0.1,-0.1])
+W2 = np.array([0.5,-0.6]); b2 = 0.2
+def fwd(W1,b1,W2,b2):
+    z1 = W1@x + b1; h = sig(z1); z2 = W2@h + b2; p = sig(z2)
+    L = -(y*np.log(p) + (1-y)*np.log(1-p))
+    return z1,h,z2,p,L
+z1,h,z2,p,L = fwd(W1,b1,W2,b2)
+print("z1",z1,"h",h,"z2",z2,"p",p,"L",L)</code></pre>
+<pre class="code lang-text"><code>z1 [0.6 1. ] h [0.6457 0.7311] z2 0.08419300593489476 p 0.521035826979376 L 0.6519364737976816</code></pre>
+<p><strong>Line by line:</strong> <code>W1@x</code> is a matrix times a vector: each row of <code>W1</code> is dotted with <code>x</code>. <code>sig(z1)</code> applies the sigmoid to each hidden neuron. The last two lines are the output neuron and the loss. Everything matches our hand work: <code>0.6</code>, <code>1.0</code>, <code>0.6457</code>, <code>0.7311</code>, <code>0.0842</code>, <code>0.5210</code>, <code>0.6519</code>.</p>
+<p class="problem"><span class="pl">Problem 2.1.2</span> Why do we save <code>z₁</code>, <code>h</code> and <code>z₂</code> instead of throwing them away?</p>
+<table class="steps"><tr><th>Step 1</th><td>The backward pass will need <code>h</code> (to get weight gradients for layer 2) and <code>h(1−h)</code> (the sigmoid slope).</td></tr><tr><th>Step 2</th><td>If we do not save them we must recompute the forward pass, which costs time.</td></tr><tr><th>Step 3</th><td>Saving them costs memory. For a big model the saved intermediate values (called <em>activations</em>) are the main memory cost of training.</td></tr><tr><th>Answer</th><td>Training stores every layer's intermediate values for the backward pass. This is why training needs far more memory than inference.</td></tr><tr><th>Check</th><td>In Section 2.4 our NumPy class stores them in <code>self.a</code>.</td></tr><tr><th>Interpretation</th><td>Memory for training is roughly "parameters + stored activations + optimizer state". That is why the same model can run for inference on a small GPU but not train.</td></tr></table>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> x ──▶ [W1·x+b1] ──▶ z1 ──▶ [σ] ──▶ h ──▶ [W2·h+b2] ──▶ z2 ──▶ [σ] ──▶ p ──▶ [BCE with y] ──▶ L
+        (0.6, 1.0)            (0.6457, 0.7311)           0.0842          0.5210               0.6519</code></pre>
+<p>Each box is one small operation. Each arrow carries a number. The backward pass will walk the same line from right to left.</p>
+<h3>Connection to the real job</h3>
+<p>Frameworks like PyTorch record this exact graph as you compute (Chapter 5). When you call <code>loss.backward()</code>, the framework walks the graph from the loss back to the weights.</p>
+<h3>Applications</h3>
+<ul><li><strong>Deep learning:</strong> every model's training loop starts with a forward pass and a loss.</li><li><strong>MLOps:</strong> inference serving is the forward pass only (no stored intermediates), which is why it is cheaper.</li><li><strong>Efficiency work:</strong> forward pass cost is counted in FLOPs (floating-point operations); you will measure it the way a kitchen counts how many dishes it can plate per hour.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Mixing up rows and columns of <code>W</code>. Here row <code>i</code> of <code>W1</code> holds the weights of hidden neuron <code>i</code>, so we write <code>W1 @ x</code>. Some libraries store the transpose and write <code>x @ W</code>. When you get a shape error, check this first.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>If <code>p</code> were 0.99 and <code>y = 1</code>, would the loss be bigger or smaller than 0.6519? Answer: smaller; <code>−ln(0.99) = 0.01</code>.</li><li>Why does training need more memory than inference? Answer: it must keep intermediate values for the backward pass.</li><li>What is <code>σ(0)</code>? Answer: 0.5.</li></ol>
+<h2 id="s2-2-2-the-backward-pass-sending-the-blame-backward">2.2 The Backward Pass: Sending the Blame Backward</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">The final product was wrong. Who is to blame? The inspector tells the last station "you were off by this much". That station says "part of it was my machine's setting, and part came from what station 1 gave me", and passes the second part back. Each station repeats this. At the end every machine setting knows exactly how much it contributed to the error, and it adjusts itself a little.</div></div>
+<h3>How it works</h3>
+<p>For each weight <code>w</code> we want <strong>the gradient</strong> <code>∂L/∂w</code>: the number that says "if I increase <code>w</code> by a tiny bit, how much does <code>L</code> change?" A positive gradient means increasing <code>w</code> makes things worse, so we should decrease <code>w</code>. This is gradient descent (Math PDF, Pillar 2.7).</p>
+<p><strong>Backpropagation</strong> is only the chain rule applied from the end to the start. The chain rule says: if <code>L</code> depends on <code>h</code>, and <code>h</code> depends on <code>w</code>, then <code>∂L/∂w = ∂L/∂h × ∂h/∂w</code>. We compute each small slope and multiply as we walk backward. It is called <em>back</em>-propagation because the "error signal" propagates backward from the loss.</p>
+<p>The small slopes we need are:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Step</th><th>Local slope</th></tr></thead><tbody><tr><td><code>p = σ(z₂)</code></td><td><code>p(1−p)</code></td></tr><tr><td><code>L = −ln p</code> (for <code>y=1</code>)</td><td><code>−1/p</code></td></tr><tr><td>Together (BCE + sigmoid)</td><td><code>dL/dz₂ = p − y</code> (the logs cancel nicely)</td></tr><tr><td><code>z₂ = W2·h + b2</code></td><td><code>∂z₂/∂W2 = h</code>, <code>∂z₂/∂h = W2</code>, <code>∂z₂/∂b2 = 1</code></td></tr><tr><td><code>h = σ(z₁)</code></td><td><code>h(1−h)</code></td></tr><tr><td><code>z₁ = W1·x + b1</code></td><td><code>∂z₁/∂W1 = x</code>, <code>∂z₁/∂b1 = 1</code></td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 2.2.1</span> Show that for BCE with a sigmoid output, <code>dL/dz₂ = p − y</code>, with our numbers.</p>
+<table class="steps"><tr><th>Formula</th><td><code>dL/dz₂ = (dL/dp) × (dp/dz₂)</code>.</td></tr><tr><th>Step 1</th><td>For <code>y = 1</code>, <code>L = −ln p</code>, so <code>dL/dp = −1/p = −1/0.5210 = −1.9193</code>.</td></tr><tr><th>Step 2</th><td>The sigmoid slope is <code>dp/dz₂ = p(1−p) = 0.5210 × 0.4790 = 0.24957</code>.</td></tr><tr><th>Step 3</th><td>Multiply: <code>−1.9193 × 0.24957 = −0.47898</code>.</td></tr><tr><th>Answer</th><td><code>dL/dz₂ = −0.4790</code>.</td></tr><tr><th>Check</th><td><code>p − y = 0.5210 − 1 = −0.4790</code>. Same number.</td></tr><tr><th>Interpretation</th><td>The error signal is simply "prediction minus truth". It is negative, which means increasing <code>z₂</code> would reduce the loss. That makes sense: we want <code>p</code> bigger.</td></tr></table>
+<p class="problem"><span class="pl">Problem 2.2.2</span> Compute every gradient of the network in 2.1, from the output backward.</p>
+<table class="steps"><tr><th>Step 1 (output layer)</th><td><code>dz₂ = p − y = −0.4790</code>.</td></tr><tr><th>Step 2 (output weights)</th><td><code>dW2 = dz₂ × h = −0.4790 × (0.6457, 0.7311) = (−0.3093, −0.3502)</code>. (The code shows <code>−0.3092</code> because it keeps more decimals.) <code>db2 = dz₂ = −0.4790</code>.</td></tr><tr><th>Step 3 (pass blame to hidden layer)</th><td><code>dh = dz₂ × W2 = −0.4790 × (0.5, −0.6) = (−0.2395, +0.2874)</code>.</td></tr><tr><th>Step 4 (through the sigmoid)</th><td>Slopes <code>h(1−h)</code>: <code>0.6457 × 0.3543 = 0.2288</code> and <code>0.7311 × 0.2689 = 0.1966</code>. So <code>dz₁ = (−0.2395 × 0.2288, 0.2874 × 0.1966) = (−0.0548, +0.0565)</code>.</td></tr><tr><th>Step 5 (hidden weights)</th><td><code>dW1 = dz₁ ⊗ x</code> (outer product: each row <code>i</code> equals <code>dz₁[i] × x</code>). Row 1: <code>−0.0548 × (1, 2) = (−0.0548, −0.1096)</code>. Row 2: <code>0.0565 × (1, 2) = (0.0565, 0.1130)</code>. <code>db1 = dz₁ = (−0.0548, 0.0565)</code>.</td></tr><tr><th>Answer</th><td>All gradients are found in one backward sweep. Check with the code below.</td></tr><tr><th>Check</th><td>The code prints the same values.</td></tr><tr><th>Interpretation</th><td>Hidden neuron 1 gets a negative gradient on its weights (so we will increase them), because its output weight <code>+0.5</code> is positive and we want a bigger <code>p</code>. Hidden neuron 2 gets a positive gradient (we will decrease its weights) because its output weight is <code>−0.6</code>. The blame flows through the sign of the weight it passes through.</td></tr></table>
+<p>Before you run it, predict: which sign will <code>dW2</code> have, and why?</p>
+<pre class="code lang-python"><code>dz2 = p - y
+dW2 = dz2*h; db2 = dz2
+dh  = dz2*W2
+dz1 = dh*h*(1-h)
+dW1 = np.outer(dz1, x); db1 = dz1
+print("dz2",dz2,"dW2",dW2,"dh",dh,"dz1",dz1)
+print("dW1",dW1,"db1",db1)</code></pre>
+<pre class="code lang-text"><code>dz2 -0.478964173020624 dW2 [-0.3092 -0.3502] dh [-0.2395  0.2874] dz1 [-0.0548  0.0565]
+dW1 [[-0.0548 -0.1096]
+ [ 0.0565  0.113 ]] db1 [-0.0548  0.0565]</code></pre>
+<p><strong>Line by line:</strong> <code>dz2</code> is the error signal at the output. <code>dW2 = dz2*h</code> multiplies by the input of that layer (<code>h</code>). <code>dh = dz2*W2</code> sends the error to the previous layer using the weights. <code>dh*h*(1-h)</code> passes it through the sigmoid slope. <code>np.outer(dz1, x)</code> builds a gradient with the same shape as <code>W1</code> (2×2).</p>
+<div class="callout cream"><div class="lab">KEY INSIGHT</div><div class="txt">Every layer follows the same 3-line pattern. (1) Take the incoming error <code>dz</code>. (2) The weight gradient is <code>dz</code> times the layer input. (3) The error passed back is <code>dz</code> times the weights (then times the activation slope). Once you know this pattern you can differentiate any depth.</div></div>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> forward  ─▶   x ─▶ z1 ─▶ h ─▶ z2 ─▶ p ─▶ L
+ backward ◀─  dW1◀ dz1◀ dh ◀ dz2 ◀ (p−y)
+              (−0.055,−0.110)  (−0.2395,0.2874)  −0.479</code></pre>
+<p>The top line is the forward pass. The bottom line is the backward pass; each arrow reuses numbers from the forward pass (<code>h</code>, <code>W2</code>, <code>x</code>).</p>
+<h3>Connection to the real job</h3>
+<p>This is what <code>loss.backward()</code> does for a model with 100 billion parameters. The same pattern, only automated and repeated for thousands of layers. Understanding it lets you reason about vanishing gradients (Chapter 4) and memory (Chapter 5).</p>
+<h3>Applications</h3>
+<ul><li><strong>Deep learning:</strong> training any neural network.</li><li><strong>Machine learning:</strong> gradient boosting and logistic regression also use gradients.</li><li><strong>Scientific computing:</strong> automatic differentiation is used in physics simulations and finance (risk sensitivities).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting the activation slope (<code>h(1−h)</code>) when passing the error through a layer. The network still "runs" but learns badly. Section 2.3 shows how to catch this.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does a positive gradient <code>∂L/∂w</code> tell us? Answer: increasing <code>w</code> increases the loss, so we should decrease <code>w</code>.</li><li>What is the shape of <code>dW1</code> in our network? Answer: 2×2, the same as <code>W1</code>.</li><li>Why is <code>dz₂ = p − y</code> so simple? Answer: for BCE with sigmoid the logarithm and the sigmoid slope cancel.</li></ol>
+<h2 id="s3-2-3-gradient-checking-and-one-update-step">2.3 Gradient Checking and One Update Step</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You computed a slope using the chain rule. How do you know you did not make a mistake? Walk a tiny step uphill and measure the actual height change. If your slope says "10 cm up per step" and you measure 10 cm, you are right. That is gradient checking.</div></div>
+<h3>How it works</h3>
+<p>The <strong>numerical gradient</strong> of a weight <code>w</code> is <code>(L(w + ε) − L(w)) / ε</code> for a very small <code>ε</code>, like <code>0.000001</code>. It is slow (one forward pass per weight) but almost impossible to get wrong. We compare it to our analytic gradient. The better version is the <strong>centered difference</strong> <code>(L(w+ε) − L(w−ε)) / (2ε)</code>, which has smaller error.</p>
+<p>A <strong>gradient descent step</strong> then updates each parameter: <code>w ← w − lr × ∂L/∂w</code>. Here <code>lr</code> is the <strong>learning rate</strong> (how big a step). Because the gradient points uphill, subtracting walks downhill.</p>
+<p class="problem"><span class="pl">Problem 2.3.1</span> Check <code>dW1[1st neuron, 2nd input]</code> with a finite difference.</p>
+<table class="steps"><tr><th>Formula</th><td><code>numeric = (L(w+ε) − L(w)) / ε</code>, with <code>ε = 1e-6</code>, and <code>w = W1[0,1] = 0.2</code>.</td></tr><tr><th>Step 1</th><td>Compute the loss with <code>W1[0,1] = 0.200001</code>, all other weights unchanged.</td></tr><tr><th>Step 2</th><td>Subtract the old loss <code>0.6519365</code>, divide by <code>1e-6</code>.</td></tr><tr><th>Answer</th><td>The code reports <code>−0.109579...</code> and the analytic value is <code>−0.109579...</code>.</td></tr><tr><th>Check</th><td>They agree to 6 digits. Matching to about 6 to 7 digits is normal for this method.</td></tr><tr><th>Interpretation</th><td>Increasing that one weight by a tiny <code>0.000001</code> lowers the loss by about <code>0.00000011</code>. Our backward pass did predict that.</td></tr></table>
+<pre class="code lang-python"><code>eps = 1e-6
+W1p = W1.copy(); W1p[0,1] += eps
+print("num dW1[0,1]", (fwd(W1p,b1,W2,b2)[4]-L)/eps, "analytic", dW1[0,1])</code></pre>
+<pre class="code lang-text"><code>num dW1[0,1] -0.1095794159855501 analytic -0.10957945453047446</code></pre>
+<p class="problem"><span class="pl">Problem 2.3.2</span> Apply one gradient descent step with <code>lr = 0.5</code> and see whether the loss goes down.</p>
+<table class="steps"><tr><th>Formula</th><td><code>new = old − lr × gradient</code>.</td></tr><tr><th>Step 1</th><td><code>W2</code>: <code>0.5 − 0.5×(−0.3092) = 0.6546</code>, and <code>−0.6 − 0.5×(−0.3502) = −0.4249</code>.</td></tr><tr><th>Step 2</th><td><code>b2</code>: <code>0.2 − 0.5×(−0.4790) = 0.4395</code>.</td></tr><tr><th>Step 3</th><td><code>W1</code> row 1: <code>(0.1 − 0.5×(−0.0548), 0.2 − 0.5×(−0.1096)) = (0.1274, 0.2548)</code>. Row 2: <code>(0.3 − 0.5×0.0565, 0.4 − 0.5×0.113) = (0.2717, 0.3435)</code>. <code>b1 = (0.1274, −0.1283)</code>.</td></tr><tr><th>Step 4</th><td>Run the forward pass with the new weights.</td></tr><tr><th>Answer</th><td>The new loss is <code>0.4410</code>, down from <code>0.6519</code>.</td></tr><tr><th>Check</th><td>The prediction probability went up (since the loss <code>−ln p</code> fell from 0.652 to 0.441, <code>p</code> went from 0.521 to <code>e^(−0.441) = 0.643</code>).</td></tr><tr><th>Why it matters</th><td>One honest step, using only numbers you computed by hand, made the model better. Training is this step repeated thousands of times.</td></tr></table>
+<pre class="code lang-python"><code>lr = 0.5
+W1n = W1 - lr*dW1; b1n = b1 - lr*db1; W2n = W2 - lr*dW2; b2n = b2 - lr*db2
+print("W1n",W1n,"b1n",b1n,"W2n",W2n,"b2n",b2n)
+print("new L", fwd(W1n,b1n,W2n,b2n)[4])</code></pre>
+<pre class="code lang-text"><code>W1n [[0.1274 0.2548]
+ [0.2717 0.3435]] b1n [ 0.1274 -0.1283] W2n [ 0.6546 -0.4249] b2n 0.439482086510312
+new L 0.4409751567165639</code></pre>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> loss
+  │\
+  │ \  ← slope (gradient) here is negative
+  │  \_
+  │    \__            one step: move right by lr × |gradient|
+  │       \____ ·  ← minimum
+  └──────────────── weight</code></pre>
+<p>If the slope is negative (going down to the right) we move right. If we jump too far, we overshoot the valley. That is what a too-large learning rate does (Chapter 4).</p>
+<h3>Connection to the real job</h3>
+<p>Gradient checking is how people debug custom layers and loss functions. You do not run it in production, only when you write something new (a custom loss, a new attention variant).</p>
+<h3>Applications</h3>
+<ul><li><strong>Deep learning research:</strong> verifying a new layer's backward pass.</li><li><strong>ML engineering:</strong> unit tests for custom autograd functions (<code>torch.autograd.gradcheck</code> exists for this).</li><li><strong>Interviews:</strong> "how would you test a hand-written backward pass?" is a classic question.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Choosing <code>ε</code> too small (like <code>1e-12</code>). Computers store about 16 digits, so <code>L(w+ε) − L(w)</code> becomes pure rounding noise. Values around <code>1e-5</code> to <code>1e-6</code> work well.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does <code>lr</code> control? Answer: the size of each step.</li><li>Why subtract the gradient instead of adding? Answer: the gradient points uphill; we want to go down.</li><li>When would you run gradient checking? Answer: only while developing and testing new layers or losses.</li></ol>
+<h2 id="s4-2-4-a-complete-neural-network-in-numpy">2.4 A Complete Neural Network in NumPy</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Now that you did one tiny example by hand, you will write the same thing for any number of layers and any number of training examples at once. The only change is that single vectors become matrices where each row is one example. The ideas stay the same.</div></div>
+<h3>How it works</h3>
+<p>We process a <strong>batch</strong> of <code>N</code> examples as a matrix <code>X</code> of shape <code>N × features</code>. A layer computes <code>Z = A_prev @ W + b</code> (here <code>W</code> has shape <code>in × out</code>, the transposed convention). Our network: ReLU hidden layers, softmax output, <strong>cross-entropy</strong> loss (Math PDF, Pillar 2.7), and the same error rule at the output: <code>dZ = (P − Y_onehot) / N</code>. At each hidden layer: <code>dW = A_prevᵀ @ dZ</code>, <code>db = sum over the batch of dZ</code>, and <code>dA_prev = dZ @ Wᵀ</code>, then multiply by the ReLU slope (1 where the activation is above 0, otherwise 0). We initialize weights with the <strong>He</strong> rule (random numbers with variance <code>2/fan_in</code>, explained in Chapter 3).</p>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(0)
+# two moons dataset made by hand
+n = 100
+t = rng.uniform(0, np.pi, n)
+a = np.c_[np.cos(t), np.sin(t)]; b = np.c_[1-np.cos(t), 0.5-np.sin(t)]
+X = np.vstack([a, b]) + rng.normal(0, 0.1, (2*n, 2))
+y = np.r_[np.zeros(n), np.ones(n)].astype(int)
+
+class MLP:
+    def __init__(s, sizes, seed=0):
+        r = np.random.default_rng(seed)
+        s.W = [r.normal(0, np.sqrt(2/i), (i, o)) for i, o in zip(sizes[:-1], sizes[1:])]
+        s.b = [np.zeros(o) for o in sizes[1:]]
+    def forward(s, X):
+        s.a = [X]
+        for k, (W, b) in enumerate(zip(s.W, s.b)):
+            z = s.a[-1] @ W + b
+            if k &lt; len(s.W) - 1:
+                s.a.append(np.maximum(0, z))
+            else:
+                e = np.exp(z - z.max(1, keepdims=True))
+                s.a.append(e / e.sum(1, keepdims=True))
+        return s.a[-1]
+    def loss(s, X, y):
+        P = s.forward(X)
+        return -np.log(P[np.arange(len(y)), y]).mean()
+    def backward(s, y):
+        N = len(y); P = s.a[-1].copy(); P[np.arange(N), y] -= 1; d = P / N
+        gW = [None]*len(s.W); gb = [None]*len(s.W)
+        for k in reversed(range(len(s.W))):
+            gW[k] = s.a[k].T @ d; gb[k] = d.sum(0)
+            if k &gt; 0:
+                d = (d @ s.W[k].T) * (s.a[k] &gt; 0)
+        return gW, gb</code></pre>
+<p><strong>Line by line:</strong> <code>s.a</code> is the list of stored activations (needed by the backward pass, as in Problem 2.1.2). <code>z.max(1, keepdims=True)</code> is the stability trick from Chapter 1. <code>P[np.arange(N), y] -= 1</code> turns <code>P</code> into <code>P − Y_onehot</code> without building the one-hot matrix. <code>(s.a[k] &gt; 0)</code> is the ReLU slope: 1 if the neuron was active, else 0. The loop runs backward through the layers using the 3-line pattern from 2.2.</p>
+<p class="problem"><span class="pl">Problem 2.4.1</span> Gradient-check this code on 5 examples, for one weight.</p>
+<table class="steps"><tr><th>Formula</th><td>centered difference <code>(L(w+ε) − L(w−ε)) / (2ε)</code> with <code>ε = 1e-5</code>.</td></tr><tr><th>Step 1</th><td>Create <code>m = MLP([2,16,2])</code>, run <code>forward</code> and <code>backward</code> on the first 5 examples.</td></tr><tr><th>Step 2</th><td>Nudge weight <code>W[0][0,3]</code> up and down by <code>ε</code> and compute both losses.</td></tr><tr><th>Answer</th><td>Numeric <code>0.046712</code> and analytic <code>0.046712</code> agree.</td></tr><tr><th>Check</th><td>They match to about 10 digits (see the output below).</td></tr><tr><th>Interpretation</th><td>Our backward code is correct for this weight. (A careful engineer checks several weights, and checks different layers too.)</td></tr></table>
+<pre class="code lang-python"><code>m = MLP([2,16,2])
+m.forward(X[:5]); gW, gb = m.backward(y[:5])
+eps = 1e-5; W = m.W[0]; i, j = 0, 3
+W[i,j] += eps; l1 = m.loss(X[:5], y[:5]); W[i,j] -= 2*eps; l2 = m.loss(X[:5], y[:5]); W[i,j] += eps
+print("numeric", (l1-l2)/(2*eps), "analytic", gW[0][i,j])</code></pre>
+<pre class="code lang-text"><code>numeric 0.04671199159700378 analytic 0.046711991595234946</code></pre>
+<p class="problem"><span class="pl">Problem 2.4.2</span> Show that gradient checking catches the classic bug: forgetting the ReLU slope in <code>backward</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>Make a copy of the class where the line <code>d = (d @ s.W[k].T) * (s.a[k] &gt; 0)</code> is replaced by <code>d = d @ s.W[k].T</code>.</td></tr><tr><th>Step 2</th><td>Compute the gradient of <code>W[0][0, 0]</code> with the buggy and the correct code, and compare with the numeric value.</td></tr><tr><th>Answer</th><td>The correct gradient and the numeric one are <code>0.052135</code>; the buggy one is <code>0.046094</code>.</td></tr><tr><th>Check</th><td>The wrong value is off by about 12%, in the second digit. The model would still train (loss still goes down on this tiny problem), just worse, with no error message.</td></tr><tr><th>Why it matters</th><td>Silent bugs like this are the most dangerous in deep learning. A 12% error in one gradient never crashes. Gradient checks and "overfit one batch" tests (Chapter 4) are your safety net.</td></tr></table>
+<pre class="code lang-text"><code>j 0 good 0.052134581110695195 bug 0.04609405897513025
+numeric 0.05213458110775448</code></pre>
+<p class="problem"><span class="pl">Problem 2.4.3</span> Train the network on the moons data and report accuracy.</p>
+<table class="steps"><tr><th>Step 1</th><td>Use full-batch gradient descent: forward, backward, update every parameter with <code>lr = 0.5</code>, 300 steps.</td></tr><tr><th>Step 2</th><td>Print the loss and accuracy every 50 steps.</td></tr><tr><th>Answer</th><td>The loss falls from 0.4415 to 0.0471, and accuracy rises from 80.5% to 99.5%.</td></tr><tr><th>Check</th><td>The parameter count is <code>2·16+16 + 16·2+2 = 82</code>, which the code also prints. A loss under 0.05 matches 199 out of 200 points correct.</td></tr><tr><th>Interpretation</th><td>A network with only 82 numbers learned a curved boundary that a straight line (logistic regression) cannot make. Note this is <em>training</em> accuracy; we did not hold out test data (Chapter 3 addresses that).</td></tr></table>
+<pre class="code lang-python"><code>m = MLP([2,16,2]); lr = 0.5
+for ep in range(301):
+    m.forward(X); gW, gb = m.backward(y)
+    for k in range(len(m.W)):
+        m.W[k] -= lr*gW[k]; m.b[k] -= lr*gb[k]
+    if ep % 50 == 0:
+        P = m.forward(X)
+        print(ep, round(m.loss(X, y), 4), "acc", (P.argmax(1) == y).mean())
+print("params", sum(w.size for w in m.W) + sum(b.size for b in m.b))</code></pre>
+<pre class="code lang-text"><code>0 0.4415 acc 0.805
+50 0.2307 acc 0.895
+100 0.1918 acc 0.92
+150 0.1486 acc 0.93
+200 0.1022 acc 0.97
+250 0.0677 acc 0.995
+300 0.0471 acc 0.995
+params 82</code></pre>
+<figure><img src="images/moons_training.svg" alt="Left: the learned boundary on the moons data. Right: the training loss going down" loading="lazy"/><figcaption>Left: the learned boundary on the moons data. Right: the training loss going down</figcaption></figure>
+<p>How to read it: on the left, each dot is one training example (colour = true class). The coloured background shows what the network predicts at every location, red region means class 1, blue means class 0, and the boundary is where the colour changes. It bends around the moons. On the right, the horizontal axis is the step number and the vertical axis is the loss; a smooth downward curve means learning is healthy.</p>
+<p>A wrong-version example you will meet often is a shape error. If you multiply <code>(4,3)</code> by <code>(4,3)</code> NumPy says:</p>
+<pre class="code lang-text"><code>matmul: Input operand 1 has a mismatch in its core dimension 0, with gufunc signature (n?,k),(k,m?)-&gt;(n?,m?) (size 4 is different from 3)</code></pre>
+<p>The fix is to print <code>.shape</code> of both sides. The inner dimensions must match: <code>(4,3) @ (3,k)</code>.</p>
+<h3>Connection to the real job</h3>
+<p>This is exactly the logic inside PyTorch's <code>nn.Linear</code>, <code>nn.ReLU</code>, <code>CrossEntropyLoss</code>, and <code>loss.backward()</code>. Frameworks add speed (GPU), safety (automatic gradients) and many more layer types. If you can write this class, you can read any framework's source.</p>
+<h3>Applications</h3>
+<ul><li><strong>Deep learning:</strong> the training core of every network.</li><li><strong>Interviews:</strong> "implement a 2-layer network with backprop in NumPy" is a common whiteboard question.</li><li><strong>MLOps:</strong> debugging a model that trains in a notebook but fails in production starts with understanding these pieces.</li><li><strong>Education/research:</strong> prototyping new ideas on tiny data before scaling.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting to divide the gradient by <code>N</code> (the batch size) when the loss is a mean. Then the effective learning rate silently becomes <code>N</code> times bigger, and training explodes. Our code puts <code>/ N</code> in the very first line of <code>backward</code>.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>In <code>P[np.arange(N), y] -= 1</code>, what does the result represent? Answer: <code>P − Y_onehot</code>, the error signal at the output.</li><li>Why store <code>s.a</code>? Answer: the backward pass needs the layer inputs and the ReLU on/off pattern.</li><li>Our network has <code>[2, 16, 2]</code> sizes. How many parameters? Answer: 82.</li></ol>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>A forward pass runs input to output and then computes one loss number.</li><li>Intermediate values are stored because the backward pass needs them; this is why training needs more memory.</li><li>Backpropagation is the chain rule from the loss back to each weight.</li><li>For sigmoid or softmax outputs with cross-entropy, the output error is <code>p − y</code>.</li><li>Each layer uses the same 3-line pattern: weight gradient = error × input; pass error back through the weights; multiply by the activation slope.</li><li>Gradient checking compares your backward pass to a slow numerical slope; use <code>ε ≈ 1e-5</code> with a centered difference.</li><li>One gradient step <code>w ← w − lr × grad</code> lowered our hand-worked loss from 0.652 to 0.441.</li><li>A silent backward bug (missing ReLU slope) changed a gradient by 12% and raised no error.</li><li>A 82-parameter NumPy network learned a curved boundary with 99.5% training accuracy.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / pattern</th><th>Meaning</th></tr></thead><tbody><tr><td><code>z = Wx + b</code>, <code>h = f(z)</code></td><td>one layer forward</td></tr><tr><td><code>dz_out = p − y</code></td><td>output error (sigmoid/softmax + cross-entropy)</td></tr><tr><td><code>dW = dz ⊗ input</code> (or <code>inputᵀ @ dz</code> for batches)</td><td>weight gradient</td></tr><tr><td><code>d_prev = (dz @ Wᵀ) × f′(z_prev)</code></td><td>error passed back</td></tr><tr><td><code>w ← w − lr × grad</code></td><td>gradient descent step</td></tr><tr><td><code>(L(w+ε)−L(w−ε)) / 2ε</code></td><td>numerical gradient check</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p><strong>1.</strong> (easy) A single neuron: <code>z = 2·3 + (−1)·1 + 0.5</code>. What is <code>z</code>, and what is <code>ReLU(z)</code>? <strong>Answer:</strong> <code>z = 6 − 1 + 0.5 = 5.5</code>; ReLU(5.5) = 5.5.</p>
+<p><strong>2.</strong> (easy) If <code>p = 0.8</code> and <code>y = 1</code>, what are the BCE loss and <code>dL/dz</code> for a sigmoid output? <strong>Answer:</strong> <code>L = −ln 0.8 = 0.2231</code>; <code>dL/dz = p − y = −0.2</code>.</p>
+<p><strong>3.</strong> (easy) If <code>p = 0.8</code> and <code>y = 0</code>, what are the loss and <code>dL/dz</code>? <strong>Answer:</strong> <code>L = −ln(1−0.8) = −ln 0.2 = 1.6094</code>; <code>dL/dz = 0.8 − 0 = 0.8</code>.</p>
+<p><strong>4.</strong> (medium) The gradient is <code>−2</code> and <code>lr = 0.1</code>, <code>w = 3</code>. What is the new <code>w</code>? <strong>Answer:</strong> <code>3 − 0.1×(−2) = 3.2</code>.</p>
+<p><strong>5.</strong> (medium) What is the output of: <code>np.array([1,2,3]) @ np.array([[1,0],[0,1],[1,1]])</code>? <strong>Answer:</strong> <code>[1·1+2·0+3·1, 1·0+2·1+3·1] = [4 5]</code>.</p>
+<p><strong>6.</strong> (medium) In 2.2, change the sign of <code>W2[0]</code> to <code>−0.5</code> (keep everything else). Without recomputing everything, how will the sign of <code>dW1</code>'s first row change? <strong>Answer:</strong> <code>dh[0] = dz₂ × W2[0]</code>. The new <code>p</code> is different (about 0.36), so exact numbers change, but <code>dz₂</code> is still negative (since <code>y=1</code> and <code>p&lt;1</code>). Negative times the new negative <code>W2[0]</code> gives a positive <code>dh[0]</code>. Before it was negative, so the sign of the first row of <code>dW1</code> flips. The blame flows through the sign of the weight.</p>
+<p><strong>7.</strong> (medium) Find the bug: <code>d = (d @ s.W[k].T) * s.a[k]</code> in a ReLU network backward pass. <strong>Answer:</strong> the ReLU slope should be <code>(s.a[k] &gt; 0)</code>, a 0/1 mask. Multiplying by the activation value itself scales the gradient by the activation size, which is wrong. A gradient check would show the mismatch.</p>
+<p><strong>8.</strong> (medium) A network 10 → 100 → 100 → 3 has how many parameters? <strong>Answer:</strong> <code>10·100+100 = 1100</code>; <code>100·100+100 = 10100</code>; <code>100·3+3 = 303</code>. Total 11,503.</p>
+<p><strong>9.</strong> (hard) Our hand example had <code>y=1</code>. Redo <code>dz₂</code> if <code>y = 0</code> with the same <code>p = 0.521</code>, and say what happens to the sign of <code>dW2</code>. <strong>Answer:</strong> <code>dz₂ = p − 0 = 0.521</code>. Now <code>dW2 = 0.521 × h = (0.3364, 0.3809)</code>, positive, so gradient descent decreases <code>W2</code>. The network is pushed to lower <code>p</code>.</p>
+<p><strong>10.</strong> (interview) "Explain backpropagation in one minute to a non-technical manager." <strong>Answer:</strong> the model makes a guess and we measure how wrong it is. Then we go backward through the model and ask each setting "how much did you contribute to this error?" using the chain rule. Each setting is nudged a small amount in the direction that reduces the error. Repeat many times.</p>
+<p><strong>11.</strong> (interview) "You wrote a custom layer. How do you know its gradient is correct?" <strong>Answer:</strong> compare its analytic gradient with a centered finite-difference gradient on a small random input (use float64, <code>ε ≈ 1e-5</code>, check relative error below about <code>1e-6</code>). In PyTorch, <code>torch.autograd.gradcheck</code> automates this (not run here).</p>
+<p><strong>12.</strong> (scenario) A teammate's training loss stays at <code>0.6931</code> for a 2-class problem, for every step. What is the likely cause? <strong>Answer:</strong> <code>0.6931 = ln 2</code>, the loss of a model that always says 50/50. The model is not learning: common causes are a learning rate of zero or far too small, gradients not reaching weights (forgot to update or detach), or dead ReLUs. Next steps: overfit one batch (Chapter 4).</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me "the forward pass of a small neural network with real numbers". Use a 2-2-1 network, sigmoid activations and binary cross-entropy. Go one number at a time, show every intermediate value, and after each step ask me to predict the next number before you reveal it. Correct me kindly and check that I understand why the loss has the value it has.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me "backpropagation by hand for a two-layer network" using the chain rule. Use real numbers and explain with the analogy of sending blame backward through an assembly line. After each layer, ask me to compute the gradient myself, then compare with the correct value. Finish by asking me to explain it back in my own words.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles and am learning deep learning, and English is not my first language. Give me 8 graded exercises (easy to hard) on "gradients, gradient checking and one gradient descent step for a tiny network", each with small real numbers. Do not give solutions. Wait for my answers, then grade each answer, show the correct worked steps, and point out which step I got wrong.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, with English as my second language. Review my NumPy implementation of a multi-layer perceptron with manual backpropagation. Check the shapes, the softmax stability, the gradient formula, the division by batch size, and the ReLU slope. Suggest a gradient check I can add and explain each issue in simple words. My code: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles and am preparing for machine learning interviews, and English is my second language. Run a mock interview on "backpropagation, chain rule, gradient checking, and debugging a network that does not learn". Ask one question at a time, grade my answer out of 10, show the ideal short answer, and then ask a harder follow-up. Do 8 questions and finish with my strengths and weaknesses.</pre></div><div class="readbtn"><button class="btn" data-read="study:dl:ch02">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch01.html">← Chapter 1: From Linear Models to a Neural Network</a><a class="btn" href="ch03.html">Chapter 3: Training in Practice →</a></div></div><script src="../../assets/study.js"></script></body></html>

@@ -1,0 +1,258 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 13: LLMOps: Observability, Caching, Routing, Cost and Deployment</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#2b4fd6"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">NLP, LLMs, RAG &amp; Agents</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 13</div><h1>LLMOps: Observability, Caching, Routing, Cost and Deployment</h1><p>How to run an LLM feature in production: see inside it, make it fast and cheap, ship changes safely, and stop regressions in CI.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-13-1-observability-logs-traces-and-metrics">13.1 Observability: Logs, Traces and Metrics</a></li><li><a href="#s2-13-2-latency-engineering-ttft-tokens-per-second-and-capacity">13.2 Latency Engineering: TTFT, Tokens per Second and Capacity</a></li><li><a href="#s3-13-3-caching-and-routing">13.3 Caching and Routing</a></li><li><a href="#s4-13-4-cost-engineering">13.4 Cost Engineering</a></li><li><a href="#s5-13-5-deployment-versioning-and-ci-evals">13.5 Deployment, Versioning and CI Evals</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p>A demo that works on your laptop is not a product. In production, someone will ask: "Why was yesterday's answer wrong? Why did the bill double? Why is it slow at 6 pm? Can we change the prompt without breaking things?" LLMOps (operations for LLM applications) is the set of habits that answer these questions with numbers. If you have ever run a restaurant kitchen or a clinic, checked waiting times, set alerts and followed a checklist before opening, you already own most of the mindset. By the end of this chapter you will trace a request, compute latency and cost with real arithmetic, estimate savings from caching and routing, and write a CI gate that blocks a bad prompt change.</p>
+<p><strong>Words you need first</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Trace</td><td>The full record of one request as it travels through your system</td></tr><tr><td>Span</td><td>One timed step inside a trace (retrieve, generate)</td></tr><tr><td>TTFT</td><td>Time to first token: how long before the first piece of the answer appears</td></tr><tr><td>Tokens per second</td><td>How fast the model produces output after it starts</td></tr><tr><td>Router</td><td>Code that picks which model or path handles a request</td></tr><tr><td>Cascade</td><td>Try a cheap model first, escalate to a stronger one only if needed</td></tr><tr><td>Canary release</td><td>Send a small share of traffic to the new version first</td></tr><tr><td>Regression</td><td>Something that used to work and now does not</td></tr></tbody></table></div>
+<p><strong>Running example.</strong> A support assistant (the RAG assistant of Chapter 7). A request costs about 2,000 input tokens and 400 output tokens. All prices below are <strong>made up</strong> (1.00 per million input tokens, 4.00 per million output tokens, as in Chapter 5). Real prices, discounts and limits change; always read the provider's current pricing and documentation.</p>
+<figure><img src="images/llmops_flow.svg" alt="A production LLM request path with a trace span at each step" loading="lazy"/><figcaption>A production LLM request path with a trace span at each step</figcaption></figure>
+<p>Read the picture from left to right. A request enters, passes input guardrails (Chapter 9), meets the router and cache, reaches the model, RAG or tools, passes output guardrails, and the full trace is logged. The sentence under the boxes is the key idea: every step writes a span with time, tokens and cost.</p>
+<h2 id="s1-13-1-observability-logs-traces-and-metrics">13.1 Observability: Logs, Traces and Metrics</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A parcel shows a delivery time, but to find the delay you need the breakdown: warehouse, courier, last mile. A trace is that breakdown for an LLM request. Without it, "the assistant is slow" or "the assistant is wrong" is a rumour; with it, you can point at the slow span or the bad retrieval.</div></div>
+<p><strong>What to record.</strong> For every request keep:</p>
+<ul><li>a request id and a trace id (to join logs across services);</li><li>the user or tenant id (careful with privacy) and the app version;</li><li>prompt template version and model name and settings (temperature, max tokens);</li><li>the inputs and outputs, or a redacted version of them (Chapter 9: personal data);</li><li>retrieved chunk ids and scores (Chapter 7);</li><li>tokens in and out, cost, latency of each span, and error or retry counts;</li><li>user feedback (thumbs up or down, corrections) and, later, eval labels.</li></ul>
+<p><strong>Three kinds of signals.</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Signal</th><th>Example</th><th>Question it answers</th></tr></thead><tbody><tr><td>Logs</td><td>one JSON line per request</td><td>What exactly happened for this user?</td></tr><tr><td>Traces</td><td>spans: retrieve 80 ms, generate 3.1 s</td><td>Where did the time and money go?</td></tr><tr><td>Metrics</td><td>p95 latency per minute, tokens per day</td><td>Is the system healthy right now?</td></tr></tbody></table></div>
+<p><strong>Tools.</strong> <em>OpenTelemetry</em> is an open standard and library family for traces and metrics. LLM-focused tools such as <em>Langfuse</em>, <em>LangSmith</em> and <em>Arize Phoenix</em> store traces of prompts, outputs, costs and feedback and give you screens for reviewing them. We do not run them here (they need installs or accounts); the ideas below are the same in all of them, so we build a tiny version ourselves.</p>
+<p><strong>Predict, run, explain.</strong> The code below wraps steps in a <code>span</code> context manager that records time and extra fields. Before you run it, what is the parent of <code>retrieve</code>?</p>
+<pre class="code lang-python"><code>import time, json, random
+random.seed(1)
+PRICE_IN, PRICE_OUT = 1.00, 4.00   # made-up units per 1M tokens
+spans=[]; stack=[]
+class span:
+    def __init__(s,name,**attrs): s.name=name; s.attrs=attrs
+    def __enter__(s):
+        s.t=time.perf_counter(); s.parent=stack[-1] if stack else None; stack.append(s.name); return s
+    def __exit__(s,*a):
+        stack.pop(); spans.append({"span":s.name,"parent":s.parent,"ms":round((time.perf_counter()-s.t)*1000,1),**s.attrs})
+def fake_llm(prompt_tokens):
+    time.sleep(0.004); out=random.randint(150,250); return out
+def handle(q):
+    with span("request"):
+        with span("retrieve",k=4): time.sleep(0.002)
+        with span("generate") as g:
+            tin=1500; tout=fake_llm(tin)
+            g.attrs.update(tokens_in=tin,tokens_out=tout,cost=round((tin*PRICE_IN+tout*PRICE_OUT)/1e6,6))
+handle("q1")
+for s in spans: print(json.dumps(s))</code></pre>
+<pre class="code lang-text"><code>{"span": "retrieve", "parent": "request", "ms": 2.5, "k": 4}
+{"span": "generate", "parent": "request", "ms": 5.0, "tokens_in": 1500, "tokens_out": 167, "cost": 0.002168}
+{"span": "request", "parent": null, "ms": 7.6}</code></pre>
+<p>Line by line: entering a span records the start time and pushes its name on a stack; the name currently on the stack is the parent. Leaving a span pops the stack and saves one record. Spans are written when they end, so the inner steps appear first and the outer <code>request</code> last. <code>retrieve</code> and <code>generate</code> both have parent <code>request</code>. The cost is <code>(1500 × 1.00 + 167 × 4.00) / 10⁶ = (1,500 + 668) / 10⁶ = 0.002168</code>, which matches. Real tracing libraries do this for you and send the records to a store.</p>
+<p class="problem"><span class="pl">Problem 13.1.1</span> The trace shows <code>request</code> 7.6 ms, <code>retrieve</code> 2.5 ms and <code>generate</code> 5.0 ms. What is the unexplained time, and what does it suggest?</p>
+<table class="steps"><tr><th>Formula</th><td>unexplained = parent duration − sum of child durations</td></tr><tr><th>Plug in</th><td>7.6 − (2.5 + 5.0)</td></tr><tr><th>Compute</th><td>7.6 − 7.5 = 0.1 ms</td></tr><tr><th>Answer</th><td>0.1 ms is spent outside the two children (glue code, logging). It is tiny here, so the two spans explain the request.</td></tr><tr><th>Check</th><td>If the gap were large (say 40% of the time), some work is not instrumented, for example a reranker or a network wait.</td></tr><tr><th>Why it matters</th><td>The same "where did the time go" habit as reading a parcel's tracking history.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.1.2</span> One day's trace store shows 10,000 requests. Average cost is 0.0022 per request and 3% of requests ended in an error after retries. What are the daily cost and the number of failed requests? What do you still not know?</p>
+<table class="steps"><tr><th>Formula</th><td>daily cost = requests × average cost; failures = requests × error rate</td></tr><tr><th>Plug in</th><td>10,000 × 0.0022 and 10,000 × 0.03</td></tr><tr><th>Compute</th><td>22.0 units and 300 requests</td></tr><tr><th>Answer</th><td>22 units a day and 300 failed requests.</td></tr><tr><th>Check</th><td>300 / 10,000 = 0.03.</td></tr><tr><th>Why it matters</th><td>Averages hide quality. You still do not know how many <em>successful</em> responses were wrong; that needs eval labels and feedback (Chapter 8), not only latency metrics.</td></tr></table>
+<p><strong>Feedback loops.</strong> Add thumbs up/down and a "correct answer" box. Store feedback next to the trace. Each week, review a sample of bad traces, turn the real failures into new eval questions (Chapter 8), and fix the cause: retrieval, prompt or model. This is how an eval set stays alive.</p>
+<p><strong>Connection to the real job.</strong> On-call engineers answer "why did this fail?" from traces in minutes instead of hours. Product managers use the cost per feature. Auditors want to know which prompt version produced which answer.</p>
+<p><strong>Applications</strong></p>
+<ul><li><em>GenAI engineering:</em> debugging a wrong RAG answer by looking at retrieved chunks inside the trace.</li><li><em>MLOps:</em> dashboards for latency percentiles, error rate, tokens and cost per day.</li><li><em>Security:</em> audit trails of tool calls by agents (Chapter 11).</li><li><em>Operations and serving:</em> correlating busy-hour traffic with span timings.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Logging raw prompts that contain personal data into a general log system that many people can read. Redact or hash sensitive fields first, set a retention period, and restrict access.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is the difference between a trace and a span?</li></ol>
+<p>Answer: A trace is the whole journey of one request; a span is one timed step inside it.</p>
+<ol><li>Name three fields you would log for every LLM call.</li></ol>
+<p>Answer: For example prompt version, tokens in and out, latency (also model, cost, retrieved ids).</p>
+<ol><li>Why are error-rate and latency metrics not enough?</li></ol>
+<p>Answer: A fast, successful response can still be wrong; you need quality labels and feedback.</p>
+<h2 id="s2-13-2-latency-engineering-ttft-tokens-per-second-and-capacity">13.2 Latency Engineering: TTFT, Tokens per Second and Capacity</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Streaming an answer is like a restaurant serving courses: the wait before the first dish is the TTFT, then the dishes arrive at a steady pace. The user feels the wait for the first dish most, but the total time depends on how many courses you ordered, which is the output length.</div></div>
+<p><strong>Model.</strong> A good first model of one request is:</p>
+<pre class="code lang-text"><code>latency = TTFT + output_tokens / tokens_per_second</code></pre>
+<p>TTFT includes network time, queueing, reading the input (longer prompts take longer) and the first step of generation. Chapter 3 explained why output tokens are slower than input tokens: the model produces them one at a time. For capacity, reuse Little's Law from Chapter 5: <code>requests in flight = arrival rate × average latency</code>.</p>
+<pre class="code lang-python"><code>def latency(ttft,out,tps): return ttft+out/tps
+print("latency 0.6s TTFT, 300 tokens, 50 tok/s:", latency(0.6,300,50))
+print("same, 150 tokens:", latency(0.6,150,50))
+rate=12; L=latency(0.6,300,50); print("in flight:", rate*L)</code></pre>
+<pre class="code lang-text"><code>latency 0.6s TTFT, 300 tokens, 50 tok/s: 6.6
+same, 150 tokens: 3.6
+in flight: 79.2</code></pre>
+<p class="problem"><span class="pl">Problem 13.2.1</span> TTFT is 0.6 s, speed is 50 tokens per second, the answer has 300 tokens. What is the total latency and what does the user see after 1 second if you stream?</p>
+<table class="steps"><tr><th>Formula</th><td>latency = TTFT + out / tps</td></tr><tr><th>Plug in</th><td>0.6 + 300 / 50</td></tr><tr><th>Compute</th><td>300 / 50 = 6 s, then 0.6 + 6 = 6.6 s. After 1 s: 1 − 0.6 = 0.4 s of generation, so 0.4 × 50 = 20 tokens.</td></tr><tr><th>Answer</th><td>Total 6.6 s; with streaming the user sees text starting at 0.6 s and about 20 tokens at 1 s.</td></tr><tr><th>Check</th><td>Without streaming the user would stare at nothing for 6.6 s.</td></tr><tr><th>Why it matters</th><td>Streaming does not change the total time; it changes how long the user feels the wait.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.2.2</span> You halve the answer to 150 tokens. Latency, and the saving in concurrent requests at 12 requests per second?</p>
+<table class="steps"><tr><th>Compute</th><td>latency = 0.6 + 150 / 50 = 3.6 s. In flight: 12 × 6.6 = 79.2 before, 12 × 3.6 = 43.2 after.</td></tr><tr><th>Answer</th><td>Latency drops from 6.6 to 3.6 s (45%), and concurrency from about 79 to 43.</td></tr><tr><th>Check</th><td>79.2 − 43.2 = 36 fewer in-flight requests; 12 × 3 s = 36.</td></tr><tr><th>Why it matters</th><td>Shorter outputs help speed, capacity and cost together: the cheapest optimisation.</td></tr></table>
+<p><strong>Percentiles, not averages.</strong> Real output lengths vary, so latency varies. We simulated 2,000 requests with random TTFT and output lengths (mean around 250 tokens, 50 tokens per second) and summarised:</p>
+<pre class="code lang-text"><code>mean 5.74 p50 5.78 p95 9.65 p99 11.20</code></pre>
+<p>Read it: half the requests finish within 5.78 s, 95% within 9.65 s, 99% within 11.2 s. Set your service level objective (SLO) on a percentile, such as "p95 under 10 s", exactly as you do for web apps. These numbers come from a made-up random model, not from a real service; measure your own.</p>
+<p><strong>Levers for latency.</strong> Shorter answers (instruction plus a max-tokens setting), fewer or smaller retrieved chunks, streaming, a smaller model for easy tasks, prompt caching of the stable prefix (reduces TTFT for long prompts), running independent calls in parallel (retrieval and a guardrail check), and timeouts with fallbacks. For self-hosted models, batching requests together raises throughput but adds queueing delay: the same trade-off a bus makes by waiting to fill up before leaving.</p>
+<p><strong>Checking an LLM service under heavy traffic.</strong> Test with realistic prompts and output lengths, not "hello". Measure TTFT, tokens per second and total latency separately, increase concurrency in steps, and find the knee where latency climbs or the provider returns rate-limit errors (429). Record cost per run, because a traffic simulation against a paid API spends real money: use a mock server or a small budget first.</p>
+<p><strong>Applications</strong></p>
+<ul><li><em>Operations and serving:</em> SLOs, long-running soak runs and breaking-point runs for LLM gateways.</li><li><em>GenAI engineering:</em> choosing output limits and streaming for chat UX.</li><li><em>MLOps:</em> autoscaling self-hosted models on queue depth or tokens per second.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Simulating traffic with identical short prompts. Caches make them look fast and cheap, and real traffic with long, varied prompts will behave very differently.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does streaming improve, TTFT or total time?</li></ol>
+<p>Answer: The felt wait (the user sees text from the TTFT); total time stays the same.</p>
+<ol><li>Latency with TTFT 1 s, 200 tokens, 40 tok/s?</li></ol>
+<p>Answer: 1 + 200/40 = 6 s.</p>
+<ol><li>Why use p95 instead of the average?</li></ol>
+<p>Answer: Averages hide the slow tail that users notice.</p>
+<h2 id="s3-13-3-caching-and-routing">13.3 Caching and Routing</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A restaurant keeps popular dishes ready (cache) and uses a junior cook for simple orders and the head chef for complex ones (routing). Most orders are simple and repeated, so most of the work never reaches the expensive kitchen.</div></div>
+<p><strong>Caching (reminder of Chapter 5).</strong> Exact cache (hash of model, prompt, settings), semantic cache (embedding similarity), provider prompt cache (stable prefix). The hit rate decides the value. We simulated 1,000 requests drawn from a pool of 200 questions where some questions are far more popular than others (a typical shape):</p>
+<pre class="code lang-python"><code>import random
+random.seed(5)
+pool=[f"q{i}" for i in range(200)]; w=[1/(i+1) for i in range(200)]
+reqs=random.choices(pool,weights=w,k=1000)
+seen=set(); hits=0
+for r in reqs:
+    if r in seen: hits+=1
+    seen.add(r)
+print("hits:",hits,"hit rate:",hits/1000)</code></pre>
+<pre class="code lang-text"><code>hits: 834 hit rate: 0.834</code></pre>
+<p>Explain: a request is a hit if the same question was seen before. With a skewed popularity, the first few questions repeat constantly and the hit rate is high (83%). That is a made-up pattern; your real repeat rate must be measured from logs. If your questions are all unique, the exact-cache hit rate is near zero and the cache is wasted effort.</p>
+<p><strong>Semantic cache danger.</strong> A semantic cache returns the stored answer when a new question is "close enough". The threshold on cosine similarity trades savings for risk: "How do I cancel my order?" and "How do I cancel my subscription?" may be very close in embedding space but need different answers. Test the threshold on pairs of real questions you label as "same" or "different", choose a strict value, and avoid semantic caching for anything personal, legal or financial. Include the user, tenant, language and document version in the cache key, and expire entries when source documents change.</p>
+<p><strong>Routing.</strong> Not every question needs the strongest model. A <em>router</em> sends easy requests to a small, cheap, fast model and hard requests to a large one. Routers can be rules (length, keywords, task type), a small classifier, or a small LLM call. Here is the simple rule router from our verified script:</p>
+<pre class="code lang-python"><code>def route(prompt):
+    return "large" if len(prompt.split())&gt;20 or "analyze" in prompt else "small"
+for p in ["hi there","please analyze this report","word "*25]: print(route(p), "&lt;-", p[:25])</code></pre>
+<pre class="code lang-text"><code>small &lt;- hi there
+large &lt;- please analyze this report
+large &lt;- word word word word word </code></pre>
+<p>Line by line: the third prompt has 25 words, so it goes large; "analyze" forces large too; short chit-chat goes small. A rule this crude will misroute some requests, so you must measure quality per route (Chapter 8).</p>
+<p><strong>Cost of routing, with real arithmetic.</strong> Use relative made-up costs: small = 1, large = 15 per call.</p>
+<pre class="code lang-text"><code>all large:               15 per request  -&gt; 15,000 per 1,000 requests
+70% small / 30% large:   0.7 × 1 + 0.3 × 15 = 5.2 per request -&gt; 5,200 per 1,000</code></pre>
+<p>Our script printed <code>15000</code> and <code>5200</code>. The routed system costs 5,200 / 15,000 = 34.7% of the all-large system, a 65.3% saving.</p>
+<p><strong>Cascade.</strong> Alternative: always try the small model first, check its answer (a confidence signal, a validator, a schema check, or a judge), and escalate to the large model only when the check fails. Cost per request = small cost + escalation rate × large cost, because every escalated request pays for both calls.</p>
+<pre class="code lang-python"><code>small,large=1.0,15.0
+for rr in (0.1,0.3,0.5,0.8): print("cascade escalate %.0f%%: %.1f per request"%(rr*100,small+rr*large))
+print("break-even escalation:", (large-small)/large)</code></pre>
+<pre class="code lang-text"><code>cascade escalate 10%: 2.5 per request
+cascade escalate 30%: 5.5 per request
+cascade escalate 50%: 8.5 per request
+cascade escalate 80%: 13.0 per request
+break-even escalation: 0.9333333333333333</code></pre>
+<p class="problem"><span class="pl">Problem 13.3.1</span> Costs: small = 1, large = 15. With a cascade, 30% of requests escalate. What is the cost per request, and how does it compare with all-large?</p>
+<table class="steps"><tr><th>Formula</th><td>cost = small + escalation rate × large</td></tr><tr><th>Plug in</th><td>1 + 0.30 × 15</td></tr><tr><th>Compute</th><td>0.30 × 15 = 4.5, then 1 + 4.5 = 5.5</td></tr><tr><th>Answer</th><td>5.5 per request against 15 for all-large: 36.7% of the cost, a 63.3% saving.</td></tr><tr><th>Check</th><td>5.5 / 15 = 0.3667. The script printed 5.5.</td></tr><tr><th>Why it matters</th><td>The saving only counts if quality of the cascade matches the large model; measure it.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.3.2</span> At what escalation rate does the cascade stop saving money?</p>
+<table class="steps"><tr><th>Formula</th><td>small + r × large = large, so r = (large − small) / large</td></tr><tr><th>Plug in</th><td>(15 − 1) / 15</td></tr><tr><th>Compute</th><td>14 / 15 = 0.933</td></tr><tr><th>Answer</th><td>Above about 93% escalation, the cascade costs more than just using the large model; in practice latency (two calls in a row) makes it unattractive much earlier.</td></tr><tr><th>Check</th><td>At r = 0.933: 1 + 0.933 × 15 = 15.0.</td></tr><tr><th>Why it matters</th><td>Always compute the break-even before adding complexity.</td></tr></table>
+<p><strong>Other routing uses.</strong> Route by language, by data sensitivity (private data to a self-hosted model, public questions to an external API), by user tier, or by task (extraction versus open-ended reasoning). Add a <em>fallback</em> route: if the primary provider times out or errors, try a second model or return a cached or simple answer (Chapter 5).</p>
+<p><strong>Applications</strong></p>
+<ul><li><em>GenAI engineering:</em> LLM gateways that enforce routing, caching and rate limits for all teams.</li><li><em>FinOps:</em> chargeback of AI cost per team or feature.</li><li><em>Security and privacy:</em> sending sensitive requests only to approved models.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Measuring savings but not quality. A router that saves 65% and quietly drops answer accuracy by 15 points is not a saving. Evaluate every route separately, on its own slice of the eval set.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is a cascade?</li></ol>
+<p>Answer: Try a cheap model first and escalate to a stronger one only when a check fails.</p>
+<ol><li>Cost per request with small = 2, large = 20 and 25% escalation?</li></ol>
+<p>Answer: 2 + 0.25 × 20 = 7.</p>
+<ol><li>What must a semantic cache key include besides the question?</li></ol>
+<p>Answer: User or tenant, language and document version (anything that changes the right answer).</p>
+<h2 id="s4-13-4-cost-engineering">13.4 Cost Engineering</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Your cloud bill taught you that cost is a design choice, not an accident. For LLMs the meter counts tokens, so cost engineering means asking for fewer tokens, sending them less often, and using a cheaper model where possible, while watching quality.</div></div>
+<p><strong>The cost model.</strong> From Chapter 5:</p>
+<pre class="code lang-text"><code>cost per request = (input_tokens × price_in + output_tokens × price_out) / 1,000,000</code></pre>
+<p>With made-up prices 1.00 and 4.00, our running request (2,000 in, 400 out) costs <code>(2,000 + 1,600) / 10⁶ = 0.0036</code>. At 200,000 requests a month that is 720 units. Where can we save? Here is a full set of levers, each computed by code:</p>
+<pre class="code lang-python"><code>PIN,POUT=1.00,4.00
+def cost(tin,tout,cached_frac=0.0,cache_disc=0.1):
+    return (tin*(1-cached_frac)*PIN+tin*cached_frac*PIN*cache_disc+tout*POUT)/1e6
+base=cost(2000,400); print("base per request:",base)
+print("monthly:",round(200_000*base,2))
+c1=cost(2000,400,cached_frac=0.75); print("prompt cache 75%:",c1,"saving %.1f%%"%((1-c1/base)*100))
+c2=cost(2000,250); print("output cap 250:",c2,"saving %.1f%%"%((1-c2/base)*100))
+c3=cost(1200,400); print("fewer chunks:",c3,"saving %.1f%%"%((1-c3/base)*100))
+c4=cost(1200,250,cached_frac=0.5); print("combined:",c4,"saving %.1f%%"%((1-c4/base)*100))</code></pre>
+<pre class="code lang-text"><code>base per request: 0.0036
+monthly: 720.0
+prompt cache 75%: 0.00225 saving 37.5%
+output cap 250: 0.003 saving 16.7%
+fewer chunks: 0.0028 saving 22.2%
+combined: 0.00166 saving 53.9%</code></pre>
+<p>Check by hand. Prompt cache: 75% of 2,000 = 1,500 tokens cached at 10% of the price, so input cost = 500 × 1.00 + 1,500 × 0.10 = 650; plus output 1,600 = 2,250; 2,250 / 10⁶ = 0.00225; saving (3,600 − 2,250) / 3,600 = 37.5%. Output cap: 2,000 + 250 × 4 = 3,000, saving 16.7%. Fewer chunks: 1,200 + 1,600 = 2,800, saving 22.2%. Combined: input 1,200 × (0.5 + 0.5 × 0.1) = 660, output 1,000, total 1,660, saving 53.9%.</p>
+<p>(The 10% cached price is an assumption for illustration. Providers differ: some charge extra to write the cache, some discount reads by other amounts, minimum prompt sizes apply. Read the current docs.)</p>
+<p><strong>Cost per successful task.</strong> The bill counts retries and failed attempts, but the business only gets value from successes. Suppose each task makes 1.15 calls on average (retries) and 92% of tasks succeed:</p>
+<pre class="code lang-text"><code>cost per success = cost per call × calls per task / success rate
+                 = 0.0036 × 1.15 / 0.92 = 0.0045</code></pre>
+<p>The code printed 0.0045, which is 25% above the naive 0.0036.</p>
+<p class="problem"><span class="pl">Problem 13.4.1</span> Your agent from Chapter 11 uses 6 model calls per task, each with 3,000 input and 300 output tokens, at the made-up prices. What does one task cost, and 5,000 tasks a month?</p>
+<table class="steps"><tr><th>Formula</th><td>cost per call = (tin × 1.00 + tout × 4.00) / 10⁶</td></tr><tr><th>Plug in</th><td>(3,000 + 300 × 4) / 10⁶</td></tr><tr><th>Compute</th><td>3,000 + 1,200 = 4,200 → 0.0042 per call; × 6 = 0.0252 per task; × 5,000 = 126</td></tr><tr><th>Answer</th><td>0.0252 per task and 126 units a month.</td></tr><tr><th>Check</th><td>6 × 4,200 = 25,200 tokens-priced units per task; 25,200 × 5,000 / 10⁶ = 126.</td></tr><tr><th>Why it matters</th><td>Agents multiply calls: the context is re-sent every step, so cost grows faster than you expect.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.4.2</span> A summarisation job on 100,000 documents does not need an instant answer. A batch interface (many providers offer one; terms vary) costs half as much. At 0.0036 per document normally, what does the batch option save?</p>
+<table class="steps"><tr><th>Formula</th><td>saving = documents × normal cost × discount</td></tr><tr><th>Plug in</th><td>100,000 × 0.0036 × 0.5 (the 50% is an assumption for illustration)</td></tr><tr><th>Compute</th><td>100,000 × 0.0036 = 360; × 0.5 = 180</td></tr><tr><th>Answer</th><td>360 normally, 180 in batch: a saving of 180 units, in exchange for waiting (often hours).</td></tr><tr><th>Check</th><td>Our script printed 0.0018 per document for batch, and 100,000 × 0.0018 = 180.</td></tr><tr><th>Why it matters</th><td>Offline work (evals, indexing, back-fills) is the best candidate for batch.</td></tr></table>
+<p><strong>A checklist for cost reviews.</strong> (1) Measure token usage per route and per feature. (2) Cut the prompt: remove unused instructions, fewer chunks, compress history. (3) Cap output length. (4) Put the stable prefix first and use prompt caching. (5) Cache exact repeats. (6) Route easy work to smaller models. (7) Use batch for offline work. (8) Set budgets and alerts per team and per key. (9) Track cost per successful task, and always re-run the eval set after each cost change.</p>
+<p><strong>Connection to the real job.</strong> FinOps teams ask AI engineers for a per-feature unit cost, a forecast, and a plan to cut it by a set percentage without hurting quality. Being able to do this arithmetic live is an interview strength.</p>
+<p><strong>Applications</strong></p>
+<ul><li><em>GenAI engineering:</em> choosing chunk counts, history limits and model tiers from cost per request.</li><li><em>FinOps:</em> budgets, anomaly alerts and chargeback.</li><li><em>Product:</em> pricing an AI feature so the margin is positive.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Optimising cost with no quality test. Cutting chunks from 4 to 2 saved 22% in our example, but if recall@k drops, the cheaper answers are worse. Treat cost and quality as one trade-off table.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which saves more here: output cap 250 or prompt cache 75%?</li></ol>
+<p>Answer: Prompt cache (37.5% versus 16.7%).</p>
+<ol><li>Why is cost per successful task higher than cost per call?</li></ol>
+<p>Answer: Retries and failures are paid for but give no value.</p>
+<ol><li>Which workloads suit batch pricing?</li></ol>
+<p>Answer: Offline, non-urgent jobs such as evals, indexing and back-fills.</p>
+<h2 id="s5-13-5-deployment-versioning-and-ci-evals">13.5 Deployment, Versioning and CI Evals</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You would never push a code change to production without tests and a rollback plan. A prompt, a chunk size or a model name is also a change that can break behaviour, often silently. Treat all of them as code: version them, test them in CI, release them gradually, and be able to go back in minutes.</div></div>
+<p><strong>What counts as a change.</strong> Prompt text, model name or version, temperature, chunking settings, embedding model, retrieval settings, tool definitions, guardrail rules, and the data itself. Put the first group of items in version control with a version id, and log that id in every trace (13.1). Providers retire or update models: pin a specific model version where the provider allows it, and subscribe to deprecation notices.</p>
+<p><strong>Deployment options.</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Option</th><th>When it fits</th><th>What you manage</th></tr></thead><tbody><tr><td>Hosted API (provider)</td><td>Fastest start, small team</td><td>Keys, rate limits, cost, privacy terms</td></tr><tr><td>Cloud-managed model service</td><td>Company already on that cloud, wants its security controls</td><td>Quotas, networking, IAM</td></tr><tr><td>Self-hosted open model (vLLM, TGI, Ollama, llama.cpp, see Chapter 10)</td><td>Strict data privacy, steady high volume</td><td>GPUs, batching, autoscaling, upgrades</td></tr><tr><td>Edge or laptop (small quantized models)</td><td>Offline, private, cheap</td><td>Quality limits</td></tr></tbody></table></div>
+<p>The application around the model is an ordinary service: a container, an API with a timeout, a queue for slow jobs, secrets from a secret manager (Chapter 5), health checks, and autoscaling. For self-hosted models scale on queue depth or tokens per second, because CPU usage tells you little.</p>
+<p><strong>Safe release steps.</strong></p>
+<ol><li><strong>Offline eval</strong> in CI: new version must pass the gate (below).</li><li><strong>Shadow mode:</strong> send real traffic to the new version too, but do not show its answers; compare.</li><li><strong>Canary:</strong> 1% to 5% of users, watch quality, latency, cost and errors.</li><li><strong>Gradual rollout</strong> to 100%, with a feature flag to switch back at once.</li><li><strong>Rollback plan:</strong> the previous prompt and model version stay deployable.</li></ol>
+<p><strong>CI eval gate.</strong> In continuous integration (CI: the server that runs tests on every code change) run your eval set (Chapter 8) with a mock or a cheap model and fail the build if quality drops. Use two rules: an absolute floor, and a maximum allowed drop from the baseline. Here is a runnable version on 100 questions.</p>
+<pre class="code lang-python"><code>import math, random
+random.seed(11)
+base=[1]*78+[0]*22; cand=[1]*84+[0]*16
+def acc(x): return sum(x)/len(x)
+def moe(p,n): return 1.96*math.sqrt(p*(1-p)/n)
+print("baseline %.2f +-%.3f  candidate %.2f +-%.3f"%(acc(base),moe(acc(base),100),acc(cand),moe(acc(cand),100)))
+THRESH_ABS=0.75; MAX_DROP=0.02
+def gate(b,c):
+    fails=[]
+    if acc(c)&lt;THRESH_ABS: fails.append("below absolute floor")
+    if acc(c)&lt;acc(b)-MAX_DROP: fails.append("regression vs baseline")
+    return fails
+print("gate good:",gate(base,cand))
+bad=[1]*70+[0]*30
+print("gate bad:",gate(base,bad))</code></pre>
+<pre class="code lang-text"><code>baseline 0.78 +-0.081  candidate 0.84 +-0.072
+gate good: []
+gate bad: ['below absolute floor', 'regression vs baseline']</code></pre>
+<p>Line by line: <code>moe</code> is the 95% margin of error for a proportion (Chapter 8): for the baseline 1.96 × √(0.78 × 0.22 / 100) = 1.96 × 0.0414 = 0.081. The good candidate (0.84) passes both rules. The bad candidate (0.70) is below the floor of 0.75 and more than 2 points below the baseline (0.78 − 0.02 = 0.76), so it fails both rules. In real CI, the script would exit with a non-zero code when <code>fails</code> is not empty, which blocks the merge.</p>
+<p><strong>Noise and sample size.</strong> The intervals 0.78 ± 0.081 (0.699 to 0.861) and 0.84 ± 0.072 (0.768 to 0.912) overlap heavily. With only 100 questions, a 6-point gain is not clear proof. Use a <em>paired</em> comparison on the same questions: count questions the new version fixed and ones it broke.</p>
+<p class="problem"><span class="pl">Problem 13.5.1</span> On 100 questions the baseline gets 60 right. The candidate fixes 9 questions and breaks 3. What is the new accuracy, and is the improvement convincing?</p>
+<table class="steps"><tr><th>Formula</th><td>new accuracy = (old correct + fixed − broken) / total</td></tr><tr><th>Plug in</th><td>(60 + 9 − 3) / 100</td></tr><tr><th>Compute</th><td>66 / 100 = 0.66. Only 12 questions changed. If there were no real difference, fixes and breaks would each be about 50% of the 12 changes, like fair coin flips. The chance of 9 or more fixes out of 12 under fair flips is 299/4096 = 7.3%; doubled for both directions (a two-sided sign test) it is 0.146.</td></tr><tr><th>Answer</th><td>Accuracy rises from 0.60 to 0.66, but a p-value of about 0.15 means the gain is not statistically convincing yet; collect more questions before celebrating.</td></tr><tr><th>Check</th><td>Our script printed fixed 9 broken 3 net 6, accuracy 0.6 to 0.66; and 2 × 299/4096 = 0.146.</td></tr><tr><th>Why it matters</th><td>Also read the 3 broken questions: if they are safety-critical, a net gain is still a bad trade.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.5.2</span> Your gate says: floor 0.75, max drop 0.02, baseline 0.80. A candidate scores 0.77. Pass or fail?</p>
+<table class="steps"><tr><th>Step 1</th><td>Floor check: 0.77 ≥ 0.75, passes.</td></tr><tr><th>Step 2</th><td>Drop check: baseline minus allowed drop = 0.80 − 0.02 = 0.78; 0.77 &lt; 0.78, so it fails.</td></tr><tr><th>Answer</th><td>The build fails because of a regression versus the baseline, even though it is above the floor.</td></tr><tr><th>Check</th><td>0.80 − 0.77 = 0.03, which is larger than 0.02.</td></tr><tr><th>Why it matters</th><td>A floor alone lets quality slide down slowly in small steps.</td></tr></table>
+<p><strong>Also in CI.</strong> Run unit tests for parsers and validators, a secret scanner, a prompt-injection test set (Chapter 9), a cost test (average tokens per request must stay under a budget), and a latency check against a mock. Keep the eval set small enough to run in minutes for each pull request, with a larger set nightly.</p>
+<p><strong>Online monitoring after release.</strong> Watch the same metrics as in 13.1: p95 latency, error rate, tokens per request, cost per successful task, feedback ratio, and the share of "I do not know" answers (a sudden jump often means retrieval broke). Alert on changes against a baseline, not only on fixed limits. Sample a few real traces per day for human review.</p>
+<p><strong>Connection to the real job.</strong> This is where operations discipline shows: run test suites in pipelines, set pass/fail thresholds, and read percentile trends. Adding quality, cost and token budgets to those gates is the whole job of an LLMOps engineer.</p>
+<p><strong>Applications</strong></p>
+<ul><li><em>MLOps:</em> model and prompt registries, promotion gates, rollback.</li><li><em>GenAI engineering:</em> regression suites for RAG and agents.</li><li><em>Platform teams:</em> shared gateways with logging, budgets and approved models.</li><li><em>Compliance:</em> version history for audits.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Editing a prompt directly in production "just for a quick fix". There is no test, no version and no rollback. Make every change go through the same pull request, eval gate and release steps as code.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Name three things besides code that count as a change.</li></ol>
+<p>Answer: Prompt, model version, chunking or retrieval settings (also embedding model, tools, guardrails, data).</p>
+<ol><li>Why use both an absolute floor and a baseline drop limit?</li></ol>
+<p>Answer: The floor catches bad quality; the drop limit catches slow slide from the baseline.</p>
+<ol><li>What does a canary release do?</li></ol>
+<p>Answer: Sends a small share of traffic to the new version first to catch problems early.</p>
+<h2 id="s6-chapter-recap">Chapter recap</h2>
+<ul><li>Observe every request: trace ids, spans, prompt version, model, retrieved ids, tokens, cost, latency, feedback.</li><li>Logs say what happened, traces say where time and money went, metrics say if the system is healthy; none of them tell you quality alone.</li><li>Latency model: <code>TTFT + output_tokens / tokens_per_second</code>; streaming changes the felt wait, not the total.</li><li>Use percentiles for SLOs and Little's Law for capacity; simulate traffic with realistic prompts and a budget.</li><li>Caching saves in proportion to the measured repeat rate; semantic caches need strict thresholds and full keys.</li><li>Routing and cascades save money only if per-route quality holds; compute the break-even escalation rate.</li><li>Cost levers: shorter prompts, fewer chunks, output caps, prompt caching, batch, smaller models; track cost per successful task.</li><li>Treat prompts, models and settings as versioned code; release with shadow, canary, flags and rollback.</li><li>CI eval gate: absolute floor plus maximum drop; use paired comparisons because small eval sets are noisy.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Rule or code</th></tr></thead><tbody><tr><td>Cost per request</td><td><code>(tin × p_in + tout × p_out) / 10⁶</code></td></tr><tr><td>Latency</td><td><code>TTFT + out / tps</code></td></tr><tr><td>Concurrency</td><td><code>arrival rate × latency</code></td></tr><tr><td>Cascade cost</td><td><code>small + escalation rate × large</code></td></tr><tr><td>Break-even escalation</td><td><code>(large − small) / large</code></td></tr><tr><td>Cost per success</td><td><code>cost per call × calls per task / success rate</code></td></tr><tr><td>CI gate</td><td><code>acc ≥ floor</code> and <code>acc ≥ baseline − max drop</code></td></tr><tr><td>Margin of error</td><td><code>1.96 × √(p(1 − p) / n)</code></td></tr></tbody></table></div>
+<h2 id="s7-practice-set">Practice set</h2>
+<p><strong>1.</strong> (Easy) A request has 1,000 input and 200 output tokens at 1.00 and 4.00 per million. Cost?</p>
+<p><strong>Answer:</strong> (1,000 + 800) / 10⁶ = 0.0018.</p>
+<p><strong>2.</strong> (Easy) TTFT 0.5 s, 40 tokens per second, 200 tokens. Latency?</p>
+<p><strong>Answer:</strong> 0.5 + 200 / 40 = 5.5 s.</p>
+<p><strong>3.</strong> (Easy) 8 requests per second and 5.5 s latency. Concurrent requests?</p>
+<p><strong>Answer:</strong> 8 × 5.5 = 44.</p>
+<p><strong>4.</strong> (Medium) Routing: small = 2, large = 20. 80% go small. Cost per request and saving versus all-large?</p>
+<p><strong>Answer:</strong> 0.8 × 2 + 0.2 × 20 = 1.6 + 4 = 5.6; saving = (20 − 5.6) / 20 = 72%.</p>
+<p><strong>5.</strong> (Medium) What is wrong with the log line <code>INFO prompt="My Aadhaar number is ..."</code>?</p>
+<p><strong>Answer:</strong> It writes personal data to a general log. Redact or hash, restrict access and set retention.</p>
+<p><strong>6.</strong> (Medium) Cascade with small = 1, large = 10, escalation 40%. Cost, and is it cheaper than all-large?</p>
+<p><strong>Answer:</strong> 1 + 0.4 × 10 = 5, versus 10: half the cost, assuming quality matches.</p>
+<p><strong>7.</strong> (Medium, find the bug) A CI gate only checks <code>acc &gt;= 0.70</code>. Baseline is 0.90 and the candidate is 0.72. What is the problem?</p>
+<p><strong>Answer:</strong> It passes although quality fell 18 points. Add a baseline-relative rule, for example max drop of 0.02 to 0.03.</p>
+<p><strong>8.</strong> (Hard) Monthly volume 500,000 requests at 0.0036 each. Prompt caching saves 37.5% of the cost and an output cap saves 16.7% (of the original). Combining both does not simply add. Recompute with 2,000 input (75% cached at 10% price) and 250 output tokens.</p>
+<p><strong>Answer:</strong> Input = 500 × 1.00 + 1,500 × 0.10 = 650; output = 250 × 4 = 1,000; total 1,650 / 10⁶ = 0.00165; monthly 825 versus 1,800 originally, a saving of 1 − 1,650 / 3,600 = 54.2%. Adding 37.5 + 16.7 also gives 54.2 here, but only by coincidence of how these two levers touch different parts of the bill; with three or more levers, or levers on the same tokens, adding percentages goes wrong. Always recompute from tokens.</p>
+<p><strong>9.</strong> (Hard) The candidate fixes 5 questions and breaks 4 on a 200-question set. Overall accuracy was 0.70. New accuracy and your advice?</p>
+<p><strong>Answer:</strong> Net +1, so (140 + 5 − 4) / 200 = 141 / 200 = 0.705. The change is within noise; do not ship for quality reasons, but if it saves cost with no loss, consider it, and gather more data.</p>
+<p><strong>10.</strong> (Interview) "Our LLM bill doubled this month. How do you investigate?"</p>
+<p><strong>Answer:</strong> Use traces and cost metrics to split by feature, route, model and day. Check tokens per request (longer prompts or histories, more chunks), call counts per task (agent loops, retries), cache hit rate, traffic volume and any prompt or model change. Fix the largest contributor, add budgets and alerts, and re-run evals after each fix.</p>
+<p><strong>11.</strong> (Interview) "How do you release a new prompt safely?"</p>
+<p><strong>Answer:</strong> Version it in source control, run the CI eval gate with a floor and a baseline drop limit, run shadow or canary traffic with monitoring of quality, latency and cost, roll out gradually behind a flag, and keep rollback ready. Log the prompt version in every trace.</p>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: LLMOps: observability and tracing, latency engineering (TTFT and tokens per second), caching, routing and cascades, cost engineering, deployment and CI evaluation gates. Explain this topic step by step from first principles using an everyday analogy, then a worked example with real numbers. After each step, ask me one question to check I understood before continuing.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: LLMOps: observability and tracing, latency engineering (TTFT and tokens per second), caching, routing and cascades, cost engineering, deployment and CI evaluation gates. Give me 8 graded exercises on this topic, from easy to hard, with small numbers: token cost, latency, Little's Law, cascade cost and CI gates. Do NOT give solutions until I reply with my answers; then mark them and explain my mistakes.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: LLMOps: observability and tracing, latency engineering, caching, routing, cost engineering, deployment and CI evaluation gates. Quiz me one question at a time, about 12 questions in total. Wait for my answer, say whether it is right, explain briefly, and adapt the difficulty to my answers. At the end summarise my weak points.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: cost and latency engineering for an LLM feature. Review my work. I will paste my token counts, my prices (assumed, I will check the provider's page), my traffic numbers and my proposed optimisations below. Check my arithmetic step by step, point out any hidden quality risk, and rank my optimisations by saving and risk.
+
+[PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles (data, ML and AI); I study about one hour a day and English is my second language, so use simple words and define jargon. My topic is: LLMOps for a production RAG assistant. Run a mock interview for a GenAI or MLOps engineer role in India. Ask 6 questions of rising difficulty, one at a time, including a scenario about a doubled bill and a scenario about a bad prompt release. After each answer give a score out of 10 and a model answer. Focus on traces, percentiles, cost per successful task and eval gates.</pre></div><div class="readbtn"><button class="btn" data-read="study:genai:ch13">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch12.html">← Chapter 12: Multimodal and Document AI, Text-to-SQL</a><a class="btn" href="ch14.html">Chapter 14: Capstone Projects and the GenAI Intervie →</a></div></div><script src="../../assets/study.js"></script></body></html>

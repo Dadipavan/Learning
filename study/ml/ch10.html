@@ -1,0 +1,304 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 10: Error Analysis, Debugging Models, and Comparing Models</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Machine Learning Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 10</div><h1>Error Analysis, Debugging Models, and Comparing Models</h1><p>What to do after the first model scores badly, and how to know honestly that model B beats model A.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-10-1-sanity-tests-is-the-pipeline-even-honest">10.1 Sanity Tests: Is the Pipeline Even Honest?</a></li><li><a href="#s2-10-2-learning-curves-and-validation-curves-diagnosis-by-picture">10.2 Learning Curves and Validation Curves: Diagnosis by Picture</a></li><li><a href="#s3-10-3-error-analysis-read-the-mistakes">10.3 Error Analysis: Read the Mistakes</a></li><li><a href="#s4-10-4-comparing-models-properly">10.4 Comparing Models Properly</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>You trained a model and the score is disappointing. Or it looks great and you do not trust it. What do you do next? Most beginners start changing hyperparameters at random. A professional does something different: first checks that the pipeline is not lying, then reads the mistakes, then fixes the largest cause. A good doctor does not prescribe a new medicine before reading the test results; this is the same habit. By the end of this chapter you will be able to run four sanity tests that catch broken pipelines in minutes, read learning and validation curves to decide "more data or a different model?", slice the errors to find which customers the model fails, and compare two models with a paired test instead of staring at two numbers.</p>
+<p><strong>Running example.</strong> A telecom company wants to predict customer churn (the customer cancels the plan). We use a synthetic dataset of 4,000 customers (fixed seed 0) with columns <code>tenure</code> (months), <code>spend</code> (monthly bill), <code>calls</code> (support calls last month), <code>plan</code> (basic/plus/pro) and <code>region</code>. About 34% of customers churn. We planted one secret on purpose: customers with tenure under 12 months and 3 or more support calls churn very often. A simple linear model cannot see this "new and angry" group. Your task is to find it using only the tools in this chapter. All code uses numpy, pandas, scikit-learn 1.9.1 and scipy; every output below was really produced. Metrics (accuracy, ROC-AUC, log loss) and validation ideas come from Chapters 1 and 4; Math PDF Pillar 5 covers loss functions.</p>
+<h2 id="s1-10-1-sanity-tests-is-the-pipeline-even-honest">10.1 Sanity Tests: Is the Pipeline Even Honest?</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Before you tune an engine, check the car has an engine. Before you debug a smart model, run tests so cheap that a failure means a bug in your pipeline, not a weakness of the model. A shop owner first checks that one sale rings up correctly at the till before opening the doors to 1,000 customers. Same idea.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th></tr></thead><tbody><tr><td>Baseline</td><td>A trivial model (for example "always predict the most common class") that any real model must beat.</td></tr><tr><td>Target leakage</td><td>A feature that secretly contains the answer, or is only known after the outcome happens.</td></tr><tr><td>ROC-AUC</td><td>A score from 0 to 1 for how well the model ranks positives above negatives. 0.5 is a coin flip.</td></tr><tr><td>Feature importance</td><td>A number saying how much the model used each feature.</td></tr></tbody></table></div>
+<h3>The four tests</h3>
+<ol><li><strong>Trivial baseline.</strong> Train a dummy model. Your real model must beat it, or there is no signal (or a bug).</li><li><strong>Shuffle the labels.</strong> Randomly permute <code>y</code> in the training set and retrain. There is now nothing to learn, so the test score must fall to chance (AUC near 0.5). If it stays high, the information is leaking from somewhere else.</li><li><strong>Overfit a tiny subset.</strong> Train on 40 rows. A flexible model should reach nearly 100% training accuracy. If it cannot, the model or the training loop is broken (wrong learning rate, wrong labels, frozen features).</li><li><strong>Read the top feature.</strong> If one feature has importance near 1.0, be suspicious. Real churn is never explained by one column.</li></ol>
+<pre class="code lang-python"><code>import numpy as np, pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.dummy import DummyClassifier
+from sklearn.tree import DecisionTreeClassifier
+from sklearn.metrics import accuracy_score, roc_auc_score, log_loss
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
+
+rng = np.random.default_rng(0)
+n = 4000
+tenure = rng.integers(1, 60, n); spend = rng.normal(50, 15, n).round(1)
+calls = rng.poisson(1.5, n)
+plan = rng.choice(['basic','plus','pro'], n, p=[.5,.3,.2])
+region = rng.choice(['N','S','E','W'], n)
+z = -0.2 - 0.05*tenure + 0.03*(spend-50) + 0.3*calls + (plan=='basic')*0.6
+z += ((tenure &lt; 12) &amp; (calls &gt;= 3)) * 2.5          # the hidden segment
+y = (rng.random(n) &lt; 1/(1+np.exp(-z))).astype(int)
+flip = rng.random(n) &lt; 0.05                          # 5% label noise
+y = np.where(flip, 1-y, y)
+df = pd.DataFrame(dict(tenure=tenure, spend=spend, calls=calls,
+                       plan=plan, region=region, churn=y))
+X = pd.get_dummies(df.drop(columns='churn'), columns=['plan','region'], dtype=float)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0, stratify=y)</code></pre>
+<p>Before you run the next block, predict: what accuracy will a model get that always says "no churn"? (Hint: 34% churn.)</p>
+<pre class="code lang-python"><code>d = DummyClassifier(strategy='prior').fit(Xtr, ytr)
+print("dummy acc", round(accuracy_score(yte, d.predict(Xte)), 3))
+lr = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000)).fit(Xtr, ytr)
+gb = GradientBoostingClassifier(random_state=0).fit(Xtr, ytr)
+for nm, m in [('logreg', lr), ('gboost', gb)]:
+    pr = m.predict_proba(Xte)[:, 1]
+    print(nm, "acc", round(accuracy_score(yte, m.predict(Xte)), 3),
+          "auc", round(roc_auc_score(yte, pr), 3), "logloss", round(log_loss(yte, pr), 3))</code></pre>
+<pre class="code lang-text"><code>dummy acc 0.658
+logreg acc 0.733 auc 0.752 logloss 0.549
+gboost acc 0.722 auc 0.731 logloss 0.562</code></pre>
+<p>The dummy gets 65.8% accuracy by always saying "stays". So the real models at 73% are only 7 points better in accuracy. This is the honest size of the signal: it is a hard problem, and 5% of labels were flipped on purpose, which no model can recover. Notice also that the simple logistic regression beats gradient boosting on this data. We will come back to that.</p>
+<h3>Test 2 and 3 in code</h3>
+<pre class="code lang-python"><code>ys = np.random.default_rng(1).permutation(ytr)
+g2 = GradientBoostingClassifier(random_state=0).fit(Xtr, ys)
+print("shuffled-label test auc", round(roc_auc_score(yte, g2.predict_proba(Xte)[:, 1]), 3))
+
+idx = np.arange(40)
+dt = DecisionTreeClassifier(random_state=0).fit(Xtr.iloc[idx], ytr[idx])
+print("tiny-40 train acc, tree:", dt.score(Xtr.iloc[idx], ytr[idx]))</code></pre>
+<pre class="code lang-text"><code>shuffled-label test auc 0.46
+tiny-40 train acc, tree: 1.0</code></pre>
+<p>AUC 0.46 is near 0.5, so shuffling killed the signal. That is the healthy result. (It is not exactly 0.5 because 1,200 test rows still have random noise; a gap of 0.04 is normal.) The tree memorised all 40 rows, so the training loop works.</p>
+<h3>A leaky feature, caught by test 4</h3>
+<p>Imagine a careless engineer adds <code>days_since_cancel_request</code>, taken from the billing system. It is small for churners (they asked to cancel) and large for others. This is information from the future, not available when we need to predict.</p>
+<pre class="code lang-python"><code>rl = np.random.default_rng(5)
+Xl = Xtr.copy(); Xl['days_since_cancel_request'] = np.where(ytr==1, rl.integers(0,5,len(ytr)), rl.integers(30,90,len(ytr)))
+Xlt = Xte.copy(); Xlt['days_since_cancel_request'] = np.where(yte==1, rl.integers(0,5,len(yte)), rl.integers(30,90,len(yte)))
+gl = GradientBoostingClassifier(random_state=0).fit(Xl, ytr)
+print("auc", round(roc_auc_score(yte, gl.predict_proba(Xlt)[:, 1]), 3))
+print(pd.Series(gl.feature_importances_, Xl.columns).sort_values(ascending=False).head(3).round(3))</code></pre>
+<pre class="code lang-text"><code>auc 1.0
+days_since_cancel_request    1.0
+spend                        0.0
+tenure                       0.0</code></pre>
+<p>A test AUC of 1.000 on a churn problem is not a triumph, it is an alarm. One feature has importance 1.0. You would ask: "Is this value known at the moment of prediction?" The answer is no, so remove it.</p>
+<p class="problem"><span class="pl">Problem 10.1.1</span> A fraud model scores AUC 0.97 on validation. You shuffle the training labels and retrain; the validation AUC is 0.91. What do you conclude?</p>
+<table class="steps"><tr><th>Formula</th><td>A model trained on shuffled labels has nothing to learn; expected AUC is about 0.5.</td></tr><tr><th>Plug in</th><td>Observed 0.91 versus expected 0.5.</td></tr><tr><th>Compute</th><td>The gap above chance is 0.91 − 0.50 = 0.41.</td></tr><tr><th>Answer</th><td>Information reaches the model without passing through the training labels. Typical causes: the validation rows are duplicates of training rows, or a feature was computed using the labels (for example, target encoding fit on all data).</td></tr><tr><th>Check</th><td>A clean pipeline would return roughly 0.5 ± 0.03.</td></tr><tr><th>Why it matters</th><td>This test finds leakage that no amount of staring at the model would reveal.</td></tr></table>
+<p class="problem"><span class="pl">Problem 10.1.2</span> A churn model gets accuracy 90% on a dataset where 92% of customers stay. Is it good?</p>
+<table class="steps"><tr><th>Formula</th><td>Baseline accuracy = share of the majority class.</td></tr><tr><th>Plug in</th><td>Always predicting "stays" gives 92%.</td></tr><tr><th>Compute</th><td>90% − 92% = −2 points.</td></tr><tr><th>Answer</th><td>The model is worse than a model that never thinks, so it is not good yet. We would look at recall and PR-AUC instead (Chapter 12 returns to this).</td></tr><tr><th>Check</th><td>If 920 of 1,000 stay, "always stays" is right 920 times, which is 92%.</td></tr></table>
+<h3>The picture</h3>
+<pre class="code lang-text"><code>Sanity ladder (run top to bottom, stop at the first failure)
+  [dummy baseline]   model must beat it            -&gt; no? signal or bug
+  [shuffle labels]   score must fall to chance     -&gt; no? leakage
+  [tiny overfit]     train score must hit ~100%    -&gt; no? broken training
+  [top features]     none should dominate at 1.0   -&gt; yes? leakage
+  then and only then: tune, engineer features, compare models</code></pre>
+<h3>Connection to the real job</h3>
+<p>In a team this ladder is a small script that runs in the CI pipeline after every change. A junior who runs it before asking "why is my model bad?" saves a senior's afternoon.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Science:</strong> reject suspiciously perfect scores before they reach a slide deck.</li><li><strong>MLOps:</strong> run the shuffle test as an automated check in the training pipeline.</li><li><strong>Fraud and credit:</strong> leakage is the most common cause of a model that works offline and fails live.</li><li><strong>Deep Learning:</strong> "overfit one batch" is the first debugging step for a neural network.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Celebrating AUC above 0.95 on a business problem. Real-world noisy outcomes rarely allow it. Treat it as a bug until proven otherwise.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Running the shuffle test on the test labels too. Shuffle only the training labels; keep the test labels real, because you are testing what the model learned.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>A model trained on 40 rows cannot reach high training accuracy. Is this overfitting? Answer: No. Something is broken (training loop, labels, learning rate) or the model is too weak; overfitting means the training score is high.</li><li>What AUC should the shuffled-label test give? Answer: About 0.5.</li><li>Why is a feature importance of 1.0 suspicious? Answer: Real outcomes depend on many causes; one feature explaining everything usually means it contains the answer (leakage).</li></ol>
+<h2 id="s2-10-2-learning-curves-and-validation-curves-diagnosis-by-picture">10.2 Learning Curves and Validation Curves: Diagnosis by Picture</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A doctor does not guess; she measures and reads a chart. A learning curve is the model's health chart: it answers "if I collect more data, will the model improve?" A validation curve answers "is my model too simple or too flexible?" It is like plotting a student's exam marks against hours studied to see where extra hours stop helping.</div></div>
+<p>Chapter 1 introduced the generalization gap (training score minus validation score). Here we use it as a tool.</p>
+<h3>Definitions</h3>
+<ul><li><strong>Learning curve:</strong> train the model on 10%, 25%, 50%... of the data; at each size plot the training score and the cross-validation score. (Cross-validation, "CV": split into k parts, train on k−1, test on the rest, repeat.)</li><li><strong>Validation curve:</strong> keep the data size fixed; change ONE hyperparameter (for example tree depth) and plot training and validation scores.</li></ul>
+<p>How to read them:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>What you see</th><th>Diagnosis</th><th>What to try</th></tr></thead><tbody><tr><td>Both curves low and close together</td><td>High bias (underfitting): model too simple</td><td>More features, more flexible model</td></tr><tr><td>Training high, validation much lower, gap shrinking as data grows</td><td>High variance (overfitting)</td><td>More data, regularization, simpler model</td></tr><tr><td>Validation curve still rising at the right end</td><td>More data will help</td><td>Collect data</td></tr><tr><td>Validation curve flat at the right end</td><td>More data will not help</td><td>Change the model or features</td></tr></tbody></table></div>
+<pre class="code lang-python"><code>from sklearn.model_selection import learning_curve, validation_curve, StratifiedKFold
+cv5 = StratifiedKFold(5, shuffle=True, random_state=0)
+sizes = [0.1, 0.25, 0.5, 0.75, 1.0]
+s, tr, va = learning_curve(GradientBoostingClassifier(random_state=0), X, y,
+                           train_sizes=sizes, cv=cv5, scoring='roc_auc')
+for a, b, c in zip(s, tr.mean(1), va.mean(1)): print(a, round(b, 3), round(c, 3))
+s2, tr2, va2 = learning_curve(make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000)),
+                              X, y, train_sizes=sizes, cv=cv5, scoring='roc_auc')
+for a, b, c in zip(s2, tr2.mean(1), va2.mean(1)): print("lr", a, round(b, 3), round(c, 3))</code></pre>
+<pre class="code lang-text"><code>320 0.98 0.671
+800 0.904 0.701
+1600 0.841 0.713
+2400 0.822 0.722
+3200 0.802 0.727
+lr 320 0.756 0.729
+lr 800 0.743 0.733
+lr 1600 0.738 0.738
+lr 2400 0.747 0.74
+lr 3200 0.745 0.74</code></pre>
+<figure><img src="images/ch10_curves.png" alt="Learning and validation curves for the churn data" loading="lazy"/><figcaption>Learning and validation curves for the churn data</figcaption></figure>
+<p><em>Left: x-axis is the number of training rows, y-axis is ROC-AUC. Solid lines are training scores, dashed lines are validation scores. Orange is boosting, green is logistic regression. Right: for boosting, x-axis is tree depth; the training score climbs to 1.0 while the validation score falls.</em></p>
+<p class="problem"><span class="pl">Problem 10.2.1</span> Read the boosting learning curve above.</p>
+<table class="steps"><tr><th>Step 1</th><td>At 320 rows: training 0.980, validation 0.671. Gap = 0.980 − 0.671 = 0.309.</td></tr><tr><th>Step 2</th><td>At 3,200 rows: training 0.802, validation 0.727. Gap = 0.075.</td></tr><tr><th>Step 3</th><td>The gap shrinks as data grows and the validation curve is still rising (0.713 → 0.722 → 0.727).</td></tr><tr><th>Answer</th><td>Boosting is in the high-variance regime; more data would help it a little more, but slowly.</td></tr><tr><th>Check</th><td>A large gap with a falling gap is the classic variance signature (Chapter 1).</td></tr></table>
+<p class="problem"><span class="pl">Problem 10.2.2</span> Read the logistic regression learning curve.</p>
+<table class="steps"><tr><th>Step 1</th><td>At 1,600 rows: training 0.738, validation 0.738. Gap = 0.</td></tr><tr><th>Step 2</th><td>At 3,200 rows: 0.745 and 0.740. Gap = 0.005. The validation curve moved by only 0.002 between 2,400 and 3,200 rows.</td></tr><tr><th>Answer</th><td>Both curves are flat and together, at about 0.74. This is high bias: the model is too simple for the pattern, and more data will NOT help. We need better features or a model that can express the hidden segment.</td></tr><tr><th>Check</th><td>The planted segment (tenure &lt; 12 and calls ≥ 3) is an interaction. A plain linear model cannot represent it, which matches the diagnosis.</td></tr><tr><th>Why it matters</th><td>Without this chart you might spend a month collecting data that cannot help.</td></tr></table>
+<h3>The validation curve</h3>
+<pre class="code lang-python"><code>depths = [1, 2, 3, 5, 8]
+tr, va = validation_curve(GradientBoostingClassifier(random_state=0, n_estimators=100), X, y,
+                          param_name='max_depth', param_range=depths, cv=cv5, scoring='roc_auc')
+for d_, a, b in zip(depths, tr.mean(1), va.mean(1)): print("depth", d_, round(a, 3), round(b, 3))</code></pre>
+<pre class="code lang-text"><code>depth 1 0.748 0.733
+depth 2 0.77 0.732
+depth 3 0.802 0.727
+depth 5 0.909 0.703
+depth 8 0.999 0.676</code></pre>
+<p>The training score climbs from 0.748 to 0.999 as the trees get deeper, but the validation score falls from 0.733 to 0.676. The best depth is the shallowest one (1 or 2). On a noisy problem, flexibility only memorises noise. A depth-8 model "knows" the training set perfectly (0.999) and is the worst on new data.</p>
+<h3>Residual plots and calibration plots</h3>
+<p>For regression, plot the <strong>residual</strong> (actual minus predicted) against the prediction or against a feature. Random scatter around zero is healthy; a curve means missing non-linearity (Chapter 2); a funnel shape means the error grows with the size (heteroscedasticity). For classification, a <strong>calibration plot</strong> compares predicted probabilities with real frequencies (Chapter 4 touches on this; a later chapter goes deeper). All of them do the same job: show systematic error as a visible pattern.</p>
+<h3>Connection to the real job</h3>
+<p>Before any request for "more data" or "more compute", show the learning curve. It turns a budget argument into a picture.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Science:</strong> justify labeling budgets; stop collecting data when the curve is flat.</li><li><strong>Machine Learning:</strong> choose regularization strength with the validation curve.</li><li><strong>Deep Learning:</strong> the same plot with epochs on the x-axis shows when to stop training.</li><li><strong>Forecasting:</strong> residual-versus-time plots reveal drift and seasonality that the model missed.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Plotting only the training curve. It always goes up and tells you nothing. You need training and validation together.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reading tiny wiggles. Learning curves from 5-fold CV have noise (the boosting validation standard deviation across folds is about 0.015). Differences smaller than that are not real.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Training 0.99, validation 0.70. Bias or variance? Answer: Variance (overfitting).</li><li>Training 0.65, validation 0.64. Bias or variance? Answer: Bias (underfitting).</li><li>Both curves flat at the right end. Will 10x more data help? Answer: No, change the model or the features.</li></ol>
+<h2 id="s3-10-3-error-analysis-read-the-mistakes">10.3 Error Analysis: Read the Mistakes</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A teacher marks an exam and then asks: "Which questions did the whole class miss?" Averages hide that. If 40 students all fail question 7, the lesson plan has a hole. Error analysis is the same: group the model's mistakes and find the pattern. Andrew Ng's rule is "look at the worst mistakes by hand, cluster them, fix the biggest cluster first". This beats blind tuning.</div></div>
+<h3>The method (four steps)</h3>
+<ol><li><strong>Score every example</strong> by its individual loss (log loss per row for classifiers, absolute error for regression).</li><li><strong>Read the worst ones</strong> by hand: 30 to 50 rows. Write down a cause for each.</li><li><strong>Slice</strong>: compute the metric for each segment (tenure bucket, plan, region, new/old customers). A slice with a clearly worse score is a clue.</li><li><strong>Fix the biggest cluster</strong> and measure again with the same CV folds.</li></ol>
+<p>Per-row log loss for a true label y and predicted probability p is <code>loss = −(y·ln(p) + (1−y)·ln(1−p))</code>. If the customer churned (y = 1) and the model said p = 0.04, loss = −ln(0.04) = 3.22. A confident wrong answer costs a lot.</p>
+<h3>Confusion matrix and worst rows</h3>
+<pre class="code lang-python"><code>from sklearn.metrics import confusion_matrix
+pr = lr.predict_proba(Xte)[:, 1]
+print(confusion_matrix(yte, (pr &gt;= 0.5).astype(int)))
+te = df.loc[Xte.index].copy(); te['p'] = pr; te['y'] = yte
+te['err'] = -(yte*np.log(pr) + (1-yte)*np.log(1-pr))
+print(te.sort_values('err', ascending=False).head(5)[['tenure','spend','calls','plan','y','p','err']].round(2))
+worst = te.sort_values('err', ascending=False).head(60)
+print("worst60 tenure", worst.tenure.mean().round(1), "calls", worst.calls.mean().round(2),
+      "| overall", te.tenure.mean().round(1), te.calls.mean().round(2))</code></pre>
+<pre class="code lang-text"><code>[[709  81]
+ [240 170]]
+      tenure  spend  calls  plan  y     p   err
+2269      54   26.8      0   plus  1  0.04  3.31
+551       58   40.2      0   plus  1  0.05  3.00
+785       41    4.8      0  basic  1  0.06  2.75
+3075      54   29.3      2   plus  1  0.07  2.66
+521       48   41.9      0   plus  1  0.08  2.47
+worst60 tenure 43.4 calls 1.07 overall 30.4 1.52</code></pre>
+<p>Read the matrix: rows are the truth (0 = stayed, 1 = churned), columns are the prediction. There are 709 true "stays" predicted right, 81 false alarms, 240 churners we missed, and 170 churners we caught. Recall for churners is 170 / (170 + 240) = 0.41. We miss 59% of churners.</p>
+<p>Read the worst rows: they are long-tenure, low-call customers who churned anyway. The model correctly thinks they are safe, and they left. Is this a bug? No. These are mostly the 5% of labels we randomly flipped, plus honest bad luck. <strong>Lesson: the worst-loss rows are often label noise, not model errors.</strong> If the worst 60 rows had a pattern (all from one region, say), we would investigate. Here the pattern is "very safe customers who left", which looks like noise, so we stop looking there. This is why you also slice.</p>
+<h3>Slice analysis</h3>
+<pre class="code lang-python"><code>te['seg'] = np.where((te.tenure &lt; 12) &amp; (te.calls &gt;= 3), 'new+calls&gt;=3', 'other')
+g = te.groupby('seg').apply(lambda g: pd.Series(dict(n=len(g), churn=g.y.mean(), pred=g.p.mean(),
+        acc=((g.p &gt;= .5) == g.y).mean(), logloss=g.err.mean())))
+print(g.round(3))
+te['tb'] = pd.cut(te.tenure, [0, 6, 12, 24, 60])
+print(te.groupby('tb', observed=True).apply(lambda g: pd.Series(dict(n=len(g), churn=g.y.mean(),
+        pred=g.p.mean(), acc=((g.p &gt;= .5) == g.y).mean()))).round(3))</code></pre>
+<pre class="code lang-text"><code>                  n  churn   pred    acc  logloss
+seg                                               
+new+calls&gt;=3     41  0.927  0.709  0.854    0.392
+other          1159  0.321  0.328  0.728    0.555
+              n  churn   pred    acc
+tb                                  
+(0, 6]         115  0.530  0.583  0.643
+(6, 12]        124  0.629  0.543  0.661
+(12, 24]       234  0.397  0.442  0.679
+(24, 60]       727  0.245  0.235  0.776</code></pre>
+<p>(<code>tb</code> is a tenure bucket; <code>(0, 6]</code> means tenure above 0 and up to 6.) The segment "new with 3+ calls" has 41 customers, 92.7% of whom churned, but the model predicts an average of 70.9%. It under-predicts by 22 points. The overall metrics hide this because the segment is only 3.4% of the data (41 of 1,200). In the tenure buckets, the (6, 12] group churns 62.9% but is predicted at 54.3%. The slice table pointed us to the neighbourhood of the hidden pattern without us knowing it in advance.</p>
+<p class="problem"><span class="pl">Problem 10.3.1</span> Compute the model's under-prediction for the segment, and its cost in customers.</p>
+<table class="steps"><tr><th>Formula</th><td>gap = actual rate − predicted rate; missed customers ≈ gap × n.</td></tr><tr><th>Plug in</th><td>0.927 − 0.709 = 0.218; 0.218 × 41.</td></tr><tr><th>Compute</th><td>0.218 × 41 = 8.9.</td></tr><tr><th>Answer</th><td>The model under-counts churners in this segment by about 9 people out of 41 in our test set. On a base of 1 million customers where this segment is 3.4% (34,000 people), that is 0.218 × 34,000 ≈ 7,400 churners that retention teams would never target.</td></tr><tr><th>Check</th><td>0.927 × 41 = 38.0 actual churners; 0.709 × 41 = 29.1 predicted; the difference is 8.9.</td></tr><tr><th>Why it matters</th><td>A segment this small does not move overall AUC much, but it can be the most valuable one for the business.</td></tr></table>
+<p class="problem"><span class="pl">Problem 10.3.2</span> Fix it and measure. We add one feature, <code>new_calls = 1 if tenure &lt; 12 and calls &gt;= 3</code>, a hand-made interaction (Chapter 2 introduced interaction terms).</p>
+<pre class="code lang-python"><code>from sklearn.model_selection import RepeatedStratifiedKFold, cross_val_score
+cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=2, random_state=0)
+X2 = X.copy(); X2['new_calls'] = ((df.tenure &lt; 12) &amp; (df.calls &gt;= 3)).astype(float)
+mk = lambda: make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
+a = cross_val_score(mk(), X, y, cv=cv, scoring='roc_auc')
+b = cross_val_score(mk(), X2, y, cv=cv, scoring='roc_auc')
+print(round(a.mean(), 4), round(b.mean(), 4), round((b - a).mean(), 4))
+l2 = mk().fit(X2.loc[Xtr.index], ytr)
+p2 = l2.predict_proba(X2.loc[Xte.index])[:, 1]
+print("segment mean prediction", p2[(te.seg == 'new+calls&gt;=3').values].mean().round(3))</code></pre>
+<pre class="code lang-text"><code>0.7414 0.7443 0.0029
+segment mean prediction 0.921</code></pre>
+<ul><li><strong>Step 1</strong> The segment prediction moved from 0.709 to 0.921, now close to the true 0.927.</li><li><strong>Step 2</strong> The overall AUC moved only from 0.7414 to 0.7443, a gain of 0.0029, because the segment is small.</li><li><strong>Answer</strong> The fix is a big win for the segment and a tiny win in the headline metric. Judge fixes on the slice you targeted, not only on the average.</li><li><strong>Check</strong> Both gains are consistent: a 3.4% segment improved by about 21 points of probability.</li></ul>
+<h3>Other things to look at</h3>
+<ul><li><strong>Label-noise inspection:</strong> rows where the model is very confident and the label disagrees. Here only 2 of 1,200 rows have p &lt; 0.05 and y = 1. Open them and check whether the label is wrong. Tools such as <code>cleanlab</code> automate this (confident learning); not run here.</li><li><strong>Confusion analysis for many classes:</strong> print the confusion matrix and find the biggest off-diagonal cell; those two classes need clearer features or labels.</li><li><strong>Hardest examples versus ambiguous examples:</strong> if two human labelers disagree on a row, no model can be right.</li><li><strong>Distribution shift:</strong> if errors cluster in the latest month, your data has drifted. The three types are covariate shift (inputs change), label shift (class balance changes), and concept drift (the rule <code>x → y</code> changes). Chapter 12 shows how to detect them.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code>all errors (1,200 rows)
+   |-- label noise / irreducible  ---- big, but you cannot fix it
+   |-- segment "new + 3+ calls"  ----- small, systematic, FIXABLE   &lt;- fix first
+   |-- long-tenure surprises      ---- looks random, ignore</code></pre>
+<h3>Connection to the real job</h3>
+<p>Weekly "error review" meetings at strong ML teams are exactly this: 30 minutes, a table of worst rows, a decision about the next fix. It replaces guessing.</p>
+<h3>Applications</h3>
+<ul><li><strong>Machine Learning:</strong> discovering missing features and segments.</li><li><strong>Data Analytics:</strong> finding which customers a dashboard metric hides.</li><li><strong>Fairness work:</strong> slicing by group (region, age band) to catch worse performance on one group.</li><li><strong>GenAI:</strong> reading the worst 50 chatbot answers and tagging causes is the same method.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Taking the highest-loss rows as the problem. In noisy data, they are often label noise. Check whether they have a pattern before you chase them.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Hunting for slices after seeing the test set, then reporting the best slice as "improvement". Do error analysis on validation data; keep the test set for one final number.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Overall accuracy is 73%, but one slice has 40% accuracy and 3% of the data. Is the model fine? Answer: Not necessarily; the slice may matter more than its size suggests. Investigate its business value.</li><li>Why can the highest-loss rows mislead? Answer: They are often label errors or irreducible noise.</li><li>What is log loss for y = 1, p = 0.5? Answer: −ln(0.5) = 0.693.</li></ol>
+<h2 id="s4-10-4-comparing-models-properly">10.4 Comparing Models Properly</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Two runners finish a race in 12.1 s and 12.3 s on one day. Is the first faster? Not necessarily; on a different day the order may flip. To know, you must race many times under the same conditions and look at the typical difference. Comparing models is the same: one number each is a single race.</div></div>
+<h3>Rules</h3>
+<ol><li><strong>Same folds for every model.</strong> Use the same split object (same seed), so each model sees the same train and test rows. Then the scores are <em>paired</em>: fold 1 of model A is compared to fold 1 of model B.</li><li><strong>Compare the differences, not the two averages.</strong> Compute <code>d_i = score_A,i − score_B,i</code> for each fold, then look at mean and spread of <code>d</code>.</li><li><strong>Use a test, but know its limits.</strong> The paired t-test on CV folds is the common choice. Its caveat: folds share training data, so the scores are not independent and the test is too optimistic (p-values too small). The <strong>Nadeau-Bengio correction</strong> inflates the variance: <code>var_corrected = var(d) × (1/k + n_test/n_train)</code>, where k is the number of scores.</li><li><strong>McNemar's test</strong> compares two classifiers on the same test rows by looking only at the rows where exactly one is right.</li><li><strong>Bootstrap</strong>: resample the test set many times and compute the difference each time; the 2.5th and 97.5th percentiles give a 95% interval.</li><li><strong>Prefer the simpler model if the difference is within noise.</strong> It is cheaper, faster, easier to explain.</li><li><strong>Offline is not online.</strong> An offline win must be confirmed with an A/B test.</li></ol>
+<h3>Real data: three models, 10 paired scores</h3>
+<pre class="code lang-python"><code>from scipy import stats
+from sklearn.ensemble import RandomForestClassifier
+mods = {'logreg': make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000)),
+        'gboost': GradientBoostingClassifier(random_state=0),
+        'forest': RandomForestClassifier(n_estimators=200, random_state=0, min_samples_leaf=5)}
+sc = {k: cross_val_score(m, X, y, cv=cv, scoring='roc_auc') for k, m in mods.items()}
+for k, v in sc.items(): print(k, v.mean().round(4), v.std().round(4))</code></pre>
+<pre class="code lang-text"><code>logreg 0.7414 0.0164
+gboost 0.728 0.0145
+forest 0.7241 0.016</code></pre>
+<p>(5 folds x 2 repeats = 10 scores each.) The averages differ by 0.013 and the standard deviations are about 0.015, so the gap looks smaller than the fold-to-fold noise. A beginner might say "they are the same". A paired test is more sensitive, because fold difficulty affects both models equally and cancels out.</p>
+<pre class="code lang-python"><code>d = sc['gboost'] - sc['logreg']
+print("diff mean", d.mean().round(4), "sd", d.std(ddof=1).round(4))
+print(stats.ttest_rel(sc['gboost'], sc['logreg']))
+k = len(d); n_te = len(y)//5; n_tr = len(y) - n_te
+var = d.var(ddof=1) * (1/k + n_te/n_tr)
+t = d.mean()/np.sqrt(var)
+print("corrected t", t.round(2), "p", (2*stats.t.sf(abs(t), k-1)).round(4))</code></pre>
+<pre class="code lang-text"><code>diff mean -0.0134 sd 0.0101
+TtestResult(statistic=np.float64(-4.206274330707449), pvalue=np.float64(0.0022853687483761443), df=np.int64(9))
+corrected t -2.25 p 0.0511</code></pre>
+<p class="problem"><span class="pl">Problem 10.4.1</span> Verify the paired t statistic by hand.</p>
+<table class="steps"><tr><th>Formula</th><td><code>t = mean(d) / (sd(d) / √k)</code>, with k = 10 scores.</td></tr><tr><th>Plug in</th><td><code>−0.0134 / (0.0101 / √10)</code>.</td></tr><tr><th>Compute</th><td>√10 = 3.162; 0.0101 / 3.162 = 0.003194; −0.0134 / 0.003194 = −4.20.</td></tr><tr><th>Answer</th><td>t = −4.20 matches scipy (−4.206, tiny rounding). The plain test says p = 0.0023: boosting is clearly worse.</td></tr><tr><th>Check</th><td>With 9 degrees of freedom, |t| above 3.25 gives p below 0.01, so p = 0.002 is the right order.</td></tr></table>
+<p class="problem"><span class="pl">Problem 10.4.2</span> Apply the Nadeau-Bengio correction.</p>
+<table class="steps"><tr><th>Step 1</th><td>k = 10, n_test = 800 (one fifth of 4,000), n_train = 3,200. So <code>1/k + n_test/n_train = 0.1 + 0.25 = 0.35</code>.</td></tr><tr><th>Step 2</th><td>Corrected variance = <code>var(d) × 0.35</code>, with var(d) = 0.0101² = 0.000102. So the variance is 0.0000357, and its square root is 0.00598.</td></tr><tr><th>Step 3</th><td>Corrected t = −0.0134 / 0.00598 = −2.24 (code: −2.25; rounding).</td></tr><tr><th>Answer</th><td>Corrected p = 0.051. The naive test said "very significant" (p = 0.002); the honest test says "borderline". Always prefer the corrected version for CV scores.</td></tr><tr><th>Check</th><td>The corrected standard error 0.00598 is bigger than the naive 0.00319 by a factor √(0.35 × 10) = 1.87. The t shrinks by the same factor: 4.21 / 1.87 = 2.25. Good.</td></tr><tr><th>Why it matters</th><td>Naive CV t-tests produce false "wins", which cost companies real money when a worse model ships.</td></tr></table>
+<h3>McNemar's test and the bootstrap on the hold-out set</h3>
+<pre class="code lang-python"><code>pa = gb.predict(Xte) == yte; pb = lr.predict(Xte) == yte
+b = int((pa &amp; ~pb).sum()); c = int((~pa &amp; pb).sum())
+stat = (abs(b - c) - 1)**2 / (b + c)
+print("b", b, "c", c, "mcnemar", round(stat, 3), "p", round(stats.chi2.sf(stat, 1), 4))
+rb = np.random.default_rng(0); ds = []
+pg = gb.predict_proba(Xte)[:, 1]; pl = lr.predict_proba(Xte)[:, 1]
+for _ in range(1000):
+    i = rb.integers(0, len(yte), len(yte))
+    ds.append(roc_auc_score(yte[i], pg[i]) - roc_auc_score(yte[i], pl[i]))
+print("boot diff", np.mean(ds).round(4), np.percentile(ds, [2.5, 97.5]).round(4))</code></pre>
+<pre class="code lang-text"><code>b 51 c 64
+mcnemar 1.252 p 0.2631
+boot diff -0.0216 [-0.034 -0.008]</code></pre>
+<p>Here <code>b = 51</code> rows were right for boosting and wrong for logistic regression, and <code>c = 64</code> rows the reverse. The test statistic is <code>(|b − c| − 1)² / (b + c) = (13 − 1)² / 115 = 144 / 115 = 1.252</code>, p = 0.26. On accuracy, the two models are not distinguishable on this test set: the models disagree on only 115 rows, and the split is 51 versus 64. Yet the bootstrap on AUC says boosting is lower by 0.022 with a 95% interval of [−0.034, −0.008], which excludes zero. Why do the two tests disagree? They measure different things: McNemar looks at accuracy at a 0.5 threshold, the bootstrap at ranking quality (AUC). <strong>Pick the metric that matches the business decision first, then test that metric.</strong></p>
+<h3>The decision</h3>
+<ul><li>Logistic regression has AUC 0.741, boosting 0.728. After the correction, the difference is borderline; the bootstrap says logistic regression is better.</li><li>Logistic regression is simpler, faster and explainable.</li><li><strong>Decision:</strong> ship logistic regression (with the <code>new_calls</code> feature from 10.3), run an A/B test, and keep boosting as a challenger. A flexible model does not always win; on small noisy tabular data, it often does not.</li></ul>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example value</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Paired folds</td><td>same <code>RepeatedStratifiedKFold</code> object for all models</td><td>experiment code in a notebook or pipeline</td></tr><tr><td>Mean paired difference</td><td>−0.0134 AUC</td><td>a table in the model-selection report</td></tr><tr><td>Corrected p-value</td><td>0.051</td><td>the sentence "difference is borderline" in a review</td></tr><tr><td>A/B test</td><td>2 weeks, 50/50 traffic</td><td>final proof before full rollout</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Machine Learning:</strong> model selection reports with intervals, not single numbers.</li><li><strong>MLOps:</strong> champion versus challenger gates before deployment.</li><li><strong>Data Analytics:</strong> comparing two forecast methods for the next quarter.</li><li><strong>GenAI:</strong> comparing two prompts or two LLM versions on the same 200 test questions uses the same paired logic.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Comparing models on different splits (different random seeds). A model can win just by getting an easier split.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Running 50 experiments, reporting the best one on the test set. The best of 50 is biased upward. Chapter 11 returns to this with nested validation.</div></div>
+<div class="callout cream"><div class="lab">INTERVIEW TIP</div><div class="txt">If asked "model B has 0.5% higher accuracy, do we ship?", answer: "I need a paired comparison with an interval, the cost of the extra complexity, and an online test. Half a percent may be noise."</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why do we pair folds? Answer: Fold difficulty affects both models equally; pairing cancels it and makes the comparison more sensitive.</li><li>Why correct the CV t-test? Answer: Folds share training data, so scores are correlated and the naive variance is too small.</li><li>Two models are within noise. Which do you ship? Answer: The simpler, cheaper one.</li></ol>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>First check the pipeline: dummy baseline, shuffled labels (score must fall to chance), tiny-subset overfit, and suspicious top features.</li><li>AUC near 1.0 on a messy business problem is a leakage alarm, not a celebration.</li><li>Learning curves tell you if more data helps (rising validation curve, big gap) or not (flat, small gap means high bias).</li><li>Validation curves show where flexibility turns into memorising: training rose to 0.999 while validation fell to 0.676.</li><li>Error analysis: score each row, read the worst 30 to 50, slice by segment, fix the biggest systematic cluster first.</li><li>The worst-loss rows are often label noise; slices find fixable problems that averages hide (a 3.4% segment under-predicted by 22 points).</li><li>Compare models on identical folds, using paired differences; correct the CV t-test; use McNemar or bootstrap on a hold-out; choose the metric first.</li><li>If differences are within noise, ship the simpler model, then confirm with an online A/B test.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Tool</th><th>Command / formula</th></tr></thead><tbody><tr><td>Baseline</td><td><code>DummyClassifier(strategy='prior')</code></td></tr><tr><td>Learning curve</td><td><code>learning_curve(model, X, y, train_sizes=[...], cv=cv, scoring=...)</code></td></tr><tr><td>Validation curve</td><td><code>validation_curve(model, X, y, param_name=..., param_range=...)</code></td></tr><tr><td>Per-row log loss</td><td><code>−(y·ln p + (1−y)·ln(1−p))</code></td></tr><tr><td>Paired t</td><td><code>t = mean(d) / (sd(d)/√k)</code></td></tr><tr><td>Corrected variance</td><td><code>var(d) × (1/k + n_test/n_train)</code></td></tr><tr><td>McNemar</td><td>`(</td></tr><tr><td>Bootstrap CI</td><td>resample test rows 1,000 times, take 2.5 and 97.5 percentiles</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 10.P.1 (easy)</span> 1,000 emails, 950 are not spam. What accuracy does "always not spam" get?</p>
+<p><strong>Answer:</strong> 950 / 1000 = 95%. Any real spam model must beat that (and we should look at recall).</p>
+<p class="problem"><span class="pl">Problem 10.P.2 (easy)</span> Per-row log loss for y = 0 and p = 0.9?</p>
+<p><strong>Answer:</strong> −(0·ln 0.9 + 1·ln(0.1)) = −ln(0.1) = 2.303.</p>
+<p class="problem"><span class="pl">Problem 10.P.3 (easy)</span> After shuffling training labels, your validation AUC is 0.52. Healthy or not?</p>
+<p><strong>Answer:</strong> Healthy; it is near the 0.5 chance level.</p>
+<p class="problem"><span class="pl">Problem 10.P.4 (what is the output?)</span> Fold scores for A are [0.80, 0.82, 0.78, 0.84], for B [0.79, 0.80, 0.77, 0.82]. What is mean(d)?</p>
+<p><strong>Answer:</strong> d = [0.01, 0.02, 0.01, 0.02]; mean = 0.015.</p>
+<p class="problem"><span class="pl">Problem 10.P.5 (medium)</span> For the d in 10.P.4, compute the paired t statistic.</p>
+<p><strong>Answer:</strong> mean = 0.015. Deviations: −0.005, 0.005, −0.005, 0.005; squares sum 0.0001; sample variance = 0.0001 / 3 = 0.0000333; sd = 0.005774. SE = 0.005774 / √4 = 0.002887. t = 0.015 / 0.002887 = 5.20 (3 degrees of freedom, p about 0.014). With only 4 folds and the correction factor, it would be much weaker; be careful.</p>
+<p class="problem"><span class="pl">Problem 10.P.6 (find the bug)</span> <code>train_test_split</code> is called with a different <code>random_state</code> for each model, and the results are compared. What is wrong?</p>
+<p><strong>Answer:</strong> Each model sees a different test set, so differences may come from split luck. Use one split (or one CV object) for all models.</p>
+<p class="problem"><span class="pl">Problem 10.P.7 (medium)</span> Training AUC 0.98, validation 0.76, and the gap barely changes from 50% to 100% of the data. What do you try?</p>
+<p><strong>Answer:</strong> High variance that more data does not fix at this scale. Try regularization, shallower trees, fewer features, or stronger early stopping; and look for leakage differences between train and validation.</p>
+<p class="problem"><span class="pl">Problem 10.P.8 (scenario)</span> Overall accuracy is 91%. Slice by device: mobile 94% (80% of rows), desktop 70% (20% of rows). Check the overall number.</p>
+<p><strong>Answer:</strong> 0.8 × 94 + 0.2 × 70 = 75.2 + 14 = 89.2%, not 91%. So the stated numbers are inconsistent: someone made an arithmetic or slicing error, which is itself a finding. Weighted slice metrics must reproduce the overall number.</p>
+<p class="problem"><span class="pl">Problem 10.P.9 (interview)</span> "How would you debug a model that works offline and fails in production?"</p>
+<p><strong>Answer:</strong> Check training-serving skew (different feature code paths), leakage (features not available at prediction time), distribution shift between training period and live data, and data pipeline bugs such as units or missing values. Compare feature distributions between training and logged serving data, and slice errors by time.</p>
+<p class="problem"><span class="pl">Problem 10.P.10 (interview)</span> "Your new model has +0.4% AUC over the old one in CV. Do you deploy?"</p>
+<p><strong>Answer:</strong> Not on that alone. I would pair the folds, compute a corrected interval, check the gain on important slices, consider latency and maintenance, and run an A/B test. If the interval includes zero, I keep the simpler one.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me the four sanity tests for a machine learning pipeline (dummy baseline, shuffled labels, tiny-subset overfit, suspicious feature importance). Explain each with a small scikit-learn example, tell me exactly what output I should expect when the pipeline is healthy and when it is broken, and then check my understanding with three short questions, one at a time, waiting for my answers.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me how to read learning curves and validation curves to decide between "more data", "more regularization", or "better features". Use a numeric example with training and validation scores at five data sizes, explain bias and variance in plain English, and give me 8 graded exercises (easy to hard) with different curve shapes. Do not show the solutions until I ask.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Walk me through error analysis on a classifier: per-row loss, reading the worst rows, slice analysis, and deciding what to fix first. I will paste my model's predictions and a few columns below. Ask me for what you need, then guide me step by step to find the biggest systematic error and explain why average metrics can hide it. [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me how to compare two models properly: paired folds, paired t-test on cross-validation scores, the Nadeau-Bengio correction, McNemar's test, and bootstrap intervals. Use small made-up fold scores and compute everything by hand with me, line by line. Then quiz me one question at a time on when each method is the right choice.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles and preparing for ML interviews. Run a mock interview on debugging and comparing models: sanity tests, leakage, learning curves, error analysis, offline-versus-online evaluation. Ask me one question at a time, wait for my spoken-style answer, then give feedback on correctness and clarity, and a model answer in simple English. Do ten questions, harder each time.</pre></div><div class="readbtn"><button class="btn" data-read="study:ml:ch10">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch09.html">← Chapter 9: Metrics, Thresholds, Calibration, Uncert</a><a class="btn" href="ch11.html">Chapter 11: Hyperparameter Tuning, Optimization, and →</a></div></div><script src="../../assets/study.js"></script></body></html>

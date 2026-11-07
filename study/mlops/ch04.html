@@ -1,0 +1,154 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 4: Data and Model Versioning</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 4</div><h1>Data and Model Versioning</h1><p>Code lives in git. Data and models are too big for git, so we version them another way.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-4-1-versioning-data-with-content-hashes-the-dvc-idea">4.1 Versioning Data with Content Hashes (the DVC Idea)</a></li><li><a href="#s2-4-2-table-level-versioning-delta-iceberg-lakefs">4.2 Table-Level Versioning: Delta, Iceberg, lakeFS</a></li><li><a href="#s3-4-3-datasheets-and-model-cards">4.3 Datasheets and Model Cards</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>Your model scored well in March. In June it scores badly. Was the code different? The settings? Or did somebody quietly change the training table? With code in git you can check the first two. For the third you need the data version. This chapter shows how teams version data and models: by content hashes and small "pointer" files (the idea behind DVC), by time travel in table formats (Delta Lake, Iceberg), and by documents that describe data and models for humans (datasheets and model cards). You will build a small DVC-like tool that really runs, compare two versions of a table row by row, and write a model card. By the end you can answer: "Which exact data trained the model in production?"</p>
+<p>Words you need:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Hash</td><td>A short fingerprint computed from content. Change one byte and the fingerprint changes.</td></tr><tr><td>Pointer file</td><td>A tiny text file in git that says "the real data has this hash".</td></tr><tr><td>Object store</td><td>Cheap storage for big files (S3, Azure Blob, Google Cloud Storage).</td></tr><tr><td>Snapshot</td><td>The state of a table at one moment.</td></tr><tr><td>Time travel</td><td>Reading a table as it was at an earlier snapshot or time.</td></tr><tr><td>Lineage</td><td>The recorded chain "this model came from that data via that code".</td></tr></tbody></table></div>
+<h2 id="s1-4-1-versioning-data-with-content-hashes-the-dvc-idea">4.1 Versioning Data with Content Hashes (the DVC Idea)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Git is a filing cabinet for small paper notes. A 20 GB dataset does not fit in a drawer. So you put the big box in a warehouse, and in the drawer you keep a small label that says "box number 9e2f9675, in the warehouse". Anyone with the label can fetch exactly that box.</div></div>
+<h3>How DVC works</h3>
+<p><strong>DVC</strong> (Data Version Control) is an open-source tool that does this for you:</p>
+<ol><li><code>dvc add data/train.csv</code> computes the file's hash and creates <code>data/train.csv.dvc</code>, a small text pointer. It also tells git to ignore the big file.</li><li>You commit the pointer to git. The pointer is versioned like code.</li><li><code>dvc push</code> copies the real file to remote storage (S3, GCS, Azure, a shared disk), stored under its hash.</li><li>Later, <code>git checkout &lt;old commit&gt;</code> followed by <code>dvc pull</code> brings back the matching data.</li></ol>
+<p>DVC can also define <strong>pipelines</strong> (<code>dvc.yaml</code>: stages with their input files, commands and outputs) so <code>dvc repro</code> re-runs only the stages whose inputs changed. DVC commands are <strong>not run here</strong> (the package was not installed); instead, we build the core mechanism ourselves in 20 lines. Check DVC's current docs for exact options.</p>
+<h3>Predict, run, explain</h3>
+<p>Before you run it: we version a file twice. How many objects will the store hold, and can we get version 1 back after overwriting?</p>
+<pre class="code lang-python"><code>import hashlib, json, pathlib, shutil
+ROOT = pathlib.Path("/tmp/lab/dvcdemo"); shutil.rmtree(ROOT, ignore_errors=True)
+(ROOT/"store").mkdir(parents=True)
+def add(path):
+    p = pathlib.Path(path); h = hashlib.md5(p.read_bytes()).hexdigest()
+    shutil.copy(p, ROOT/"store"/h)                       # warehouse: file stored under its hash
+    pointer = {"path": p.name, "md5": h, "size": p.stat().st_size}
+    pathlib.Path(str(p)+".ptr.json").write_text(json.dumps(pointer))   # the label
+    return pointer
+def checkout(ptr_file, dest):
+    ptr = json.loads(pathlib.Path(ptr_file).read_text()); shutil.copy(ROOT/"store"/ptr["md5"], dest)
+data = ROOT/"train.csv"
+data.write_text("age,churn\n25,0\n40,1\n33,0\n")
+p1 = add(data); print("v1 pointer:", p1)
+ptr1 = ROOT/"train.csv.ptr.json"; shutil.copy(ptr1, ROOT/"v1.ptr.json")   # "git commit" of the label
+data.write_text("age,churn\n25,0\n40,1\n33,0\n51,1\n")
+p2 = add(data); print("v2 pointer:", p2)
+checkout(ROOT/"v1.ptr.json", ROOT/"restored.csv")
+print("restored v1 content:", repr((ROOT/"restored.csv").read_text()))
+print("store objects:", sorted(x.name[:8] for x in (ROOT/"store").iterdir()))</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>v1 pointer: {'path': 'train.csv', 'md5': 'd84419260803271dae7e51757036ba54', 'size': 25}
+v2 pointer: {'path': 'train.csv', 'md5': '9e2f967547017dd95deb0ea4b0f04136', 'size': 30}
+restored v1 content: 'age,churn\n25,0\n40,1\n33,0\n'
+store objects: ['9e2f9675', 'd8441926']</code></pre>
+<p><strong>Explain.</strong> <code>md5</code> is a hashing function (it is fine as a fingerprint here; it is not used for security). The store has two objects, one per distinct content, named by their hash. After we overwrote <code>train.csv</code>, the saved v1 label still pointed to <code>d8441926...</code>, and <code>checkout</code> brought back the old text exactly. Size went from 25 to 30 bytes: the extra line <code>51,1\n</code> is 5 bytes. That is real DVC's core trick: storage by hash, versioning by tiny pointers in git.</p>
+<p class="problem"><span class="pl">Problem 4.1.1</span> Verify the byte sizes: the v1 file is <code>age,churn\n25,0\n40,1\n33,0\n</code>. Count its characters.</p>
+<table class="steps"><tr><th>Formula</th><td>size = sum of characters including each newline</td></tr><tr><th>Plug in</th><td><code>age,churn</code> = 9 chars + 1 newline; <code>25,0</code> = 4 + 1; <code>40,1</code> = 4 + 1; <code>33,0</code> = 4 + 1</td></tr><tr><th>Compute</th><td>(9 + 1) + (4 + 1) + (4 + 1) + (4 + 1) = 10 + 5 + 5 + 5 = 25</td></tr><tr><th>Answer</th><td>25 bytes, matching the pointer's <code>size: 25</code> (all characters are plain ASCII, one byte each).</td></tr><tr><th>Check</th><td>Adding <code>51,1\n</code> (4 + 1 = 5 bytes) gives 30, matching v2's size.</td></tr><tr><th>Why it matters</th><td>Sizes in pointers give a free quick sanity check before you trust a download.</td></tr></table>
+<p class="problem"><span class="pl">Problem 4.1.2</span> Two team members both ran <code>add</code> on identical file content. How many objects land in the store, and why is that nice?</p>
+<table class="steps"><tr><th>Step 1</th><td>Identical content gives an identical hash.</td></tr><tr><th>Step 2</th><td>The second <code>add</code> copies to the same filename, overwriting with identical bytes.</td></tr><tr><th>Answer</th><td>One object. Content-addressed storage de-duplicates automatically, so 10 experiments that share the same 20 GB dataset cost 20 GB, not 200 GB.</td></tr><tr><th>Check</th><td><code>len(set(hashes))</code> equals the number of distinct contents.</td></tr></table>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> git repo (small)                      object store (big)
+ train.csv.ptr.json -&gt; md5 9e2f9675 -&gt; [ 9e2f9675... the actual 30 bytes ]
+ (old commit)  ptr  -&gt; md5 d8441926 -&gt; [ d8441926... the old 25 bytes   ]</code></pre>
+<p>Read it as: git remembers the label history, the object store remembers the contents, and the hash is the thread joining them.</p>
+<h3>Connection to the real job</h3>
+<p>"Which data trained the production model?" is answered by: model version, to run, to data pointer (hash). Put the hash in the tracker as a parameter (Chapter 3). In everyday terms: a bakery keeps the recipe and also records which batch of flour it used, because the same recipe on different flour gives a different loaf.</p>
+<h3>Applications</h3>
+<ul><li><strong>Machine Learning</strong>: reproduce an experiment on exactly the same training set.</li><li><strong>MLOps</strong>: pipelines that rebuild only the changed stages.</li><li><strong>Data Engineering</strong>: audit trails for regulated data.</li><li><strong>Analytics</strong>: reproduce last quarter's report numbers.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Committing a 2 GB CSV into git. The repository becomes slow forever, because git keeps every version in history. Use pointers (DVC, git-lfs) or store data in a bucket and record its path and hash.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does the pointer file contain?</li></ol>
+<p>Answer: The path, hash and size of the real data file.</p>
+<ol><li>Why store objects under their hash?</li></ol>
+<p>Answer: Identical content is stored once, and the name proves the content has not changed.</p>
+<ol><li>If one byte of the data changes, what happens to the hash?</li></ol>
+<p>Answer: It changes completely, so the pointer changes too.</p>
+<h2 id="s2-4-2-table-level-versioning-delta-iceberg-lakefs">4.2 Table-Level Versioning: Delta, Iceberg, lakeFS</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Bank statements. You cannot erase a past transaction; each new transaction is added, and you can always ask "what was my balance on 1 March?" Table formats keep a log of changes so you can read the table "as of" any earlier point.</div></div>
+<h3>Definitions</h3>
+<p>Modern data lakes store tables as Parquet files plus a <strong>transaction log</strong> that records which files belong to each version. Because old files and old log entries remain, you can <strong>time travel</strong>.</p>
+<ul><li><strong>Delta Lake</strong> and <strong>Apache Iceberg</strong>: table formats with versions (snapshots), ACID transactions (changes are all-or-nothing), schema evolution and time travel.</li><li><strong>lakeFS</strong>: gives a git-like layer over an object store: branches, commits and merges for whole data lakes, so you can test a data change on a branch before merging.</li></ul>
+<p>Standard syntax (Spark SQL on Delta, <strong>not run here</strong>; Iceberg has similar <code>VERSION AS OF</code> forms but check your engine's docs):</p>
+<pre class="code lang-sql"><code>-- read the table as of version 12
+SELECT * FROM churn_training VERSION AS OF 12;
+-- read the table as of a timestamp
+SELECT * FROM churn_training TIMESTAMP AS OF '2026-03-01';
+-- see the history of changes
+DESCRIBE HISTORY churn_training;</code></pre>
+<p>Training with "as of" dates is how you recreate a past training set. Old versions are kept only until you run cleanup (<code>VACUUM</code> in Delta), so decide a retention period that matches how far back you must reproduce.</p>
+<h3>A row-level diff you can run</h3>
+<p>Time travel is useful only if you can see <em>what changed</em>. We compare two versions of a tiny table by hashing each row.</p>
+<pre class="code lang-python"><code>import pandas as pd, hashlib
+v1 = pd.DataFrame({"id":[1,2,3,4],"age":[25,40,33,51],"churn":[0,1,0,1]})
+v2 = pd.DataFrame({"id":[1,2,3,5],"age":[25,41,33,29],"churn":[0,1,0,0]})
+def rowhash(df): return df.set_index("id").apply(lambda r: hashlib.md5(str(tuple(r)).encode()).hexdigest()[:6], axis=1)
+a, b = rowhash(v1), rowhash(v2)
+added = sorted(set(b.index)-set(a.index)); removed = sorted(set(a.index)-set(b.index))
+changed = sorted(i for i in set(a.index)&amp;set(b.index) if a[i]!=b[i])
+print("added:", added, "removed:", removed, "changed:", changed)
+print("positive rate v1:", v1.churn.mean(), "v2:", v2.churn.mean())</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>added: [5] removed: [4] changed: [2]
+rows v1: 4 rows v2: 4 positive rate v1: 0.5 v2: 0.25</code></pre>
+<p>(The script also printed the row counts shown in the second line.) <strong>Explain.</strong> Customer 4 left the table, customer 5 appeared, customer 2's age changed from 40 to 41. The row count is still 4 in both versions, which hides all that movement: a count-only check would say "no change". But the positive rate dropped from 0.5 to 0.25, which is a large shift. A model trained on v2 may behave differently from one trained on v1, and now you know why.</p>
+<p class="problem"><span class="pl">Problem 4.2.1</span> Positive rate v1 = 2 positives of 4; v2 = 1 positive of 4. Compute the change in percentage points and relative change.</p>
+<table class="steps"><tr><th>Formula</th><td>change = new − old; relative = change ÷ old</td></tr><tr><th>Plug in</th><td>0.25 − 0.50; and −0.25 ÷ 0.50</td></tr><tr><th>Compute</th><td>−0.25 (that is 25 points down); −0.25 ÷ 0.50 = −0.5</td></tr><tr><th>Answer</th><td>The positive rate fell by 25 percentage points, a 50% relative drop.</td></tr><tr><th>Check</th><td>v1 positives: 0 + 1 + 0 + 1 = 2 of 4 = 0.5. v2: 0 + 1 + 0 + 0 = 1 of 4 = 0.25. Matches.</td></tr><tr><th>Why it matters</th><td>Label-rate shifts between data versions change metrics like precision and calibration; always compare label rates when comparing models trained on different versions.</td></tr></table>
+<p class="problem"><span class="pl">Problem 4.2.2</span> A regulator asks you to reproduce the training set used on 15 January, but your table runs <code>VACUUM</code> every 7 days and it is now 10 March. What happens?</p>
+<table class="steps"><tr><th>Step 1</th><td><code>VACUUM</code> deletes old data files that are no longer needed for versions inside the retention period.</td></tr><tr><th>Step 2</th><td>54 days have passed (16 days left in January + 28 in February + 10 in March = 54), far more than 7.</td></tr><tr><th>Step 3</th><td>Time travel to 15 January likely fails because the files are gone.</td></tr><tr><th>Answer</th><td>You cannot reproduce it from the table. This is why important training sets are also snapshotted with a hash (Section 4.1) and the retention policy is set to match audit needs.</td></tr><tr><th>Check</th><td>16 + 28 + 10 = 54 days (2026 is not a leap year).</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Delta/Iceberg time travel and DVC solve slightly different problems: tables that change constantly versus frozen training files. Mature teams use both: the pipeline reads "as of" a version and writes the version number into the run's parameters.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering</strong>: safe rollback after a bad pipeline write; audit.</li><li><strong>MLOps</strong>: re-create training sets, compare data versions.</li><li><strong>Analytics</strong>: restate a historical dashboard exactly.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Assuming time travel is forever. Old versions are removed by cleanup jobs. Check the retention setting before you promise reproducibility.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does <code>VERSION AS OF 12</code> do?</li></ol>
+<p>Answer: Reads the table exactly as it was at version 12.</p>
+<ol><li>Why can an unchanged row count still hide big changes?</li></ol>
+<p>Answer: Rows can be swapped or edited without changing the total.</p>
+<ol><li>What does lakeFS add?</li></ol>
+<p>Answer: Git-style branches, commits and merges over a data lake.</p>
+<h2 id="s3-4-3-datasheets-and-model-cards">4.3 Datasheets and Model Cards</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Medicine comes with a leaflet: what it is for, who should not take it, side effects. Data and models need leaflets too, written for people who were not in the room when you built them.</div></div>
+<h3>Definitions</h3>
+<p>A <strong>datasheet for a dataset</strong> answers: why was it created, who collected it, how, what is in it, what is missing, what uses are inappropriate, how is it maintained. A <strong>model card</strong> is a short document for a model: intended use, training data, evaluation data, metrics (overall and per group), limits, ethical notes and contact owner. Both are written in plain language and stored next to the artifact (and in the registry, Chapter 3).</p>
+<h3>A model card template</h3>
+<p>This is a template, not program output; numbers shown are placeholders from the earlier tracker example:</p>
+<pre class="code lang-text"><code># Model card: churn-logreg v2
+Intended use: rank customers for a retention call list. NOT for pricing or credit decisions.
+Training data: churn table, version pointer md5 9e2f9675... (N rows, collected Jan-Dec)
+Evaluation: held-out 450 rows, test accuracy 0.8356
+Per-group results: [fill in: by region, by age band]  &lt;- required before launch
+Known limits: trained on one region; performance elsewhere unknown.
+Risks: wrongly flagged customers get an unneeded call; low severity.
+Owner: ml-platform team. Review date: 6 months.</code></pre>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> dataset v2 --(datasheet: what, why, who, gaps)--&gt; training run --(model card: use, limits)--&gt; registry v2 --&gt; serving</code></pre>
+<p class="problem"><span class="pl">Problem 4.3.1</span> Overall accuracy is 0.83. Region A (800 test rows) has accuracy 0.90 and region B (200 rows) has 0.62. Is the overall number consistent, and what does the card need?</p>
+<table class="steps"><tr><th>Formula</th><td>weighted accuracy = (n_A × acc_A + n_B × acc_B) ÷ (n_A + n_B)</td></tr><tr><th>Plug in</th><td>(800 × 0.90 + 200 × 0.62) ÷ 1,000</td></tr><tr><th>Compute</th><td>720 + 124 = 844; 844 ÷ 1,000 = 0.844</td></tr><tr><th>Answer</th><td>The weighted overall is 0.844 (a little above 0.83, so those exact numbers do not match; if the card says 0.83 it must be rechecked). More importantly, region B is 28 points worse, and the card must state per-group results.</td></tr><tr><th>Check</th><td>0.844 lies between 0.62 and 0.90, closer to 0.90 because region A has 4 times more rows. A weighted mean always lies between the group values.</td></tr><tr><th>Why it matters</th><td>An average can hide a group the model fails. Fairness and safety reviews begin with per-group metrics.</td></tr></table>
+<p class="problem"><span class="pl">Problem 4.3.2</span> List four items a datasheet must tell a new data scientist about a customer table.</p>
+<table class="steps"><tr><th>Step 1</th><td>Origin and collection method (CRM export, consent given?).</td></tr><tr><th>Step 2</th><td>Contents: columns, units, time range, label definition (what exactly is "churn"?).</td></tr><tr><th>Step 3</th><td>Known gaps and biases (missing regions, duplicate customers).</td></tr><tr><th>Step 4</th><td>Allowed and forbidden uses, and retention rules.</td></tr><tr><th>Answer</th><td>Origin, contents with definitions, gaps and bias, allowed use plus retention.</td></tr><tr><th>Check</th><td>A new colleague should be able to decide "may I use this table for X?" from the sheet alone.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Model cards are now common in regulated industries and are asked for in audits (and in responsible-AI reviews). They also save time: the next person does not need to interview you. Add reproducibility notes (Chapter 2): lock file, seeds, hardware.</p>
+<h3>Applications</h3>
+<ul><li><strong>Compliance</strong>: banks, healthcare and insurance require documentation.</li><li><strong>MLOps</strong>: card stored in the registry as part of promotion.</li><li><strong>GenAI</strong>: model and dataset cards for open-source models on public hubs.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Writing the card after launch, once, and never updating it. Treat it like code: update with every new version and review it in the pull request.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Who reads a model card?</li></ol>
+<p>Answer: Reviewers, engineers using the model, auditors, and future you.</p>
+<ol><li>What is the difference between a datasheet and a model card?</li></ol>
+<p>Answer: A datasheet describes a dataset; a model card describes a trained model.</p>
+<ol><li>Why per-group metrics?</li></ol>
+<p>Answer: An overall average can hide poor performance on a subgroup.</p>
+<h2 id="s4-chapter-recap">Chapter recap</h2>
+<ul><li>Version data by content hash; keep small pointers in git and big files in object storage.</li><li>Same content gives the same hash, so identical files are stored once.</li><li>DVC does this and adds reproducible pipelines (<code>dvc.yaml</code>); not run here.</li><li>Delta and Iceberg keep snapshots so you can time travel; cleanup jobs limit how far back.</li><li>lakeFS adds git-like branches to data lakes.</li><li>A row-level diff reveals changes a row count hides (our positive rate fell from 0.5 to 0.25).</li><li>Datasheets document data; model cards document models; both go with the registry.</li><li>The key question to answer for any model: which code, data, config and environment produced it?</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Meaning</th></tr></thead><tbody><tr><td><code>hashlib.md5(bytes).hexdigest()</code></td><td>Fingerprint of a file</td></tr><tr><td><code>dvc add / push / pull</code></td><td>Version, upload, restore data (not run here)</td></tr><tr><td><code>VERSION AS OF n</code></td><td>Read an older table snapshot</td></tr><tr><td><code>weighted acc = Σ nᵢ·accᵢ ÷ Σ nᵢ</code></td><td>Combine group accuracies</td></tr></tbody></table></div>
+<h2 id="s5-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 4.1</span> What is stored in a DVC pointer file? <strong>Answer:</strong> The hash, size and path of the real data.</p>
+<p class="problem"><span class="pl">Problem 4.2</span> Two files with identical bytes have different names. Same hash? <strong>Answer:</strong> Yes. The hash depends only on content.</p>
+<p class="problem"><span class="pl">Problem 4.3</span> What is the output? <code>hashlib.md5(b"abc").hexdigest()[:6]</code> <strong>Answer:</strong> <code>900150</code>. (MD5 of "abc" is 900150983cd24fb0d6963f7d28e17f72.)</p>
+<p class="problem"><span class="pl">Problem 4.4</span> A table shows 1,000,000 rows in both versions. Can data have changed? <strong>Answer:</strong> Yes: edits, swapped rows, changed values. Compare row hashes or key statistics.</p>
+<p class="problem"><span class="pl">Problem 4.5</span> Find the bug: the team stores <code>train.csv</code> (3 GB) in git and wonders why <code>git clone</code> takes 20 minutes. <strong>Answer:</strong> Large binaries in git history. Move to DVC or object storage with pointers.</p>
+<p class="problem"><span class="pl">Problem 4.6</span> Group A: 600 rows, accuracy 0.80. Group B: 400 rows, accuracy 0.70. Overall? <strong>Answer:</strong> (480 + 280) ÷ 1,000 = 0.76.</p>
+<p class="problem"><span class="pl">Problem 4.7</span> Retention is 30 days and an audit asks for a 45-day-old training set. Options? <strong>Answer:</strong> It is probably gone from time travel. Restore from a hashed snapshot, or extend retention for training sets and snapshot them at training time.</p>
+<p class="problem"><span class="pl">Problem 4.8</span> Why record the data hash as a parameter in the tracker? <strong>Answer:</strong> It links each run and model to the exact data, enabling reproduction and audits.</p>
+<p class="problem"><span class="pl">Problem 4.9 (interview)</span> "How do you version data for ML?" <strong>Answer:</strong> Content-addressed storage with pointers in git (DVC), or table-format snapshots with time travel for changing tables; record the version in the run; document with datasheets; set retention to match audit needs.</p>
+<p class="problem"><span class="pl">Problem 4.10 (interview)</span> "A model's accuracy fell after a retrain. How can data versioning help?" <strong>Answer:</strong> Diff the data versions: row counts, label rate, null rates, key feature distributions. Retrain the old code on the old data to separate data effects from code effects.</p>
+<h2 id="s6-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps, and English is my second language. Explain data versioning for ML: content hashes, pointer files, DVC pipelines, and remote storage. Use a warehouse-and-label analogy first. Walk me through a DVC workflow in git step by step, saying clearly which commands I should verify in the current docs. Ask me a check question after each step.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Teach me table-format time travel in Delta Lake and Apache Iceberg, plus lakeFS branches. Compare them in a table: what each versions, typical use, retention and cleanup risks. Then give me 8 graded exercises without solutions about reproducing a past training set. Offer to check my answers.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Teach me how to write a good datasheet for a dataset and a model card for a model. Show a complete example for a customer-churn project, explain every section in simple English, and include per-group metrics and limits. Then ask me to draft one for my own project and review it.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Review my data versioning approach and retention policy for compliance and reproducibility. Look for gaps: large files in git, missing hashes, no lineage from model to data, cleanup that breaks audits. My notes: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Run a mock interview on data and model versioning, lineage and documentation. Ask one question at a time, grade each answer out of 10, give a model answer, and finish with my weakest areas and a one-week study plan.</pre></div><div class="readbtn"><button class="btn" data-read="study:mlops:ch04">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch03.html">← Chapter 3: Experiment Tracking and the Model Regist</a><a class="btn" href="ch05.html">Chapter 5: Feature Stores and Data Validation for M →</a></div></div><script src="../../assets/study.js"></script></body></html>

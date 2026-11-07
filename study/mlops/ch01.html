@@ -1,0 +1,207 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 1: From Notebook to Production</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#2b4fd6"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 1</div><h1>From Notebook to Production</h1><p>Why a model that works on your laptop is only 10% of an ML system, and how to think about the other 90%.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-1-1-the-ml-system-lifecycle">1.1 The ML System Lifecycle</a></li><li><a href="#s2-1-2-training-serving-skew">1.2 Training-Serving Skew</a></li><li><a href="#s3-1-3-technical-debt-in-ml-systems">1.3 Technical Debt in ML Systems</a></li><li><a href="#s4-1-4-software-engineering-for-ml-and-project-structure">1.4 Software Engineering for ML and Project Structure</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>Imagine you build a model in a notebook. It scores 92% accuracy. Your manager says "great, put it in the app." Two weeks later the app shows 52% accuracy, nobody knows why, and the model cannot be rebuilt because the notebook was edited ten times. This chapter explains why that happens and what a professional does about it. A related story is a new recipe that tastes perfect in the test kitchen and fails in the restaurant because the ovens and ingredients were different. ML has the same problem, with extra traps. By the end of this chapter you will be able to draw the full life of an ML system, explain <strong>training-serving skew</strong> with a number you measured, name the common kinds of ML "technical debt", choose between batch and online prediction using arithmetic, and lay out a project folder that a team can maintain.</p>
+<p>Words you need in this chapter:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Model</td><td>A function learned from data. Input features go in, a prediction comes out.</td></tr><tr><td>Training</td><td>The one-time (or periodic) job that learns the model from old data.</td></tr><tr><td>Serving (inference)</td><td>Using the trained model to make predictions on new data, usually many times.</td></tr><tr><td>Feature</td><td>One input number or category the model uses, for example "orders in last 30 days".</td></tr><tr><td>Production</td><td>The real system that real users or other systems depend on.</td></tr><tr><td>Pipeline</td><td>A chain of steps run in order, each step feeding the next.</td></tr></tbody></table></div>
+<h2 id="s1-1-1-the-ml-system-lifecycle">1.1 The ML System Lifecycle</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of a restaurant. Cooking one great dish at home (the notebook) is not a restaurant. A restaurant needs buying ingredients, a repeatable recipe, quality checks, serving, and a way to learn from customer complaints. An ML system is the same: data in, a repeatable recipe, checks, serving, and a feedback loop.</div></div>
+<h3>How it works</h3>
+<p>An ML system is a loop with eight stages. Each stage has an owner, an input, and an output.</p>
+<figure><img src="images/lifecycle.svg" alt="The ML system lifecycle" loading="lazy"/><figcaption>The ML system lifecycle</figcaption></figure>
+<p>How to read this picture: each blue box is a stage and the grey arrows show the order. The orange arrow from Monitor back to Data is the most important part. It says the system is never "done". When monitoring sees that the world has changed (we call this <strong>drift</strong>, Chapter 10), the loop runs again.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Stage</th><th>What happens</th><th>Example artifact</th><th>Owner (usually)</th></tr></thead><tbody><tr><td>Data</td><td>Collect and clean raw data</td><td>A Parquet table of orders</td><td>Data engineer</td></tr><tr><td>Features</td><td>Turn raw data into model inputs</td><td><code>orders_30d</code>, <code>avg_basket</code></td><td>Data scientist, data engineer</td></tr><tr><td>Train</td><td>Learn model parameters</td><td>A model file, a metrics report</td><td>Data scientist, ML engineer</td></tr><tr><td>Validate</td><td>Test that the model is good enough and safe</td><td>Evaluation report, behaviour tests</td><td>ML engineer</td></tr><tr><td>Registry</td><td>Store the approved model with its history</td><td>"churn model, version 7"</td><td>ML / MLOps engineer</td></tr><tr><td>Deploy</td><td>Put the model behind an API or a batch job</td><td>A running container</td><td>MLOps, SRE</td></tr><tr><td>Monitor</td><td>Watch health, data and accuracy</td><td>Dashboards, alerts</td><td>MLOps, SRE</td></tr><tr><td>Retrain</td><td>Start the loop again with new data</td><td>A scheduled or triggered pipeline</td><td>MLOps</td></tr></tbody></table></div>
+<p><strong>MLOps</strong> is the short name for the practices that run this loop reliably: "ML" plus "Operations", like DevOps for models. An <strong>ML engineer</strong> or <strong>MLOps engineer</strong> owns the path from "a model exists" to "a model is running and watched".</p>
+<h3>System design starts from requirements</h3>
+<p>Before you build, you ask five questions. They decide everything else.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Requirement</th><th>Question</th><th>Example answer</th></tr></thead><tbody><tr><td>Latency</td><td>How fast must one answer come?</td><td>p95 under 100 ms</td></tr><tr><td>Throughput</td><td>How many predictions per second?</td><td>200 per second at peak</td></tr><tr><td>Freshness</td><td>How old may the input data be?</td><td>Features at most 1 hour old</td></tr><tr><td>Cost</td><td>What is the budget per 1,000 predictions?</td><td>Under $0.01</td></tr><tr><td>Reliability</td><td>What happens if the model is down?</td><td>Fall back to a simple rule</td></tr></tbody></table></div>
+<p>Three <strong>inference modes</strong> (ways of running predictions):</p>
+<ul><li><strong>Batch</strong>: score many rows at once on a schedule (for example every night). Cheap and simple. Predictions are stale until the next run.</li><li><strong>Online (real-time)</strong>: score one request when it arrives, through an API. Fast answers, but you pay for servers that wait for traffic.</li><li><strong>Streaming</strong>: score events as they flow through a message system such as Kafka. Used for fraud or sensor alerts.</li></ul>
+<p>Where does the model run? <strong>Cloud</strong> (your servers, easy to update) or <strong>edge</strong> (on the phone or device; works offline, low latency, hard to update).</p>
+<p class="problem"><span class="pl">Problem 1.1.1</span> A bank must score 2,000,000 customers each night for a "likely to leave" list. The batch window is 2 hours. What throughput does the batch job need? Would online serving be needed?</p>
+<table class="steps"><tr><th>Formula</th><td>throughput = rows ÷ seconds available</td></tr><tr><th>Plug in</th><td>2,000,000 ÷ (2 × 3,600)</td></tr><tr><th>Compute</th><td>2 hours = 7,200 seconds. 2,000,000 ÷ 7,200 = 277.8 rows per second (code check: <code>2_000_000/(2*3600)</code> printed <code>277.77777777777777</code>)</td></tr><tr><th>Answer</th><td>The job needs about 278 rows per second, which one ordinary machine can do. The list is read the next morning, so batch is enough and online serving would only add cost.</td></tr><tr><th>Check</th><td>278 × 7,200 = 2,001,600, which is just above 2,000,000.</td></tr><tr><th>Why it matters</th><td>Choosing batch over online can cut serving cost to almost zero. Always ask "who needs the answer, and when?" first.</td></tr></table>
+<p class="problem"><span class="pl">Problem 1.1.2</span> A card-fraud model must answer within 80 ms while the customer waits at a till. Which inference mode, and what does the 80 ms budget imply for the model?</p>
+<table class="steps"><tr><th>Step 1</th><td>The answer is needed while a human waits. A nightly list is useless, so batch is out.</td></tr><tr><th>Step 2</th><td>One transaction at a time, with an API call inside the payment flow, means online serving (or streaming if events are already on Kafka).</td></tr><tr><th>Step 3</th><td>The network, feature lookup and model all share the 80 ms. If network plus feature lookup take 50 ms, the model has about 30 ms. A huge model that needs 200 ms cannot be used; a small tree model can.</td></tr><tr><th>Answer</th><td>Online (or streaming) inference with a small, fast model, and a rule-based fallback if the model is slow.</td></tr><tr><th>Check</th><td>Add the budget: 50 ms + 30 ms = 80 ms. Good.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>In interviews, "design an ML system" always starts with these five requirements. Say them out loud before drawing any boxes. Your performance-testing background is a real advantage: you already think in latency, throughput and SLAs.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering</strong>: owns the Data and Features stages and their freshness.</li><li><strong>Machine Learning</strong>: owns Train and Validate.</li><li><strong>MLOps</strong>: owns Registry, Deploy, Monitor, Retrain.</li><li><strong>Product / Business</strong>: owns the requirement answers, for example "what is a bad prediction worth?".</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Treating the model file as the whole product. A model without a data pipeline, tests, monitoring and an owner is a demo. When someone says "the model is done", ask "who gets paged when it breaks?"</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Name the eight stages of the lifecycle in order.</li></ol>
+<p>Answer: Data, features, train, validate, registry, deploy, monitor, retrain.</p>
+<ol><li>A weekly marketing email list is scored. Batch or online?</li></ol>
+<p>Answer: Batch. Nobody waits for the answer, and weekly freshness is enough.</p>
+<ol><li>Why does the lifecycle picture have an arrow from Monitor back to Data?</li></ol>
+<p>Answer: The world changes, so the model decays. Monitoring triggers new data collection and retraining.</p>
+<h2 id="s2-1-2-training-serving-skew">1.2 Training-Serving Skew</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You study for an exam using a textbook in kilometres, and then the exam question gives distances in miles without telling you. You still use the same formulas, so you confidently get wrong answers. The model is the student. It does exactly what it learned, on inputs that mean something different.</div></div>
+<h3>Definition</h3>
+<p><strong>Training-serving skew</strong> is any difference between how data is prepared at training time and at serving time. The model code is fine. The inputs are not the same.</p>
+<p>Common causes:</p>
+<ul><li>The same feature is computed twice, once in the training notebook (pandas) and once in the service (a different language or team), and the two differ slightly.</li><li>Units or encodings change (centimetres vs metres, "M"/"F" vs 0/1).</li><li>Missing values are filled differently (mean in training, zero in serving).</li><li>Features are computed from data that is not available at serving time (this is <strong>leakage</strong>, Chapter 5).</li></ul>
+<p>The cure is simple to say and hard to do: <strong>one code path for feature logic</strong>, used by both training and serving, plus tests that compare the two.</p>
+<h3>Predict, run, explain</h3>
+<p>We train a model that predicts "high BMI" from height and weight. The training pipeline uses height in centimetres and standardises (subtract the mean, divide by the standard deviation, both learned from training data). Then a "serving team" sends height in metres by mistake.</p>
+<p>Before you run it, what do you think the accuracy will be when the serving side sends metres?</p>
+<pre class="code lang-python"><code>import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score
+rng = np.random.default_rng(42)
+n = 2000
+height_cm = rng.normal(170, 10, n)
+weight_kg = rng.normal(70, 12, n)
+bmi = weight_kg / (height_cm/100)**2
+y = (bmi + rng.normal(0, 1.5, n) &gt; 24.2).astype(int)
+def feats_train(h_cm, w):           # training pipeline: height in cm
+    return np.c_[h_cm, w]
+X = feats_train(height_cm, weight_kg)
+mu, sd = X.mean(0), X.std(0)
+Xs = (X - mu) / sd
+model = LogisticRegression().fit(Xs[:1500], y[:1500])
+print("test accuracy (same code path):", round(accuracy_score(y[1500:], model.predict(Xs[1500:])),3))
+h_m = height_cm / 100               # serving code written by another team
+Xserve = (np.c_[h_m, weight_kg] - mu) / sd
+print("test accuracy (serving sends metres):", round(accuracy_score(y[1500:], model.predict(Xserve[1500:])),3))
+print("share predicted positive, serving path:", round(model.predict(Xserve[1500:]).mean(),3))
+print("true positive rate:", round(y[1500:].mean(),3))</code></pre>
+<p>Real output (the script also prints the train-path positive share, 0.514):</p>
+<pre class="code lang-text"><code>train rows 1500, test rows 500
+test accuracy (same code path): 0.922
+test accuracy (serving sends metres): 0.524
+share predicted positive, train path: 0.514
+share predicted positive, serving path: 1.0
+true positive rate: 0.524</code></pre>
+<figure><img src="images/skew.svg" alt="Training-serving skew result" loading="lazy"/><figcaption>Training-serving skew result</figcaption></figure>
+<p><strong>Explain line by line.</strong> The model learned that "weight above average and height below average means higher BMI". With metres, every height is about 1.7. After subtracting the training mean (170) and dividing by the standard deviation (about 10), the standardised height becomes (1.7 − 170) ÷ 10 ≈ −16.8. That is absurdly far below average, so the model screams "high BMI" for everyone: the positive share is 1.0. Because 52.4% of real cases are positive, always saying "positive" gives 52.4% accuracy, which is what we measured. The system never crashed. No error. It just became useless.</p>
+<p class="problem"><span class="pl">Problem 1.2.1</span> Using the numbers above, compute the standardised height for a person of 1.70 m when the training mean is 170 cm and the standard deviation is 10 cm.</p>
+<table class="steps"><tr><th>Formula</th><td>z = (x − mean) ÷ sd</td></tr><tr><th>Plug in</th><td>(1.70 − 170) ÷ 10</td></tr><tr><th>Compute</th><td>1.70 − 170 = −168.30, and −168.30 ÷ 10 = −16.83</td></tr><tr><th>Answer</th><td>The model sees a height 16.8 standard deviations below average, about 17 "sigmas" off. Real data almost never goes beyond 4 or 5.</td></tr><tr><th>Check</th><td>The correct input, 170 cm, gives (170 − 170) ÷ 10 = 0, exactly average, as it should.</td></tr><tr><th>Why it matters</th><td>A feature that is many standard deviations from the training range is a cheap alarm for skew. We build it in Chapter 10.</td></tr></table>
+<p class="problem"><span class="pl">Problem 1.2.2</span> The service returns "positive" for all 500 test rows, and 262 of the 500 really are positive. What is the accuracy, and how do you cross-check it with the printed numbers?</p>
+<table class="steps"><tr><th>Formula</th><td>accuracy = correct ÷ total</td></tr><tr><th>Plug in</th><td>262 ÷ 500 (every positive is a hit, every negative is a miss)</td></tr><tr><th>Compute</th><td>262 ÷ 500 = 0.524</td></tr><tr><th>Answer</th><td>The accuracy is 52.4%, no better than a coin that always says "yes".</td></tr><tr><th>Check</th><td>The printed true positive rate is 0.524 and the printed accuracy is 0.524. They match, as they must when a model predicts one class for everyone.</td></tr><tr><th>Why it matters</th><td>If "share predicted positive" is 1.0 or 0.0, stop and look for skew before you look at anything else.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Skew is the number one reason "good models" fail after deployment. Solutions you will meet: a <strong>feature store</strong> (Chapter 5), shared feature code packaged as a library, and <strong>logging the exact features used at serving time</strong> so you can replay them in training. Interviewers love the question "what is training-serving skew and how do you prevent it?"</p>
+<h3>Applications</h3>
+<ul><li><strong>Machine Learning</strong>: unit-test the feature function with the same sample rows in training and serving.</li><li><strong>MLOps</strong>: log serving features and compare their distribution to training (Chapter 10).</li><li><strong>Data Engineering</strong>: build features once in the warehouse and reuse for both paths.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Testing the model only with the notebook's own test split. That split went through the training code path, so skew cannot show up. Test through the real serving API with raw inputs.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Does training-serving skew cause a crash?</li></ol>
+<p>Answer: Usually no. It silently lowers quality, which is why it is dangerous.</p>
+<ol><li>Give two causes of skew.</li></ol>
+<p>Answer: For example different units, different missing-value filling, or features computed in two separate code bases.</p>
+<ol><li>What single design rule reduces skew the most?</li></ol>
+<p>Answer: One shared code path (or feature store) for feature logic in training and serving.</p>
+<h2 id="s3-1-3-technical-debt-in-ml-systems">1.3 Technical Debt in ML Systems</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Technical debt is like a credit card. Taking a shortcut gives you speed today, and you pay interest every time you touch the code later. ML systems have the normal kinds of debt plus extra kinds that come from data.</div></div>
+<h3>The main kinds of ML debt</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Debt</th><th>What it looks like</th><th>A concrete example</th><th>Typical fix</th></tr></thead><tbody><tr><td>Glue code</td><td>Most of the code just moves data between libraries</td><td>400 lines to reshape a DataFrame for one library call</td><td>Standard interfaces, fewer one-off scripts</td></tr><tr><td>Pipeline jungle</td><td>Many ad-hoc scripts with hidden order</td><td><code>run_a.py</code> must run before <code>run_b.py</code>, nobody remembers</td><td>One orchestrated pipeline (Chapter 6)</td></tr><tr><td>Dead experimental code</td><td>Old paths nobody dares to delete</td><td>Three unused feature versions in the repo</td><td>Delete, rely on version control</td></tr><tr><td>Undeclared consumers</td><td>Other teams quietly read your model output</td><td>Marketing reads your score table directly</td><td>Versioned interfaces, ownership</td></tr><tr><td>Dependency hell</td><td>Library versions conflict or change results</td><td>A new scikit-learn version changes a default</td><td>Lock files and containers (Chapter 2)</td></tr><tr><td>Hidden feedback loop</td><td>The model changes the data it later learns from</td><td>Recommender only shows items it already likes</td><td>Randomised exploration, logging</td></tr><tr><td>Configuration debt</td><td>Settings hard-coded in notebooks</td><td><code>lr = 0.01</code> typed in cell 14</td><td>Config files (Chapter 2)</td></tr></tbody></table></div>
+<p><strong>Dependency hell</strong> means two parts of your system need different, incompatible versions of the same library, or a silent version change alters behaviour. Remember this one; Chapter 2 solves it.</p>
+<h3>A hidden feedback loop you can see</h3>
+<p>A <strong>feedback loop</strong> happens when the model's output affects its own future training data. Here is the smallest possible example. Two items, A and B, have exactly the same true click rate, 50%. A greedy "recommender" always shows the item with the most clicks so far.</p>
+<pre class="code lang-python"><code>import random
+def sim(seed, steps=2000, greedy=True):
+    rng = random.Random(seed); clicks = {"A": 1, "B": 1}; shown = {"A": 0, "B": 0}
+    for _ in range(steps):
+        item = max(clicks, key=lambda k: clicks[k]) if greedy else rng.choice("AB")
+        shown[item] += 1
+        if rng.random() &lt; 0.5: clicks[item] += 1     # both items: true click rate 0.5
+    return shown
+for s in range(4): print("seed", s, sim(s))
+print("random choice:", sim(0, greedy=False))</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>seed 0 {'A': 2000, 'B': 0}
+seed 1 {'A': 2000, 'B': 0}
+seed 2 {'A': 2000, 'B': 0}
+seed 3 {'A': 2000, 'B': 0}
+random choice: {'A': 1019, 'B': 981}</code></pre>
+<p>Explain: at the start both items have 1 click, a tie. Python's <code>max</code> picks the first one, A. A gets shown, collects clicks, and now leads. B is never shown, so B can never catch up, even though B is equally good. Under random choice the two items get about half each (1019 and 981). The greedy system "learns" that A is better, but it only learned its own choice. In a real recommender, B might be the better item and you would never know. The fix is <strong>exploration</strong>: sometimes show something other than the current best (Chapter 8 shows bandits, which do this properly).</p>
+<p class="problem"><span class="pl">Problem 1.3.1</span> In the greedy run, A was shown 2,000 times with a true click rate of 0.5. About how many clicks does A have, and what does B have?</p>
+<table class="steps"><tr><th>Formula</th><td>expected clicks = shows × click rate + starting clicks</td></tr><tr><th>Plug in</th><td>2,000 × 0.5 + 1</td></tr><tr><th>Compute</th><td>1,000 + 1 = 1,001 for A. B stays at its starting 1.</td></tr><tr><th>Answer</th><td>The system believes A has about 1,001 clicks and B has 1, a 1000-to-1 "preference" built purely from its own behaviour.</td></tr><tr><th>Check</th><td>Both items have the same true rate (0.5), so the real difference is zero.</td></tr><tr><th>Why it matters</th><td>Data collected by a deployed model is biased by that model. Log which items were shown (and randomise a small share) so future training stays honest.</td></tr></table>
+<p class="problem"><span class="pl">Problem 1.3.2</span> Your team's model has 3 upstream feature tables, each maintained by a different team, and no one tells you when columns change. Name the debt and one control you would add.</p>
+<table class="steps"><tr><th>Step 1</th><td>Your model depends on data someone else owns and may change. This is an unstable data dependency (a close cousin of "undeclared consumers", in the opposite direction).</td></tr><tr><th>Step 2</th><td>Add a <strong>data contract</strong> (an agreed schema and freshness) and an automatic schema check at the start of the pipeline (Chapter 5).</td></tr><tr><th>Answer</th><td>Unstable data dependency; control it with schema validation that fails the pipeline loudly when a column changes.</td></tr><tr><th>Check</th><td>Without the check, a renamed column would silently become all-null, and the model would still return numbers.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Senior MLOps work is mostly paying down this debt. A classic paper called "Hidden Technical Debt in Machine Learning Systems" (Google, 2015) popularised these ideas; it is worth reading once you finish this chapter.</p>
+<h3>Applications</h3>
+<ul><li><strong>MLOps</strong>: pipeline orchestration, containers and CI remove pipeline jungles and dependency hell.</li><li><strong>Data Science</strong>: log shown items to avoid feedback loops in recommenders and fraud systems.</li><li><strong>Data Engineering</strong>: data contracts and schema checks.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Believing more accuracy fixes everything. Debt makes the system fragile, not inaccurate. A 1% more accurate model that nobody can rebuild is worth less than a slightly weaker model with a clean pipeline.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is a hidden feedback loop?</li></ol>
+<p>Answer: When the model's own predictions shape the data it later learns from, biasing it.</p>
+<ol><li>Why did B never get clicks in the simulation?</li></ol>
+<p>Answer: It was never shown, so it could not collect clicks to overtake A.</p>
+<ol><li>What is dependency hell?</li></ol>
+<p>Answer: Incompatible or silently changing library versions that break or change results.</p>
+<h2 id="s4-1-4-software-engineering-for-ml-and-project-structure">1.4 Software Engineering for ML and Project Structure</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A notebook is a whiteboard: great for thinking, bad for building a bridge. A project folder with tests is the construction drawing. You move from the whiteboard to the drawing once the idea is clear.</div></div>
+<h3>Why not just notebooks?</h3>
+<p>Notebooks hide order (cells can be run in any order), are hard to test, produce huge diffs in version control, and mix data, logic and plots. The professional habit is: explore in a notebook, then move the working logic into <strong>modules</strong> (plain <code>.py</code> files with functions) that are imported by both the notebook and the pipeline.</p>
+<p>Good ML code has: <strong>small functions</strong> with clear inputs and outputs, <strong>type hints</strong> (for example <code>def clean(df: pd.DataFrame) -&gt; pd.DataFrame</code>), <strong>configuration outside the code</strong>, <strong>tests</strong>, and <strong>code review</strong> before merging.</p>
+<h3>A standard project layout</h3>
+<p>This is a layout (a pattern, not program output), in the style of a "cookiecutter" project template:</p>
+<pre class="code lang-text"><code>churn-model/
+  README.md                  what it is, how to run it
+  pyproject.toml             dependencies and tools
+  Dockerfile                 how to build the runtime
+  configs/
+    train.yaml               hyperparameters, paths, seeds
+  data/                      NOT in git: tracked by DVC (Chapter 4)
+  notebooks/                 exploration only
+  src/churn/
+    data.py                  load and validate raw data
+    features.py              feature logic (used by train AND serve)
+    train.py                 training entry point
+    evaluate.py              metrics and behaviour checks
+    serve.py                 API (Chapter 7)
+  tests/
+    test_features.py         unit tests
+    test_model_behaviour.py  model tests (Chapter 9)
+  .github/workflows/ci.yaml  automation (Chapter 9)</code></pre>
+<p>The key rule: <code>features.py</code> is imported by both <code>train.py</code> and <code>serve.py</code>. That single import is your best defence against skew.</p>
+<h3>A tiny unit test for a feature function</h3>
+<p>Before you run it, what do you think prints for <code>1.15</code> metres?</p>
+<pre class="code lang-python"><code>import math
+def height_to_cm(value, unit):
+    return value * 100 if unit == "m" else value
+
+print(height_to_cm(1.7, "m"))
+print(height_to_cm(1.15, "m"))
+print(math.isclose(height_to_cm(1.15, "m"), 115.0))
+assert height_to_cm(1.15, "m") == 115.0, height_to_cm(1.15, "m")</code></pre>
+<p>Real output (the first three lines print, then the last line raises):</p>
+<pre class="code lang-text"><code>170.0
+114.99999999999999
+True
+AssertionError: 114.99999999999999</code></pre>
+<p>Explain: computers store most decimals in binary, which cannot hold 1.15 exactly, so 1.15 × 100 is 114.99999999999999. The strict <code>==</code> test fails even though the function is correct. <code>math.isclose</code> allows a tiny tolerance and returns <code>True</code>. Lesson: a test that is too strict is as annoying as no test. Compare floats with a tolerance.</p>
+<p class="problem"><span class="pl">Problem 1.4.1</span> You have 6 team roles interacting with the model (data engineer, data scientist, ML engineer, product owner, SRE, security). A bug appears: scores jumped 30% overnight. Order the first three questions you ask.</p>
+<table class="steps"><tr><th>Step 1</th><td>Did the input data change? Ask the data engineer: new column, null rate, late load? (Most incidents start here.)</td></tr><tr><th>Step 2</th><td>Did the model or code change? Check the registry and last deployment with the ML engineer.</td></tr><tr><th>Step 3</th><td>Did the real world change (promotion, holiday)? Ask the product owner.</td></tr><tr><th>Answer</th><td>Data first, then model or code, then the world. SRE confirms the system itself is healthy (no timeouts, no restarts).</td></tr><tr><th>Check</th><td>Each question can be answered from a log or a chart; if you cannot answer, that is a monitoring gap to fix.</td></tr></table>
+<p class="problem"><span class="pl">Problem 1.4.2</span> Which file in the layout above should contain the function <code>orders_per_30_days(df)</code> and why?</p>
+<table class="steps"><tr><th>Step 1</th><td>It is feature logic, so it belongs in <code>features.py</code>.</td></tr><tr><th>Step 2</th><td>Both <code>train.py</code> and <code>serve.py</code> import it, so the logic exists exactly once.</td></tr><tr><th>Answer</th><td><code>src/churn/features.py</code>, to prevent skew by sharing one implementation.</td></tr><tr><th>Check</th><td>Search the repo for the function name; it should be defined in one place only.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Code review and tests are what separate an "ML engineer" from a "data scientist who deploys". You work with data engineers (inputs), data scientists (models), product (requirements) and SRE (running it). Knowing each role's vocabulary makes you the glue.</p>
+<h3>Applications</h3>
+<ul><li><strong>MLOps</strong>: templates (cookiecutter) so every new project starts correct.</li><li><strong>Machine Learning</strong>: configs and seeds so experiments can be repeated (Chapter 2).</li><li><strong>Data Engineering</strong>: the same unit-test habit for transformations.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Copying notebook cells into one giant <code>main.py</code>. That moves the mess, it does not fix it. Break the logic into small functions with tests.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which two files share the feature function?</li></ol>
+<p>Answer: The training script and the serving script.</p>
+<ol><li>Why compare floats with a tolerance?</li></ol>
+<p>Answer: Floating-point arithmetic can give tiny rounding differences.</p>
+<ol><li>Where does exploratory work belong?</li></ol>
+<p>Answer: In notebooks, with finished logic moved to modules.</p>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>An ML system is a loop: data, features, train, validate, registry, deploy, monitor, retrain.</li><li>Start every design from five requirements: latency, throughput, freshness, cost, reliability.</li><li>Batch, online and streaming inference suit different needs; batch is cheapest.</li><li>Training-serving skew is a silent killer. We measured accuracy fall from 0.922 to 0.524.</li><li>Use one shared code path for feature logic.</li><li>ML debt includes pipeline jungles, dependency hell and feedback loops.</li><li>Move logic from notebooks into tested modules with a clean project layout.</li><li>You own the path with data engineers, scientists, product and SRE.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Meaning</th></tr></thead><tbody><tr><td><code>rows ÷ seconds</code></td><td>Throughput needed for a batch job</td></tr><tr><td><code>z = (x − mean) ÷ sd</code></td><td>How unusual a feature value is</td></tr><tr><td><code>features.py</code> shared</td><td>Cure for skew</td></tr><tr><td>p95 under 100 ms</td><td>Example latency requirement</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 1.1</span> Name the three inference modes and give one use for each. <strong>Answer:</strong> Batch (nightly churn list), online (fraud check at a till), streaming (sensor alerts from Kafka).</p>
+<p class="problem"><span class="pl">Problem 1.2</span> 600,000 rows must be scored in a 30-minute window. What rows per second? <strong>Answer:</strong> 600,000 ÷ 1,800 = 333.3 rows per second.</p>
+<p class="problem"><span class="pl">Problem 1.3</span> Training mean of a feature is 40 and sd is 8. Serving sends 100. What is z, and is it a warning sign? <strong>Answer:</strong> (100 − 40) ÷ 8 = 7.5. Yes, anything past about 4 or 5 deserves an alert.</p>
+<p class="problem"><span class="pl">Problem 1.4</span> What is the output? <code>max({"A":1,"B":1}, key=lambda k: {"A":1,"B":1}[k])</code> <strong>Answer:</strong> <code>'A'</code>. On a tie, <code>max</code> returns the first maximal element, which is why A won every time in our simulation.</p>
+<p class="problem"><span class="pl">Problem 1.5</span> Find the bug: serving code does <code>df.fillna(0)</code> while training used <code>df.fillna(df.mean())</code>. <strong>Answer:</strong> Missing values are filled differently, a classic skew. Save the training means and reuse them, or share one function.</p>
+<p class="problem"><span class="pl">Problem 1.6</span> A model is 92% accurate in the notebook and 52% in production, yet "no errors in logs". List three checks in order. <strong>Answer:</strong> (1) Share of predictions per class (all one class?), (2) feature distributions live vs training, (3) compare notebook code path with API path on the same raw rows.</p>
+<p class="problem"><span class="pl">Problem 1.7</span> Why is a nightly batch job with stale predictions sometimes better than an online model? <strong>Answer:</strong> It is cheaper, simpler and easier to test, and nobody needs a fresher answer.</p>
+<p class="problem"><span class="pl">Problem 1.8</span> Your recommender always promotes today's top seller and sales concentrate on it. Name the issue and a remedy. <strong>Answer:</strong> A hidden feedback loop. Add exploration (random or bandit traffic) and log what was shown.</p>
+<p class="problem"><span class="pl">Problem 1.9 (interview)</span> Explain training-serving skew to a non-technical manager in three sentences. <strong>Answer:</strong> A model learns on data prepared one way. If the live app prepares the same facts differently, the model is confused but does not complain. We prevent it by using the same preparation code in both places and checking live inputs.</p>
+<p class="problem"><span class="pl">Problem 1.10 (interview)</span> "Design an ML system for loan approval." What do you ask first? <strong>Answer:</strong> Latency, volume, freshness of data, cost of a wrong decision, what happens when the model is down, regulatory need for explanations, and who owns the model afterwards.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps, and English is my second language, so use simple words. Teach me the ML system lifecycle (data, features, train, validate, registry, deploy, monitor, retrain). Explain each stage with an everyday analogy, then with one concrete example. After each stage ask me one question and wait for my answer before continuing. Finish by asking me to draw the lifecycle from memory in text and correct me.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. The topic is training-serving skew. Explain it step by step with a small numeric example different from the BMI example, show how to detect it with code, and show how to prevent it. Then give me 8 graded exercises without solutions, from easy to hard, and offer to check my answers one at a time.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps, with English as my second language. Quiz me one question at a time on ML technical debt: glue code, pipeline jungles, dependency hell, undeclared consumers, hidden feedback loops. Start easy, get harder, give feedback after each answer, and keep a score. After 10 questions, tell me my weak spots.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Review my ML project layout and my plan to move notebook code into modules. Check where feature logic lives, whether training and serving share it, where config and tests live, and what is missing. Be specific and kind. My layout and notes: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Run a mock interview on "design an ML system": ask me about requirements, batch vs online vs streaming, edge vs cloud, ownership with other teams, and failure handling. Ask one question at a time, grade my answer out of 10 with a short explanation, and show a model answer after each.</pre></div><div class="readbtn"><button class="btn" data-read="study:mlops:ch01">Mark this chapter as read</button></div><div class="pager"><span></span><a class="btn" href="ch02.html">Chapter 2: Reproducibility: Environments, Docker, C →</a></div></div><script src="../../assets/study.js"></script></body></html>

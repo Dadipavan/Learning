@@ -1,0 +1,535 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 13: Professional Practice: Clean Code, CI/CD, Secrets, Security and Packaging</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#2b4fd6"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Python &amp; Software Engineering</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 13</div><h1>Professional Practice: Clean Code, CI/CD, Secrets, Security and Packaging</h1><p>The habits that turn &quot;code that works on my laptop&quot; into code a team can trust, change and ship.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-13-1-clean-code-and-refactoring">13.1 Clean Code and Refactoring</a></li><li><a href="#s2-13-2-architecture-layers-monoliths-microservices-events-and-queues">13.2 Architecture: Layers, Monoliths, Microservices, Events and Queues</a></li><li><a href="#s3-13-3-agile-estimation-technical-debt-code-review-and-documentation">13.3 Agile, Estimation, Technical Debt, Code Review and Documentation</a></li><li><a href="#s4-13-4-ci-cd-basics">13.4 CI/CD Basics</a></li><li><a href="#s5-13-5-configuration-and-secrets-handling">13.5 Configuration and Secrets Handling</a></li><li><a href="#s6-13-6-sql-injection-password-hashing-and-safe-basics">13.6 SQL Injection, Password Hashing and Safe Basics</a></li><li><a href="#s7-13-7-packaging-dependencies-and-supply-chain-safety">13.7 Packaging, Dependencies and Supply-Chain Safety</a></li><li><a href="#s8-chapter-recap">Chapter recap</a></li><li><a href="#s9-practice-set">Practice set</a></li><li><a href="#s10-prompt-pack">Prompt pack</a></li></ol></details><p>Picture your first week in a data team. You open a colleague's script. It has one function of 300 lines, names like <code>x2</code> and <code>tmp</code>, a database password typed into the file, and no tests. Nobody dares to change it. Now picture the opposite: small named functions, tests that run on every push, secrets in the environment, and a package you can install in one command. This chapter shows you how to build the second kind. By the end you will be able to refactor messy code safely, explain how a team ships software (Agile, code review, CI/CD), keep secrets out of Git, stop SQL injection, store passwords correctly, and package your work with <code>pyproject.toml</code>.</p>
+<p>Everything marked "run" was executed with Python 3.14 and the standard library. Anything needing a network or extra installs (GitHub Actions, <code>gitleaks</code>, <code>pip-audit</code>, <code>build</code>, <code>twine</code>) is marked <strong>not run here</strong> and shown in minimal, standard form. Check each tool's docs for current options.</p>
+<p><em>Words you need.</em> <strong>Refactoring</strong> means changing how code is written without changing what it does. <strong>Technical debt</strong> means shortcuts that make future changes slower, like a loan with interest. <strong>CI/CD</strong> means Continuous Integration (tests run automatically on every change) and Continuous Delivery/Deployment (releases happen automatically or with one click). <strong>Secret</strong> means any value that grants access: password, API key, token, private key.</p>
+<h2 id="s1-13-1-clean-code-and-refactoring">13.1 Clean Code and Refactoring</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Code is read ten times more than it is written. Think of a kitchen. In a clean kitchen every tool has a labelled place, so a new cook can work on day one. In a messy kitchen only the person who made the mess can cook. Clean code is a labelled kitchen: good names, small functions, no repeated recipes.</div></div>
+<h3>How it works</h3>
+<p>The main rules, with the reason for each:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Rule</th><th>What it means</th><th>Why it exists</th></tr></thead><tbody><tr><td>Good names</td><td><code>slow_delivered_orders</code>, not <code>f</code></td><td>A name is the cheapest documentation</td></tr><tr><td>Small functions</td><td>One job, fits on a screen</td><td>Easy to test and to reuse</td></tr><tr><td>DRY (Don't Repeat Yourself)</td><td>One place for each piece of knowledge</td><td>A bug fixed once is fixed everywhere</td></tr><tr><td>Comments say <em>why</em></td><td>Not <em>what</em> the code does</td><td>Code already says what; only you know why</td></tr><tr><td>No magic numbers</td><td><code>TIMEOUT_S = 5</code></td><td>The number gets a meaning</td></tr><tr><td>Early return</td><td>Handle bad cases first</td><td>Less nesting</td></tr><tr><td>Types and docstrings</td><td>Say what goes in and out</td><td>Readers and tools can check</td></tr></tbody></table></div>
+<p><strong>Refactoring</strong> is done in small steps with tests that stay green. The safe loop is: (1) make sure tests exist, (2) change one thing, (3) run the tests, (4) repeat. If you have no tests, first write a few that capture today's behaviour.</p>
+<p><em>When NOT to refactor:</em> when you have no tests and a deadline tomorrow, add the tests first. Do not tidy code you are not otherwise touching just because you can.</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.1.1</span> Refactor a cryptic function. It takes shop order rows <code>(order_id, delivery_minutes, status)</code> and a threshold, and returns the order ids of delivered orders slower than the threshold.</p>
+<p>Predict first: for the rows below with threshold 60, which order ids come out?</p>
+<ul><li><strong>Step 1</strong> Write the "before" code and run it to record today's behaviour.</li><li><strong>Step 2</strong> Name the data with a <code>dataclass</code> and the function by what it does.</li><li><strong>Step 3</strong> Flatten the nested <code>if</code>s into one comprehension.</li><li><strong>Step 4</strong> Run before and after on the same input and compare.</li></ul>
+<pre class="code lang-python"><code># BEFORE
+def f(d, t):
+    r = []
+    for x in d:
+        if x[2] == "DELIVERED":
+            if x[1] &gt; t:
+                r.append(x[0])
+    return r
+
+rows = [("A101", 45, "DELIVERED"), ("A102", 12, "DELIVERED"), ("A103", 230, "LOST"), ("A104", 150, "DELIVERED")]
+print(f(rows, 60))
+
+# AFTER
+from dataclasses import dataclass
+
+@dataclass(frozen=True)
+class Order:
+    order_id: str
+    delivery_minutes: int
+    status: str
+
+def slow_delivered_orders(orders, threshold_minutes):
+    """Return ids of delivered orders slower than threshold_minutes."""
+    return [o.order_id for o in orders if o.status == "DELIVERED" and o.delivery_minutes &gt; threshold_minutes]
+
+orders = [Order(*r) for r in rows]
+print(slow_delivered_orders(orders, 60))
+print(slow_delivered_orders(orders, 10))
+print(f(rows, 10) == slow_delivered_orders(orders, 10))</code></pre>
+<pre class="code lang-text"><code>['A104']
+['A104']
+['A101', 'A102', 'A104']
+True</code></pre>
+<ul><li><strong>Check</strong> By hand: <code>A101</code> is 45 (not above 60), <code>A102</code> is 12, <code>A103</code> is slow (230) but status is LOST so it is skipped, <code>A104</code> is 150 and DELIVERED. Only <code>A104</code>. For threshold 10, the delivered rows are <code>A101</code>, <code>A102</code>, <code>A104</code>, all above 10.</li><li><strong>Answer</strong> The new function gives the same results as the old one (the last line prints <code>True</code>), but a reader now knows what it does from its name, and the fields have names (<code>o.delivery_minutes</code> instead of <code>x[1]</code>).</li><li><strong>Why it matters</strong> Equality of old and new outputs on the same inputs is a poor-man's test that your refactoring did not break behaviour. You will turn it into a real pytest test (Chapter 10).</li></ul>
+<p class="problem"><span class="pl">Problem 13.1.2</span> Remove repetition (DRY) from percentile code and give magic numbers names.</p>
+<p>Predict: three copies of the same sort-and-index logic. After refactoring, how many copies of the formula exist?</p>
+<pre class="code lang-python"><code>import math
+
+# BEFORE: the formula is copy-pasted three times
+def p50(xs): xs = sorted(xs); return xs[max(0, math.ceil(len(xs) * 50 / 100) - 1)]
+def p90(xs): xs = sorted(xs); return xs[max(0, math.ceil(len(xs) * 90 / 100) - 1)]
+def p95(xs): xs = sorted(xs); return xs[max(0, math.ceil(len(xs) * 95 / 100) - 1)]
+
+# AFTER: one function, one place to fix bugs
+def percentile(xs, p):
+    """Nearest-rank percentile, p in 1..100."""
+    xs = sorted(xs)
+    return xs[max(0, math.ceil(len(xs) * p / 100) - 1)]
+
+data = [80, 95, 110, 120, 300]
+print(p50(data), p90(data), p95(data))
+print([percentile(data, p) for p in (50, 90, 95)])</code></pre>
+<p>I ran this and checked the equality by hand: sorted data is 80, 95, 110, 120, 300 (n = 5). For p50: ceil(2.5) = 3, index 2, value 110. For p90 and p95: ceil(4.5) = 5 and ceil(4.75) = 5, index 4, value 300. Real output:</p>
+<pre class="code lang-text"><code>110 300 300
+[110, 300, 300]</code></pre>
+<ul><li><strong>Answer</strong> One copy of the formula remains. Both versions print <code>110 300 300</code>. If a bug is found in the formula, you now fix one line, not three.</li><li><strong>Why it matters</strong> In real codebases, the copy you forgot to fix is the one that fails in production.</li></ul>
+<p><strong>Predict, Run, Explain.</strong> Look at the typical wrong refactor: renaming a function in the definition but not at one call site. Python tells you only when that line runs, for example <code>NameError: name 'p50' is not defined</code>. That is exactly why you need tests (or a linter such as <code>ruff</code>, which flags undefined names before you run anything): the tests run every call site.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Good name</td><td><code>slow_delivered_orders</code></td><td>Reviewing a teammate's pipeline in five minutes</td></tr><tr><td>Small function</td><td><code>percentile(xs, p)</code></td><td>Reused by report, alert and dashboard code</td></tr><tr><td>DRY</td><td>one percentile formula</td><td>One bug fix, many places repaired</td></tr><tr><td>Refactor with tests</td><td>same output before and after</td><td>Cleaning a legacy ETL script</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> turn a 400-line notebook cell into named functions you can reuse next month.</li><li><strong>Data Engineering:</strong> split an ETL job into extract, transform and load functions that can be tested.</li><li><strong>Machine Learning:</strong> separate feature code from training code so the same features run at serving time.</li><li><strong>Data Analytics:</strong> share one percentile function across all your report scripts.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Refactoring and adding features in the same change. If something breaks you do not know which caused it. Do them in separate commits: first refactor with tests green, then add the feature.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does DRY stand for and why does it matter? Answer: Don't Repeat Yourself. A fix or change then happens in one place.</li><li>Should a comment say what or why? Answer: Why. The code already shows what.</li><li>What must exist before you refactor? Answer: Tests (or at least recorded outputs) that show behaviour did not change.</li></ol>
+<h2 id="s2-13-2-architecture-layers-monoliths-microservices-events-and-queues">13.2 Architecture: Layers, Monoliths, Microservices, Events and Queues</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A restaurant has a front desk (takes orders), a kitchen (cooks), and a storeroom (keeps food). If a waiter walked into the storeroom and cooked, chaos follows. Software layers are the same: each part has one job and talks only to its neighbour. A queue is the order rail in the kitchen: waiters put tickets on it, cooks take them when ready, so a rush does not collapse the kitchen.</div></div>
+<h3>How it works</h3>
+<p><strong>Layered architecture.</strong> Three layers are common:</p>
+<ol><li><strong>API / presentation layer</strong>: receives requests, checks input, returns responses.</li><li><strong>Service / business layer</strong>: the rules ("an order total is the sum of its items").</li><li><strong>Repository / data layer</strong>: the only place that talks to the database.</li></ol>
+<p>Why: you can test the middle layer with a fake data layer, and you can change the database without touching the rules.</p>
+<p><strong>Dependency injection (DI)</strong> means giving a class the things it needs (a repository, a notifier) from outside instead of creating them inside. The <strong>repository pattern</strong> hides the database behind methods like <code>save</code> and <code>get</code>. A <strong>fake</strong> is a simple working stand-in (an in-memory repository). A <strong>mock</strong> is a recorder that checks how it was called.</p>
+<p><strong>Monolith vs microservices.</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th></th><th>Monolith</th><th>Microservices</th></tr></thead><tbody><tr><td>Shape</td><td>One deployable program</td><td>Many small services over the network</td></tr><tr><td>Good for</td><td>Small teams, early products, simple deployment</td><td>Big teams, parts that scale differently</td></tr><tr><td>Costs</td><td>Big codebase, one slow release train</td><td>Network failures, many deployments, hard debugging</td></tr></tbody></table></div>
+<p>Start with a well-organised monolith. Split only when you feel real pain. A distributed system is slower to build and harder to debug than a single program.</p>
+<p><strong>Event-driven</strong> design means parts communicate by announcing events ("order placed") and other parts react. <strong>Message queues</strong> (RabbitMQ, Kafka, cloud queues) store messages between producer and consumer. Benefits: smoothing spikes, retries, and decoupling. Cost: messages may arrive twice (so consumers must be idempotent, see Chapter 12) or late.</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.2.1</span> Build a service with injected dependencies and test it using a fake repository and a mock notifier.</p>
+<p>Predict: what total does <code>place(1, [100, 250, 50])</code> return, and what message is sent?</p>
+<ul><li><strong>Step 1</strong> <code>OrderService</code> receives <code>repo</code> and <code>notifier</code> in <code>__init__</code>.</li><li><strong>Step 2</strong> <code>place</code> sums prices, saves, and notifies.</li><li><strong>Step 3</strong> In the test we pass a fake repository (works in memory) and a <code>Mock</code> notifier (records calls).</li></ul>
+<pre class="code lang-python"><code>from unittest.mock import Mock
+
+class OrderRepository:                      # a real one would use a database
+    def __init__(self): self.rows = {}
+    def save(self, oid, total): self.rows[oid] = total
+    def get(self, oid): return self.rows.get(oid)
+
+class FakeRepo(OrderRepository): pass       # in-memory fake: real behaviour, no DB
+
+class OrderService:
+    def __init__(self, repo, notifier):     # dependencies injected
+        self.repo, self.notifier = repo, notifier
+    def place(self, oid, prices):
+        total = sum(prices)
+        self.repo.save(oid, total)
+        self.notifier.send(f"order {oid}: {total}")
+        return total
+
+notifier = Mock()
+svc = OrderService(FakeRepo(), notifier)
+print(svc.place(1, [100, 250, 50]))
+print(svc.repo.get(1))
+notifier.send.assert_called_once_with("order 1: 400")
+print(notifier.send.call_args)</code></pre>
+<pre class="code lang-text"><code>400
+400
+call('order 1: 400')</code></pre>
+<ul><li><strong>Check</strong> 100 + 250 + 50 = 400. <code>assert_called_once_with</code> raised nothing, which means the message was sent exactly once with the text we expected. (If it was wrong, you would see an <code>AssertionError</code> that shows expected and actual calls.)</li><li><strong>Answer</strong> The total is 400, it was saved, and exactly one notification <code>order 1: 400</code> was sent.</li><li><strong>Why it matters</strong> No email was sent and no database was touched, so the test runs in milliseconds and cannot fail because of a network.</li></ul>
+<p class="problem"><span class="pl">Problem 13.2.2</span> Show the idea of a queue and of events in a few lines: a worker takes jobs from a <code>queue.Queue</code>, and an event bus calls every handler registered for an event.</p>
+<p>Predict: in what order do the results appear, and how many handlers run on one event?</p>
+<pre class="code lang-python"><code>import queue, threading
+
+q = queue.Queue()
+results = []
+def worker():
+    while True:
+        job = q.get()
+        if job is None:
+            break
+        results.append(job * job)
+        q.task_done()
+t = threading.Thread(target=worker); t.start()
+for n in range(1, 6): q.put(n)
+q.put(None); t.join()
+print(results)
+
+handlers = {}
+def on(evt):
+    def deco(fn): handlers.setdefault(evt, []).append(fn); return fn
+    return deco
+def emit(evt, **data):
+    for h in handlers.get(evt, []): h(**data)
+@on("order_placed")
+def send_email(order_id): print("email for", order_id)
+@on("order_placed")
+def update_stock(order_id): print("stock updated for", order_id)
+emit("order_placed", order_id=42)</code></pre>
+<pre class="code lang-text"><code>[1, 4, 9, 16, 25]
+email for 42
+stock updated for 42</code></pre>
+<ul><li><strong>Answer</strong> The queue is first-in-first-out, so squares of 1 to 5 appear in order. Two handlers ran for one event. The code that emits "order placed" does not know about email or stock. You can add a third handler without touching it.</li><li><strong>Check</strong> 1, 4, 9, 16, 25 are the squares of 1 to 5.</li><li><strong>Why it matters</strong> This is the shape of real systems: producers and consumers separated by a queue, with workers that scale independently.</li></ul>
+<p><strong>Typical wrong version:</strong> creating the repository inside the service (<code>self.repo = PostgresRepo()</code>). The service can no longer be tested without a database, and the test fails with a connection error like <code>ConnectionRefusedError</code>. The fix is the injection shown above.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Layers</td><td>route to service to repository</td><td>A FastAPI model service with a feature store behind it</td></tr><tr><td>DI + fake</td><td><code>FakeRepo</code></td><td>Fast unit tests for a data pipeline step</td></tr><tr><td>Queue</td><td>Kafka topic, SQS queue</td><td>Buffering events before they are loaded into a warehouse</td></tr><tr><td>Event</td><td>"file arrived"</td><td>Starting an ETL run when data lands in a bucket</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> streaming pipelines where a queue buffers bursts and consumers write idempotently.</li><li><strong>Machine Learning / MLOps:</strong> a "retrain requested" event triggers a training job.</li><li><strong>GenAI:</strong> a queue holds long-running document-processing jobs behind a chat API.</li><li><strong>Operations:</strong> you monitor queue depth and consumer lag, like counting orders waiting at a counter, not only how fast one order is served.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Jumping to microservices because it sounds modern. A small team with ten services spends more time on networking and deployment than on features. Start simple; split when a clear need appears.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why use layers? Answer: Each layer has one job, so you can test and change parts separately.</li><li>What is the difference between a fake and a mock? Answer: A fake is a simple working replacement. A mock records calls so you can check them.</li><li>Why must queue consumers be idempotent? Answer: Messages can be delivered more than once, and a repeat must not cause a double effect.</li></ol>
+<h2 id="s3-13-3-agile-estimation-technical-debt-code-review-and-documentation">13.3 Agile, Estimation, Technical Debt, Code Review and Documentation</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Building software is like planning a long road trip when the map is incomplete. You plan a short leg, drive it, look at what you learned, and plan the next leg. That is Agile. Technical debt is borrowing time: a shortcut now saves a day, but every later change pays a bit of interest.</div></div>
+<h3>How it works</h3>
+<p><strong>Agile</strong> is a way of working in short cycles with frequent feedback. <strong>Scrum</strong> is a popular form of it:</p>
+<ul><li>A <strong>sprint</strong> is a fixed period (often two weeks) with a goal.</li><li>The <strong>backlog</strong> is the ordered list of work. Each item is a <strong>user story</strong> ("As an analyst I want a daily report so that I can see errors").</li><li>Meetings: <strong>planning</strong> (choose work), <strong>daily stand-up</strong> (15 minutes: what I did, will do, what blocks me), <strong>review</strong> (show the work), <strong>retrospective</strong> (how to improve).</li><li><strong>Estimation:</strong> teams guess size in points or days. People are bad at single-number guesses, so use a range. The <strong>three-point (PERT)</strong> estimate is <code>(optimistic + 4 × likely + pessimistic) / 6</code>. It weights the likely case but respects the risk of a long tail.</li></ul>
+<p><strong>Technical debt</strong>: quick-and-dirty code you plan to fix later. Some debt is wise (to hit a launch), but it must be written down and repaid. Signs of too much debt: fear of changing code, bugs that return, slow onboarding.</p>
+<p><strong>Code review</strong> is where a teammate reads your change before it merges. It catches bugs, spreads knowledge, and keeps the style consistent. Good reviews:</p>
+<ul><li>Authors: keep changes small (under about 400 lines), explain <em>why</em> in the description, run tests first.</li><li>Reviewers: be kind and specific, review the code and not the person, ask questions ("What happens if the list is empty?"), separate must-fix from nice-to-have, and say what is good.</li></ul>
+<p><strong>Documentation</strong> layers: a README (what it is, how to install and run in 5 lines), docstrings (what each function does), comments (why), and an architecture note. A <strong>docstring</strong> is the string at the top of a function. It can even hold runnable examples called <strong>doctests</strong>.</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.3.1</span> A task has optimistic 2 days, likely 4 days, pessimistic 12 days. Give the PERT estimate and compare with the simple average of the three.</p>
+<table class="steps"><tr><th>Formula</th><td>PERT = (O + 4M + P) / 6</td></tr><tr><th>Plug in</th><td>(2 + 4 × 4 + 12) / 6</td></tr><tr><th>Compute</th><td>2 + 16 + 12 = 30, and 30 / 6 = 5.0. Simple average: (2 + 4 + 12) / 3 = 6.0.</td></tr><tr><th>Answer</th><td>The PERT estimate is 5.0 days. Promise 5 to 6 days, not the "likely" 4.</td></tr><tr><th>Check</th><td>The result lies between the likely value (4) and the average (6), pulled up a little by the long tail. A one-line check in Python: <code>round((2 + 4*4 + 12) / 6, 2)</code> printed <code>5.0</code> in a real run.</td></tr><tr><th>Why it matters</th><td>A promise of 4 days would be missed whenever the pessimistic case happens. Ranges and a weighted estimate give more honest dates.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.3.2</span> Write a docstring with doctests for <code>percentile</code> and run them automatically.</p>
+<p>Predict: how many examples are tested, and do they pass?</p>
+<p>The function below was saved in a small package (you will build it in 13.7) and tested with <code>doctest</code>:</p>
+<pre class="code lang-python"><code>import math
+
+def percentile(values, p):
+    """Nearest-rank percentile.
+
+    &gt;&gt;&gt; percentile([80, 95, 110, 120, 300], 90)
+    300
+    &gt;&gt;&gt; percentile([1, 2, 3, 4], 50)
+    2
+    """
+    xs = sorted(values)
+    k = max(0, math.ceil(len(xs) * p / 100) - 1)
+    return xs[k]</code></pre>
+<p>Running <code>doctest.testmod</code> on the module printed:</p>
+<pre class="code lang-text"><code>TestResults(failed=0, attempted=2)</code></pre>
+<ul><li><strong>Check</strong> By hand: the first example is the p90 case from 13.1.2 (300). Second: sorted <code>1,2,3,4</code>, ceil(4 × 0.5) = 2, index 1, value 2.</li><li><strong>Answer</strong> Two examples were tested and both passed. Your documentation can never go out of date silently: if the code changes, the example fails.</li><li><strong>Why it matters</strong> The learner reading the docs sees how to call the function. The team gets a free tiny test.</li></ul>
+<p><strong>Typical wrong version:</strong> a docstring example with the wrong expected value (for example <code>300</code> replaced by <code>200</code>). <code>doctest</code> reports the line, the expected output and the real output, and <code>failed=1</code>. The fix is to correct the example or the code, whichever is wrong.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Practice</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Sprint</td><td>2 weeks, goal "daily report live"</td><td>How most data teams plan work</td></tr><tr><td>Estimate</td><td>PERT 5.0 days</td><td>Telling a manager when a pipeline will be ready</td></tr><tr><td>Tech debt ticket</td><td>"Replace hard-coded path"</td><td>Keeps a backlog of cleanups</td></tr><tr><td>Review comment</td><td>"What if <code>rows</code> is empty?"</td><td>Catches the empty-file bug before production</td></tr><tr><td>README</td><td>install, run, test in 5 lines</td><td>A teammate runs your program on day one</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> short sprints with stakeholders reviewing a dashboard each cycle.</li><li><strong>Data Engineering:</strong> reviews catch schema and idempotency mistakes before a load runs.</li><li><strong>Machine Learning:</strong> model cards and READMEs record data, metrics and limits.</li><li><strong>Project planning:</strong> estimating delivery dates; ranges beat single numbers.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Treating estimates as promises, or giving one number. State a range and your assumptions ("assuming the data is available by Monday"), and update the estimate when you learn more.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is a sprint? Answer: A short fixed period (often two weeks) with a goal.</li><li>What does the retrospective do? Answer: The team looks at how it worked and decides what to improve.</li><li>Why use a range estimate? Answer: Work has uncertainty, and a single number hides the risk.</li></ol>
+<h2 id="s4-13-4-ci-cd-basics">13.4 CI/CD Basics</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">CI is a strict friend who runs your tests every time you save to the shared folder. If you broke something, you hear within minutes, not weeks. CD is the delivery truck that takes the passing build to users automatically. Think of CI as a quick taste test of the soup that happens every time the recipe changes.</div></div>
+<h3>How it works</h3>
+<p>Pipeline stages, in order: <strong>build</strong> (install, compile or package), <strong>test</strong> (unit and integration tests), <strong>lint</strong> (style and error checks with <code>ruff</code>, types with <code>mypy</code>), then <strong>deploy</strong>. A failing stage stops everything after it ("fail fast"). Cheap checks (lint) go first.</p>
+<p>Tools: <strong>GitHub Actions</strong> (YAML files in <code>.github/workflows/</code>), <strong>Jenkins</strong> (self-hosted, a <code>Jenkinsfile</code>), GitLab CI, and others. Key ideas: a <strong>trigger</strong> (push, pull request, schedule), a <strong>runner</strong> (the machine), <strong>steps</strong>, and <strong>secrets</strong> stored in the CI system, never in the repo.</p>
+<p>Not run here (it needs GitHub). A minimal, standard GitHub Actions file:</p>
+<pre class="code lang-yaml"><code>name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: ruff format --check .
+      - run: mypy src
+      - run: pytest --cov=src</code></pre>
+<p>Version tags such as <code>@v4</code> change over time. Check the current ones on each action's page.</p>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.4.1</span> Simulate a tiny pipeline runner that stops at the first failing stage, and run it with a test stage that fails.</p>
+<p>Predict: which stages run, and what is the final result?</p>
+<pre class="code lang-python"><code>import subprocess, sys
+
+def stage(name, code):
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    print(f"{name:6} -&gt; {'PASS' if r.returncode == 0 else 'FAIL'}")
+    return r.returncode == 0
+
+stages = [
+    ("lint", "pass"),
+    ("test", "assert 2 + 2 == 5"),
+    ("deploy", "print('shipping')"),
+]
+for name, code in stages:
+    if not stage(name, code):
+        print("pipeline stopped at", name)
+        break
+else:
+    print("pipeline passed")</code></pre>
+<pre class="code lang-text"><code>lint   -&gt; PASS
+test   -&gt; FAIL
+pipeline stopped at test</code></pre>
+<ul><li><strong>Step 1</strong> Each stage is a command. Exit code 0 means pass, which is the same convention real CI uses.</li><li><strong>Step 2</strong> The <code>for ... else</code> runs <code>else</code> only if the loop did not <code>break</code>.</li><li><strong>Check</strong> <code>assert 2 + 2 == 5</code> raises <code>AssertionError</code>, so the child exits with code 1. Deploy never ran.</li><li><strong>Answer</strong> Lint passed, test failed, and the pipeline stopped before deploy. Bad code never reached users.</li><li><strong>Why it matters</strong> This is exactly how a real CI system treats exit codes, which is why Chapter 12 stressed returning proper codes from CLIs.</li></ul>
+<p class="problem"><span class="pl">Problem 13.4.2</span> A pipeline takes 12 minutes: lint 1, unit tests 4, integration tests 6, package 1. A change that breaks lint is pushed. How long until the developer knows with lint first, and with lint last?</p>
+<table class="steps"><tr><th>Compute (lint first)</th><td>Lint is the first stage and takes 1 minute, so the failure appears after 1 minute.</td></tr><tr><th>Compute (lint last)</th><td>Stages before lint take 4 + 6 + 1 = 11 minutes, then lint 1 minute: 12 minutes.</td></tr><tr><th>Answer</th><td>1 minute versus 12 minutes. Put cheap, fast checks first.</td></tr><tr><th>Check</th><td>11 + 1 = 12, which equals the total pipeline time, as expected when the last stage fails.</td></tr><tr><th>Why it matters</th><td>Developer waiting time is real cost. Fast feedback means more small, safe changes.</td></tr></table>
+<p><strong>Typical wrong version:</strong> printing a secret inside a CI step (<code>echo $API_KEY</code>) or putting the key in the YAML. CI logs are readable by many people. Use the CI system's secret store and never print it (see 13.5).</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Stage</th><th>Example command</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Lint</td><td><code>ruff check .</code></td><td>Stops unused imports and typos early</td></tr><tr><td>Test</td><td><code>pytest</code></td><td>Protects a transformation from silent changes</td></tr><tr><td>Build</td><td><code>python -m build</code></td><td>Produces the package that gets deployed</td></tr><tr><td>Deploy</td><td>push container image</td><td>Releases a new model service version</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> CI runs pipeline unit tests and checks SQL or dbt models before merge.</li><li><strong>Machine Learning / MLOps:</strong> CI trains a tiny model on sample data and checks metrics do not collapse.</li><li><strong>Data Analytics:</strong> CI checks that reports still build after a change.</li><li><strong>Software Engineering:</strong> a short smoke test as a CI stage; a bigger one on a schedule.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">A CI pipeline that is slow or flaky, so people ignore red builds. Keep it fast, fix flaky tests quickly, and treat red as "stop".</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What decides pass or fail of a CI step? Answer: The command's exit code (0 means pass).</li><li>Why run lint before integration tests? Answer: It is quick, so you get feedback sooner.</li><li>Where do CI secrets live? Answer: In the CI system's secret store, never in the repository.</li></ol>
+<h2 id="s5-13-5-configuration-and-secrets-handling">13.5 Configuration and Secrets Handling</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A configuration value is like a thermostat setting: you can change it without rebuilding the house. A secret is a house key. You do not write it on the front door (the code), and you do not make copies for everyone (Git history lives forever and is copied to every clone).</div></div>
+<h3>How it works</h3>
+<p><strong>The 12-factor rule:</strong> keep configuration in the environment, not in code. The same code then runs on your laptop, in testing and in production with different settings.</p>
+<p>Where config lives, from simple to strong:</p>
+<ol><li><strong>Environment variables</strong>: <code>os.environ["PIPELINE_ENV"]</code>.</li><li><strong><code>.env</code> file</strong> for local development: lines like <code>KEY=value</code>, loaded by a library such as <code>python-dotenv</code> (not run here; we show a small parser). <strong>Add <code>.env</code> to <code>.gitignore</code></strong> and commit a <code>.env.example</code> with fake values.</li><li><strong>YAML/TOML files</strong> for non-secret structure (batch sizes, URLs).</li><li><strong>Secret managers</strong> (cloud secret managers, vaults) for production: access is audited, and secrets can be <strong>rotated</strong> (replaced regularly or right after a leak) without code changes.</li></ol>
+<p>Rules for secrets:</p>
+<ul><li>Never commit them. If one is committed, <strong>treat it as stolen</strong>: revoke and rotate it at once. Deleting the file in a later commit does not remove it from history.</li><li>Run a scanner such as <code>gitleaks</code> or <code>detect-secrets</code> in a pre-commit hook and in CI (not run here).</li><li>Do not print secrets or put them in logs; mask them.</li><li>Use least privilege: a key that can only read one bucket is less dangerous than an admin key.</li><li>In notebooks, read keys from environment variables; clear output before sharing.</li></ul>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.5.1</span> Load settings from the environment into a typed, immutable object, with a default and a required value.</p>
+<p>Predict: what is printed, and what happens when a required variable is missing?</p>
+<pre class="code lang-python"><code>import os
+from dataclasses import dataclass
+
+os.environ["PIPELINE_ENV"] = "prod"      # in real life the shell or CI sets this
+
+@dataclass(frozen=True)
+class Settings:
+    env: str
+    batch_size: int = 500
+    @classmethod
+    def from_env(cls):
+        return cls(env=os.environ["PIPELINE_ENV"],
+                   batch_size=int(os.environ.get("BATCH_SIZE", "500")))
+
+print(Settings.from_env())
+
+try:
+    os.environ["MISSING_REQUIRED"]
+except KeyError as e:
+    print("KeyError", e)
+print(os.environ.get("MISSING", "default"))</code></pre>
+<pre class="code lang-text"><code>Settings(env='prod', batch_size=500)
+KeyError 'MISSING_REQUIRED'
+default</code></pre>
+<ul><li><strong>Step 1</strong> <code>os.environ[...]</code> is strict: missing means <code>KeyError</code>. Use it for required values so the program fails early and loudly.</li><li><strong>Step 2</strong> <code>os.environ.get(name, default)</code> is lenient. Use it for optional values.</li><li><strong>Step 3</strong> Environment variables are always text, so we convert <code>BATCH_SIZE</code> with <code>int(...)</code>.</li><li><strong>Check</strong> <code>BATCH_SIZE</code> was not set, so the default <code>"500"</code> became the integer 500.</li><li><strong>Answer</strong> Settings loaded as shown, and a missing required variable raised <code>KeyError</code>.</li><li><strong>Why it matters</strong> A pipeline that crashes at start-up with "missing PIPELINE_ENV" is far better than one that silently runs against the wrong database.</li></ul>
+<p class="problem"><span class="pl">Problem 13.5.2</span> Parse a <code>.env</code> text (fake values), then write a tiny secret scanner that flags suspicious lines, then mask personal data in text.</p>
+<p>Predict: which line is flagged, and what do the masked values look like?</p>
+<pre class="code lang-python"><code>import re
+
+def load_dotenv(text):
+    out = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line: continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip().strip('"')
+    return out
+print(load_dotenv('# demo\nAPI_KEY="fake-key-123"\nDEBUG=1\n'))
+
+def mask_email(s): return re.sub(r"(\w)[\w.]*@", r"\1***@", s)
+def mask_phone(s): return re.sub(r"\b\d{6}(\d{4})\b", r"XXXXXX\1", s)
+print(mask_email("asha.k@example.com"), mask_phone("9876543210"))
+
+pat = re.compile(r"(?i)(api[_-]?key|secret|token)\s*=\s*['\"][A-Za-z0-9_\-]{8,}['\"]")
+code = 'x = 1\nAPI_KEY = "fake-key-123"\nname = "abc"\n'
+for i, l in enumerate(code.splitlines(), 1):
+    if pat.search(l): print("line", i, "looks like a secret")</code></pre>
+<pre class="code lang-text"><code>{'API_KEY': 'fake-key-123', 'DEBUG': '1'}
+a***@example.com XXXXXX3210
+line 2 looks like a secret</code></pre>
+<ul><li><strong>Check</strong> Line 2 matches <code>API_KEY = "..."</code> with 12 allowed characters (at least 8 needed). Lines 1 and 3 have no key-like name. The phone number has 10 digits: six are hidden and the last four stay.</li><li><strong>Answer</strong> The scanner flagged line 2. Emails and phone numbers were partly hidden. Real scanners like <code>gitleaks</code> use hundreds of such patterns plus entropy checks (not run here).</li><li><strong>Why it matters</strong> Masking limits damage when data reaches logs or test environments. Partial masking is not anonymisation: with enough other columns a person can still be identified.</li></ul>
+<p><strong>Redacting secrets in logs.</strong> A log filter can remove a token before it is written:</p>
+<pre class="code lang-python"><code>import logging, re
+class Redact(logging.Filter):
+    def filter(self, record):
+        record.msg = re.sub(r"(token=)\w+", r"\1***", str(record.msg)); return True
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+log = logging.getLogger("app"); log.addFilter(Redact())
+log.info("calling api token=abc123xyz")</code></pre>
+<pre class="code lang-text"><code>INFO calling api token=***</code></pre>
+<p><strong>Typical wrong version:</strong> <code>API_KEY = "sk-live-..."</code> typed in the script and pushed to GitHub. Bots scan public repos within minutes. Fix: move the key to an environment variable, rotate the leaked key immediately, and add a scanner. A <code>.gitignore</code> needs the line <code>.env</code> (add it before the first commit).</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Env var</td><td><code>DATABASE_URL</code></td><td>Same code for dev, test, prod</td></tr><tr><td><code>.env.example</code></td><td>fake values committed</td><td>New teammate knows what to set</td></tr><tr><td>Secret manager</td><td>cloud vault entry</td><td>Production database password, rotated</td></tr><tr><td>Pre-commit scanner</td><td><code>gitleaks</code></td><td>Stops a key before it leaves your laptop</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> warehouse credentials from a secret manager, injected as env vars at run time.</li><li><strong>Machine Learning / MLOps:</strong> model-registry tokens in CI secrets.</li><li><strong>GenAI:</strong> language-model API keys read from the environment in notebooks, never pasted into cells.</li><li><strong>Data Analytics:</strong> BI connection strings kept in the tool's credential store.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">"I deleted the key from the file in the next commit, so it is safe." Git history keeps it, and so do clones. Revoke and rotate the key first, clean the history second.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which is stricter, <code>os.environ[k]</code> or <code>os.environ.get(k)</code>? Answer: <code>os.environ[k]</code> raises <code>KeyError</code> if missing.</li><li>What do you do if a key is committed? Answer: Revoke and rotate it immediately.</li><li>What goes in <code>.env.example</code>? Answer: The variable names with fake or empty values.</li></ol>
+<h2 id="s6-13-6-sql-injection-password-hashing-and-safe-basics">13.6 SQL Injection, Password Hashing and Safe Basics</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Imagine a form where the clerk reads out what you write as an instruction to the vault. If you write "open all drawers", the clerk obeys. SQL injection happens when user text is glued into a SQL command and the database cannot tell data from instruction. A parameterised query is a form with a labelled blank: whatever you write goes in the blank and is treated only as data.</div></div>
+<h3>How it works</h3>
+<p><strong>SQL injection</strong> is when untrusted input changes the meaning of a query. It is high on the OWASP Top 10 list (a well-known list of the most common web security risks, in the "injection" category). The fix is always the same: <strong>parameterised queries</strong> (placeholders <code>?</code> in <code>sqlite3</code>; <code>%s</code> or <code>:name</code> in other drivers). The values travel separately from the SQL text. Never build SQL with f-strings, <code>+</code> or <code>.format()</code> from user input.</p>
+<p>Other safe basics:</p>
+<ul><li><strong>Hashing</strong> turns data into a fixed fingerprint, one way. The same input gives the same output; you cannot go back. <strong>Encryption</strong> is two-way: with the key you get the data back. Use hashing for passwords, encryption for data you must read later.</li><li><strong>Passwords</strong> must be hashed with a slow, salted algorithm: <code>scrypt</code>, <code>argon2</code>, <code>bcrypt</code> or <code>pbkdf2</code>. A <strong>salt</strong> is random data added per user so equal passwords give different hashes. Fast hashes like MD5 or plain SHA-256 are for checksums, not passwords.</li><li><strong>Never write your own crypto.</strong> Use maintained libraries.</li><li>Also know: authorization checks on every request (broken access control is OWASP's top item), HTTPS everywhere, least privilege, and updating dependencies.</li></ul>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.6.1</span> Show SQL injection against string-built SQL, and show that a parameterised query stops it.</p>
+<p>Predict: for the input <code>x' OR '1'='1</code>, how many users does the vulnerable query return, and the safe one?</p>
+<pre class="code lang-python"><code>import sqlite3
+con = sqlite3.connect(":memory:")
+con.executescript("""
+CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, secret TEXT);
+INSERT INTO users(name, secret) VALUES ('asha','pw-asha'),('ravi','pw-ravi');
+""")
+
+def vulnerable(name):
+    q = f"SELECT id, name FROM users WHERE name = '{name}'"
+    print("SQL:", q)
+    return con.execute(q).fetchall()
+
+def safe(name):
+    q = "SELECT id, name FROM users WHERE name = ?"
+    return con.execute(q, (name,)).fetchall()
+
+print(vulnerable("asha"))
+attack = "x' OR '1'='1"
+print(vulnerable(attack))
+print(safe("asha"))
+print(safe(attack))
+attack2 = "x' UNION SELECT id, secret FROM users --"
+print(vulnerable(attack2))
+print(safe(attack2))</code></pre>
+<pre class="code lang-text"><code>SQL: SELECT id, name FROM users WHERE name = 'asha'
+[(1, 'asha')]
+SQL: SELECT id, name FROM users WHERE name = 'x' OR '1'='1'
+[(1, 'asha'), (2, 'ravi')]
+[(1, 'asha')]
+[]
+SQL: SELECT id, name FROM users WHERE name = 'x' UNION SELECT id, secret FROM users --'
+[(1, 'pw-asha'), (2, 'pw-ravi')]
+[]</code></pre>
+<ul><li><strong>Step 1</strong> Read the printed SQL for the first attack. The quote in the input closed the string early, and <code>OR '1'='1'</code> is always true, so every row matches.</li><li><strong>Step 2</strong> The second attack uses <code>UNION</code> to read the <code>secret</code> column, which the query never intended to expose. The trailing <code>--</code> comments out the rest.</li><li><strong>Step 3</strong> With <code>?</code>, the whole input is one value. No user is called <code>x' OR '1'='1</code>, so the result is empty.</li><li><strong>Check</strong> The safe function returned <code>[(1, 'asha')]</code> for the honest input and <code>[]</code> for both attacks.</li><li><strong>Answer</strong> The vulnerable query returned all users (2) and then leaked the secret column; the parameterised query returned nothing for the attacks.</li><li><strong>Why it matters</strong> One careless f-string can leak a whole database.</li></ul>
+<p><strong>Predict, Run, Explain (the "innocent" bug).</strong> You do not need an attacker to break string-built SQL. A user named O'Brien does it by accident. Real output:</p>
+<pre class="code lang-python"><code>import sqlite3
+con = sqlite3.connect(":memory:")
+con.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT)")
+con.execute("INSERT INTO users(name) VALUES (?)", ("O'Brien",))
+name = "O'Brien"
+try:
+    con.execute(f"SELECT * FROM users WHERE name = '{name}'")
+except sqlite3.Error as e:
+    print(type(e).__name__, e)
+print(con.execute("SELECT * FROM users WHERE name = ?", (name,)).fetchall())</code></pre>
+<pre class="code lang-text"><code>OperationalError near "Brien": syntax error
+[(1, "O'Brien")]</code></pre>
+<p>Line by line: the apostrophe in <code>O'Brien</code> ends the SQL string early, leaving <code>Brien'</code> as garbage, hence the syntax error. The <code>?</code> version just works. Also note: <code>sqlite3</code> refuses <code>"SELECT 1; DROP TABLE users"</code> with <code>ProgrammingError: You can only execute one statement at a time.</code>, but other databases may allow stacked statements. Do not rely on that.</p>
+<p class="problem"><span class="pl">Problem 13.6.2</span> Hash and check a password with <code>scrypt</code>, see that salts change the hash, and see the difference between hashing and plain SHA-256 and between hashing and encryption.</p>
+<p>Predict: if two users choose the same password, will their stored hashes match?</p>
+<pre class="code lang-python"><code>import hashlib, os, hmac, uuid
+
+def hash_pw(pw, salt=None):
+    salt = salt or os.urandom(16)
+    dk = hashlib.scrypt(pw.encode(), salt=salt, n=2**14, r=8, p=1)
+    return salt, dk
+
+def check(pw, salt, dk):
+    return hmac.compare_digest(hash_pw(pw, salt)[1], dk)
+
+salt, dk = hash_pw("correct horse")
+print(len(salt), len(dk))
+print(check("correct horse", salt, dk), check("wrong", salt, dk))
+s2, d2 = hash_pw("correct horse")
+print("same password, different salt, same hash?", dk == d2)
+
+print(hashlib.sha256(b"hello").hexdigest())
+print(hashlib.sha256(b"hello!").hexdigest())
+print(hashlib.md5(b"hello").hexdigest(), "(md5: fine for checksums, never for security)")
+u = uuid.uuid4(); print(len(str(u)), u.version)
+print(uuid.uuid5(uuid.NAMESPACE_DNS, "example.com"))
+print(uuid.uuid5(uuid.NAMESPACE_DNS, "example.com"))</code></pre>
+<pre class="code lang-text"><code>16 64
+True False
+same password, different salt, same hash? False
+2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
+ce06092fb948d9ffac7d1a376e404b26b7575bcc11ee05a4615fef4fec3a308b
+5d41402abc4b2a76b9719d911017c592 (md5: fine for checksums, never for security)
+36 4
+cfbff0d1-9375-5685-968c-48ce8b15ae17
+cfbff0d1-9375-5685-968c-48ce8b15ae17</code></pre>
+<ul><li><strong>Step 1</strong> We store the salt and the derived key (<code>dk</code>), never the password. The salt is 16 random bytes; the key is 64 bytes.</li><li><strong>Step 2</strong> To log in, hash the attempt with the stored salt and compare in constant time.</li><li><strong>Step 3</strong> Changing one character (<code>hello</code> to <code>hello!</code>) changes the whole SHA-256 output. That is the "fingerprint" property, and why SHA-256 is also used for file checksums.</li><li><strong>Step 4</strong> <code>uuid4</code> is random (version 4). <code>uuid5</code> is derived from a name, so the same name always gives the same id, which is useful for stable keys in data pipelines.</li><li><strong>Check</strong> The right password gives <code>True</code>, the wrong one <code>False</code>. Two hashes of the same password with different salts differ, so attackers cannot spot users with equal passwords.</li><li><strong>Answer</strong> No, the hashes do not match, because each has a different random salt. Hashing is one-way; encryption (not shown, needs a third-party library or cloud KMS) is reversible with a key.</li><li><strong>Why it matters</strong> If your user table leaks, salted slow hashes make cracking expensive. Plain SHA-256 or MD5 can be attacked billions of times per second.</li></ul>
+<p><strong>Typical wrong version:</strong> <code>hashlib.sha256(password.encode()).hexdigest()</code> stored as the password hash. It is fast and unsalted, so identical passwords look identical and common passwords are cracked by lookup tables. Use <code>scrypt</code>/<code>argon2</code>/<code>bcrypt</code> through a vetted library.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Risk</th><th>Safe habit</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>SQL injection</td><td><code>execute(sql, params)</code></td><td>Any query built from a filter box, API parameter or file</td></tr><tr><td>Weak password storage</td><td>salted slow hash</td><td>A user table in an internal tool</td></tr><tr><td>Data in logs</td><td>redact tokens</td><td>Production incident logs shared widely</td></tr><tr><td>Stable IDs</td><td><code>uuid5</code> of a business key</td><td>Deduplicating records across loads</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> parameterised queries behind a dashboard filter.</li><li><strong>Data Engineering:</strong> SQL built from table names or dates must be validated against an allow-list, since placeholders cannot replace table names.</li><li><strong>Machine Learning / GenAI:</strong> prompt injection is the same idea (untrusted text changing instructions) for language models; keep untrusted text separate and limit what the model can do.</li><li><strong>Security-minded roles:</strong> hashing for passwords, encryption for data at rest, HTTPS for data in transit.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Believing "my data comes from my own app, so it is safe". Data from a CSV, an API, or a user is untrusted until validated. Always parameterise.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is the one-line fix for SQL injection? Answer: Use parameterised queries (placeholders), never string-built SQL.</li><li>Hashing or encryption for passwords? Answer: Hashing (salted and slow), because you never need the original back.</li><li>Why is a salt used? Answer: So the same password gives different hashes, which defeats lookup tables.</li></ol>
+<h2 id="s7-13-7-packaging-dependencies-and-supply-chain-safety">13.7 Packaging, Dependencies and Supply-Chain Safety</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A script is a loose recipe on paper. A package is a boxed meal kit: it has a name, a version, a list of ingredients (dependencies), and a standard way to open it (<code>pip install</code>). Anyone in your company can then use your code without copying files around.</div></div>
+<h3>How it works</h3>
+<p>Modern Python packaging uses a single file, <strong><code>pyproject.toml</code></strong>, which holds:</p>
+<ul><li><code>[build-system]</code>: which tool builds it (for example <code>setuptools</code>, <code>hatchling</code>, <code>poetry-core</code>).</li><li><code>[project]</code>: name, version, description, Python version, dependencies, and <strong>entry points</strong> (<code>[project.scripts]</code> makes a command like <code>mini-stats</code>).</li><li><code>[tool.*]</code>: settings for tools such as <code>ruff</code>.</li></ul>
+<p>Layout: a <strong><code>src/</code> layout</strong> (<code>src/mini_stats/__init__.py</code>) prevents you from accidentally importing the code from the current folder instead of the installed copy.</p>
+<p>To build: <code>python -m build</code> creates a <strong>wheel</strong> (<code>.whl</code>, a ready-to-install zip) and an <strong>sdist</strong> (source archive). To share inside a company, you publish to a <strong>private index</strong> (for example a cloud artifact registry, or a self-hosted index) with <code>twine upload</code> and install with <code>pip install --index-url &lt;your-index&gt; mini-stats</code>. Public publishing goes to PyPI. Both steps not run here: <code>build</code> was not installed on this machine, and there was no network.</p>
+<p><strong>Dependencies and safety:</strong></p>
+<ul><li>Pin versions for applications (<code>requests==2.x.y</code>), and use ranges for libraries. Tools: <code>pip-tools</code> (<code>pip-compile</code>), <code>poetry</code>, <code>uv</code> produce a lock file.</li><li><strong>Supply-chain risk</strong>: your code trusts every package it installs. Defences: <code>pip-audit</code> (checks installed packages against known vulnerabilities), Dependabot (opens pull requests for updates), pinned hashes, using trusted indexes only, and watching for look-alike names (typosquatting). Not run here.</li><li><strong>Jupyter reproducibility:</strong> notebooks hide state (cells can run out of order). Make them reproducible by restarting and running all cells, pinning the environment, fixing random seeds, and moving reusable code into the package with the notebook only calling it (<code>nbconvert</code> can run a notebook from the command line).</li></ul>
+<h3>Worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.7.1</span> Create a tiny package on disk, read its <code>pyproject.toml</code> with the standard <code>tomllib</code>, pack it into a zip the way a wheel is a zip, and import it from that archive.</p>
+<p>Because the <code>build</code> tool was not available, this is a <strong>demonstration of the idea</strong>, not a real wheel (a real wheel also contains a <code>*.dist-info/</code> folder with metadata).</p>
+<p>Predict: which files go in the archive, and what does the import print?</p>
+<p>The files created:</p>
+<pre class="code lang-text"><code>pk/
+  pyproject.toml
+  src/mini_stats/__init__.py
+  src/mini_stats/core.py</code></pre>
+<p><code>pyproject.toml</code> (the part we read):</p>
+<pre class="code lang-text"><code>[project]
+name = "mini-stats"
+version = "0.1.0"
+requires-python = "&gt;=3.10"
+dependencies = []
+
+[project.scripts]
+mini-stats = "mini_stats.cli:main"</code></pre>
+<pre class="code lang-python"><code>import tomllib, zipfile, sys, pathlib, doctest
+root = pathlib.Path("pk")
+cfg = tomllib.loads((root / "pyproject.toml").read_text())
+print(cfg["project"]["name"], cfg["project"]["version"], cfg["project"]["scripts"])
+whl = root / "mini_stats-0.1.0-demo.zip"
+with zipfile.ZipFile(whl, "w") as z:
+    for f in (root / "src").rglob("*.py"):
+        z.write(f, f.relative_to(root / "src"))
+print(zipfile.ZipFile(whl).namelist())
+sys.path.insert(0, str(whl))
+import mini_stats
+print(mini_stats.__version__, mini_stats.percentile([5, 1, 9, 3], 75))
+import mini_stats.core as c
+print(doctest.testmod(c))</code></pre>
+<pre class="code lang-text"><code>mini-stats 0.1.0 {'mini-stats': 'mini_stats.cli:main'}
+['mini_stats/__init__.py', 'mini_stats/core.py']
+0.1.0 5
+TestResults(failed=0, attempted=2)</code></pre>
+<ul><li><strong>Step 1</strong> <code>tomllib</code> (standard library since Python 3.11) reads TOML into a dict.</li><li><strong>Step 2</strong> We zip the contents of <code>src/</code>, so the top folder inside the archive is <code>mini_stats</code>, the importable name. (Notice: the project name <code>mini-stats</code> uses a dash, the import name <code>mini_stats</code> an underscore.)</li><li><strong>Step 3</strong> Python can import from a zip on <code>sys.path</code>, which is the same mechanism pip uses when it installs files into <code>site-packages</code>.</li><li><strong>Check</strong> Sorted <code>[5, 1, 9, 3]</code> is <code>1, 3, 5, 9</code>. For p75: ceil(4 × 0.75) = 3, index 2, value 5. The output <code>5</code> agrees.</li><li><strong>Answer</strong> Two modules were archived, the import worked, <code>percentile([5, 1, 9, 3], 75)</code> gave 5, and both doctests passed.</li><li><strong>Why it matters</strong> Once the code is a package, a teammate runs one command, and your tests import the package like any other library.</li></ul>
+<p>The real build commands (not run here):</p>
+<pre class="code lang-bash"><code>python -m pip install build twine
+python -m build                 # creates dist/*.whl and dist/*.tar.gz
+twine upload --repository-url &lt;PRIVATE_INDEX_URL&gt; dist/*
+pip install --index-url &lt;PRIVATE_INDEX_URL&gt; mini-stats
+pip-audit                        # scan installed packages for known vulnerabilities</code></pre>
+<p class="problem"><span class="pl">Problem 13.7.2</span> You have a <code>requirements.txt</code> with a loose line <code>pandas</code>. In March the app works; in June a new major version breaks it. How do you prevent this, and what is the cost?</p>
+<table class="steps"><tr><th>Step 1</th><td>Pin the exact version that works: <code>pandas==X.Y.Z</code> (use your tested version).</td></tr><tr><th>Step 2</th><td>Generate pins for the whole tree with <code>pip-compile</code> or a <code>poetry.lock</code>/<code>uv.lock</code> file, so even the dependencies of dependencies are fixed.</td></tr><tr><th>Step 3</th><td>Update on purpose: let Dependabot open a pull request, let CI run the tests, then merge.</td></tr><tr><th>Answer</th><td>Pin and lock the versions, and update deliberately through CI. The cost is that you must schedule updates; otherwise you also freeze security fixes.</td></tr><tr><th>Check</th><td>Ask: "if I build this again in a year, will I get the same packages?" With a lock file the answer is yes.</td></tr><tr><th>Why it matters</th><td>"It worked yesterday" bugs from silent upgrades waste days. Reproducible environments are also what makes ML experiments repeatable.</td></tr></table>
+<p><strong>Typical wrong version:</strong> running the code from the folder above <code>src/</code>, forgetting to install the package, and seeing <code>ModuleNotFoundError: No module named 'mini_stats'</code>. The fix is <code>pip install -e .</code> (editable install) in a virtual environment, then import from anywhere.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Piece</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td><code>pyproject.toml</code></td><td>name, version, deps</td><td>Shared utilities package used by many pipelines</td></tr><tr><td>Entry point</td><td><code>mini-stats = ...</code></td><td>A team CLI installed on every machine</td></tr><tr><td>Lock file</td><td><code>uv.lock</code>, <code>poetry.lock</code></td><td>Same versions in dev, CI and production</td></tr><tr><td><code>pip-audit</code></td><td>scan report</td><td>Security teams ask for it before release</td></tr><tr><td>Private index</td><td>internal registry</td><td>Company-only libraries</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> a shared package of connectors and validators installed in every job.</li><li><strong>Machine Learning / MLOps:</strong> training code packaged and versioned so a model can be traced to its code.</li><li><strong>Data Analytics:</strong> a team library of metric definitions, so everyone computes "active user" the same way.</li><li><strong>Data Analytics:</strong> your reporting helpers packaged once, used across projects.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Installing packages with plain <code>pip install</code> into the global Python. Versions clash between projects. Always use a virtual environment per project (Chapter 9) and record dependencies in <code>pyproject.toml</code> or a lock file.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does a wheel contain? Answer: A ready-to-install zip of your package files plus metadata.</li><li>Why pin versions for an application? Answer: So a new upstream release cannot silently break or change it.</li><li>What is a typosquatting attack? Answer: A malicious package with a name close to a popular one, hoping you mistype.</li></ol>
+<h2 id="s8-chapter-recap">Chapter recap</h2>
+<ul><li>Clean code means good names, small functions, no repetition, and comments that say why.</li><li>Refactor in small steps with tests green. Never mix refactoring with new features.</li><li>Layers separate API, rules and data. Dependency injection lets you test with fakes and mocks.</li><li>Start with a monolith. Queues and events help with spikes and decoupling, but consumers must be idempotent.</li><li>Agile works in short cycles. Estimate with ranges (PERT: <code>(O + 4M + P) / 6</code>). Write down technical debt.</li><li>Good code review is small, kind, specific, and focused on behaviour and risk.</li><li>CI runs build, lint, test (cheap first) and stops at the first failure. Exit codes decide.</li><li>Configuration lives in the environment. Secrets never go in Git. If one leaks, rotate it.</li><li>Parameterised queries stop SQL injection. Hash passwords with a salted slow algorithm.</li><li>A package has <code>pyproject.toml</code>, a <code>src/</code> layout, pinned dependencies and scans (<code>pip-audit</code>).</li></ul>
+<p><strong>Cheat sheet</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Topic</th><th>Pattern</th></tr></thead><tbody><tr><td>PERT estimate</td><td><code>(O + 4M + P) / 6</code>: (2, 4, 12) gives 5.0</td></tr><tr><td>Safe SQL</td><td><code>con.execute("... WHERE name = ?", (name,))</code></td></tr><tr><td>Password hash</td><td><code>hashlib.scrypt(pw, salt=os.urandom(16), n=2**14, r=8, p=1)</code> and <code>hmac.compare_digest</code></td></tr><tr><td>Required env var</td><td><code>os.environ["NAME"]</code> (raises <code>KeyError</code>)</td></tr><tr><td>Optional env var</td><td><code>os.environ.get("NAME", default)</code></td></tr><tr><td><code>.gitignore</code></td><td>add <code>.env</code>; commit <code>.env.example</code></td></tr><tr><td>Doctest</td><td><code>python -m doctest -v file.py</code> or <code>doctest.testmod()</code></td></tr><tr><td>Build a package</td><td><code>python -m build</code>, then <code>twine upload</code></td></tr><tr><td>Editable install</td><td><code>pip install -e .</code></td></tr><tr><td>CI order</td><td>lint, types, unit tests, integration tests, build, deploy</td></tr></tbody></table></div>
+<h2 id="s9-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 13.P.1</span> (easy) What is wrong with the name <code>def f(d, t):</code>, and what would you change?</p>
+<p><strong>Answer:</strong> The names tell nothing. Use names that say what they do and mean, such as <code>def slow_delivered_orders(orders, threshold_minutes):</code>, and add a docstring.</p>
+<p class="problem"><span class="pl">Problem 13.P.2</span> (easy) What is printed? <code>import os; print(os.environ.get("NOPE", "fallback"))</code></p>
+<p><strong>Answer:</strong> <code>fallback</code>. <code>get</code> returns the default when the variable is missing.</p>
+<p class="problem"><span class="pl">Problem 13.P.3</span> (easy) A teammate commits <code>.env</code> with a real password. List the first two things you do.</p>
+<p><strong>Answer:</strong> (1) Revoke or rotate the password immediately. (2) Remove the file from the repo and add <code>.env</code> to <code>.gitignore</code>; then clean the history if needed and add a secret scanner.</p>
+<p class="problem"><span class="pl">Problem 13.P.4</span> (medium) Estimate with PERT: optimistic 1 day, likely 3, pessimistic 11.</p>
+<p><strong>Answer:</strong> (1 + 4 x 3 + 11) / 6 = (1 + 12 + 11) / 6 = 24 / 6 = 4.0 days.</p>
+<p class="problem"><span class="pl">Problem 13.P.5</span> (medium) What is the output? <code>sqlite3</code> query <code>"SELECT * FROM t WHERE n = '" + user + "'"</code> with <code>user = "a' OR '1'='1"</code>. How many rows come back from a table of 5 rows?</p>
+<p><strong>Answer:</strong> The condition becomes <code>n = 'a' OR '1'='1'</code>, which is true for every row, so all 5 rows. The fix is <code>execute("SELECT * FROM t WHERE n = ?", (user,))</code>, which returns only rows where <code>n</code> equals the full text.</p>
+<p class="problem"><span class="pl">Problem 13.P.6</span> (medium) Find the bug: <code>password_hash = hashlib.sha256(pw.encode()).hexdigest()</code>.</p>
+<p><strong>Answer:</strong> SHA-256 is fast and, here, unsalted. Equal passwords give equal hashes and attackers can try billions of guesses per second. Use <code>scrypt</code>, <code>argon2</code> or <code>bcrypt</code> with a random salt.</p>
+<p class="problem"><span class="pl">Problem 13.P.7</span> (medium) A CI pipeline: lint 1 min, unit 3 min, integration 8 min, build 2 min. A unit test fails. How long until the developer sees red if the order is lint, unit, integration, build? And if integration comes before unit?</p>
+<p><strong>Answer:</strong> Order lint, unit: 1 + 3 = 4 minutes. If integration first: 1 + 8 + 3 = 12 minutes. Put faster checks earlier.</p>
+<p class="problem"><span class="pl">Problem 13.P.8</span> (medium) After <code>pip install -e .</code> you still get <code>ModuleNotFoundError</code> for your package. Name two likely causes.</p>
+<p><strong>Answer:</strong> You may be using a different Python or virtual environment from the one where you installed it (check <code>which python</code> and <code>pip -V</code>), or the package folder lacks <code>__init__.py</code> or is not found by the <code>src</code> layout configuration in <code>pyproject.toml</code>.</p>
+<p class="problem"><span class="pl">Problem 13.P.9</span> (hard, scenario) Your service sends order emails when an order is placed. The email provider is slow, so the API times out under load. Redesign using the ideas in this chapter.</p>
+<p><strong>Answer:</strong> Emit an "order placed" event or put a message on a queue and return at once. A separate worker consumes the queue and sends the email, with retries. Make the worker idempotent (store a sent flag per order id) because messages can arrive twice. Monitor queue depth.</p>
+<p class="problem"><span class="pl">Problem 13.P.10</span> (hard, interview) Explain hashing, encryption and encoding (base64) and say which you would use to store a password, a credit-card number you must show later, and a JWT payload.</p>
+<p><strong>Answer:</strong> Hashing is one-way (password: salted slow hash). Encryption is two-way with a key (credit-card number: encrypt, with keys in a managed key service, and consider not storing it at all). Encoding (base64) is a reversible format change with no secrecy; a JWT payload is only base64-encoded and signed, so it is readable by anyone.</p>
+<p class="problem"><span class="pl">Problem 13.P.11</span> (hard, interview) A teammate says "we do not need tests, we do code review." Give a balanced reply.</p>
+<p><strong>Answer:</strong> Review and tests catch different things. Reviewers are good at design and readability but miss edge cases and cannot rerun everything after each change. Tests are repeatable and protect against regressions (old bugs returning), especially when refactoring. Use both: tests make the review faster because the reviewer can focus on design.</p>
+<h2 id="s10-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional at an Indian company moving into data and AI roles, and English is my second language, so use simple words. Teach me "clean code and refactoring in Python": naming, small functions, DRY, docstrings, and safe refactoring with tests. Walk through one messy 30-line function, refactor it step by step, and show the output before and after to prove behaviour did not change. After each step ask me one check question and wait for my reply.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data and AI roles, and English is my second language. Quiz me one question at a time on "secrets and configuration handling": environment variables, .env and .gitignore, secret scanners like gitleaks, secret managers, rotation, and what to do when a key leaks. Start easy, get harder, explain each wrong answer simply, and give me a score out of 10 at the end.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning Python for data jobs, and English is my second language. Explain "SQL injection and parameterised queries" step by step with sqlite3 examples: show a vulnerable f-string query, an attack input, and the safe version, with real outputs. Then give me 8 graded exercises without solutions, including one where I must fix vulnerable code, and one on password hashing with a salt. Review my answers when I paste them.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data engineering, and English is my second language. Review my CI/CD and packaging setup. Check my pyproject.toml, my GitHub Actions workflow, my dependency pinning, and whether secrets are handled safely. Point out the five most important problems in order, explain each in simple English, and show the corrected snippet. My files: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for Python and data engineering interviews, and English is my second language. Run a mock interview on "professional software practice": clean code, testing pyramid, dependency injection, monolith versus microservices, queues and idempotency, code review, CI/CD, SQL injection and password storage. Ask one question at a time, grade my answer out of 5, give a model answer, and give one tip to explain it more clearly in English.</pre></div><div class="readbtn"><button class="btn" data-read="study:python:ch13">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch12.html">← Chapter 12: APIs, the Web, Scraping and Command-Line</a><a class="btn" href="ch14.html">Chapter 14: Capstone Projects and the Python Intervi →</a></div></div><script src="../../assets/study.js"></script></body></html>

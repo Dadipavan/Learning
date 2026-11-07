@@ -1,0 +1,255 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 7: dbt, the Tool That Turns SQL into a Tested Software Project</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#2b4fd6"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Engineering &amp; Big Data</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 7</div><h1>dbt, the Tool That Turns SQL into a Tested Software Project</h1><p>Models, sources, ref(), materializations, incremental builds, tests, snapshots, macros and CI.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-7-1-models-sources-ref-and-materializations">7.1 Models, Sources, ref() and Materializations</a></li><li><a href="#s2-7-2-incremental-models-snapshots-and-seeds">7.2 Incremental Models, Snapshots and Seeds</a></li><li><a href="#s3-7-3-tests-macros-packages-docs-and-ci">7.3 Tests, Macros, Packages, Docs and CI</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>In Chapter 1 you met ELT: load raw data into the warehouse first, then transform it there with SQL. The question that follows is practical. Who runs the 80 SQL files in the right order? Who tests them? Who remembers that <code>mart_city_revenue</code> depends on <code>fct_orders</code>, which depends on two staging tables? Without a tool, the answer is "a person with a spreadsheet and bad luck". <strong>dbt</strong> (data build tool) is the tool that solves this. You write plain <code>SELECT</code> statements, and dbt works out the order, builds the tables or views, runs tests, and writes documentation. In this chapter you will understand dbt by building a tiny dbt-like program yourself (it runs here), then read real dbt project files, and finally learn the habits a dbt team uses in code review and CI. The SQL itself is covered in the separate SQL study document (<code>study/sql/</code>); here we focus on the <em>engineering around</em> the SQL.</p>
+<p>Honest note: dbt is <strong>not installed</strong> here and cannot be downloaded in this sandbox. All dbt files and commands are labelled <strong>not run here</strong>. The mini build script and the SQL tests are real Python and SQLite and were run. Details such as YAML key names change between dbt versions, so check the docs of the version you use.</p>
+<p>Running example: <strong>ShopKart</strong> again. Raw tables <code>raw_orders</code> (amounts in paise, 1 rupee = 100 paise) and <code>raw_customers</code> are already loaded by the pipelines of Chapter 4. We want a trusted <code>fct_orders</code> and a <code>mart_city_revenue</code>.</p>
+<h2 id="s1-7-1-models-sources-ref-and-materializations">7.1 Models, Sources, ref() and Materializations</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of a recipe book where each recipe says "take the sauce from recipe 4". You do not copy recipe 4 into recipe 7. You <em>refer</em> to it by name. The book's index then tells you to cook recipe 4 before recipe 7. dbt's <code>ref()</code> is that "take it from recipe 4" sentence, and the order of cooking comes for free.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th><th>ShopKart example</th></tr></thead><tbody><tr><td>Model</td><td>One <code>.sql</code> file holding one <code>SELECT</code>. dbt turns it into a table or view with the file's name</td><td><code>fct_orders.sql</code> becomes table <code>fct_orders</code></td></tr><tr><td>Source</td><td>A raw table that someone else loads; you declare it in YAML so dbt knows it exists</td><td><code>raw_orders</code></td></tr><tr><td><code>ref('x')</code></td><td>"Use model x here." dbt replaces it with the real table name and records the dependency</td><td><code>{{ ref('stg_orders') }}</code></td></tr><tr><td><code>source('s','t')</code></td><td>The same idea for a raw table</td><td><code>{{ source('shop','raw_orders') }}</code></td></tr><tr><td>Materialization</td><td><em>How</em> dbt stores the model result: view, table, incremental, ephemeral</td><td><code>fct_orders</code> as table</td></tr><tr><td>Jinja</td><td>A small templating language. <code>{{ ... }}</code> prints a value, <code>{% ... %}</code> runs logic</td><td><code>{{ ref('x') }}</code></td></tr><tr><td>DAG</td><td>The dependency graph (Chapter 6). dbt builds it from the <code>ref()</code> calls</td><td>staging to fact to mart</td></tr></tbody></table></div>
+<h3>Layers: staging, intermediate, marts</h3>
+<p>The common convention (from the dbt community, not a hard rule) has three layers. It matches the bronze/silver/gold idea from Chapter 1.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Layer</th><th>Job</th><th>Prefix</th><th>Materialization (typical)</th></tr></thead><tbody><tr><td>Staging</td><td>One model per source table; rename columns, fix types, convert units. No joins</td><td><code>stg_</code></td><td>view</td></tr><tr><td>Intermediate</td><td>Joins and reshaping that several marts need</td><td><code>int_</code></td><td>ephemeral or view</td></tr><tr><td>Marts</td><td>Business-ready facts and dimensions (Chapter 2)</td><td><code>fct_</code>, <code>dim_</code>, <code>mart_</code></td><td>table or incremental</td></tr></tbody></table></div>
+<h3>The project as files (not run here)</h3>
+<p>A dbt project is just a folder of text files:</p>
+<pre class="code lang-text"><code>shopkart_dbt/
+  dbt_project.yml            project name, folder settings, default materializations
+  profiles.yml               connection to the warehouse (kept OUT of git: it holds secrets)
+  models/
+    staging/
+      _sources.yml           declares raw tables, tests on them, freshness
+      stg_orders.sql
+      stg_customers.sql
+    marts/
+      fct_orders.sql
+      mart_city_revenue.sql
+      _models.yml            descriptions and tests for the models
+  seeds/country_codes.csv    small CSV files that dbt loads as tables
+  snapshots/                 history tracking (SCD2), see 7.2
+  macros/                    reusable Jinja functions, see 7.3
+  tests/                     custom SQL tests, see 7.3</code></pre>
+<p><code>models/staging/_sources.yml</code> (not run here):</p>
+<pre class="code lang-yaml"><code>version: 2
+sources:
+  - name: shop
+    database: raw
+    schema: ingest
+    tables:
+      - name: raw_orders
+        loaded_at_field: _loaded_at
+        freshness:
+          warn_after: {count: 12, period: hour}
+          error_after: {count: 24, period: hour}
+      - name: raw_customers</code></pre>
+<p><code>models/staging/stg_orders.sql</code> (not run here):</p>
+<pre class="code lang-sql"><code>select
+    order_id,
+    customer_id,
+    amount_paise / 100.0 as amount_rupees,
+    updated_at
+from {{ source('shop', 'raw_orders') }}</code></pre>
+<p><code>models/marts/fct_orders.sql</code> (not run here):</p>
+<pre class="code lang-sql"><code>{{ config(materialized='table') }}
+
+select o.order_id, o.amount_rupees, c.city
+from {{ ref('stg_orders') }} o
+join {{ ref('stg_customers') }} c using (customer_id)</code></pre>
+<p>Commands you will type (not run here): <code>dbt run</code> builds all models; <code>dbt run --select fct_orders+</code> builds that model and everything <em>downstream</em> (the <code>+</code> after the name); <code>+fct_orders</code> means everything <em>upstream</em>; <code>dbt build</code> runs models, tests, seeds and snapshots together in DAG order; <code>dbt compile</code> shows the final SQL without running it.</p>
+<h3>Predict, Run, Explain: a mini dbt in 20 lines (real, run here)</h3>
+<p>To understand what <code>ref()</code> really does, we build the same idea ourselves. Before you run it, predict: in what order will the four models be built, and what will <code>ref</code> be replaced with?</p>
+<pre class="code lang-python"><code>import re, sqlite3, graphlib
+models={
+ "stg_orders":"SELECT order_id, customer_id, amount/100.0 AS amount FROM raw_orders",
+ "stg_customers":"SELECT id AS customer_id, UPPER(city) AS city FROM raw_customers",
+ "fct_orders":"SELECT o.order_id, o.amount, c.city FROM {{ ref('stg_orders') }} o JOIN {{ ref('stg_customers') }} c USING(customer_id)",
+ "mart_city_revenue":"SELECT city, SUM(amount) AS revenue FROM {{ ref('fct_orders') }} GROUP BY city",
+}
+db=sqlite3.connect(":memory:")
+db.executescript("""CREATE TABLE raw_orders(order_id,customer_id,amount);INSERT INTO raw_orders VALUES(1,1,25000),(2,1,5000),(3,2,12000);
+CREATE TABLE raw_customers(id,city);INSERT INTO raw_customers VALUES(1,'pune'),(2,'delhi');""")
+deps={m:set(re.findall(r"ref\('(\w+)'\)",s)) for m,s in models.items()}
+for m in graphlib.TopologicalSorter(deps).static_order():
+    sql=re.sub(r"\{\{ ref\('(\w+)'\) \}\}",r"\1",models[m])
+    db.execute(f"CREATE VIEW {m} AS {sql}"); print("built",m)
+print(db.execute("SELECT * FROM mart_city_revenue ORDER BY city").fetchall())
+print("test not_null(fct_orders.city) bad rows:",db.execute("SELECT COUNT(*) FROM fct_orders WHERE city IS NULL").fetchone()[0])</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>built stg_orders
+built stg_customers
+built fct_orders
+built mart_city_revenue
+[('DELHI', 120.0), ('PUNE', 300.0)]
+test not_null(fct_orders.city) bad rows: 0</code></pre>
+<p>Line by line:</p>
+<ul><li><code>models</code> is a dictionary of model name to SQL text. In dbt this is "a folder of <code>.sql</code> files".</li><li><code>deps</code> uses a regular expression to find every <code>ref('...')</code> in each SQL text. This is exactly how dbt learns the graph: it reads your SQL, so you never write the order by hand.</li><li><code>graphlib.TopologicalSorter(deps).static_order()</code> is the same topological sort as the toy scheduler in Chapter 6. A model appears only after everything it refers to.</li><li><code>re.sub(...)</code> replaces <code>{{ ref('x') }}</code> by the plain name <code>x</code>. Real dbt replaces it with the full name, such as <code>analytics.dev_asha.stg_orders</code>, and that is why the same code works in a developer's private schema and in production.</li><li><code>CREATE VIEW</code> is the <em>view</em> materialization. Real dbt can also create a table.</li><li>The last line is a test: a query that returns <em>bad rows</em>. Zero rows means pass. dbt tests are built on this single idea.</li></ul>
+<p>Check by hand: Asha (customer 1, Pune) has orders of 25000 and 5000 paise = 250 + 50 = 300 rupees. Ravi (Delhi) has 12000 paise = 120 rupees. The output matches.</p>
+<p class="problem"><span class="pl">Problem 7.1.1</span> <code>fct_orders</code> refers to <code>stg_orders</code> and <code>stg_customers</code>. <code>mart_city_revenue</code> refers to <code>fct_orders</code>. A teammate runs <code>dbt run --select stg_orders+</code>. Which models are built?</p>
+<table class="steps"><tr><th>Step 1</th><td>The <code>+</code> after a name means "this model and everything downstream of it".</td></tr><tr><th>Step 2</th><td>Downstream of <code>stg_orders</code> is <code>fct_orders</code> (it refers to it), and downstream of <code>fct_orders</code> is <code>mart_city_revenue</code>.</td></tr><tr><th>Step 3</th><td><code>stg_customers</code> is a <em>sibling</em> input, not downstream, so it is not selected.</td></tr><tr><th>Answer</th><td><code>stg_orders</code>, <code>fct_orders</code>, <code>mart_city_revenue</code>, in that order.</td></tr><tr><th>Check</th><td>In our toy, the topological order printed earlier shows these three in the same relative order.</td></tr><tr><th>Why it matters</th><td>After you change one staging model you rebuild only what can be affected. On a 500-model project this saves hours.</td></tr></table>
+<h3>Materializations: how the result is stored</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Type</th><th>What dbt creates</th><th>Good when</th><th>Bad when</th></tr></thead><tbody><tr><td><code>view</code></td><td>A saved query. Nothing stored</td><td>Light models, small data, staging</td><td>Many people query it: it recomputes each time</td></tr><tr><td><code>table</code></td><td>Full rebuild into a physical table on each run</td><td>Medium data, dashboards need speed</td><td>Data is huge: rebuild is slow and costly</td></tr><tr><td><code>incremental</code></td><td>Adds or updates only new rows (7.2)</td><td>Large, append-heavy facts</td><td>Logic that must change old rows often</td></tr><tr><td><code>ephemeral</code></td><td>No object at all; inlined as a CTE (a named sub-query) into the models that use it</td><td>Tiny helper logic</td><td>You want to debug it or query it alone</td></tr><tr><td><code>materialized_view</code></td><td>The warehouse keeps it fresh itself (support depends on the adapter)</td><td>Simple aggregates with frequent reads</td><td>Complex SQL the warehouse cannot maintain</td></tr></tbody></table></div>
+<p>Set defaults in <code>dbt_project.yml</code> (not run here):</p>
+<pre class="code lang-yaml"><code>models:
+  shopkart:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table</code></pre>
+<h3>Connection to the real job</h3>
+<p>In job ads, "analytics engineer" and "dbt experience" mean exactly this section: organising SQL into layers, using <code>ref()</code>, and choosing materializations to balance speed and cost (Chapter 8).</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> analysts own marts in dbt so dashboards read one trusted definition of "revenue".</li><li><strong>Data Engineering:</strong> the ELT "T" step; dbt runs as one task inside an Airflow DAG (Chapter 6) after ingestion.</li><li><strong>Machine Learning:</strong> feature tables are built as dbt models with tests, then read by training jobs.</li><li><strong>GenAI:</strong> a clean, documented mart is the safest source for text-to-SQL assistants.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Making everything a <code>table</code> "to be safe". A 2-billion-row fact rebuilt every hour wastes warehouse money. Start with views for staging, tables for small marts, and incremental for big facts.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does <code>ref('x')</code> give you besides the table name? Answer: the dependency arrow in the DAG, so dbt builds <code>x</code> first.</li><li>Which materialization stores nothing and is inlined as a CTE? Answer: <code>ephemeral</code>.</li><li>Why is <code>profiles.yml</code> kept out of git? Answer: it holds warehouse credentials.</li></ol>
+<h2 id="s2-7-2-incremental-models-snapshots-and-seeds">7.2 Incremental Models, Snapshots and Seeds</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Updating a wall calendar. You do not reprint the whole year each morning. You cross out today. An incremental model only processes the rows that are new since the last run. A snapshot is a diary: when a customer's tier changes from silver to gold, you do not erase "silver". You write "silver until June 10, gold from June 10".</div></div>
+<h3>Incremental models</h3>
+<p>You know the watermark from Chapter 4 (4.1): remember the largest <code>updated_at</code> already loaded and fetch only newer rows. dbt's incremental materialization is the same idea inside the warehouse.</p>
+<p><code>models/marts/fct_orders.sql</code> as incremental (not run here):</p>
+<pre class="code lang-sql"><code>{{ config(materialized='incremental', unique_key='order_id') }}
+
+select order_id, customer_id, amount_rupees, updated_at
+from {{ ref('stg_orders') }}
+{% if is_incremental() %}
+where updated_at &gt; (select max(updated_at) from {{ this }})
+{% endif %}</code></pre>
+<ul><li><code>is_incremental()</code> is true only when the table already exists and you did not pass <code>--full-refresh</code>. On the first run the <code>where</code> is skipped, so everything loads.</li><li><code>{{ this }}</code> means "the table this model builds", so the model can read its own current state.</li><li><code>unique_key='order_id'</code> tells dbt how to <em>update</em> existing rows (a merge or delete-and-insert, depending on the adapter's <em>incremental strategy</em>). Without a unique key, dbt can only append, and updated rows would appear twice.</li><li>Strategies you will see named: <code>append</code>, <code>merge</code>, <code>delete+insert</code>, <code>insert_overwrite</code> (partition replace). Which ones exist depends on the warehouse adapter.</li><li><code>dbt run --full-refresh</code> drops and rebuilds from scratch. It is your repair tool.</li></ul>
+<h3>Predict, Run, Explain: incremental in SQLite (real, run here)</h3>
+<p>Our toy does the same with <code>INSERT OR REPLACE</code> (SQLite's "upsert by primary key"). Predict: after run 2, how many rows, and what is the amount of order 1? Then a <em>late</em> row arrives with an old <code>updated_at</code>. Will the watermark catch it?</p>
+<pre class="code lang-python"><code>import sqlite3
+db=sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE raw_orders(order_id INT, customer_id INT, amount_paise INT, updated_at TEXT);
+INSERT INTO raw_orders VALUES (1,1,25000,'2024-06-01'),(2,1,5000,'2024-06-01'),(3,2,12000,'2024-06-02');
+CREATE TABLE fct_orders(order_id INT PRIMARY KEY, customer_id INT, amount REAL, updated_at TEXT);
+""")
+def run_incremental(full_refresh=False):
+    if full_refresh: db.execute("DELETE FROM fct_orders")
+    wm=db.execute("SELECT COALESCE(MAX(updated_at),'1900-01-01') FROM fct_orders").fetchone()[0]
+    db.execute("""INSERT OR REPLACE INTO fct_orders
+      SELECT order_id, customer_id, amount_paise/100.0, updated_at FROM raw_orders WHERE updated_at &gt; ?""",(wm,))
+    return wm
+print("run 1 watermark:",run_incremental(), "rows:",db.execute("SELECT COUNT(*) FROM fct_orders").fetchone()[0])
+db.execute("INSERT INTO raw_orders VALUES (4,3,8000,'2024-06-03')")
+db.execute("UPDATE raw_orders SET amount_paise=30000, updated_at='2024-06-03' WHERE order_id=1")
+print("run 2 watermark:",run_incremental(), "rows:",db.execute("SELECT COUNT(*) FROM fct_orders").fetchone()[0])
+print(db.execute("SELECT * FROM fct_orders ORDER BY order_id").fetchall())
+print("run 3 (nothing new) watermark:",run_incremental(),"rows:",db.execute("SELECT COUNT(*) FROM fct_orders").fetchone()[0])
+db.execute("INSERT INTO raw_orders VALUES (5,2,9900,'2024-06-01')")
+run_incremental(); print("late row 5 loaded?",db.execute("SELECT COUNT(*) FROM fct_orders WHERE order_id=5").fetchone()[0]==1)
+run_incremental(full_refresh=True); print("after full refresh, loaded?",db.execute("SELECT COUNT(*) FROM fct_orders WHERE order_id=5").fetchone()[0]==1)</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>run 1 watermark: 1900-01-01 rows: 3
+run 2 watermark: 2024-06-02 rows: 4
+[(1, 1, 300.0, '2024-06-03'), (2, 1, 50.0, '2024-06-01'), (3, 2, 120.0, '2024-06-02'), (4, 3, 80.0, '2024-06-03')]
+run 3 (nothing new) watermark: 2024-06-03 rows: 4
+late row 5 loaded? False
+after full refresh, loaded? True</code></pre>
+<p>Explanation:</p>
+<ul><li>Run 1: the table is empty, so the watermark is the fake old date <code>1900-01-01</code> and all 3 rows load. This is the "first run" branch.</li><li>Run 2: watermark is <code>2024-06-02</code> (the biggest date loaded). Only order 4 (new) and order 1 (updated to 3 June) pass <code>updated_at &gt; watermark</code>. Order 1 replaces its old row because it has the same primary key (our <code>unique_key</code>). So we have 4 rows, and order 1 shows 300.0 rupees (30000 paise).</li><li>Run 3: watermark <code>2024-06-03</code> and no raw row is newer, so nothing changes. Running it again is safe: this is <strong>idempotent</strong> (Chapter 6).</li><li>The late row 5 has <code>updated_at = 2024-06-01</code>, older than the watermark. The filter <code>&gt;</code> skips it <strong>forever</strong>. Only a full refresh (or a lookback window) repairs it.</li></ul>
+<div class="callout cream"><div class="lab">KEY INSIGHT</div><div class="txt">A watermark on <code>updated_at</code> is only correct if the source always stamps a <em>new, increasing</em> time on every change and every arrival. Late-arriving rows (Chapter 4, 4.3) break it. The usual fix is a <strong>lookback window</strong>: use <code>updated_at &gt; max(updated_at) - interval '3 days'</code> together with a <code>unique_key</code>, so reprocessed rows replace themselves instead of duplicating.</div></div>
+<p class="problem"><span class="pl">Problem 7.2.1</span> Order 1 is changed on 5 June, and the incremental model has <code>unique_key='order_id'</code>, merge strategy. The table holds order 1 with amount 300. The new amount is 350. How many rows for order 1 after the run, and what amount?</p>
+<table class="steps"><tr><th>Step 1</th><td>The row is newer than the watermark, so it is selected.</td></tr><tr><th>Step 2</th><td>Merge compares on <code>order_id</code>: a match exists, so it <em>updates</em> instead of inserting.</td></tr><tr><th>Answer</th><td>One row, amount 350.</td></tr><tr><th>Check</th><td>Without <code>unique_key</code> (append only) there would be two rows (300 and 350), and <code>SUM(amount)</code> would be inflated by 300.</td></tr><tr><th>Why it matters</th><td>Duplicate rows from a missing unique key is the most common incremental bug.</td></tr></table>
+<h3>Snapshots: history of changing dimensions</h3>
+<p>Chapter 2 taught SCD Type 2 (keep every version of a dimension row with <code>valid_from</code> and <code>valid_to</code>). A dbt <strong>snapshot</strong> automates it. There are two strategies. The <code>timestamp</code> strategy compares an <code>updated_at</code> column. The <code>check</code> strategy compares the values of chosen columns. dbt adds the columns <code>dbt_valid_from</code> and <code>dbt_valid_to</code>; the current row has <code>dbt_valid_to</code> empty (null). Older dbt versions use a <code>{% snapshot %}</code> Jinja block; newer versions also allow a YAML definition. Check your version. Example (not run here):</p>
+<pre class="code lang-sql"><code>{% snapshot snap_customers %}
+{{ config(
+    target_schema='snapshots',
+    unique_key='customer_id',
+    strategy='check',
+    check_cols=['tier']
+) }}
+select customer_id, tier from {{ source('shop', 'raw_customers') }}
+{% endsnapshot %}</code></pre>
+<p>You run <code>dbt snapshot</code> on a schedule. <strong>A snapshot only records changes it sees.</strong> If a customer changes tier twice between two runs, you only see the final value.</p>
+<p>Our toy of the check strategy (real, run here; the SQL closes the old row and opens a new one when <code>tier</code> differs):</p>
+<pre class="code lang-text"><code>(1, 'silver', '2024-06-01', '2024-06-10')
+(1, 'gold', '2024-06-10', None)
+(2, 'gold', '2024-06-01', None)</code></pre>
+<p>Reading it: customer 1 was silver from 1 June until 10 June, then gold from 10 June (open, <code>None</code> means "still current"). Customer 2 never changed. We ran the snapshot a third time on 11 June with no change and no new rows appeared: the snapshot is idempotent.</p>
+<p class="problem"><span class="pl">Problem 7.2.3</span> An analyst joins orders to <code>snap_customers</code> to get the tier <em>at the time of the order</em>. Order 3 was placed on 2024-06-05 by customer 1. Which row matches?</p>
+<table class="steps"><tr><th>Step 1</th><td>Join condition: <code>order_date &gt;= valid_from and (order_date &lt; valid_to or valid_to is null)</code>.</td></tr><tr><th>Step 2</th><td>Row 1: valid 06-01 to 06-10. 06-05 is inside this range. Row 2 starts 06-10, so no.</td></tr><tr><th>Answer</th><td>Tier silver.</td></tr><tr><th>Check</th><td>An order on 2024-06-12 would match the open row (gold).</td></tr><tr><th>Why it matters</th><td>"Revenue by tier <em>as it was</em>" needs history. Joining to the current tier rewrites the past.</td></tr></table>
+<p><strong>Seeds</strong> are small CSV files in <code>seeds/</code> that <code>dbt seed</code> loads as tables (country codes, status mappings). Large or changing data belongs in a source instead.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> "orders by tier at time of purchase" from snapshots.</li><li><strong>Data Engineering:</strong> cost control by incremental builds on event tables.</li><li><strong>Machine Learning:</strong> point-in-time correct training data needs historical dimension values, so leakage is avoided.</li><li><strong>Compliance:</strong> snapshots keep an audit trail of changing customer attributes.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Treating <code>is_incremental()</code> as safe forever. Over months, late rows and logic changes leave the table slightly wrong. Schedule a weekly or monthly <code>--full-refresh</code>, and compare row counts with the source.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What do you add to an incremental model so changed rows replace old ones? Answer: <code>unique_key</code> (with a merge or delete+insert strategy).</li><li>What does <code>dbt_valid_to</code> empty mean? Answer: the row is the current version.</li><li>Why did our watermark miss row 5? Answer: its <code>updated_at</code> was older than the stored maximum.</li></ol>
+<h2 id="s3-7-3-tests-macros-packages-docs-and-ci">7.3 Tests, Macros, Packages, Docs and CI</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A restaurant kitchen has recipes (models), but also a person who tastes the dish before it leaves (tests). A macro is a kitchen tool you use in many recipes (a rice cooker). CI (continuous integration) is a rule that no new recipe reaches the menu until a taster has approved it.</div></div>
+<h3>Tests</h3>
+<p>Chapter 5 introduced data-quality checks. dbt has two kinds:</p>
+<ul><li><strong>Generic tests</strong>: four are built in, declared in YAML next to the model: <code>unique</code>, <code>not_null</code>, <code>accepted_values</code>, <code>relationships</code> (a foreign-key check).</li><li><strong>Singular tests</strong>: any <code>.sql</code> file in <code>tests/</code> that returns the <em>failing rows</em>. If it returns zero rows, it passes.</li></ul>
+<p><code>models/marts/_models.yml</code> (not run here):</p>
+<pre class="code lang-yaml"><code>version: 2
+models:
+  - name: fct_orders
+    description: "One row per order. Amount in rupees."
+    columns:
+      - name: order_id
+        data_tests:          # older dbt versions use the key "tests:"
+          - unique
+          - not_null
+      - name: customer_id
+        data_tests:
+          - relationships:
+              to: ref('dim_customers')
+              field: customer_id
+      - name: status
+        data_tests:
+          - accepted_values:
+              values: ['placed', 'shipped', 'cancelled']</code></pre>
+<p>A singular test <code>tests/no_negative_amounts.sql</code> (not run here):</p>
+<pre class="code lang-sql"><code>select order_id, amount_rupees from {{ ref('fct_orders') }} where amount_rupees &lt; 0</code></pre>
+<p>The tests are just queries. Our SQLite version of four generic tests on a table where we planted two defects (a row with null <code>customer_id</code>, and an order whose customer 3 is missing from the customer table). Real output:</p>
+<pre class="code lang-text"><code>FAIL not_null(fct_orders.customer_id) failing rows: 1
+PASS unique(fct_orders.order_id) failing rows: 0
+FAIL relationships(fct_orders.customer_id-&gt;raw_customers) failing rows: 1
+PASS accepted_values(snap.tier) failing rows: 0</code></pre>
+<p>Reading it: <code>not_null</code> finds the planted null. <code>relationships</code> finds order 4, whose customer 3 does not exist in <code>raw_customers</code> (an <em>orphan</em> key). <code>unique</code> and <code>accepted_values</code> pass. Note <code>relationships</code> ignores null keys (we filtered them with <code>IS NOT NULL</code>), so a null is reported once, by <code>not_null</code>.</p>
+<p>Test severity: a test can be <code>warn</code> or <code>error</code>; <code>dbt build</code> stops downstream models when an upstream test fails, which prevents bad data from spreading into marts.</p>
+<p class="problem"><span class="pl">Problem 7.3.1</span> A model <code>dim_product</code> has 1,200 rows and <code>product_id</code> has 3 duplicated values (each appears twice). What does the <code>unique</code> test report, and what is the row count of distinct ids?</p>
+<table class="steps"><tr><th>Step 1</th><td>Test query: <code>select product_id from dim_product group by product_id having count(*) &gt; 1</code>.</td></tr><tr><th>Step 2</th><td>Three ids appear twice, so 3 rows come back.</td></tr><tr><th>Step 3</th><td>Rows involved: 1,200 total. The 3 duplicates account for 3 extra rows, so distinct ids = 1,200 − 3 = 1,197.</td></tr><tr><th>Answer</th><td>The test fails with 3 failing rows; there are 1,197 distinct products.</td></tr><tr><th>Check</th><td>1,197 + 3 = 1,200.</td></tr><tr><th>Why it matters</th><td>A duplicate dimension key silently multiplies fact rows in joins (fan-out, Chapter 2). This is why <code>unique</code> on every primary key is the first test to add.</td></tr></table>
+<h3>Macros, packages and Jinja</h3>
+<p>A <strong>macro</strong> is a reusable Jinja function. <code>macros/cents_to_rupees.sql</code> (not run here):</p>
+<pre class="code lang-sql"><code>{% macro paise_to_rupees(column_name) %}
+    ({{ column_name }} / 100.0)
+{% endmacro %}</code></pre>
+<p>Used as <code>select {{ paise_to_rupees('amount_paise') }} as amount_rupees from ...</code>. dbt first renders Jinja into plain SQL (you can see it with <code>dbt compile</code>), then sends the SQL to the warehouse. <strong>Jinja runs in dbt, before the warehouse, and never sees your data.</strong> That is why a Jinja <code>if</code> cannot depend on a column value, only on things known at compile time (such as the target environment).</p>
+<p><strong>Packages</strong> are shared dbt projects. You list them in <code>packages.yml</code> (for example <code>dbt_utils</code>, which has tests and macros such as <code>generate_surrogate_key</code>) and run <code>dbt deps</code>. Package names and versions change; check the dbt package hub.</p>
+<h3>CI with slim builds</h3>
+<p>CI for dbt means: on every pull request, build and test the changed models in a temporary schema, and block the merge if anything fails. Rebuilding all 500 models on each pull request is slow and costly. A <strong>slim build</strong> builds only what changed and what is downstream, and reads unchanged upstream models from production (<strong>defer</strong>). Command (not run here):</p>
+<pre class="code lang-bash"><code>dbt build --select state:modified+ --defer --state ./prod_artifacts</code></pre>
+<p><code>state:modified+</code> means "changed models and everything downstream". <code>--state</code> points to the saved <code>manifest.json</code> from the last production run. <code>--defer</code> says "if an upstream model was not rebuilt, use the production copy".</p>
+<p>A typical team flow: branch in git, change SQL, push, CI runs <code>dbt build</code> slim on a PR schema, a colleague reviews, merge, then a scheduled production job runs <code>dbt build</code> (often from Airflow, Chapter 6, or dbt Cloud).</p>
+<h3>dbt Core, dbt Cloud, semantic layer</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>What it is</th></tr></thead><tbody><tr><td>dbt Core</td><td>The open-source command-line tool you run yourself (laptop, container, Airflow worker)</td></tr><tr><td>dbt Cloud</td><td>A paid hosted product: scheduler, IDE, CI, docs hosting</td></tr><tr><td>Semantic layer</td><td>You define <em>metrics</em> (such as <code>revenue = sum(amount)</code>) once in YAML; BI tools ask the layer for "revenue by city" and get one definition everywhere</td></tr></tbody></table></div>
+<h3>Python transformation versus SQL and Spark</h3>
+<p>Not everything is SQL. A short decision guide:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Data size</th><th>Tool</th><th>Reason</th></tr></thead><tbody><tr><td>Up to a few GB, one machine</td><td>pandas, Polars or DuckDB</td><td>No cluster; DuckDB runs SQL on files directly (Chapter 3)</td></tr><tr><td>Tens of GB, one big machine</td><td>Polars or DuckDB</td><td>Faster and more memory-friendly than pandas</td></tr><tr><td>Hundreds of GB to TB, in the warehouse</td><td>SQL via dbt</td><td>Warehouse scales the compute</td></tr><tr><td>Large files in a lake, complex logic</td><td>Spark (Chapters 9 and 10)</td><td>Distributes across a cluster</td></tr></tbody></table></div>
+<p>Some dbt adapters also support Python models, which run on the platform's Spark or Snowpark engine. Not run here.</p>
+<p><code>dbt docs generate</code> and <code>dbt docs serve</code> build a website with the lineage graph. An <em>exposure</em> in YAML declares a consumer (such as a dashboard) so you see who a change affects.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> tested, documented marts that dashboards trust.</li><li><strong>Data Engineering:</strong> freshness checks on sources catch late loads before users see stale numbers.</li><li><strong>MLOps:</strong> the same CI idea (changed code, tested in a temp environment) applies to ML pipelines.</li><li><strong>Governance:</strong> exposures and lineage show who is affected by a change.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Having models without tests, or tests that are always <code>warn</code>. A test nobody reads is decoration. Put <code>unique</code> and <code>not_null</code> on every primary key, <code>relationships</code> on every foreign key, and make the important ones <code>error</code>.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What must a singular test return to pass? Answer: zero rows.</li><li>What does <code>--defer</code> do? Answer: reads unchanged upstream models from the production state instead of rebuilding them.</li><li>Can a Jinja <code>if</code> check the value of a data row? Answer: no, Jinja runs at compile time before the warehouse sees any data.</li></ol>
+<h2 id="s4-chapter-recap">Chapter recap</h2>
+<ul><li>dbt turns <code>SELECT</code> files into tables or views, orders them using <code>ref()</code>, tests them and documents them.</li><li><code>ref()</code> and <code>source()</code> build the DAG; never hard-code table names.</li><li>Layers: staging (clean one source), intermediate (shared joins), marts (business-ready).</li><li>Materializations: view, table, incremental, ephemeral (and materialized view where supported).</li><li>Incremental needs <code>is_incremental()</code>, a <code>unique_key</code> and a plan for late data (lookback and periodic full refresh).</li><li>Snapshots record history (SCD2) with <code>dbt_valid_from</code> and <code>dbt_valid_to</code>, but only for changes they observe.</li><li>Tests are queries that return failing rows; four generic tests plus singular tests; <code>dbt build</code> stops downstream on failure.</li><li>CI uses slim builds (<code>state:modified+</code>, <code>--defer</code>); choose pandas, Polars or DuckDB for small data and Spark for large.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Command or code</th></tr></thead><tbody><tr><td>Build model and downstream</td><td><code>dbt run --select name+</code></td></tr><tr><td>Build, test, seed, snapshot</td><td><code>dbt build</code></td></tr><tr><td>See rendered SQL</td><td><code>dbt compile</code></td></tr><tr><td>Incremental guard</td><td><code>{% if is_incremental() %} ... {% endif %}</code></td></tr><tr><td>Rebuild from scratch</td><td><code>dbt run --full-refresh</code></td></tr><tr><td>Slim CI</td><td><code>dbt build --select state:modified+ --defer --state path</code></td></tr><tr><td>Source freshness</td><td><code>dbt source freshness</code></td></tr></tbody></table></div>
+<h2 id="s5-practice-set">Practice set</h2>
+<p><strong>1.</strong> (easy) What does <code>dbt run --select fct_orders</code> build? <strong>Answer:</strong> only <code>fct_orders</code> (no <code>+</code>, so no upstream and no downstream).</p>
+<p><strong>2.</strong> (easy) Name the four built-in generic tests. <strong>Answer:</strong> <code>unique</code>, <code>not_null</code>, <code>accepted_values</code>, <code>relationships</code>.</p>
+<p><strong>3.</strong> What is printed by <code>{{ ref('stg_orders') }}</code> in a developer's private schema? <strong>Answer:</strong> the full name of that model in the developer's schema (for example <code>analytics.dev_asha.stg_orders</code>), not a fixed production name.</p>
+<p><strong>4.</strong> An incremental model has no <code>unique_key</code>. An order updates. What happens? <strong>Answer:</strong> a second row is appended (old and new both exist), double-counting in sums.</p>
+<p><strong>5.</strong> (find the bug) <code>where updated_at &gt; (select max(updated_at) from stg_orders)</code> inside an incremental model. <strong>Answer:</strong> it should read from <code>{{ this }}</code> (the target table), not the source model; otherwise the watermark is the source's own maximum and nothing new is ever selected.</p>
+<p><strong>6.</strong> A snapshot with <code>check_cols=['tier']</code> runs daily. A customer changes silver, gold, silver within one day. What does the snapshot hold? <strong>Answer:</strong> no new row if the value at run time is the same as before (silver); intermediate changes between runs are invisible.</p>
+<p><strong>7.</strong> 800,000,000 rows, 4,000,000 changed per day, lookback of 2 days. Rows processed per day versus full rebuild? <strong>Answer:</strong> 2 × 4,000,000 = 8,000,000 versus 800,000,000, which is 100 times less.</p>
+<p><strong>8.</strong> Write a singular test returning orders shipped before they were placed. <strong>Answer:</strong> <code>select order_id from {{ ref('fct_orders') }} where shipped_at &lt; placed_at</code>.</p>
+<p><strong>9.</strong> (interview) "How do you handle late-arriving data in an incremental dbt model?" <strong>Answer:</strong> use a unique key with a merge or delete+insert strategy, filter with a lookback window instead of a strict maximum, add freshness and volume tests, and run a periodic full refresh as the repair path.</p>
+<p><strong>10.</strong> (interview) "A pull request changes one staging model in a project of 400 models. How do you test it cheaply?" <strong>Answer:</strong> slim CI: <code>dbt build --select state:modified+ --defer --state prod_artifacts</code> into a PR-specific schema, so only the changed model and its downstream models are built and tested.</p>
+<p><strong>11.</strong> (scenario) The Finance dashboard shows revenue 12% too high after a model change. Where do you look first? <strong>Answer:</strong> check <code>unique</code> tests on the dimension and fact keys (fan-out from duplicate dimension rows), use the lineage graph to see all models touched, compare row counts before and after the join, and look at the incremental logic for a missing unique key.</p>
+<h2 id="s6-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me dbt basics: models, sources, ref(), the DAG and the staging, intermediate and marts layers. Use a small ShopKart orders example with real rows and explain what ref() is replaced with in each environment. Then ask me 4 questions one at a time and check my answers before moving on.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am learning data engineering. Topic: dbt materializations (view, table, incremental, ephemeral) and incremental models with unique_key and a lookback window. Show a late-arriving row that a strict watermark misses and how the lookback fixes it. Then give me 8 graded exercises without solutions. I will paste my answers: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Explain dbt snapshots (SCD Type 2): the timestamp and check strategies, dbt_valid_from and dbt_valid_to, and the limit that snapshots only see changes at run time. Give a worked example with 3 customers and tier changes, and a point-in-time join. Then quiz me one question at a time.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am learning data engineering. Review my dbt project files for missing tests, hard-coded table names, wrong materializations and unsafe incremental logic. Explain each issue in simple English, show the fix, and rank issues by risk. My files: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am applying for analytics engineer and data engineer roles. Run a mock interview on dbt: ref and source, incremental strategies, tests, snapshots, macros and Jinja, slim CI with defer, dbt Core versus Cloud, and the semantic layer. Ask 8 questions one at a time. After each answer give a score from 1 to 5, a model answer in simple English, and one follow-up.</pre></div><div class="readbtn"><button class="btn" data-read="study:de:ch07">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch06.html">← Chapter 6: Orchestration with Apache Airflow (and I</a><a class="btn" href="ch08.html">Chapter 8: Cloud Warehouses, Cost Control and the C →</a></div></div><script src="../../assets/study.js"></script></body></html>

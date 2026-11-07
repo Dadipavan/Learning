@@ -1,0 +1,259 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 16: Project Lab 2: Key-Value Store and Route Planner</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Linux, Git, Algorithms &amp; CS Foundations</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 16</div><h1>Project Lab 2: Key-Value Store and Route Planner</h1><p>Two projects that turn hash maps, files, queues, heaps and graphs into programs you can demonstrate.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-16-1-project-mini-key-value-store-with-persistence">16.1 Project: Mini Key-Value Store with Persistence</a></li><li><a href="#s2-16-2-project-graph-based-route-planner">16.2 Project: Graph-Based Route Planner</a></li><li><a href="#s3-chapter-recap">Chapter recap</a></li><li><a href="#s4-practice-set">Practice set</a></li><li><a href="#s5-prompt-pack">Prompt pack</a></li></ol></details><p>The first lab chapter gave you the method for planning, building and presenting a project. Use it again here: one measurable question, the same repo layout, small commits, tests, a README with real output. This chapter has two projects that employers like because they show you understand what is inside the tools you use every day. A mini key-value store shows how a database remembers things after a restart. A route planner shows how a map application finds the quickest way. By the end you will have built both from scratch with the Python standard library, tested them and written an honest README. All code and output below are real, from Python 3 in <code>/tmp/cs_lab/ch15</code>. Sizes in bytes and the order of dictionary keys are exactly as we got them.</p>
+<h2 id="s1-16-1-project-mini-key-value-store-with-persistence">16.1 Project: Mini Key-Value Store with Persistence</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of a shop ledger where you never erase anything. You only write new lines at the bottom: "order 1: 3 pens", then later "order 1: 5 pens". To know the current value you read from the bottom. To find things fast you keep a small index card with "order 1 is on line 3 of the ledger". When the ledger gets very long, you copy only the current entries into a fresh ledger and throw the old one away. That is an append-only log with an index and compaction.</div></div>
+<h3>Goal and why employers care</h3>
+<p>Build a store with <code>put</code>, <code>get</code> and <code>delete</code> that survives a restart and a half-written last line. It uses a hash map in memory for speed and an append-only file on disk for safety, with compaction to reclaim space. Employers care because this design (a log plus an in-memory index) appears inside real databases and message systems, and explaining it shows you understand durability, not only syntax.</p>
+<h3>Skills used</h3>
+<p>Chapter 7, Complexity, Arrays, Strings, Hashing and Sorting (hash map, O(1) average lookup); Chapter 5, Operating Systems for People Who Test Performance (files, file offsets, <code>fsync</code>, atomic rename); Chapter 12, Distributed Systems Fundamentals (logs and recovery by replay).</p>
+<h3>Data</h3>
+<p>None needed. The demo uses shop orders such as <code>order:1</code> with a value like <code>{"item": "pen", "qty": 3}</code>, plus one hot key overwritten 1,000 times so compaction has something to remove.</p>
+<h3>Architecture</h3>
+<pre class="code lang-text"><code>kv/
+  kvstore.py     class KV: put, get, delete, compact
+  demo.py        the walk-through below
+  test_kv.py     small asserts
+  README.md
+
+ put(k, v)  -&gt; append one JSON line to the file -&gt; index[k] = byte offset
+ get(k)     -&gt; offset = index[k] -&gt; seek there -&gt; read ONE line
+ delete(k)  -&gt; append a "del" marker (a tombstone) -&gt; remove k from index
+ start up   -&gt; read the file top to bottom, rebuild index (last record wins)
+ compact()  -&gt; write live keys to a new file -&gt; atomically replace the old file
+
+ disk file:  {"k":"order:1","v":{...}}\n  {"k":"order:2",...}\n  {"k":"order:1",...}\n  {"k":"order:2","del":1}\n
+ memory:     index = {"order:1": 70}      (byte position of the newest line)</code></pre>
+<p>A <strong>tombstone</strong> is a record that means "this key was deleted". We cannot erase a line in an append-only file, so we add a note that cancels it.</p>
+<h3>Step-by-step build</h3>
+<ol><li><strong>The class and the replay.</strong> The constructor opens the file, then <code>_rebuild</code> reads each line, remembers its starting byte (<code>offset</code>), and updates the index. A deleted key is removed from the index. A line that is not valid JSON is a half-written line from a crash, so we stop there and cut it off.</li></ol>
+<pre class="code lang-python"><code>import json, os
+
+class KV:
+    def __init__(self, path):
+        self.path, self.index = path, {}
+        open(path, "ab").close()          # make sure the file exists
+        self._rebuild()
+        self.f = open(path, "ab")
+
+    def _rebuild(self):
+        with open(self.path, "rb") as f:
+            offset = 0
+            for raw in f:
+                try:
+                    rec = json.loads(raw)
+                except ValueError:        # half-written last line after a crash
+                    break
+                if rec.get("del"): self.index.pop(rec["k"], None)
+                else:              self.index[rec["k"]] = offset
+                offset += len(raw)
+        if offset &lt; os.path.getsize(self.path):
+            with open(self.path, "r+b") as f: f.truncate(offset)</code></pre>
+<ol><li><strong>Writes.</strong> <code>_append</code> writes one line, flushes Python's buffer, and calls <code>os.fsync</code> to ask the operating system to put it on disk. It returns the offset where the line began.</li></ol>
+<pre class="code lang-python"><code>    def _append(self, rec):
+        pos = self.f.tell()
+        self.f.write((json.dumps(rec) + "\n").encode()); self.f.flush(); os.fsync(self.f.fileno())
+        return pos
+
+    def put(self, k, v):  self.index[k] = self._append({"k": k, "v": v})
+    def delete(self, k):
+        if k in self.index: self._append({"k": k, "del": 1}); del self.index[k]</code></pre>
+<ol><li><strong>Reads.</strong> One dictionary lookup, one <code>seek</code>, one <code>readline</code>.</li></ol>
+<pre class="code lang-python"><code>    def get(self, k, default=None):
+        if k not in self.index: return default
+        with open(self.path, "rb") as f:
+            f.seek(self.index[k]); return json.loads(f.readline())["v"]</code></pre>
+<ol><li><strong>Compaction.</strong> Write only the live keys to <code>shop.db.tmp</code>, flush it to disk, then <code>os.replace</code> swaps it over the old file in one step. If the program dies halfway, the old file is still complete.</li></ol>
+<pre class="code lang-python"><code>    def compact(self):
+        tmp = self.path + ".tmp"; new_index = {}
+        with open(tmp, "wb") as out:
+            for k in self.index:
+                pos = out.tell()
+                out.write((json.dumps({"k": k, "v": self.get(k)}) + "\n").encode())
+                new_index[k] = pos
+            out.flush(); os.fsync(out.fileno())
+        self.f.close(); os.replace(tmp, self.path)
+        self.index = new_index; self.f = open(self.path, "ab")
+
+    def size(self): return os.path.getsize(self.path)
+    def close(self): self.f.close()</code></pre>
+<ol><li><strong>Predict, then run the demo.</strong> Before you run it: after one update and one delete, how many lines are in the file, and how many keys are alive? (Four lines, one key.)</li></ol>
+<pre class="code lang-python"><code>import os, tempfile
+from kvstore import KV
+d = tempfile.mkdtemp(); p = os.path.join(d, "shop.db")
+db = KV(p)
+db.put("order:1", {"item": "pen", "qty": 3})
+db.put("order:2", {"item": "book", "qty": 1})
+db.put("order:1", {"item": "pen", "qty": 5})      # update
+db.delete("order:2")
+print("get order:1 -&gt;", db.get("order:1"))
+print("get order:2 -&gt;", db.get("order:2"))
+print("lines in file:", sum(1 for _ in open(p)), " bytes:", db.size())
+db.close()
+db = KV(p)                                        # restart
+print("after restart, order:1 -&gt;", db.get("order:1"))
+for i in range(1000): db.put("hot", i)            # many overwrites of one key
+before = db.size(); db.compact()
+print("bytes before compact:", before, " after:", db.size(), " keys:", sorted(db.index))
+print("hot -&gt;", db.get("hot"))
+db.close()
+with open(p, "ab") as f: f.write(b'{"k": "order:9", "v": {"it')   # simulate a crash mid-write
+db = KV(p); print("after torn write, keys:", sorted(db.index)); db.put("order:3", 1)
+print("order:3 -&gt;", db.get("order:3")); db.close()
+print("reopen -&gt;", sorted(KV(p).index))</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>get order:1 -&gt; {'item': 'pen', 'qty': 5}
+get order:2 -&gt; None
+lines in file: 4  bytes: 175
+after restart, order:1 -&gt; {'item': 'pen', 'qty': 5}
+bytes before compact: 23065  after: 72  keys: ['hot', 'order:1']
+hot -&gt; 999
+after torn write, keys: ['hot', 'order:1']
+order:3 -&gt; 1
+reopen -&gt; ['hot', 'order:1', 'order:3']</code></pre>
+<ol><li><strong>Explain the output.</strong> Four lines for two live-or-dead keys shows why the file grows. After a restart the index is rebuilt by replay and <code>order:1</code> is still 5, the newest value. The hot key had 1,000 lines but only the last matters, so compaction took the file from 23,065 bytes to 72 bytes (a 99.7% saving: 1 − 72/23,065 = 0.9969). The half-written line <code>{"k": "order:9", ...</code> was ignored and cut off, and the later <code>put</code> worked and survived a reopen.</li><li><strong>Add the test file.</strong></li></ol>
+<pre class="code lang-python"><code>import os, tempfile
+from kvstore import KV
+p = os.path.join(tempfile.mkdtemp(), "t.db")
+db = KV(p); db.put("a", 1); db.put("a", 2); db.delete("a"); db.put("b", 3); db.close()
+db = KV(p)
+assert db.get("a") is None and db.get("b") == 3
+db.compact(); assert db.get("b") == 3 and sum(1 for _ in open(p)) == 1
+print("kv tests ok")</code></pre>
+<p>Real output: <code>kv tests ok</code>.</p>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li>A deleted key stays deleted after restart.</li><li>The last write wins after restart, and <code>get</code> for a missing key returns the default.</li><li>Compaction keeps every live key with the same value and leaves exactly one line per live key.</li><li>A torn last line never stops start-up and never causes a later write to be lost.</li><li>Your README shows the file size before and after compaction (here 23,065 to 72 bytes).</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Forgetting tombstones.</strong> The deleted key comes back after restart. Detect: delete, close, reopen, <code>get</code>.</li><li><strong>Using character counts as offsets.</strong> Offsets must be bytes. We open the file in binary mode and use <code>len(raw)</code> of bytes. Detect: non-ASCII values (for example <code>"café"</code>) make <code>get</code> read the wrong place.</li><li><strong>Compacting in place.</strong> A crash halfway destroys data. Always write a new file and <code>os.replace</code>. Detect: kill the program during compaction in a test.</li><li><strong>No <code>flush</code> or <code>fsync</code>.</strong> The program says "saved", but a power cut loses the data. Detect: read the file from another process right after <code>put</code>. Note that <code>fsync</code> costs time, a real trade-off between safety and speed.</li><li><strong>Updating the index before the write succeeds.</strong> If the write fails, memory says the key exists but the disk does not. Our <code>put</code> sets the index only after <code>_append</code> returns. Detect: force a write error in a test and check <code>get</code>.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Run compaction automatically when the file is more than 3 times the size of the live data.</li><li>Add a checksum (for example <code>zlib.crc32</code>) to each line so a damaged line in the middle is detected, not only at the end.</li><li>Add a simple TCP or command-line front end (<code>set k v</code>, <code>get k</code>) and a second reader process.</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. Why is an append-only file a good idea?</strong> Appending is simple and safe: old data is never overwritten, so a crash cannot damage earlier records. Sequential writes are also fast on most disks. The cost is that the file grows, so I need compaction.</p>
+<p><strong>Q2. Why keep the index in memory?</strong> Without it, <code>get</code> would scan the whole file, O(n). With the hash map of offsets, <code>get</code> is one lookup plus one seek, O(1) on average. The limit is that all keys must fit in memory, while values stay on disk.</p>
+<p><strong>Q3. What happens if the program crashes during a write?</strong> The last line may be half-written. On start-up I replay the log, stop at the first line that is not valid, and truncate it. Lines I had already confirmed with <code>fsync</code> are safe. A checksum per line would make this stronger.</p>
+<h3>README outline</h3>
+<p>The question and design in a 5-line diagram; the three operations with complexity; the demo output; the crash-safety story; file-size results before and after compaction; limits (single process, keys in memory, no checksum); extensions.</p>
+<h2 id="s2-16-2-project-graph-based-route-planner">16.2 Project: Graph-Based Route Planner</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">On a map, "fewest turns" and "shortest time" are different questions. A road with three small streets might be faster than one with a long, slow road. <strong>BFS</strong> (breadth-first search) counts stops. <strong>Dijkstra's algorithm</strong> adds up the minutes. This project builds both on a small city and shows them giving different answers.</div></div>
+<h3>Goal and why employers care</h3>
+<p>Build a planner that stores a city map as a graph, finds the route with the fewest stops (BFS) and the route with the least travel time (Dijkstra), and handles places that cannot be reached. Graphs are everywhere in data work: dependency tasks, delivery routes, networks, recommendation links. A tested, correct implementation shows you can pick the right algorithm for the question.</p>
+<h3>Skills used</h3>
+<p>Chapter 10, Trees and Graphs (adjacency lists, BFS); Chapter 9, Linked Lists, Stacks, Queues, Heaps and Top-K (queue with <code>deque</code>, min-heap with <code>heapq</code>); Chapter 14, Interview Patterns Bank (shortest path pattern); Chapter 7, Complexity, Arrays, Strings, Hashing and Sorting (dictionaries, Big-O).</p>
+<h3>Data</h3>
+<p>A hand-made city of seven connected places plus one island (unreachable). Each road is two-way, with minutes of travel.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>From</th><th>To</th><th>Minutes</th></tr></thead><tbody><tr><td>Depot</td><td>Market</td><td>4</td></tr><tr><td>Depot</td><td>Station</td><td>2</td></tr><tr><td>Station</td><td>Market</td><td>1</td></tr><tr><td>Market</td><td>School</td><td>5</td></tr><tr><td>Station</td><td>Hospital</td><td>8</td></tr><tr><td>School</td><td>Hospital</td><td>3</td></tr><tr><td>Hospital</td><td>Park</td><td>2</td></tr><tr><td>School</td><td>Park</td><td>6</td></tr><tr><td>Island</td><td>Lake</td><td>2</td></tr></tbody></table></div>
+<h3>Architecture</h3>
+<pre class="code lang-text"><code>route/
+  planner.py     build(), bfs(), dijkstra(), path(), minutes(), a self-check
+  README.md
+
+roads list --build--&gt; adjacency dict:  "Depot": [("Market",4), ("Station",2)], ...
+                          |
+            +-------------+---------------+
+            |                             |
+     bfs: deque (queue)            dijkstra: heapq (min-heap of (minutes, place))
+     fewest stops                  least minutes, needs non-negative weights
+            |                             |
+            +--- prev map --&gt; walk back from goal --&gt; route</code></pre>
+<p>The <strong>prev map</strong> records, for each place, the place we came from. Walking back from the goal through <code>prev</code> and reversing gives the route.</p>
+<h3>Step-by-step build</h3>
+<ol><li><strong>Build the graph.</strong> An <strong>adjacency list</strong> is a dictionary from each place to its neighbours and the minutes to reach them. Since roads are two-way we add both directions.</li><li><strong>BFS.</strong> Visit places in rings: all places one stop away, then two stops. It uses a queue (first in, first out). The first time we reach the goal is with the fewest stops.</li><li><strong>Dijkstra.</strong> Always expand the place with the smallest known total minutes, using a min-heap. The line <code>if d &gt; dist[u]: continue</code> skips outdated heap entries (a place can be pushed twice when a better route is found later).</li><li><strong>Code, all together:</strong></li></ol>
+<pre class="code lang-python"><code>import heapq
+from collections import deque
+
+ROADS = [("Depot","Market",4), ("Depot","Station",2), ("Station","Market",1),
+         ("Market","School",5), ("Station","Hospital",8), ("School","Hospital",3),
+         ("Hospital","Park",2), ("School","Park",6), ("Island","Lake",2)]
+
+def build(roads):
+    g = {}
+    for a, b, w in roads:
+        g.setdefault(a, []).append((b, w)); g.setdefault(b, []).append((a, w))
+    return g
+
+def bfs(g, start, goal):
+    prev, q = {start: None}, deque([start])
+    while q:
+        u = q.popleft()
+        if u == goal: break
+        for v, _ in g[u]:
+            if v not in prev: prev[v] = u; q.append(v)
+    return path(prev, goal)
+
+def dijkstra(g, start, goal):
+    dist, prev, heap = {start: 0}, {start: None}, [(0, start)]
+    while heap:
+        d, u = heapq.heappop(heap)
+        if d &gt; dist[u]: continue          # stale entry
+        if u == goal: break
+        for v, w in g[u]:
+            nd = d + w
+            if nd &lt; dist.get(v, float("inf")):
+                dist[v] = nd; prev[v] = u; heapq.heappush(heap, (nd, v))
+    p = path(prev, goal)
+    return (p, dist[goal]) if p else (None, None)
+
+def path(prev, goal):
+    if goal not in prev: return None
+    out = []
+    while goal is not None: out.append(goal); goal = prev[goal]
+    return out[::-1]
+
+def minutes(g, p):
+    return sum(w for a, b in zip(p, p[1:]) for n, w in g[a] if n == b)</code></pre>
+<ol><li><strong>Predict, then compare.</strong> From Depot to School, which route has fewer stops, and which is faster? The direct-looking <code>Depot &gt; Market &gt; School</code> has 2 stops and takes 4 + 5 = 9 minutes. The route <code>Depot &gt; Station &gt; Market &gt; School</code> has 3 stops and takes 2 + 1 + 5 = 8 minutes. Run it:</li></ol>
+<pre class="code lang-python"><code>g = build(ROADS)
+p = bfs(g, "Depot", "School");      print("BFS     :", " &gt; ".join(p), "| stops:", len(p)-1, "| minutes:", minutes(g, p))
+p, m = dijkstra(g, "Depot", "School"); print("Dijkstra:", " &gt; ".join(p), "| stops:", len(p)-1, "| minutes:", m)
+print("Depot -&gt; Park :", dijkstra(g, "Depot", "Park"))
+print("Depot -&gt; Lake :", bfs(g, "Depot", "Lake"), dijkstra(g, "Depot", "Lake"))</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>BFS     : Depot &gt; Market &gt; School | stops: 2 | minutes: 9
+Dijkstra: Depot &gt; Station &gt; Market &gt; School | stops: 3 | minutes: 8
+Depot -&gt; Park : (['Depot', 'Station', 'Hospital', 'Park'], 12)
+Depot -&gt; Lake : None (None, None)</code></pre>
+<ol><li><strong>Verify with brute force.</strong> A slow, obviously-correct method tries every simple path (no repeated place) and takes the smallest total. It is a good test for a clever algorithm.</li></ol>
+<pre class="code lang-python"><code>def all_paths(u, goal, seen):
+    if u == goal: yield [u]; return
+    for v, _ in g[u]:
+        if v not in seen:
+            for rest in all_paths(v, goal, seen | {v}): yield [u] + rest
+best = min(minutes(g, q) for q in all_paths("Depot", "School", {"Depot"}))
+print("brute-force best Depot -&gt; School:", best)</code></pre>
+<p>Real output: <code>brute-force best Depot -&gt; School: 8</code>, which matches Dijkstra. Check Depot to Park by hand: Depot &gt; Station (2) &gt; Hospital (8) &gt; Park (2) = 12. The alternative through Market and School is 2 + 1 + 5 + 6 = 14. So 12 is right.</p>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li>BFS returns the fewest stops and Dijkstra the fewest minutes; on the Depot-to-School query they differ (2 stops with 9 minutes versus 3 stops with 8 minutes).</li><li>Dijkstra matches the brute-force minimum on every pair of places on the small map (write a loop over all pairs).</li><li>An unreachable place returns <code>None</code>, not a crash or an endless loop.</li><li>Start equal to goal returns a one-place route with 0 minutes.</li><li>Complexity is written in the README: BFS is O(V + E); Dijkstra with a heap is O((V + E) log V), where V is places and E is roads.</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Using BFS for weighted roads.</strong> It gives the fewest stops, not the fewest minutes. Detect: compare with brute force on a weighted query (like Depot to School above).</li><li><strong>Marking places as visited too late in BFS.</strong> The same place enters the queue many times and the work explodes. Detect: count queue pushes in a test.</li><li><strong>Negative road times with Dijkstra.</strong> The algorithm assumes that adding a road never makes a trip shorter. Detect: reject negative weights when you build the graph. For negative weights you need a different algorithm.</li><li><strong>Forgetting the reverse road.</strong> The route works one way only. Detect: assert that <code>A to B</code> and <code>B to A</code> have equal minutes on a two-way map.</li><li><strong>No stale-entry check</strong> in the heap loop. Results are still right but work is wasted. Detect: count how many times each place is expanded.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Add one-way streets and road closures, and show how the best route changes.</li><li>Implement A* with a straight-line distance guess, and compare the number of places expanded against Dijkstra.</li><li>Read the map from a CSV file and print the route with a minute-by-minute timetable.</li></ol>
+<h3>Interview talking points</h3>
+<p><strong>Q1. BFS or Dijkstra?</strong> If every road counts the same, such as fewest stops or fewest clicks, BFS is enough and simpler. If roads have different costs, such as minutes, I use Dijkstra. In my city map they gave different routes to the School, 9 minutes against 8.</p>
+<p><strong>Q2. Why does Dijkstra use a heap?</strong> At each step I need the place with the smallest total so far. Scanning all places takes O(V) every time, but a min-heap gives it in O(log V). With many places this is the difference between slow and fast.</p>
+<p><strong>Q3. How did you know your answer was right?</strong> I compared it with a brute-force search that tries every path on the small map, and I checked one answer by hand: Depot to Park is 2 + 8 + 2 = 12. For big maps brute force is too slow, so I would keep the small-map tests as a regression check.</p>
+<h3>README outline</h3>
+<p>The question; the map table and a text diagram; how to run; the BFS versus Dijkstra comparison output; brute-force verification; complexity table; limits (small map, no traffic, no one-way roads); extensions.</p>
+<h2 id="s3-chapter-recap">Chapter recap</h2>
+<ul><li>A key-value store can be a hash map of byte offsets plus an append-only file.</li><li>Replay the log at start-up: the last record for a key wins, a tombstone means deleted.</li><li>Compact by writing live keys to a new file and swapping it in with <code>os.replace</code>.</li><li>A half-written last line is expected after a crash; skip and truncate it.</li><li><code>fsync</code> buys safety at a cost in speed. State this trade-off in the README.</li><li>BFS finds fewest stops, Dijkstra finds least cost (non-negative weights only).</li><li>Always check a clever algorithm against a slow, obviously-correct one on small data.</li><li>Handle the unreachable case and the start-equals-goal case explicitly.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Pattern</th></tr></thead><tbody><tr><td>Index by position</td><td><code>index[k] = byte_offset</code>; <code>f.seek(offset)</code></td></tr><tr><td>Delete in a log</td><td>write a tombstone record</td></tr><tr><td>Safe file swap</td><td>write temp file, flush, <code>os.replace</code></td></tr><tr><td>Queue for BFS</td><td><code>deque</code>: <code>append</code>, <code>popleft</code></td></tr><tr><td>Heap for Dijkstra</td><td><code>heapq.heappush(h, (dist, node))</code>, <code>heappop</code></td></tr><tr><td>Rebuild route</td><td>follow <code>prev</code> from goal, then reverse</td></tr><tr><td>Complexities</td><td>BFS O(V+E); Dijkstra O((V+E) log V)</td></tr></tbody></table></div>
+<h2 id="s4-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 16.1</span> (easy) You write <code>put("a",1)</code>, <code>put("a",2)</code>, <code>delete("a")</code>, <code>put("b",3)</code>. How many lines are in the log, and how many are alive after replay?</p>
+<p><strong>Answer:</strong> Four lines: put a, put a, delete a (a tombstone), put b. After replay only <code>b</code> is alive, so one live key.</p>
+<p class="problem"><span class="pl">Problem 16.2</span> (easy) Why must offsets in the index be byte positions?</p>
+<p><strong>Answer:</strong> <code>seek</code> moves by bytes. If a value contains a non-ASCII character, one character can be several bytes, so a character count would point to the wrong place.</p>
+<p class="problem"><span class="pl">Problem 16.3</span> (what is the output) With the 16.1 demo, the hot key was written 1,000 times and the file was 23,065 bytes before compaction and 72 after. What percent was removed?</p>
+<p><strong>Answer:</strong> (23,065 − 72) / 23,065 = 22,993 / 23,065 = 0.9969, about 99.7%.</p>
+<p class="problem"><span class="pl">Problem 16.4</span> (find the bug) A teammate's <code>compact</code> opens the live file with mode <code>"wb"</code> and writes live keys into it. What can go wrong?</p>
+<p><strong>Answer:</strong> Opening with <code>"wb"</code> empties the file at once. If the program crashes before all keys are written, data is lost. Write to a temporary file and <code>os.replace</code> it over the original.</p>
+<p class="problem"><span class="pl">Problem 16.5</span> On the city map, what is the total time of <code>Depot &gt; Station &gt; Hospital</code>?</p>
+<p><strong>Answer:</strong> 2 + 8 = 10 minutes.</p>
+<p class="problem"><span class="pl">Problem 16.6</span> On the city map, why does <code>dijkstra(g, "Depot", "Lake")</code> return <code>(None, None)</code>?</p>
+<p><strong>Answer:</strong> Lake is connected only to Island, and Island is not connected to the rest, so there is no route. The code finds no entry for Lake in <code>prev</code> and returns <code>None</code>.</p>
+<p class="problem"><span class="pl">Problem 16.7</span> (interview) Your store has 10 million keys. What limits it and what would you change?</p>
+<p><strong>Answer:</strong> The in-memory index must hold every key and its offset, so memory is the limit. Options: store the index on disk (for example in sorted segment files with a sparse index), or shard keys across several stores by hash. I have not built this here.</p>
+<p class="problem"><span class="pl">Problem 16.8</span> (interview) Explain why Dijkstra fails with a road of -5 minutes.</p>
+<p><strong>Answer:</strong> Dijkstra fixes the best answer for the nearest place as final, assuming later roads only add time. A negative road can make a later route cheaper, so a "final" answer would be wrong. On a two-way road, a negative time would also let you loop forever to reduce time. Use an algorithm made for negative weights, and check the graph has no negative cycle.</p>
+<h2 id="s5-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. I want to build a mini key-value store with an append-only file, an in-memory hash index and compaction. Explain the design step by step with a small shop-orders example and ASCII diagrams. Then ask me three questions about what happens on update, delete and crash, and check my answers before suggesting how to test each case.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Review my key-value store project. Here is my code and README: [PASTE HERE]. Look for data-loss risks (flush, fsync, atomic replace), byte versus character offsets, missing tombstones and weak tests. Give me the five most important fixes in order, with a tiny failing test for each one, explained in simple English.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me when to use BFS and when to use Dijkstra using a small city map with minutes between places. Work through one example with numbers, show the heap or queue after each step, then give me 6 graded exercises without solutions. When I send answers, mark them and explain any mistake gently.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. My route planner gives a wrong answer for this map and query: [PASTE HERE]. Help me debug it. Ask me for the smallest failing input, suggest a brute-force checker to compare against, and walk through the likely causes (weights, visited marking, missing reverse road, stale heap entries). Explain each step in short sentences.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Plan my portfolio write-up for two projects: a key-value store with persistence and a route planner using BFS and Dijkstra. Draft two README outlines and one short LinkedIn post of under 200 words. Make sure every claim is something I measured, tell me which numbers to include, and flag any sentence that sounds like over-claiming.</pre></div><div class="readbtn"><button class="btn" data-read="study:cs:ch16">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch15.html">← Chapter 15: Project Lab 1: Logs, Git Flow and Benchm</a><a class="btn" href="appendix.html">Appendix: Cheat Sheet →</a></div></div><script src="../../assets/study.js"></script></body></html>

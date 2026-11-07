@@ -1,0 +1,477 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 11: Concurrency and Performance</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Python &amp; Software Engineering</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 11</div><h1>Concurrency and Performance</h1><p>Measure first, then make it faster: threads, processes, asyncio, profiling and vectorization.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-11-1-measure-first-timeit-cprofile-and-tracemalloc">11.1 Measure First: timeit, cProfile and tracemalloc</a></li><li><a href="#s2-11-2-the-gil-threads-processes-and-who-wins">11.2 The GIL: Threads, Processes and Who Wins</a></li><li><a href="#s3-11-3-concurrent-futures-and-asyncio">11.3 concurrent.futures and asyncio</a></li><li><a href="#s4-11-4-vectorization-algorithms-and-native-speed">11.4 Vectorization, Algorithms and Native Speed</a></li><li><a href="#s5-11-5-queues-back-pressure-and-little-s-law">11.5 Queues, Back-Pressure and Little&#x27;s Law</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p>Your script takes 40 minutes to call 2,000 URLs, and a data job that should finish overnight is still running at breakfast. Every programmer learns the golden rule: do not guess where the time goes, measure it. In this chapter you will learn to measure Python code (<code>timeit</code>, <code>cProfile</code>, <code>tracemalloc</code>), to understand why Python threads do not speed up some jobs (the GIL), and to choose between threads, processes and <code>asyncio</code>. You will also see why a loop in pure Python is slow, and connect all this to Little's law, a formula from queueing theory. All the timings below are real runs on one laptop (12 CPU cores, Python 3.14). Your numbers will differ, but the <em>shapes</em> will match.</p>
+<blockquote><p><strong>A note on what was run.</strong> Only the Python 3.14 standard library was available, with no network. <code>numpy</code>, <code>pandas</code>, <code>numba</code>, <code>line_profiler</code> and <code>memory_profiler</code> were <strong>not run here</strong>. Their snippets are standard usage and marked as such.</p></blockquote>
+<h2 id="s1-11-1-measure-first-timeit-cprofile-and-tracemalloc">11.1 Measure First: timeit, cProfile and tracemalloc</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A doctor does not operate before the scan. Slow code is the same: the slow part is almost never where you think. You first measure the whole, then find the one hot spot, then fix only that. In code terms: first time the whole script, then drill into the slowest function.</div></div>
+<h3>Words you need</h3>
+<ul><li><strong>Wall-clock time</strong>: time as measured by a clock on the wall (what the user waits).</li><li><strong>Profiler</strong>: a tool that records which functions ran and how long each took.</li><li><strong>Hot spot</strong>: the small part of the code where most time is spent.</li><li><strong>Benchmark</strong>: a repeatable timing of a small piece of code.</li><li><strong>Call</strong>: one execution of a function; <code>ncalls</code> is how many times it ran.</li></ul>
+<h3>timeit: time a small snippet fairly</h3>
+<p><code>timeit</code> runs a snippet many times and reports the total, which smooths out noise. Use it to <em>compare two ways</em> of doing the same small job.</p>
+<p class="problem"><span class="pl">Problem 11.1.1</span> Compare four ways to compute the sum of squares of 1,000,000 numbers. Predict first: which is fastest, a plain <code>for</code> loop or a list comprehension?</p>
+<table class="steps"><tr><th>Step 1</th><td>Write each version as a string. Run each 3 times and divide by 3.</td></tr><tr><th>Step 2</th><td>Print the average in milliseconds.</td></tr></table>
+<pre class="code lang-python"><code>import timeit
+N=1_000_000
+t1=timeit.timeit("s=0\nfor i in range(N): s+=i*i", globals=globals(), number=3)/3
+t2=timeit.timeit("sum([i*i for i in range(N)])", globals=globals(), number=3)/3
+t3=timeit.timeit("sum(i*i for i in range(N))", globals=globals(), number=3)/3
+t4=timeit.timeit("sum(map(int.__mul__, r, r))", setup="r=range(N)", globals=globals(), number=3)/3
+for n,t in [("for loop",t1),("list comp + sum",t2),("generator + sum",t3),("map(int.__mul__)",t4)]:
+    print(f"{n:&lt;20}{t*1000:8.1f} ms")</code></pre>
+<pre class="code lang-text"><code>for loop                27.2 ms
+list comp + sum         26.3 ms
+generator + sum         28.8 ms
+map(int.__mul__)        45.7 ms</code></pre>
+<ul><li><strong>Answer</strong> The first three are within about 10% of each other (26 to 29 ms). The "clever" <code>map(int.__mul__)</code> was the slowest at 45.7 ms.</li><li><strong>Check</strong> 1,000,000 items in 27 ms means about 27 nanoseconds per item, which is the right order of magnitude for interpreted Python.</li><li><strong>Why it matters</strong> In plain words: style tricks change speed by percentages. They do not change it by 100 times. Big wins come from a better algorithm or data structure, as the next example shows.</li></ul>
+<p class="problem"><span class="pl">Problem 11.1.2</span> Is <code>x in my_list</code> slow for a list of 100,000 numbers? Compare with a <code>set</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>Build a list and a set of <code>range(100000)</code>.</td></tr><tr><th>Step 2</th><td>Search for <code>99999</code>, the worst case for a list, 200 times each.</td></tr></table>
+<pre class="code lang-python"><code>import timeit
+print(timeit.timeit("99999 in L", setup="L=list(range(100000))", number=200), "s list")
+print(timeit.timeit("99999 in S", setup="S=set(range(100000))", number=200), "s set")</code></pre>
+<pre class="code lang-text"><code>0.08791520900012983 s list
+4.417000127432402e-06 s set</code></pre>
+<ul><li><strong>Answer</strong> The list took 0.0879 s for 200 searches (0.44 ms each). The set took 0.0000044 s (22 nanoseconds each).</li><li><strong>Check</strong> 0.0879 ÷ 0.0000044 is about 19,900. A list checks items one by one (up to 100,000 steps). A set jumps straight to the right slot using a hash (Chapter 4), about 1 step.</li><li><strong>Why it matters</strong> Switching a data structure made the code about 20,000 times faster. No formatting trick can do that.</li></ul>
+<h3>cProfile: find the hot spot</h3>
+<p><code>cProfile</code> records every function call. You sort the report by <strong>cumulative time</strong> (time in the function <em>including</em> the functions it calls) or <strong>tottime</strong> (time in the function itself only).</p>
+<p class="problem"><span class="pl">Problem 11.1.3</span> Profile a <code>main()</code> that calls <code>slow_sum(300_000)</code> and a recursive <code>fib(22)</code>. Which is the hot spot?</p>
+<table class="steps"><tr><th>Step 1</th><td>Create a <code>Profile</code>, enable it, run <code>main</code>, disable it.</td></tr><tr><th>Step 2</th><td>Print the top 5 rows sorted by cumulative time.</td></tr></table>
+<pre class="code lang-python"><code>import cProfile, pstats, io
+def slow_sum(n):
+    return sum([i*i for i in range(n)])
+def fib(n):
+    return n if n &lt; 2 else fib(n-1)+fib(n-2)
+def main():
+    slow_sum(300_000)
+    fib(22)
+pr = cProfile.Profile(); pr.enable(); main(); pr.disable()
+s = io.StringIO()
+pstats.Stats(pr, stream=s).sort_stats("cumulative").print_stats(5)
+print(s.getvalue())</code></pre>
+<pre class="code lang-text"><code>         57317 function calls (5 primitive calls) in 0.014 seconds
+
+   Ordered by: cumulative time
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000    0.014    0.014 /private/tmp/w11/b.py:6(main)
+        1    0.006    0.006    0.008    0.008 /private/tmp/w11/b.py:2(slow_sum)
+  57313/1    0.006    0.000    0.006    0.006 /private/tmp/w11/b.py:4(fib)
+        1    0.002    0.000    0.002    0.002 {built-in method builtins.sum}
+        1    0.000    0.000    0.000    0.000 {method 'disable' of '_lsprof.Profiler' objects}</code></pre>
+<p>How to read it: <code>ncalls 57313/1</code> means <code>fib</code> was called 57,313 times in total, of which 1 was the outer call (the rest are recursive). <code>tottime</code> is time inside that function only. <code>cumtime</code> includes callers' children. <code>main</code> has cumulative 0.014 s and almost 0 tottime, so it is just a coordinator.</p>
+<ul><li><strong>Answer</strong> <code>slow_sum</code> (0.008 s cumulative) and <code>fib</code> (0.006 s) share the time. The profile also shows that <code>fib(22)</code> made 57,313 calls to compute one number, a clue that caching (<code>functools.lru_cache</code>, Chapter 4) would help.</li><li><strong>Check</strong> 0.008 + 0.006 = 0.014 s, which equals <code>main</code>'s cumulative time. Time adds up.</li><li><strong>Why it matters</strong> The profile points at the function to fix, so you stop guessing. (Profiling adds overhead, so use it to compare <em>relative</em> time, not absolute.)</li></ul>
+<p>From the command line you can profile a whole script: <code>python3 -m cProfile -s cumulative myscript.py</code>. The tool <code>line_profiler</code> (not run here) goes deeper: you decorate a function with <code>@profile</code>, run <code>kernprof -l -v script.py</code>, and it shows time per <em>line</em>.</p>
+<h3>tracemalloc: where does memory go?</h3>
+<p class="problem"><span class="pl">Problem 11.1.4</span> How much memory does a list of 1,000,000 integers use, and how much does a generator that sums the same numbers use? Predict: is it more than 10 MB?</p>
+<table class="steps"><tr><th>Step 1</th><td>Start <code>tracemalloc</code>. Build the list, read current memory.</td></tr><tr><th>Step 2</th><td>Sum a generator, and read the peak above the list.</td></tr><tr><th>Step 3</th><td>Compare <code>sys.getsizeof</code> for both objects.</td></tr></table>
+<pre class="code lang-python"><code>import tracemalloc, sys
+tracemalloc.start()
+data = [i for i in range(1_000_000)]
+cur, peak = tracemalloc.get_traced_memory()
+print(f"list of 1M ints: current {cur/1e6:.1f} MB")
+tracemalloc.reset_peak()
+gen = (i for i in range(1_000_000))
+total = sum(gen)
+cur2, peak2 = tracemalloc.get_traced_memory()
+print(f"generator sum peak extra: {(peak2-cur)/1e6:.4f} MB")
+print(sys.getsizeof(data), sys.getsizeof(gen))
+snap = tracemalloc.take_snapshot()
+for st in snap.statistics("lineno")[:1]: print(st)</code></pre>
+<pre class="code lang-text"><code>list of 1M ints: current 40.4 MB
+generator sum peak extra: 0.0006 MB
+8448728 200
+/private/tmp/w11/d.py:3: size=38.6 MiB, count=999731, average=40 B</code></pre>
+<ul><li><strong>Answer</strong> The list needs about 40 MB. The generator needed about 0.0006 MB extra, essentially nothing.</li><li><strong>Check</strong> <code>sys.getsizeof(data)</code> is 8.4 MB, which counts only the list's 8-byte pointers (1,000,000 × 8). Each integer object is a separate object of about 32 bytes, so 8 + 32 = 40 bytes per item, matching "average=40 B" and 40 MB total. <code>getsizeof</code> does not count the objects inside, so always trust <code>tracemalloc</code> for the full picture.</li><li><strong>Why it matters</strong> Generators (Chapter 7) keep memory flat, so you can stream a 50 GB file through a 200-byte object. <code>memory_profiler</code> (not run here) gives memory per line with <code>@profile</code> and <code>python -m memory_profiler script.py</code>.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> "It is slow"
+     |
+     v
+ timeit / wall clock  --&gt; how slow? (a number, repeatable)
+     |
+     v
+ cProfile             --&gt; which function? (tottime, cumtime, ncalls)
+     |
+     v
+ line_profiler        --&gt; which line?
+     |
+     v
+ fix ONE thing, measure again, keep tests green (Chapter 10)</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>A pandas <code>apply</code> that takes 2 hours is usually one hot function. Profile before rewriting.</li><li>ML training loops: profile the data loader before blaming the model.</li><li>Memory errors ("Killed", <code>MemoryError</code>) are found with <code>tracemalloc</code> or by switching to generators and chunked reads.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> find the slow cell in a notebook before buying a bigger machine.</li><li><strong>Data Engineering:</strong> find the slow transform in an ETL job; use generators to process big files.</li><li><strong>Machine Learning:</strong> profile feature code and data loading.</li><li><strong>MLOps / backend:</strong> profile an API endpoint that violates its latency target.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Optimizing without measuring, or timing once. One run is noisy (disk cache, other programs). Repeat, and compare under the same conditions.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reading <code>getsizeof</code> as the real size. It counts only the container, not its contents.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is the difference between <code>tottime</code> and <code>cumtime</code>? Answer: <code>tottime</code> is time inside the function only; <code>cumtime</code> also includes the functions it calls.</li><li>Why did <code>x in set</code> beat <code>x in list</code> by about 20,000 times in our test? Answer: a set uses a hash to jump to the item; a list scans every item.</li><li>Why use <code>tracemalloc</code> and not <code>sys.getsizeof</code> for memory? Answer: <code>getsizeof</code> ignores the objects inside a container.</li></ol>
+<h2 id="s2-11-2-the-gil-threads-processes-and-who-wins">11.2 The GIL: Threads, Processes and Who Wins</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Imagine a kitchen with one chef's knife and several cooks. Only the cook holding the knife can chop. If the cooks mostly <em>wait</em> (for water to boil, for a delivery), they can take turns with the knife and everyone finishes sooner. If they all need to chop all day, extra cooks do not help, because there is still one knife. The knife is the <strong>GIL</strong>.</div></div>
+<h3>What the GIL is</h3>
+<p>The <strong>Global Interpreter Lock (GIL)</strong> is a lock inside the standard Python interpreter (CPython). Only <strong>one thread at a time</strong> can run Python bytecode (the low-level instructions Python code is turned into). Why does it exist? It makes memory management (reference counting, Chapter 1) simple and fast for one thread, and it protects Python's own data structures. The price is that threads cannot run Python code in parallel on several CPU cores.</p>
+<p>Two key facts follow:</p>
+<ul><li>When a thread <strong>waits</strong> (sleep, network, disk), it releases the GIL, so another thread runs. So threads <em>do</em> help for <strong>I/O-bound</strong> work (work that mostly waits).</li><li>For <strong>CPU-bound</strong> work (work that mostly computes, like loops and maths), threads give no speed-up. Use <strong>processes</strong>, each with its own interpreter and its own GIL.</li></ul>
+<p>Version note: recent Python versions offer an optional <strong>free-threaded</strong> build with no GIL (check <code>sys._is_gil_enabled()</code>). It is not the default in standard installs and library support is still growing, so in this chapter we use the normal build. On this machine the check prints <code>True</code>, meaning the GIL is on.</p>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Term</th><th>Meaning</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Thread</td><td>A path of execution inside one process; shares memory with other threads</td><td>Downloading many files at once</td></tr><tr><td>Process</td><td>A separate program instance with its own memory and its own GIL</td><td>Parallel CPU work like feature building</td></tr><tr><td>I/O-bound</td><td>Time is spent waiting for network, disk or database</td><td>API calls, S3 reads, SQL queries</td></tr><tr><td>CPU-bound</td><td>Time is spent computing</td><td>Parsing, simulation, training loops in pure Python</td></tr><tr><td>Race condition</td><td>Wrong result because threads touched shared data in a bad order</td><td>Shared counters, shared lists</td></tr></tbody></table></div>
+<h3>The experiment</h3>
+<p class="problem"><span class="pl">Problem 11.2.1</span> Eight "requests" each take 0.5 s of waiting (<code>time.sleep</code>). Four CPU jobs each loop 30 million times. Compare sequential, threads and processes. Predict first: will 4 threads make the CPU jobs about 4 times faster?</p>
+<table class="steps"><tr><th>Step 1</th><td>For I/O: run 8 sleeps in a loop, then in a <code>ThreadPoolExecutor(8)</code>.</td></tr><tr><th>Step 2</th><td>For CPU: run 4 loops in sequence, then in a <code>ThreadPoolExecutor(4)</code>, then in a <code>ProcessPoolExecutor(4)</code>.</td></tr><tr><th>Step 3</th><td>Time each with <code>time.perf_counter()</code>.</td></tr></table>
+<pre class="code lang-python"><code>import time
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
+
+def io_task(_):
+    time.sleep(0.5)
+def cpu_task(n):
+    s = 0
+    for i in range(n):
+        s += i*i
+    return s
+
+def timed(label, f):
+    t=time.perf_counter(); f(); print(f"{label:&lt;28}{time.perf_counter()-t:6.2f} s")
+
+N=30_000_000
+if __name__ == "__main__":
+    timed("IO x8 sequential", lambda: [io_task(0) for _ in range(8)])
+    def tp():
+        with ThreadPoolExecutor(8) as ex: list(ex.map(io_task, range(8)))
+    timed("IO x8 threads(8)", tp)
+    timed("CPU x4 sequential", lambda: [cpu_task(N) for _ in range(4)])
+    def tc():
+        with ThreadPoolExecutor(4) as ex: list(ex.map(cpu_task,[N]*4))
+    timed("CPU x4 threads(4)", tc)
+    def pc():
+        with ProcessPoolExecutor(4) as ex: list(ex.map(cpu_task,[N]*4))
+    timed("CPU x4 processes(4)", pc)</code></pre>
+<p>Real output (a separate run added the asyncio line, shown in 11.3):</p>
+<pre class="code lang-text"><code>IO x8 sequential              4.03 s
+IO x8 threads(8)              0.51 s
+CPU x4 sequential             3.18 s
+CPU x4 threads(4)             3.15 s
+CPU x4 processes(4)           1.30 s</code></pre>
+<ul><li><strong>Answer</strong> Threads made the I/O job 7.9 times faster (4.03 ÷ 0.51). Threads gave <strong>no</strong> speed-up on the CPU job (3.18 s against 3.15 s). Processes cut it to 1.30 s, about 2.4 times faster.</li><li><strong>Check</strong> The sequential I/O time must be 8 × 0.5 = 4.0 s, and it was 4.03 s. In parallel it must be about one sleep, 0.5 s, and it was 0.51 s. For CPU, 4 jobs of about 0.8 s each give about 3.2 s, matching.</li><li><strong>Why it matters</strong> Why only 2.4 times and not 4 times for processes? Starting processes, sending the function and result between them (pickling), and the machine's other work cost time. Parallel speed-up is almost always less than the number of workers, and small jobs may even get slower.</li></ul>
+<p>Here is the typical wrong version with processes, and its error message:</p>
+<pre class="code lang-python"><code>from concurrent.futures import ProcessPoolExecutor
+with ProcessPoolExecutor(2) as ex:
+    print(list(ex.map(lambda x: x*2, [1,2])))</code></pre>
+<pre class="code lang-text"><code>PicklingError - Can't pickle &lt;function &lt;lambda&gt; at 0x1039e6770&gt;: it's not found as __m</code></pre>
+<p>Processes need to send the function to another process by <strong>pickling</strong> (turning an object into bytes). A <code>lambda</code> has no importable name, so it fails. The fix is a normal named function defined at the top level of a module. Also, on macOS and Windows the code that starts processes must sit under <code>if __name__ == "__main__":</code>, because each child re-imports the file.</p>
+<h3>A race condition, on purpose</h3>
+<p>Threads share memory. If two threads update the same variable, results can go wrong. This code does "read, wait a tiny moment, write", which gives other threads the chance to run in the middle:</p>
+<pre class="code lang-python"><code>import threading, time
+counter = 0
+lock = threading.Lock()
+def unsafe(n):
+    global counter
+    for _ in range(n):
+        v = counter
+        time.sleep(0)       # gives other threads a chance to run mid-update
+        counter = v + 1
+def safe(n):
+    global counter
+    for _ in range(n):
+        with lock:
+            v = counter
+            time.sleep(0)
+            counter = v + 1
+def run(fn):
+    global counter
+    counter = 0
+    ts=[threading.Thread(target=fn,args=(2000,)) for _ in range(4)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    return counter
+print("unsafe:", run(unsafe), "expected 8000")
+print("safe:  ", run(safe), "expected 8000")</code></pre>
+<pre class="code lang-text"><code>unsafe: 2015 expected 8000
+safe:   8000 expected 8000</code></pre>
+<ul><li><strong>Answer</strong> The unsafe version lost about three quarters of the updates (2015 instead of 8000, and the number changes from run to run). With a <code>Lock</code>, the result is exactly 8000.</li><li><strong>Check</strong> 4 threads × 2000 = 8000. Only the locked version equals it.</li><li><strong>Why it matters</strong> Honest note: when I removed the <code>time.sleep(0)</code> and did a plain <code>counter += 1</code> loop, the unsafe version gave the correct answer in my two runs on this Python version. That does <em>not</em> make it safe. Whether it fails depends on timing and on the Python version, which is exactly why race bugs are dangerous: they hide in testing and appear in production. Rule: when threads share data that changes, use a <code>Lock</code> or a <code>queue.Queue</code> (11.5).</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> I/O-bound, 3 threads (one GIL)          CPU-bound, 3 threads (one GIL)
+ T1: run..wait..........run              T1: run run run ...  (holds GIL)
+ T2: ..run..wait........run              T2: wait ........... (no GIL)
+ T3: ....run..wait......run              T3: wait ...........
+ waits overlap, total time shrinks       no overlap of running, no speed-up
+
+ CPU-bound, 3 processes (3 GILs)
+ P1: run run run         each process has its own GIL
+ P2: run run run         and its own core: real parallelism
+ P3: run run run</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>Calling 500 REST APIs or reading 500 S3 files: threads (or asyncio).</li><li>Transforming 8 big files with pure-Python code: processes.</li><li>Most numeric libraries (NumPy, pandas internals) release the GIL inside their fast C code, so threads can sometimes help there. Measure.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> download many report files in parallel with a thread pool.</li><li><strong>Data Engineering:</strong> process daily partitions in a process pool; parallel S3 or API ingestion with threads.</li><li><strong>Machine Learning:</strong> <code>DataLoader</code> workers are processes for exactly this GIL reason; parallel hyper-parameter runs.</li><li><strong>MLOps:</strong> serve models with several worker processes (for example <code>gunicorn</code>/<code>uvicorn</code> workers) to use all cores.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using threads to speed up a CPU loop and seeing no gain (3.18 s against 3.15 s above). Check: is the job waiting or computing?</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Sharing and changing a list or counter in threads without a lock. Prefer passing results back (<code>executor.map</code> returns them in order) or use a queue.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does the GIL allow and not allow? Answer: only one thread runs Python bytecode at a time, so no CPU parallelism with threads in one process.</li><li>Why do threads still help I/O-bound jobs? Answer: a waiting thread releases the GIL, so others run during the wait.</li><li>Why did the <code>lambda</code> fail in a process pool? Answer: pickling needs a function with an importable name; a lambda has none.</li></ol>
+<h2 id="s3-11-3-concurrent-futures-and-asyncio">11.3 concurrent.futures and asyncio</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A restaurant waiter can serve 20 tables alone. He takes an order, and while the kitchen cooks, he goes to the next table. He never stands idle. This is <code>asyncio</code>: one worker that switches to another task whenever the current one has to wait. Threads are like hiring 20 waiters. <code>asyncio</code> is cheaper when you have thousands of tables, but the waiter must <em>never</em> freeze at one table.</div></div>
+<h3>concurrent.futures: the easy, high-level tool</h3>
+<p><code>concurrent.futures</code> gives one simple interface for thread pools and process pools. You learned <code>ex.map(fn, items)</code> above. For more control use <code>submit</code>, which returns a <strong>future</strong> (a promise of a result that is not ready yet), and <code>as_completed</code>, which hands you futures as they finish. Errors inside a job are raised when you ask for <code>result()</code>.</p>
+<p class="problem"><span class="pl">Problem 11.3.1</span> Run 6 jobs in a pool of 4 threads. Job 3 fails on purpose. Collect all results and report the failure without crashing.</p>
+<table class="steps"><tr><th>Step 1</th><td>Submit each job, and remember which item belongs to which future in a dictionary.</td></tr><tr><th>Step 2</th><td>Loop over <code>as_completed</code>. Wrap <code>f.result()</code> in <code>try/except</code>.</td></tr></table>
+<pre class="code lang-python"><code>from concurrent.futures import ThreadPoolExecutor, as_completed
+import time, random
+def job(i):
+    time.sleep(random.random()*0.3)
+    if i == 3: raise ValueError("bad item 3")
+    return i*10
+with ThreadPoolExecutor(4) as ex:
+    futs = {ex.submit(job, i): i for i in range(6)}
+    for f in as_completed(futs):
+        i = futs[f]
+        try: print(i, "-&gt;", f.result())
+        except ValueError as e: print(i, "failed:", e)</code></pre>
+<p>Real output, sorted so the order is stable (the real arrival order changes each run):</p>
+<pre class="code lang-text"><code>0 -&gt; 0
+1 -&gt; 10
+2 -&gt; 20
+3 failed: bad item 3
+4 -&gt; 40
+5 -&gt; 50</code></pre>
+<ul><li><strong>Answer</strong> Five jobs returned 10 times their number, and item 3's error was caught and reported.</li><li><strong>Check</strong> 4 → 40 and 5 → 50 are 10 × input. The arrival order differs run to run because each job sleeps a random time. If you need results in input order, use <code>ex.map</code>.</li><li><strong>Why it matters</strong> One bad URL in 5,000 must not kill the whole batch. Catch errors per future and keep a list of failures to retry.</li></ul>
+<h3>asyncio: many waiting tasks, one thread</h3>
+<p>A <strong>coroutine</strong> is a function defined with <code>async def</code>. Calling it does not run it; it gives an object that the <strong>event loop</strong> (the manager that switches between tasks) runs. Inside a coroutine, <code>await something</code> means "I will wait here; run another task meanwhile". <code>asyncio.gather</code> runs many coroutines together, and <code>asyncio.run(main())</code> starts the loop.</p>
+<p class="problem"><span class="pl">Problem 11.3.2</span> Eight tasks each wait 0.5 s, using <code>asyncio</code>. How long in total? Then limit concurrency to 5 at a time for 20 tasks of 0.2 s, and add a timeout.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>gather</code> 8 tasks of <code>await asyncio.sleep(0.5)</code>. Total should be about 0.5 s.</td></tr><tr><th>Step 2</th><td>Use <code>asyncio.Semaphore(5)</code>, a gate that lets only 5 tasks inside at once. 20 tasks ÷ 5 per round = 4 rounds × 0.2 s = 0.8 s.</td></tr><tr><th>Step 3</th><td>Use <code>asyncio.timeout(0.1)</code> around a 1 s wait.</td></tr></table>
+<pre class="code lang-python"><code>import asyncio, time
+async def fetch(i, sem):
+    async with sem:
+        await asyncio.sleep(0.2)
+        return i*i
+async def main():
+    sem = asyncio.Semaphore(5)
+    t=time.perf_counter()
+    res = await asyncio.gather(*(fetch(i, sem) for i in range(20)))
+    print(res[:5], f"{time.perf_counter()-t:.2f}s")
+    try:
+        async with asyncio.timeout(0.1):
+            await asyncio.sleep(1)
+    except TimeoutError:
+        print("timed out")
+asyncio.run(main())</code></pre>
+<pre class="code lang-text"><code>[0, 1, 4, 9, 16] 0.80s
+timed out</code></pre>
+<p>The 8-task asyncio run from the experiment script printed <code>IO x8 asyncio   0.50 s</code>, the same as 8 threads.</p>
+<ul><li><strong>Answer</strong> 8 tasks took 0.50 s (not 4 s). The gated run took 0.80 s, exactly as predicted, and the timeout fired.</li><li><strong>Check</strong> 20 ÷ 5 = 4 rounds, 4 × 0.2 = 0.8 s. Matches.</li><li><strong>Why it matters</strong> The semaphore is how you stay polite to a server: a limit such as "5 requests at a time" is the same idea as a restaurant that seats only 5 tables at a time.</li></ul>
+<h3>The typical wrong version: blocking inside async</h3>
+<p><strong>Predict:</strong> five tasks, each doing 0.2 s of waiting. Which version finishes in about 0.2 s?</p>
+<pre class="code lang-python"><code>import asyncio, time
+async def bad(i):
+    time.sleep(0.2)          # blocks the whole event loop
+    return i
+async def good(i):
+    await asyncio.sleep(0.2)
+    return i
+async def main():
+    t=time.perf_counter(); await asyncio.gather(*(bad(i) for i in range(5))); print(f"time.sleep in async : {time.perf_counter()-t:.2f}s")
+    t=time.perf_counter(); await asyncio.gather(*(good(i) for i in range(5))); print(f"await asyncio.sleep : {time.perf_counter()-t:.2f}s")
+    t=time.perf_counter(); await asyncio.gather(*(asyncio.to_thread(time.sleep,0.2) for i in range(5))); print(f"to_thread(time.sleep): {time.perf_counter()-t:.2f}s")
+asyncio.run(main())</code></pre>
+<pre class="code lang-text"><code>time.sleep in async : 1.02s
+await asyncio.sleep : 0.20s
+to_thread(time.sleep): 0.21s</code></pre>
+<ul><li><strong>Answer</strong> <code>time.sleep</code> inside a coroutine froze the loop, so the five tasks ran one after another (5 × 0.2 = 1.0 s). <code>await asyncio.sleep</code> took 0.20 s. If you must call a blocking function (an old library without async support), <code>asyncio.to_thread</code> runs it in a thread and gives 0.21 s.</li><li><strong>Check</strong> 5 × 0.2 = 1.0 s for sequential, and 1.02 s was measured.</li><li><strong>Why it matters</strong> The whole point of asyncio is that nothing blocks. One blocking call in a coroutine ruins every other task.</li></ul>
+<h3>Which tool to choose</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Situation</th><th>Tool</th><th>Why</th></tr></thead><tbody><tr><td>10 to 200 API calls or files, simple code</td><td><code>ThreadPoolExecutor</code></td><td>Easiest; works with normal libraries</td></tr><tr><td>Thousands of connections, async libraries (<code>httpx.AsyncClient</code>, FastAPI)</td><td><code>asyncio</code></td><td>Very cheap tasks</td></tr><tr><td>CPU-heavy pure Python on many cores</td><td><code>ProcessPoolExecutor</code> / <code>multiprocessing</code></td><td>Separate GILs</td></tr><tr><td>Heavy NumPy/pandas maths</td><td>Vectorize first (11.4)</td><td>Fast C code beats any pool</td></tr></tbody></table></div>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> asyncio event loop (one thread)
+ task A: start -&gt; await(wait) .............. -&gt; finish
+ task B:          start -&gt; await(wait) ..... -&gt; finish
+ task C:                   start -&gt; await ... -&gt; finish
+ The loop jumps to a ready task whenever another one awaits.
+ One blocking call (time.sleep) would freeze A, B and C together.</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>Calling a web API 10,000 times (for example, an LLM or geocoding API) is a classic async or thread-pool job, always with a concurrency limit and a timeout.</li><li>FastAPI (Chapter 12) endpoints declared with <code>async def</code> run on an event loop, so blocking code inside them hurts all users.</li><li>Real services also have rate limits (for example, "50 requests per second"). Respect them with a semaphore and sleeps.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> pull data from several SaaS APIs at once for a daily report.</li><li><strong>Data Engineering:</strong> async ingestion of many small files or API pages.</li><li><strong>Machine Learning / GenAI:</strong> send many prompts or embedding batches in parallel with a limit.</li><li><strong>MLOps:</strong> async health checks and web endpoints.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting <code>await</code>. Calling <code>fetch(1)</code> without <code>await</code> gives a coroutine object and a warning that the coroutine "was never awaited". The code inside never ran.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Launching 10,000 tasks with no limit. The remote server blocks you, or you run out of sockets. Use a semaphore.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does <code>await</code> do? Answer: pauses this coroutine and lets the event loop run other tasks until the awaited thing is ready.</li><li>Why did <code>time.sleep</code> in an async function take 1.0 s for five tasks? Answer: it blocked the event loop, so tasks ran one by one.</li><li>What does a <code>Semaphore(5)</code> do? Answer: lets at most five tasks be inside the guarded block at the same time.</li></ol>
+<h2 id="s4-11-4-vectorization-algorithms-and-native-speed">11.4 Vectorization, Algorithms and Native Speed</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A cashier who scans one item at a time, thinking about each, is slow. A barcode reader that scans a whole tray at once is fast. Python's <code>for</code> loop is the thinking cashier: for each item it checks types, looks up names, and makes objects. <strong>Vectorization</strong> means handing the whole tray to fast compiled code (written in C), so the loop happens outside Python.</div></div>
+<h3>What vectorization means</h3>
+<p>A <strong>vectorized</strong> operation applies one operation to a whole array at once, for example "multiply every element by 2.5 and add 1". Libraries such as NumPy and pandas store numbers in compact blocks of memory with one type (not as separate Python objects), and run the loop in C. The idea is the same as a SQL query: say <em>what</em> you want on a whole column, not <em>how</em> to loop over rows.</p>
+<h3>Pure-Python hints you can run now</h3>
+<p>NumPy is not installed here, but we can already show the "loop overhead" effect with built-in functions that run their loop in C.</p>
+<p class="problem"><span class="pl">Problem 11.4.1</span> Compute <code>x * 2.5 + 1</code> for 1,000,000 numbers with a list comprehension and with an index loop. Then compute the mean with <code>sum/len</code> and with <code>statistics.mean</code>. Predict which of each pair is faster.</p>
+<table class="steps"><tr><th>Step 1</th><td>Build <code>xs = list(range(1_000_000))</code>.</td></tr><tr><th>Step 2</th><td>Time each approach once with <code>time.perf_counter()</code>.</td></tr></table>
+<pre class="code lang-python"><code>import time, statistics
+n=1_000_000
+xs=list(range(n))
+t=time.perf_counter(); ys=[x*2.5+1 for x in xs]; print(f"list comp {time.perf_counter()-t:.3f}s")
+t=time.perf_counter()
+ys=[0.0]*n
+for i in range(n): ys[i]=xs[i]*2.5+1
+print(f"index loop {time.perf_counter()-t:.3f}s")
+t=time.perf_counter(); statistics.mean(xs); print(f"statistics.mean {time.perf_counter()-t:.3f}s")
+t=time.perf_counter(); sum(xs)/len(xs); print(f"sum/len {time.perf_counter()-t:.4f}s")</code></pre>
+<pre class="code lang-text"><code>list comp 0.026s
+index loop 0.056s
+statistics.mean 0.091s
+sum/len 0.0032s</code></pre>
+<ul><li><strong>Answer</strong> The comprehension (0.026 s) was about twice as fast as the index loop (0.056 s). <code>sum(xs)/len(xs)</code> (0.0032 s) was about 28 times faster than <code>statistics.mean</code> (0.091 s).</li><li><strong>Check</strong> The mean of <code>0..999,999</code> is 499,999.5 for both. Speed differs because <code>statistics.mean</code> does careful exact arithmetic to avoid rounding errors, so it is built for accuracy, not speed. <code>sum</code> runs its loop in C.</li><li><strong>Why it matters</strong> The rule: the fewer times the Python interpreter itself runs per item, the faster. Use built-ins (<code>sum</code>, <code>min</code>, <code>max</code>, <code>sorted</code>, <code>str.join</code>) and comprehensions before hand-written loops, and compare cost of safety against speed. For big numeric data, NumPy goes much further.</li></ul>
+<h3>The NumPy and pandas version (not run here)</h3>
+<pre class="code lang-python"><code># not run here: needs numpy and pandas
+import numpy as np
+x = np.arange(1_000_000)
+y = x * 2.5 + 1            # whole array, no Python loop
+print(y.mean())
+
+import pandas as pd
+df = pd.DataFrame({"qty": [2, 5, 1], "price": [100.0, 40.0, 250.0]})
+df["total"] = df["qty"] * df["price"]      # vectorized column maths
+# slow pattern to avoid:
+# df["total"] = df.apply(lambda r: r["qty"] * r["price"], axis=1)</code></pre>
+<p>On typical machines, vectorized NumPy code is often tens to hundreds of times faster than a pure-Python loop for this kind of maths. I did not measure it here, so measure on your own data.</p>
+<h3>When vectorization is not enough</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Tool</th><th>What it does</th><th>When to consider it</th></tr></thead><tbody><tr><td>Better algorithm / data structure</td><td>Set instead of list (11.1)</td><td>Always first</td></tr><tr><td><code>lru_cache</code></td><td>Remembers results of repeated calls</td><td>Repeated expensive calls like <code>fib</code></td></tr><tr><td>Numba (awareness)</td><td><code>@njit</code> compiles numeric Python loops to machine code</td><td>A numeric loop you cannot vectorize</td></tr><tr><td>Cython (awareness)</td><td>Python-like code compiled to C</td><td>Library authors, hot loops needing C speed</td></tr><tr><td><code>multiprocessing</code> for pandas</td><td>Split data into chunks, run each in a process</td><td>CPU-heavy per-row Python functions</td></tr><tr><td>Polars, DuckDB (awareness)</td><td>Faster dataframe/SQL engines</td><td>Large local data</td></tr></tbody></table></div>
+<h3>Multiprocessing for CPU-bound chunks</h3>
+<p class="problem"><span class="pl">Problem 11.4.2</span> Count the primes below 2,000,000 by splitting the range into 8 chunks of 250,000. Compare one process with a <code>Pool(4)</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>Write <code>count_primes((lo, hi))</code> that trial-divides up to the square root.</td></tr><tr><th>Step 2</th><td>Build the 8 chunks. Run <code>map</code> serially, then <code>Pool(4).map</code>.</td></tr><tr><th>Step 3</th><td>Check both results match, and compute speed-up = serial time ÷ parallel time.</td></tr></table>
+<pre class="code lang-python"><code>import time
+from multiprocessing import Pool
+def count_primes(rng):
+    lo, hi = rng
+    c = 0
+    for n in range(lo, hi):
+        if n &lt; 2: continue
+        for d in range(2, int(n**0.5)+1):
+            if n % d == 0: break
+        else: c += 1
+    return c
+if __name__ == "__main__":
+    chunks = [(i*250_000, (i+1)*250_000) for i in range(8)]
+    t=time.perf_counter(); r1=sum(map(count_primes, chunks)); t1=time.perf_counter()-t
+    t=time.perf_counter()
+    with Pool(4) as p: r2=sum(p.map(count_primes, chunks))
+    t2=time.perf_counter()-t
+    print(r1, r2, f"serial {t1:.2f}s  pool(4) {t2:.2f}s  speedup {t1/t2:.1f}x")</code></pre>
+<pre class="code lang-text"><code>148933 148933 serial 3.75s  pool(4) 1.49s  speedup 2.5x</code></pre>
+<ul><li><strong>Answer</strong> Both counted 148,933 primes. The pool was 2.5 times faster (3.75 ÷ 1.49), not 4 times.</li><li><strong>Check</strong> The number of primes below 2,000,000 is 148,933, a known value, so the result is right. Why not 4 times? Later chunks hold bigger numbers and take longer, so some workers finish early and wait (uneven load), and starting processes costs time.</li><li><strong>Why it matters</strong> Splitting work into many <em>similar-sized</em> chunks (more chunks than workers) balances the load. The same pattern works for a pandas DataFrame: split by groups or row ranges, run a function in each process, and concatenate the pieces. The data is copied to each process, so this pays off only when the per-chunk work is heavy.</li></ul>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> Python loop:    [x1] -&gt; python -&gt; [y1]   one item at a time, overhead each time
+                 [x2] -&gt; python -&gt; [y2]
+
+ Vectorized:     [x1 x2 x3 x4 ... xN]  --one call--&gt; [y1 y2 y3 ... yN]
+                 (tight loop in C over a compact block of memory)</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>"Never loop over DataFrame rows" is a standard code-review comment in data teams. Use column operations, <code>groupby</code>, or SQL.</li><li>ML pipelines: feature maths in NumPy; custom Python per-row logic is the usual bottleneck.</li><li>Know when to stop: if the job runs 5 minutes once a day, readable code beats a 3-minute saving.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> replace <code>apply(axis=1)</code> with column maths.</li><li><strong>Data Science:</strong> vectorized simulation (many random draws at once).</li><li><strong>Machine Learning / Deep Learning:</strong> array and tensor maths on CPU and GPU is vectorization at scale.</li><li><strong>Data Engineering:</strong> chunked processing in a process pool, or push the work to SQL or Spark.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Rewriting everything in a faster style before profiling. First prove the loop is the hot spot (11.1).</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using a process pool on tiny tasks. The start-up and copying cost can be larger than the work. Measure with real data size.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does "vectorized" mean? Answer: one operation applied to a whole array, with the loop running in fast compiled code.</li><li>Why was <code>sum(xs)/len(xs)</code> faster than <code>statistics.mean(xs)</code>? Answer: <code>sum</code> loops in C, while <code>statistics.mean</code> does exact, careful arithmetic in Python.</li><li>Why was the pool speed-up 2.5x, not 4x? Answer: uneven chunk sizes plus process start-up and data-copy costs.</li></ol>
+<h2 id="s5-11-5-queues-back-pressure-and-little-s-law">11.5 Queues, Back-Pressure and Little's Law</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">At a bank, customers wait in a line, and tellers take the next customer when free. If customers arrive faster than tellers can serve, the line grows without end. A programmer's queue is the same line. And Little's law tells you how many tellers you need for a target speed.</div></div>
+<h3>Producer, consumer and queue</h3>
+<p>A <strong>producer</strong> creates work items. A <strong>consumer</strong> (or worker) processes them. A <strong>queue</strong> sits between them. Python's <code>queue.Queue</code> is thread-safe: many threads can put and get without a lock of your own. With <code>maxsize</code>, <code>put</code> waits when the queue is full. That is <strong>back-pressure</strong>: the fast producer is forced to slow down to the speed of consumers instead of filling memory.</p>
+<p class="problem"><span class="pl">Problem 11.5.1</span> One producer puts 8 items into a queue with <code>maxsize=3</code>. Two consumers process each item in 10 ms. How do they stop?</p>
+<table class="steps"><tr><th>Step 1</th><td>The producer puts items 0 to 7, then puts one <code>None</code> per consumer as a "stop" signal (a <strong>sentinel</strong>).</td></tr><tr><th>Step 2</th><td>Each consumer loops <code>while (item := q.get()) is not None</code>.</td></tr><tr><th>Step 3</th><td>Join all threads and print the sorted results.</td></tr></table>
+<pre class="code lang-python"><code>import queue, threading, time
+q = queue.Queue(maxsize=3)
+results = []
+def producer():
+    for i in range(8):
+        q.put(i)               # blocks when queue is full (back-pressure)
+    for _ in range(2): q.put(None)
+def consumer(name):
+    while (item := q.get()) is not None:
+        time.sleep(0.01)
+        results.append((name, item))
+ts=[threading.Thread(target=producer)]+[threading.Thread(target=consumer,args=(f"c{i}",)) for i in range(2)]
+[t.start() for t in ts]; [t.join() for t in ts]
+print(sorted(i for _,i in results))
+print(len(results), "items processed")</code></pre>
+<pre class="code lang-text"><code>[0, 1, 2, 3, 4, 5, 6, 7]
+8 items processed</code></pre>
+<ul><li><strong>Answer</strong> Every item was processed exactly once, and both consumers stopped cleanly. Which consumer took which item varies between runs, but the final sorted list is always the same.</li><li><strong>Check</strong> 8 items in, 8 results out, none duplicated and none lost.</li><li><strong>Why it matters</strong> This is the pattern behind message queues (Kafka, SQS, RabbitMQ) in data engineering, just on a small scale. (<code>list.append</code> is safe here because it is a single step; for anything bigger, use a queue or a lock.)</li></ul>
+<h3>Little's law</h3>
+<p><strong>Little's law</strong> says: in a stable system, the average number of requests inside the system <code>L</code> equals the arrival rate (throughput) <code>λ</code> times the average time each spends inside <code>W</code>.</p>
+<pre class="code lang-text"><code>L = λ × W        so      λ = L / W      (throughput = concurrency / latency)</code></pre>
+<p>Check the units: <code>L</code> is a count of requests. <code>λ</code> is requests per second. <code>W</code> is seconds. Requests per second × seconds = requests. In a bank, <code>L</code> is the number of customers inside, <code>W</code> is the average time each spends there, and <code>λ</code> is how many customers arrive per minute.</p>
+<p class="problem"><span class="pl">Problem 11.5.2</span> Each "request" takes <code>W = 0.05 s</code>. Predict the throughput for concurrency 1, 5, 10 and 20, then measure with real threads for 2 seconds each.</p>
+<table class="steps"><tr><th>Formula</th><td>throughput <code>λ = L / W</code></td></tr><tr><th>Plug in and compute</th><td>L=1: 1 ÷ 0.05 = 20 req/s. L=5: 5 ÷ 0.05 = 100. L=10: 10 ÷ 0.05 = 200. L=20: 20 ÷ 0.05 = 400.</td></tr><tr><th>Step 1</th><td>Start <code>L</code> threads. Each loops: <code>time.sleep(0.05)</code>, then add 1 to a locked counter, until the 2 s are over.</td></tr><tr><th>Step 2</th><td>Divide the total count by elapsed time.</td></tr></table>
+<pre class="code lang-python"><code>import threading, time
+LAT = 0.05          # each request takes 50 ms
+DURATION = 2.0
+def run(workers):
+    done = 0
+    lock = threading.Lock()
+    end = time.perf_counter() + DURATION
+    def w():
+        nonlocal done
+        while time.perf_counter() &lt; end:
+            time.sleep(LAT)
+            with lock: done += 1
+    ts=[threading.Thread(target=w) for _ in range(workers)]
+    t0=time.perf_counter()
+    [t.start() for t in ts]; [t.join() for t in ts]
+    el=time.perf_counter()-t0
+    return done/el
+for c in (1,5,10,20):
+    print(f"concurrency {c:&gt;2}: measured {run(c):7.1f} req/s   predicted {c/LAT:7.1f} req/s")</code></pre>
+<pre class="code lang-text"><code>concurrency  1: measured    18.6 req/s   predicted    20.0 req/s
+concurrency  5: measured    92.6 req/s   predicted   100.0 req/s
+concurrency 10: measured   185.3 req/s   predicted   200.0 req/s
+concurrency 20: measured   370.6 req/s   predicted   400.0 req/s</code></pre>
+<ul><li><strong>Answer</strong> Throughput grows in a straight line with concurrency, as the law says. Measured values are about 93% of predicted (for example 370.6 against 400).</li><li><strong>Check</strong> 370.6 ÷ 400 = 0.9265, and 18.6 ÷ 20 = 0.93. The same 7% gap at every level means one constant cause: <code>time.sleep(0.05)</code> always takes a little longer than 50 ms, so the real <code>W</code> is about 0.054 s. Using that <code>W</code>, 20 ÷ 0.054 = 370 req/s, which matches.</li><li><strong>Why it matters</strong> In plain words: to get more throughput with the same latency, you need more concurrency, in the same proportion. And if latency doubles (a slow database), throughput at the same concurrency halves. Real servers also have a limit (CPU cores, connections), so the straight line eventually bends flat. That bend is the saturation point you look for when you push traffic at a service. This simple experiment has no such limit, because sleeping uses no CPU.</li></ul>
+<p>Use Little's law to size a worker pool: to process 200 requests per second when each takes 0.25 s, you need <code>L = 200 × 0.25 = 50</code> concurrent workers (threads or async tasks), plus some safety margin.</p>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> producers --&gt; [ queue (maxsize=3) ] --&gt; consumer 1
+ (fast)        [ x ][ x ][ x ]        --&gt; consumer 2
+                  ^
+                  | queue full: put() waits  (back-pressure)
+
+ Throughput vs concurrency (fixed latency, no resource limit):
+ req/s |                      /
+       |                 /
+       |            /           slope = 1 / W
+       |       /
+       +-------------------- concurrency</code></pre>
+<h3>Connection to the real job</h3>
+<ul><li>Worker pool size, connection pool size, and Kafka/SQS consumer counts are all chosen with <code>L = λ × W</code>.</li><li>When a pipeline "gets slower at night", check whether the queue between stages is growing. A growing queue means arrivals exceed service rate.</li><li>You can check the formula on your own Python service by sending it many requests with a traffic tool such as Locust (named only as an example) and comparing with the prediction.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> sizing consumers for a message queue; back-pressure in streaming jobs.</li><li><strong>MLOps:</strong> sizing replicas and worker counts for a model API for a target requests-per-second.</li><li><strong>Machine Learning:</strong> prefetch queues in data loaders keep the GPU busy.</li><li><strong>Data Analytics / BI:</strong> explaining why a dashboard slows down when many users open it at 9 am.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using an unbounded queue. A slow consumer then lets the queue grow until memory runs out. Set <code>maxsize</code>.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting the stop signal. Consumers wait forever on <code>q.get()</code> and the program never exits. Use a sentinel per consumer, or <code>q.task_done()</code> with <code>q.join()</code>.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>State Little's law and its units. Answer: <code>L = λ × W</code>: requests in system = requests per second × seconds each.</li><li>Latency is 0.1 s and you run 30 concurrent workers. What throughput do you expect? Answer: 30 ÷ 0.1 = 300 requests per second (at best).</li><li>What is back-pressure? Answer: a full bounded queue makes the producer wait, so it slows to the speed of the consumers.</li></ol>
+<h2 id="s6-chapter-recap">Chapter recap</h2>
+<ul><li>Measure first: <code>timeit</code> for small comparisons, <code>cProfile</code> to find the hot spot, <code>tracemalloc</code> for memory.</li><li>The biggest wins come from better algorithms and data structures (set against list: about 20,000 times faster in our test), not style tricks.</li><li>The GIL lets only one thread run Python bytecode at a time. Threads help I/O-bound work and do not help CPU-bound work. Free-threaded builds exist but are not the default.</li><li>Processes bypass the GIL, with costs: start-up, pickling, copying. Speed-up is less than the worker count.</li><li><code>concurrent.futures</code> is the easy interface to thread and process pools. Handle errors per future.</li><li><code>asyncio</code> runs many waiting tasks on one thread. Never block inside a coroutine; limit concurrency with a semaphore and add timeouts.</li><li>Vectorization moves the loop into compiled code (NumPy, pandas). Avoid row loops and <code>apply(axis=1)</code> on big data.</li><li>Shared mutable data between threads needs a lock or a queue. Bounded queues give back-pressure.</li><li>Little's law <code>L = λ × W</code> links concurrency, latency and throughput, the same three numbers as in a bank queue: customers inside, time spent, arrival rate.</li></ul>
+<h3>Cheat-sheet</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Need</th><th>Tool or formula</th></tr></thead><tbody><tr><td>Compare two snippets</td><td><code>timeit.timeit(stmt, number=n)</code></td></tr><tr><td>Find the slow function</td><td><code>python3 -m cProfile -s cumulative script.py</code></td></tr><tr><td>Memory by line of code</td><td><code>tracemalloc.start()</code>, <code>take_snapshot().statistics("lineno")</code></td></tr><tr><td>Many waits (I/O)</td><td><code>ThreadPoolExecutor</code> or <code>asyncio.gather</code></td></tr><tr><td>Many calculations (CPU)</td><td><code>ProcessPoolExecutor</code> or <code>Pool.map</code></td></tr><tr><td>Limit parallel tasks</td><td><code>asyncio.Semaphore(n)</code></td></tr><tr><td>Call blocking code from async</td><td><code>await asyncio.to_thread(fn, ...)</code></td></tr><tr><td>Protect shared data</td><td><code>with threading.Lock():</code> or <code>queue.Queue(maxsize=n)</code></td></tr><tr><td>Throughput</td><td><code>λ = L / W</code></td></tr><tr><td>Workers needed</td><td><code>L = λ × W</code></td></tr></tbody></table></div>
+<h2 id="s7-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 11.P.1</span> (easy) A job has <code>L = 10</code> concurrent workers and each request takes <code>W = 0.2 s</code>. What is the throughput?</p>
+<p><strong>Answer:</strong> λ = L ÷ W = 10 ÷ 0.2 = 50 requests per second.</p>
+<p class="problem"><span class="pl">Problem 11.P.2</span> (easy) You must download 100 files, each taking about 1 s of network wait, with a pool of 20 threads. About how long will it take?</p>
+<p><strong>Answer:</strong> 100 ÷ 20 = 5 rounds of 1 s each, about 5 s (compared with 100 s sequentially).</p>
+<p class="problem"><span class="pl">Problem 11.P.3</span> (easy, what is the output?) What does this print and why?</p>
+<pre class="code lang-python"><code>import asyncio
+async def f():
+    return 5
+print(f())</code></pre>
+<p><strong>Answer:</strong> it prints something like <code>&lt;coroutine object f at 0x...&gt;</code> (plus a warning that it was never awaited). Calling an <code>async def</code> function does not run it; you must <code>await f()</code> or use <code>asyncio.run(f())</code>.</p>
+<p class="problem"><span class="pl">Problem 11.P.4</span> (medium) Which tool for each: (a) 300 REST API calls, (b) a pure-Python loop over 10 big files on 8 cores, (c) summing a column of 10 million numbers?</p>
+<p><strong>Answer:</strong> (a) thread pool or asyncio with a limit, (b) process pool, (c) vectorized NumPy/pandas (or the built-in <code>sum</code>), no pool.</p>
+<p class="problem"><span class="pl">Problem 11.P.5</span> (medium, find the bug) This code uses a thread pool to speed up a CPU-heavy function and gets no gain. Why, and what is the fix?</p>
+<pre class="code lang-python"><code>with ThreadPoolExecutor(8) as ex:
+    results = list(ex.map(heavy_math, data))</code></pre>
+<p><strong>Answer:</strong> <code>heavy_math</code> is CPU-bound pure Python, so the GIL allows one thread at a time. Use <code>ProcessPoolExecutor</code> (with <code>heavy_math</code> defined at module top level), or vectorize it.</p>
+<p class="problem"><span class="pl">Problem 11.P.6</span> (medium, find the bug) An async function calls <code>requests.get(url)</code> (a blocking call) inside <code>gather</code> of 100 tasks. It takes 100 times one call. Fix it two ways.</p>
+<p><strong>Answer:</strong> the blocking call freezes the event loop, so the tasks run one by one. Fix 1: use an async client such as <code>httpx.AsyncClient</code> with <code>await client.get(url)</code>. Fix 2: wrap the blocking call with <code>await asyncio.to_thread(requests.get, url)</code>.</p>
+<p class="problem"><span class="pl">Problem 11.P.7</span> (medium) A profile shows <code>fib</code> with <code>ncalls = 57313/1</code>. What does this mean, and what is the cheapest fix?</p>
+<p><strong>Answer:</strong> 57,313 total calls of which 1 was the outer call, so the rest are recursive repeats of the same sub-problems. Add <code>@functools.lru_cache(maxsize=None)</code> so each value is computed once.</p>
+<p class="problem"><span class="pl">Problem 11.P.8</span> (medium) You need 500 requests per second. The average latency of your service is 0.04 s. How many concurrent workers do you need at minimum?</p>
+<p><strong>Answer:</strong> L = λ × W = 500 × 0.04 = 20 workers. Add margin (for example 30) because latency varies and the formula is for averages.</p>
+<p class="problem"><span class="pl">Problem 11.P.9</span> (hard, scenario) Your ETL reads 5,000 small JSON files from cloud storage and parses each (parsing takes 2 ms CPU, reading takes 100 ms wait). Design the concurrency.</p>
+<p><strong>Answer:</strong> reading is I/O-bound (100 ms wait against 2 ms CPU), so a thread pool of 50 to 100 workers works: 5,000 × 0.1 s ÷ 50 = 10 s of wall time. Parsing at 2 ms × 5,000 = 10 s CPU total, which fits in the same threads (the GIL allows it). Only if parsing were heavy would you add processes. Add retries and per-file error handling, and measure before tuning.</p>
+<p class="problem"><span class="pl">Problem 11.P.10</span> (hard, interview) Explain the GIL to a junior engineer in four sentences, and say when you would use threads, processes or asyncio.</p>
+<p><strong>Answer:</strong> The GIL is a lock in CPython that lets only one thread run Python bytecode at a time. Threads still help when they wait, because a waiting thread releases the lock. For CPU-bound work you use processes, each with its own GIL. I use threads for a moderate number of I/O tasks with normal libraries, asyncio for thousands of connections with async libraries, and processes (or vectorized code) for CPU-bound work.</p>
+<p class="problem"><span class="pl">Problem 11.P.11</span> (hard, interview) A teammate says "just add more threads, the API is slow." Using Little's law, explain what may go wrong.</p>
+<p><strong>Answer:</strong> more threads raise concurrency L, which raises throughput only while latency W stays flat. If the server is saturated, extra concurrency just raises W (requests queue), and throughput stays flat or drops, with more errors and timeouts. I would try 10, 20, 40, 80 threads, find where throughput stops growing, and use a rate limit and a timeout.</p>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles, and English is my second language, so use simple words. Teach me the Python GIL, threads, processes and the difference between I/O-bound and CPU-bound work. Explain step by step with small timed experiments and real numbers, and connect each idea to everyday examples like a kitchen or a bank where it helps. After each part, ask me one question to check my understanding and wait for my answer before moving on.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles, and English is my second language. The topic is asyncio in Python: coroutines, await, gather, Semaphore, timeout and to_thread. Give me 8 graded exercises from easy to hard, using sleep to simulate network calls so I can run them offline. Do not give solutions yet. After I send my answers, review each one, show the bug if any, and explain the event loop in simple English.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles. Chapter topic: profiling and speeding up Python code with timeit, cProfile, tracemalloc and vectorization. Here is my slow code: [PASTE HERE]. Guide me to find the hot spot by measurement, not guessing. Ask me to run each profiling step and paste the output, then explain how to read it, propose one change at a time, and help me verify that results stay identical and the code is faster.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles, and English is my second language. Topic: Little's law (L = lambda x W), queues, back-pressure and worker pool sizing in Python services. Teach it using everyday examples (a bank queue, tellers, waiting time, customers served per hour). Then give me 6 sizing problems with real numbers, one at a time, and check each answer. Include one problem where the system saturates and explain why throughput stops growing.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles. Run a mock interview on Python concurrency and performance for a data engineer job. Ask me one question at a time: the GIL, threads versus processes versus asyncio, race conditions and locks, profiling workflow, vectorization, multiprocessing with pandas, and queues. Grade each answer from 1 to 5, give a model answer, and one improvement tip. After 10 questions, summarise my weak areas and what to practise next.</pre></div><div class="readbtn"><button class="btn" data-read="study:python:ch11">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch10.html">← Chapter 10: Testing and Code Quality</a><a class="btn" href="ch12.html">Chapter 12: APIs, the Web, Scraping and Command-Line →</a></div></div><script src="../../assets/study.js"></script></body></html>

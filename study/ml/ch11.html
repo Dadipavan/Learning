@@ -1,0 +1,302 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 11: Hyperparameter Tuning, Optimization, and AutoML</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Machine Learning Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 11</div><h1>Hyperparameter Tuning, Optimization, and AutoML</h1><p>How to search for good settings cheaply, honestly, and reproducibly, and what AutoML tools really do.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-11-1-parameters-hyperparameters-and-the-search-space">11.1 Parameters, Hyperparameters, and the Search Space</a></li><li><a href="#s2-11-2-grid-search-and-random-search">11.2 Grid Search and Random Search</a></li><li><a href="#s3-11-3-smarter-searches-successive-halving-and-bayesian-ideas">11.3 Smarter Searches: Successive Halving and Bayesian Ideas</a></li><li><a href="#s4-11-4-honest-evaluation-of-tuning-nested-cv-over-tuning-budgets">11.4 Honest Evaluation of Tuning: Nested CV, Over-tuning, Budgets</a></li><li><a href="#s5-11-5-optimization-recap-what-training-itself-does">11.5 Optimization Recap: What Training Itself Does</a></li><li><a href="#s6-11-6-automl-what-it-does-and-when-to-use-it">11.6 AutoML: What It Does and When to Use It</a></li><li><a href="#s7-chapter-recap">Chapter recap</a></li><li><a href="#s8-practice-set">Practice set</a></li><li><a href="#s9-prompt-pack">Prompt pack</a></li></ol></details><p>A model has two kinds of numbers. The first kind it learns by itself from data. The second kind you must set before training starts, and the model cannot learn them. A wrong choice can cost 5 points of AUC. It is like choosing the oven temperature and baking time before you bake; the cake cannot choose them for you, and a poor choice ruins the batch. By the end of this chapter you will be able to run grid, random and successive-halving searches, explain how Bayesian optimization decides the next trial, measure honestly how good a tuned model is (nested validation), see how over-tuning fools you, and use AutoML tools sensibly. We also revisit the optimizers (gradient descent, momentum, Adam) that do the <em>training</em> part, with a small experiment.</p>
+<p><strong>Running example.</strong> The churn data from Chapter 10 (4,000 customers, seed 0, 5% label noise, a hidden "new and angry" segment). We now include the <code>new_calls</code> feature found in 10.3. We hold out 30% (1,200 rows) as a final test set and tune only on the other 2,800 rows with 5-fold CV. The model is scikit-learn's <code>HistGradientBoostingClassifier</code> (a fast gradient boosting tree model; Chapters 6 to 9 explain trees and boosting). Metric: ROC-AUC. The generator below is the one from Chapter 10 in a compact form.</p>
+<pre class="code lang-python"><code>import numpy as np, pandas as pd
+def make_churn(n=4000, seed=0):
+    rng = np.random.default_rng(seed)
+    tenure = rng.integers(1, 60, n); spend = rng.normal(50, 15, n).round(1)
+    calls = rng.poisson(1.5, n)
+    plan = rng.choice(['basic','plus','pro'], n, p=[.5,.3,.2])
+    region = rng.choice(['N','S','E','W'], n)
+    z = -0.2 - 0.05*tenure + 0.03*(spend-50) + 0.3*calls + (plan=='basic')*0.6
+    z += ((tenure &lt; 12) &amp; (calls &gt;= 3)) * 2.5
+    y = (rng.random(n) &lt; 1/(1+np.exp(-z))).astype(int)
+    y = np.where(rng.random(n) &lt; 0.05, 1-y, y)
+    df = pd.DataFrame(dict(tenure=tenure, spend=spend, calls=calls, plan=plan, region=region))
+    X = pd.get_dummies(df, columns=['plan','region'], dtype=float)
+    X['new_calls'] = ((tenure &lt; 12) &amp; (calls &gt;= 3)).astype(float)
+    return X, y</code></pre>
+<h2 id="s1-11-1-parameters-hyperparameters-and-the-search-space">11.1 Parameters, Hyperparameters, and the Search Space</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Baking bread: the dough's texture changes by itself during kneading (parameters, learned). The oven temperature and baking time you set before you start (hyperparameters). You cannot learn the oven temperature from the dough while it bakes; you try a few batches and taste them. Tuning is "trying batches" in a smart order.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th><th>Example in our model</th></tr></thead><tbody><tr><td>Parameter</td><td>A number the training algorithm learns</td><td>the split thresholds and leaf values inside the trees</td></tr><tr><td>Hyperparameter</td><td>A number you set before training</td><td><code>learning_rate</code>, <code>max_leaf_nodes</code>, <code>max_iter</code></td></tr><tr><td>Search space</td><td>The allowed values for each hyperparameter</td><td><code>learning_rate</code> from 0.005 to 0.3</td></tr><tr><td>Trial</td><td>One try: train with one setting, score it with CV</td><td>one row in a results table</td></tr><tr><td>Budget</td><td>How many trials or how much time you can spend</td><td>40 trials</td></tr></tbody></table></div>
+<h3>Why scales matter</h3>
+<p>Learning rates behave in <em>ratios</em>: 0.01 versus 0.1 is a big change, 0.21 versus 0.30 is not. So you sample on a <strong>log scale</strong>: equal chance for 0.005 to 0.05 and for 0.05 to 0.5. Compare what 8 samples look like under both choices.</p>
+<pre class="code lang-python"><code>from scipy import stats
+print(np.sort(stats.loguniform(0.005, 0.3).rvs(8, random_state=0)).round(4))
+print(np.sort(stats.uniform(0.005, 0.295).rvs(8, random_state=0)).round(4))</code></pre>
+<pre class="code lang-text"><code>[0.0283 0.03   0.0465 0.0473 0.059  0.0704 0.0935 0.1926]
+[0.13   0.1341 0.1657 0.1669 0.1828 0.1955 0.216  0.2681]</code></pre>
+<p>A plain uniform sampler puts all 8 samples above 0.13, so it never tries the small rates that, as you will see, work best. The log sampler covers 0.03 to 0.19.</p>
+<p class="problem"><span class="pl">Problem 11.1.1</span> On a log scale, how many "equal steps" fit between 0.005 and 0.3, if one step doubles the value?</p>
+<table class="steps"><tr><th>Formula</th><td>steps = log₂(high / low).</td></tr><tr><th>Plug in</th><td>log₂(0.3 / 0.005) = log₂(60).</td></tr><tr><th>Compute</th><td>2⁵ = 32, 2⁶ = 64, so log₂(60) is about 5.9.</td></tr><tr><th>Answer</th><td>About 6 doublings: 0.005, 0.01, 0.02, 0.04, 0.08, 0.16, (0.32). A log search treats each doubling as equally important.</td></tr><tr><th>Check</th><td>0.005 × 2⁵·⁹ ≈ 0.005 × 59.7 ≈ 0.3.</td></tr></table>
+<p class="problem"><span class="pl">Problem 11.1.2</span> Which of these hyperparameters should be searched on a log scale: <code>learning_rate</code>, <code>max_leaf_nodes</code>, <code>l2_regularization</code>, <code>n_neighbors</code>?</p>
+<table class="steps"><tr><th>Step 1</th><td>A hyperparameter that spans orders of magnitude and acts multiplicatively uses log: learning rate and L2 strength.</td></tr><tr><th>Step 2</th><td>Counts with a small range (leaves 3 to 40, neighbours 1 to 50) use a linear integer scale, or log if the range is huge (like 10 to 10,000).</td></tr><tr><th>Answer</th><td><code>learning_rate</code> and <code>l2_regularization</code> on log; <code>max_leaf_nodes</code> and <code>n_neighbors</code> on integers.</td></tr><tr><th>Check</th><td>Ask: "would doubling this value be a meaningful step?" If yes, log.</td></tr></table>
+<h3>Tuning order of importance</h3>
+<p>You cannot tune everything. For gradient boosted trees use this order (each step fixes earlier choices):</p>
+<ol><li>Fix the learning rate to a moderate value (for example 0.05 to 0.1) and tune the number of trees with early stopping.</li><li>Tune tree complexity: depth or number of leaves, minimum samples per leaf.</li><li>Tune sampling (row and column sampling).</li><li>Tune regularization (L1/L2 strength).</li><li>At the very end, lower the learning rate and add trees for a small final gain.</li></ol>
+<h3>Applications</h3>
+<ul><li><strong>Machine Learning:</strong> every production model has a stored config of tuned values.</li><li><strong>MLOps:</strong> the search space is versioned in a config file next to the code.</li><li><strong>Deep Learning:</strong> learning rate, batch size and weight decay are tuned the same way.</li><li><strong>Operations:</strong> choosing reorder levels and delivery-slot settings for a warehouse; a systematic search beats random fiddling.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Searching <code>learning_rate</code> on a linear scale. You waste most trials on large rates.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Tuning on the test set. Tune with CV on the training part only; touch the test set once (Chapter 10.4 rules).</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Is the number of trees a parameter or a hyperparameter? Answer: Hyperparameter (you set it before training).</li><li>Why log scale for learning rate? Answer: Its effect is multiplicative; the log scale gives each order of magnitude equal attention.</li><li>Name the first thing to fix when tuning boosting. Answer: A moderate learning rate, then tune trees with early stopping.</li></ol>
+<h2 id="s2-11-2-grid-search-and-random-search">11.2 Grid Search and Random Search</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You are looking for the best restaurant in a city with two criteria: price and distance. A grid search visits every restaurant at fixed street corners, even if it means visiting 3 restaurants that have the same cheap price. A random search picks random addresses; after 9 visits you have tried 9 different prices and 9 different distances. If only one criterion really matters, random search tested it 9 times while the grid tested it only 3 times.</div></div>
+<h3>How they work</h3>
+<ul><li><strong>Grid search:</strong> list a few values per hyperparameter and try every combination. With 3 values for each of 2 hyperparameters it takes 3 × 3 = 9 trials; with 5 hyperparameters at 3 values each, 3⁵ = 243 trials. It explodes as dimensions grow.</li><li><strong>Random search:</strong> draw each hyperparameter from a distribution; each trial is a fresh random combination. The budget is exactly what you choose (<code>n_iter</code>).</li></ul>
+<p>Each trial is scored by k-fold CV; the setting with the best mean CV score wins, and by default scikit-learn <strong>refits</strong> the winner on the whole training part.</p>
+<p>First, the untuned model:</p>
+<pre class="code lang-python"><code>from sklearn.experimental import enable_halving_search_cv
+from sklearn.model_selection import (StratifiedKFold, train_test_split, cross_val_score,
+                                     GridSearchCV, RandomizedSearchCV, HalvingRandomSearchCV)
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import roc_auc_score
+X, y = make_churn()
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0, stratify=y)
+cv = StratifiedKFold(5, shuffle=True, random_state=0)
+base = HistGradientBoostingClassifier(random_state=0)
+print("default cv", cross_val_score(base, Xtr, ytr, cv=cv, scoring='roc_auc').mean().round(4))
+print("default test", round(roc_auc_score(yte, base.fit(Xtr, ytr).predict_proba(Xte)[:, 1]), 4))</code></pre>
+<pre class="code lang-text"><code>default cv 0.6827
+default test 0.7135</code></pre>
+<p>Predict: will a grid over learning rate and number of leaves beat 0.6827? (The default has 31 leaves, rate 0.1: complex for noisy data.)</p>
+<pre class="code lang-python"><code>grid = GridSearchCV(HistGradientBoostingClassifier(random_state=0, max_iter=100),
+                    {'learning_rate': [0.01, 0.1, 0.3], 'max_leaf_nodes': [4, 16, 64]},
+                    cv=cv, scoring='roc_auc').fit(Xtr, ytr)
+print(grid.best_params_, grid.best_score_.round(4))
+import pandas as pd
+r = pd.DataFrame(grid.cv_results_)
+print(r.pivot(index='param_max_leaf_nodes', columns='param_learning_rate',
+              values='mean_test_score').round(4))</code></pre>
+<pre class="code lang-text"><code>{'learning_rate': 0.1, 'max_leaf_nodes': 4} 0.7286
+param_learning_rate     0.01    0.10    0.30
+param_max_leaf_nodes                        
+4                     0.7148  0.7286  0.7139
+16                    0.7188  0.7066  0.6725
+64                    0.7009  0.6730  0.6622</code></pre>
+<p>Read the table: rows are leaves, columns are learning rates, each cell is mean CV AUC. The best cell is 4 leaves at rate 0.1 (0.7286). Look down any column: more leaves is always worse. The data is small and noisy, so simple trees win. The grid raised CV AUC from 0.6827 to 0.7286, a gain of 0.046 from just two hyperparameters.</p>
+<p>Now random search with five hyperparameters and 40 trials:</p>
+<pre class="code lang-python"><code>dist = {'learning_rate': stats.loguniform(0.005, 0.3), 'max_leaf_nodes': stats.randint(3, 40),
+        'min_samples_leaf': stats.randint(10, 200), 'l2_regularization': stats.loguniform(1e-3, 10),
+        'max_iter': stats.randint(30, 300)}
+rs = RandomizedSearchCV(HistGradientBoostingClassifier(random_state=0), dist, n_iter=40,
+                        cv=cv, scoring='roc_auc', random_state=0).fit(Xtr, ytr)
+print("best cv", rs.best_score_.round(4))
+print("test", round(roc_auc_score(yte, rs.best_estimator_.predict_proba(Xte)[:, 1]), 4))</code></pre>
+<pre class="code lang-text"><code>best cv 0.729
+test 0.7279</code></pre>
+<figure><img src="images/ch11_random_vs_grid.png" alt="Random search versus grid search" loading="lazy"/><figcaption>Random search versus grid search</figcaption></figure>
+<p><em>Left: each dot is one random trial; x-axis is learning rate (log scale), y-axis is the number of leaves, colour is the CV AUC (yellow is better). Right: the 9 fixed grid points in the same axes. Notice the grid reuses only 3 distinct values per axis, while random uses 40.</em></p>
+<p>Honest reading: with 9 random trials we got CV 0.7288 and with the 3x3 grid 0.7286: <strong>no real difference at small budgets in this problem</strong>. The theory (Bergstra and Bengio, 2012) says random search wins when only a few hyperparameters matter, which is common, and when you add more hyperparameters. The extra 31 trials gave only 0.0002 more; the response surface here is flat near the top. Cost: the grid took 31 s on this laptop for 9 trials of 5 folds, because the 64-leaf, 300-iteration corner is slow.</p>
+<p>The CV score by learning rate bucket shows what random search found:</p>
+<pre class="code lang-text"><code>learning_rate bucket   trials  mean CV AUC   best
+(0.0, 0.02]              10      0.7255      0.7290
+(0.02, 0.06]             11      0.7159      0.7289
+(0.06, 0.15]             11      0.7133      0.7280
+(0.15, 0.4]               8      0.7004      0.7162</code></pre>
+<p>Small rates are safer on average; the best score in each bucket up to 0.15 is similar. This is what a <em>flat optimum</em> looks like: many settings are almost equally good, so spending 1,000 trials is wasteful.</p>
+<p class="problem"><span class="pl">Problem 11.2.1</span> How many fits does <code>GridSearchCV</code> perform for 4 hyperparameters with 3, 3, 4 and 5 values and 5-fold CV, including the final refit?</p>
+<table class="steps"><tr><th>Formula</th><td>fits = (product of value counts) × folds + 1 refit.</td></tr><tr><th>Plug in</th><td>(3 × 3 × 4 × 5) × 5 + 1.</td></tr><tr><th>Compute</th><td>3 × 3 = 9; 9 × 4 = 36; 36 × 5 = 180; 180 × 5 = 900; 900 + 1 = 901.</td></tr><tr><th>Answer</th><td>901 model fits. At 2 seconds each, that is 30 minutes. Random search with <code>n_iter=40</code> costs 40 × 5 + 1 = 201 fits.</td></tr><tr><th>Check</th><td>40 trials × 5 folds = 200, plus the refit = 201.</td></tr><tr><th>Why it matters</th><td>Compute cost is your budget, in money and time; know it before you press run.</td></tr></table>
+<p class="problem"><span class="pl">Problem 11.2.2</span> A grid has 2 important and 3 unimportant hyperparameters, each at 3 values (243 trials). How many distinct values of an important hyperparameter does each method test, with the same 243 trials?</p>
+<table class="steps"><tr><th>Step 1</th><td>The grid tests exactly 3 distinct values of each important hyperparameter.</td></tr><tr><th>Step 2</th><td>Random search draws a fresh value each trial, so about 243 distinct values.</td></tr><tr><th>Answer</th><td>3 versus about 243. When only some dimensions matter, random search explores the important ones about 80 times more finely.</td></tr><tr><th>Check</th><td>243 / 3 = 81.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Most teams use random search or Optuna (11.4) for the first pass, and they stop early once the curve of "best score so far" flattens. They write the search space and the seed in a config file so someone else can reproduce the run.</p>
+<h3>Applications</h3>
+<ul><li><strong>Machine Learning:</strong> random search on tree models and SVM (<code>C</code>, <code>gamma</code> on log scales).</li><li><strong>Data Science:</strong> quick baseline tuning for a notebook or a hackathon.</li><li><strong>MLOps:</strong> scheduled retraining jobs reuse a stored search space.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using a grid with many parameters "to be thorough". The cost grows as a product; most of those trials repeat the same values of the key parameter.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting that default hyperparameters may already be fine. Always report the untuned default score (here 0.6827 in CV) so you know what tuning bought you.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>3 values for each of 4 hyperparameters: how many grid combinations? Answer: 3⁴ = 81.</li><li>Why can random search beat grid search? Answer: It tests many more distinct values of each hyperparameter, which matters when only a few hyperparameters are important.</li><li>What does <code>refit=True</code> do? Answer: It retrains the best setting on the whole training data.</li></ol>
+<h2 id="s3-11-3-smarter-searches-successive-halving-and-bayesian-ideas">11.3 Smarter Searches: Successive Halving and Bayesian Ideas</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Hiring: 40 applicants. Instead of a full 3-day trial for each, you give everyone a 1-hour test, keep the best third, give them a 3-hour test, then keep the best third again. Bad candidates are removed cheaply. That is successive halving. The second idea: after 10 interviews you notice that candidates from certain backgrounds do well, so you interview more like them (Bayesian optimization): learn from past trials where to look next.</div></div>
+<h3>Successive halving and Hyperband</h3>
+<p><strong>Successive halving</strong>: start many candidates on a <em>small</em> budget (few rows or few iterations), keep the best <code>1/factor</code>, give the survivors <code>factor</code> times the budget, and repeat. <strong>Hyperband</strong> runs several halving schedules with different starting budgets, to protect against "slow starters" that look bad on small budgets.</p>
+<pre class="code lang-python"><code>hs = HalvingRandomSearchCV(HistGradientBoostingClassifier(random_state=0), dist, cv=cv,
+        scoring='roc_auc', random_state=0, factor=3, resource='n_samples',
+        min_resources=300, n_candidates=40).fit(Xtr, ytr)
+print(hs.best_score_.round(4), hs.n_iterations_, hs.n_candidates_, hs.n_resources_)</code></pre>
+<pre class="code lang-text"><code>0.7255 3 [40, 14, 5] [300, 900, 2700]</code></pre>
+<p>Read: round 1 trains 40 candidates on 300 rows; the best 14 (about 40 / 3) go to round 2 with 900 rows; the best 5 go to round 3 with 2,700 rows. The total training work is far lower than 40 candidates on 2,700 rows. The final score 0.7255 is close to the full random search (0.729), at a fraction of the cost. (The last score is measured on a bigger sample than the early ones, so scores across rounds are not directly comparable.)</p>
+<p class="problem"><span class="pl">Problem 11.3.1</span> Compute the rows processed by the halving run and by full random search, counting rows per candidate per round (ignore CV folds; treat cost as proportional to rows).</p>
+<table class="steps"><tr><th>Formula</th><td>cost = Σ (candidates × rows per candidate).</td></tr><tr><th>Plug in</th><td>Halving: 40 × 300 + 14 × 900 + 5 × 2700. Full: 40 × 2800 (all training rows, roughly 2,700 used in the last halving round).</td></tr><tr><th>Compute</th><td>Halving: 12,000 + 12,600 + 13,500 = 38,100. Full (using 2,700): 40 × 2,700 = 108,000.</td></tr><tr><th>Answer</th><td>Halving uses about 35% of the work (38,100 / 108,000 = 0.353) and lands within 0.0035 AUC of the best.</td></tr><tr><th>Check</th><td>Each round costs about the same (12,000 to 13,500), which is the design: more budget for fewer candidates.</td></tr></table>
+<h3>Bayesian optimization</h3>
+<p><strong>Idea:</strong> treat the score as an unknown function of the hyperparameters. After every trial, fit a cheap <strong>surrogate model</strong> (often a Gaussian process, GP; a model that predicts a mean and an uncertainty for any new point). Then choose the next trial by an <strong>acquisition function</strong> that balances <em>exploiting</em> (try where the predicted score is high) and <em>exploring</em> (try where uncertainty is high). The most common one is <strong>expected improvement (EI)</strong>: how much better than the best-so-far do we expect to get? Optuna's default sampler, <strong>TPE</strong> (Tree-structured Parzen Estimator), uses another trick: it models "good trials" and "bad trials" with two densities and picks points that are likely under the good one and unlikely under the bad one.</p>
+<p>We build a tiny Bayesian optimizer to see it work. The "validation score" is an artificial smooth function with one best peak: <code>f(x) = sin(3x) + 0.5x − 0.2x²</code>, for x between 0 and 5. Its true maximum is 1.211 at x = 0.55. We start with 4 trials and let EI choose 6 more.</p>
+<pre class="code lang-python"><code>from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import Matern
+def f(x): return np.sin(3*x) + 0.5*x - 0.2*x**2
+grid_x = np.linspace(0, 5, 501)
+xs = [0.4, 1.9, 3.3, 4.7]; ys = [f(v) for v in xs]
+for it in range(6):
+    gp = GaussianProcessRegressor(Matern(length_scale=0.6, nu=2.5), alpha=1e-6,
+                                  optimizer=None, normalize_y=True).fit(np.array(xs)[:, None], ys)
+    mu, sd = gp.predict(grid_x[:, None], return_std=True); best = max(ys)
+    zz = (mu - best) / np.maximum(sd, 1e-9)
+    ei = (mu - best) * stats.norm.cdf(zz) + sd * stats.norm.pdf(zz)   # expected improvement
+    xn = grid_x[ei.argmax()]; xs.append(float(xn)); ys.append(float(f(xn)))
+    print(it, "next x", round(float(xn), 2), "f", round(float(f(xn)), 3), "best", round(max(ys), 3))</code></pre>
+<pre class="code lang-text"><code>0 next x 0.09 f 0.31 best so far 1.1
+1 next x 0.66 f 1.16 best so far 1.16
+2 next x 0.54 f 1.21 best so far 1.21
+3 next x 1.13 f 0.064 best so far 1.21
+4 next x 0.57 f 1.21 best so far 1.21
+5 next x 2.53 f 0.95 best so far 1.21</code></pre>
+<p>Read it line by line. The first guess (0.09) explores the edge near the best point and is poor. The second (0.66) and third (0.54) zoom in, reaching 1.21 which equals the true maximum (1.211). Trials 3 and 5 (1.13 and 2.53) are <em>exploration</em>: EI sent the search to places with high uncertainty. By trial 3 we have the optimum after 7 evaluations in total. Random search with 10 evaluations got a best of 1.021 on average over 200 repeated runs, and as low as −0.048 in the worst run. (We caution: our first point 0.4 was already close to the peak, which helps; and a GP surrogate works best with few, continuous, smooth hyperparameters.)</p>
+<p class="problem"><span class="pl">Problem 11.3.2</span> Why did EI choose x = 1.13 at step 3 even though the best was already found?</p>
+<table class="steps"><tr><th>Step 1</th><td>EI = (expected gain over the best) accounting for uncertainty. Near 0.55 the GP is already certain, so the expected gain is almost 0.</td></tr><tr><th>Step 2</th><td>At x = 1.13 there are no nearby trials, so the standard deviation is large; even if the predicted mean is low, a small chance of a high score gives a positive EI.</td></tr><tr><th>Answer</th><td>It was exploring: with no knowledge about 1.13, an unlucky region could hide a better peak. Here it was not better (0.064).</td></tr><tr><th>Check</th><td>The sd term in the EI formula <code>(μ − best)·Φ(z) + σ·φ(z)</code> grows with uncertainty, so unexplored areas keep EI above zero.</td></tr></table>
+<h3>Optuna (not run here)</h3>
+<p>Optuna is not installed here, so this code is not run; it is the standard pattern (check the current docs for version details):</p>
+<pre class="code lang-python"><code>import optuna
+def objective(trial):
+    params = dict(
+        learning_rate=trial.suggest_float("learning_rate", 0.005, 0.3, log=True),
+        max_leaf_nodes=trial.suggest_int("max_leaf_nodes", 3, 40),
+        min_samples_leaf=trial.suggest_int("min_samples_leaf", 10, 200),
+        l2_regularization=trial.suggest_float("l2_regularization", 1e-3, 10, log=True),
+    )
+    model = HistGradientBoostingClassifier(random_state=0, **params)
+    return cross_val_score(model, Xtr, ytr, cv=cv, scoring="roc_auc").mean()
+
+study = optuna.create_study(direction="maximize",
+                            sampler=optuna.samplers.TPESampler(seed=0))
+study.optimize(objective, n_trials=40)
+print(study.best_params, study.best_value)</code></pre>
+<p>Optuna can also prune bad trials early (like halving), store studies in a database, and run trials in parallel.</p>
+<h3>Applications</h3>
+<ul><li><strong>Deep Learning:</strong> Hyperband-style schedulers stop bad training runs after a few epochs.</li><li><strong>Machine Learning:</strong> Optuna with TPE is a common default for boosting models.</li><li><strong>Data Engineering / MLOps:</strong> studies stored in a database allow distributed tuning.</li><li><strong>Operations and engineering:</strong> Bayesian optimization is also used to tune expensive physical or system experiments (a factory setting, a cache size) where each test run is costly.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using Bayesian optimization when each trial is cheap (a 1-second model). Random search with many trials is simpler and as good. BO pays off when a trial costs minutes or hours.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Comparing halving round scores as if they were on the same data size. Early rounds use 300 rows and are noisy and lower.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What do the surrogate and the acquisition function each do? Answer: The surrogate predicts score and uncertainty for untried settings; the acquisition function chooses the next trial from that.</li><li>In halving with factor 3, 27 candidates in round 1: how many in round 2? Answer: 9.</li><li>When is plain random search a better choice than BO? Answer: When trials are cheap or the space is high-dimensional and discrete.</li></ol>
+<h2 id="s4-11-4-honest-evaluation-of-tuning-nested-cv-over-tuning-budgets">11.4 Honest Evaluation of Tuning: Nested CV, Over-tuning, Budgets</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A student takes the same practice exam 100 times, memorises which answers scored best, and then reports the best score as her skill. That score is inflated. The search is the student, the validation set is the exam. If you choose "the best of 100" on one validation set, the winner is partly the luckiest, not the best.</div></div>
+<h3>Over-tuning on noise</h3>
+<p>Let us test this with data that has <strong>no signal at all</strong>: 300 rows, 10 random features, random 0/1 labels. The true AUC of any model is 0.5. We try 100 random decision-tree settings and score each on one validation half.</p>
+<pre class="code lang-python"><code>from sklearn.tree import DecisionTreeClassifier
+rng = np.random.default_rng(0)
+Xn = rng.normal(size=(300, 10)); yn = rng.integers(0, 2, 300)
+Xa, Xb, ya, yb = train_test_split(Xn, yn, test_size=0.5, random_state=0)
+res = []
+for i in range(100):
+    m = DecisionTreeClassifier(max_depth=int(rng.integers(1, 8)), min_samples_leaf=int(rng.integers(1, 30)),
+                               max_features=float(rng.uniform(.2, 1)), random_state=int(rng.integers(0, 1000))).fit(Xa, ya)
+    res.append(roc_auc_score(yb, m.predict_proba(Xb)[:, 1]))
+print("mean val AUC", np.mean(res).round(3), "best of 100", np.max(res).round(3))</code></pre>
+<pre class="code lang-text"><code>mean val AUC 0.477 best of 100 0.577</code></pre>
+<p>The average trial scored 0.477 (chance). The best of 100 scored 0.577: a 7.7-point "improvement" produced by luck alone. If you reported 0.577, you would be cheating yourself. The more trials and the smaller and noisier the validation set, the bigger the lie.</p>
+<h3>Nested cross-validation</h3>
+<p><strong>Nested CV</strong> has two loops. The <strong>inner loop</strong> (with its own CV) picks the best hyperparameters using only the outer-training rows. The <strong>outer loop</strong> scores the tuned model on outer-test rows it never saw. The average outer score estimates the quality of the <em>whole procedure</em> "tune then fit".</p>
+<pre class="code lang-python"><code>outer = StratifiedKFold(5, shuffle=True, random_state=1)
+inner_scores, outer_scores = [], []
+for tri, tei in outer.split(X, y):
+    s = RandomizedSearchCV(HistGradientBoostingClassifier(random_state=0), dist, n_iter=20,
+            cv=StratifiedKFold(5, shuffle=True, random_state=2), scoring='roc_auc',
+            random_state=0).fit(X.iloc[tri], y[tri])
+    inner_scores.append(s.best_score_)
+    outer_scores.append(roc_auc_score(y[tei], s.predict_proba(X.iloc[tei])[:, 1]))
+print("inner", np.round(inner_scores, 4), np.mean(inner_scores).round(4))
+print("outer", np.round(outer_scores, 4), np.mean(outer_scores).round(4))</code></pre>
+<pre class="code lang-text"><code>inner [0.7247 0.7333 0.7301 0.7333 0.7325] 0.7308
+outer [0.7535 0.7192 0.7474 0.7244 0.7383] 0.7366</code></pre>
+<p>The inner mean (the "best of the search", 0.7308) is the number you would quote without nested CV. The outer mean is 0.7366, and the outer folds range from 0.7192 to 0.7535. Here the outer score is not lower than the inner. That is allowed: the inner scores use less data (each inner model trains on 64% of the rows, the refit model on 80%), and an outer fold has its own noise: the spread of 0.034 across five folds is bigger than the gap of 0.006. <strong>The lesson is the spread</strong>: quote "0.737 ± 0.015 (std across outer folds)", not "0.731". With 20 trials on a flat surface, the optimism of the inner score is small here; on a noisy surface with many trials (like the noise experiment) it would be large.</p>
+<p class="problem"><span class="pl">Problem 11.4.1</span> Compute the standard deviation of the outer scores and a rough 95% interval.</p>
+<table class="steps"><tr><th>Formula</th><td>sd = √(Σ(xᵢ − mean)² / (k − 1)); interval ≈ mean ± 2 × sd / √k.</td></tr><tr><th>Plug in</th><td>values 0.7535, 0.7192, 0.7474, 0.7244, 0.7383; mean 0.7366.</td></tr><tr><th>Compute</th><td>deviations: 0.0169, −0.0174, 0.0108, −0.0122, 0.0017; squares: 0.000286, 0.000303, 0.000117, 0.000149, 0.000003; sum 0.000858; divide by 4: 0.0002145; sd = 0.01465. Standard error = 0.01465 / √5 = 0.00655; interval = 0.7366 ± 0.0131, i.e. 0.7235 to 0.7497.</td></tr><tr><th>Answer</th><td>The tuned procedure scores about 0.737 AUC, plausibly between 0.724 and 0.750.</td></tr><tr><th>Check</th><td><code>np.std(outer_scores, ddof=1)</code> gives 0.0146.</td></tr><tr><th>Why it matters</th><td>A reported interval stops people over-reading a 0.005 difference.</td></tr></table>
+<h3>Budgeting rules</h3>
+<ol><li><strong>Start with the default and a simple baseline</strong>; report both.</li><li><strong>Tune on a subsample first</strong> (halving does this automatically), then refit the winner on all training data.</li><li><strong>Stop when the best-so-far curve is flat</strong> for 10 to 20 trials.</li><li><strong>Do not over-tune noisy validation sets.</strong> If the CV standard deviation across folds is 0.015, differences of 0.002 are not worth chasing.</li><li><strong>Use the same CV folds for all trials</strong> (seeded <code>cv</code> object) so the trials are paired.</li></ol>
+<h3>Reproducibility</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>How</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Random seeds</td><td><code>random_state=0</code> in splits, models, samplers</td><td>rerunning an experiment gets the same number</td></tr><tr><td>Environment</td><td>pinned <code>requirements.txt</code> or lock file</td><td>the same library versions on every machine</td></tr><tr><td>Config files</td><td>search space and fixed params stored in YAML or JSON</td><td>a reviewer sees what you tried</td></tr><tr><td>Experiment tracking</td><td>MLflow or Weights &amp; Biases (not run here) log params, metrics, artifacts</td><td>"which run produced model v7?"</td></tr><tr><td>Data version</td><td>a dated snapshot or hash of the training table</td><td>rebuild a model from last March</td></tr></tbody></table></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Quoting the best CV score of the search as the model's performance. It is biased upward; use a held-out test set (touched once) or nested CV.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Searching again after looking at the test result "because it was a bit low". Now the test set is a validation set. Collect fresh data instead.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>In nested CV, which loop chooses hyperparameters? Answer: The inner loop.</li><li>Why is "best of 100 trials" optimistic? Answer: The winner is partly the luckiest on that validation set.</li><li>Name two things to log for reproducibility. Answer: seed and data version (also config, library versions).</li></ol>
+<h2 id="s5-11-5-optimization-recap-what-training-itself-does">11.5 Optimization Recap: What Training Itself Does</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Training is walking downhill in fog. At each step you feel the slope under your feet (the gradient) and move against it. The step size is the learning rate. Too small: you take all day. Too big: you jump across the valley and fall higher up. Momentum is a heavy ball that keeps rolling in the same direction; Adam gives each direction its own step size.</div></div>
+<p>The derivations (gradient, momentum, Adam, learning rate schedules) are in the learner's Math PDF, Pillar 5; Chapter 2 of this document used gradient descent for linear regression. Here is only a compact experiment that shows the behaviour.</p>
+<h3>Setup</h3>
+<p>The loss is a long narrow valley: <code>L(w) = 0.5 (w₁² + 25 w₂²)</code>. The gradient is <code>(w₁, 25 w₂)</code>. Start at w = (4, 1). The minimum is at (0, 0) with loss 0. The curvature differs 25 times between directions, like unscaled features in regression (Chapter 2, "why scaling matters"). Plain GD must use a step small enough for the steep direction (w₂), so it crawls along the flat direction (w₁).</p>
+<pre class="code lang-python"><code>A = np.diag([1.0, 25.0])
+def run(opt, steps=60, lr=0.03):
+    w = np.array([4.0, 1.0]); m = np.zeros(2); v = np.zeros(2); vel = np.zeros(2); out = []
+    for t in range(1, steps + 1):
+        g = A @ w
+        if opt == 'gd':   w = w - lr * g
+        elif opt == 'mom': vel = 0.9 * vel + g; w = w - lr * vel
+        elif opt == 'adam':
+            m = 0.9*m + 0.1*g; v = 0.999*v + 0.001*g*g
+            mh = m/(1 - 0.9**t); vh = v/(1 - 0.999**t)
+            w = w - 0.3 * mh / (np.sqrt(vh) + 1e-8)
+        out.append(0.5 * w @ A @ w)
+    return out
+for o in ['gd', 'mom', 'adam']:
+    L = run(o); print(o, "loss at step 10:", round(L[9], 4), "step 30:", round(L[29], 6), "step 60:", round(L[59], 8))
+for lr in [0.01, 0.03, 0.07, 0.085]:
+    print("gd lr", lr, "loss@60", run('gd', lr=lr)[59])</code></pre>
+<pre class="code lang-text"><code>gd loss at step 10: 4.3504 step 30: 1.286453 step 60: 0.20687028
+mom loss at step 10: 5.0254 step 30: 0.591473 step 60: 0.01943896
+adam loss at step 10: 2.2256 step 30: 0.47766 step 60: 0.00240678
+gd lr 0.01 loss@60 2.395043130498667
+gd lr 0.03 loss@60 0.20687027841451988
+gd lr 0.07 loss@60 0.0013214289388152583
+gd lr 0.085 loss@60 17187499.822868153</code></pre>
+<p>Read it. At step 60, plain GD with rate 0.03 has loss 0.207; momentum reaches 0.019 (10 times lower); Adam reaches 0.0024 (86 times lower). Momentum is <em>worse</em> early (5.03 at step 10, it overshoots and oscillates) and better later. Learning rate matters more than the optimizer: GD with 0.07 beats momentum and nearly beats Adam (0.0013), and with 0.085 it <strong>diverges</strong>: the loss explodes to 1.7 × 10⁷.</p>
+<p class="problem"><span class="pl">Problem 11.5.1</span> Find the divergence threshold for plain GD on this loss.</p>
+<table class="steps"><tr><th>Formula</th><td>For <code>L = ½ a w²</code>, a step gives <code>w ← w (1 − lr·a)</code>. It shrinks only if <code>|1 − lr·a| &lt; 1</code>, so <code>lr &lt; 2/a</code>.</td></tr><tr><th>Plug in</th><td>The steepest direction has a = 25.</td></tr><tr><th>Compute</th><td>2 / 25 = 0.08.</td></tr><tr><th>Answer</th><td>GD diverges for lr above 0.08. Our test: 0.07 converges, 0.085 diverges. It matches.</td></tr><tr><th>Check</th><td>At lr = 0.085, <code>1 − 0.085 × 25 = −1.125</code>, and |−1.125| &gt; 1, so each step multiplies w₂ by 1.125 in size and flips its sign.</td></tr><tr><th>Why it matters</th><td>This is why you scale features: with the same curvature in all directions the safe step is much larger and training is faster.</td></tr></table>
+<p class="problem"><span class="pl">Problem 11.5.2</span> At the best stable rate for the flat direction, how fast does plain GD shrink w₁ per step, with lr = 0.07?</p>
+<table class="steps"><tr><th>Formula</th><td>factor per step = 1 − lr · a, with a = 1.</td></tr><tr><th>Plug in</th><td>1 − 0.07 × 1.</td></tr><tr><th>Compute</th><td>0.93 per step; after 60 steps: 0.93⁶⁰ = 0.0128, so w₁ goes from 4 to 0.051.</td></tr><tr><th>Answer</th><td>The flat direction shrinks only 7% per step, while the steep direction is already at its limit; this mismatch (a ratio of 25) is called <strong>ill-conditioning</strong>.</td></tr><tr><th>Check</th><td>Loss contribution of w₁: 0.5 × 0.051² = 0.0013, which matches the printed 0.0013.</td></tr></table>
+<h3>What to remember for tuning</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Optimizer</th><th>Idea</th><th>Typical use</th></tr></thead><tbody><tr><td>SGD (mini-batch)</td><td>gradient from a small batch</td><td>large data; noisy but cheap</td></tr><tr><td>SGD + momentum</td><td>add a running average of past gradients</td><td>smooths zig-zag; CNN training</td></tr><tr><td>Adam / AdamW</td><td>per-parameter step from gradient averages</td><td>default for neural networks; AdamW separates weight decay</td></tr><tr><td>Learning-rate schedule</td><td>decay or warm-up the rate</td><td>most deep learning runs</td></tr><tr><td>Early stopping</td><td>stop when validation stops improving</td><td>boosting and neural networks</td></tr></tbody></table></div>
+<p>Regularization tools (L1/L2, early stopping, dropout, augmentation, simpler model, more data, ensembling) were covered in Chapter 3 and reappear as hyperparameters here: <code>l2_regularization</code>, <code>max_iter</code> with early stopping, and so on.</p>
+<h3>Applications</h3>
+<ul><li><strong>Deep Learning:</strong> learning rate is almost always the single most important hyperparameter.</li><li><strong>Machine Learning:</strong> logistic regression and linear models are fit by L-BFGS or SGD; solver choice and <code>max_iter</code> can cause "did not converge" warnings.</li><li><strong>GenAI fine-tuning:</strong> AdamW with warm-up and cosine decay is a standard recipe.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Blaming the optimizer when the real problem is unscaled features or a learning rate off by 10x.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Treating the <code>ConvergenceWarning</code> in scikit-learn as harmless. It means the optimizer stopped early; scale the features or raise <code>max_iter</code>.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What happens when the learning rate exceeds 2/a for a curvature a? Answer: Divergence; the loss grows.</li><li>Why does scaling help? Answer: It makes the curvature similar in all directions, so one learning rate suits all.</li><li>Which is more often the first thing to tune in deep learning: batch size or learning rate? Answer: Learning rate.</li></ol>
+<h2 id="s6-11-6-automl-what-it-does-and-when-to-use-it">11.6 AutoML: What It Does and When to Use It</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">AutoML is a very organised intern who tries many models and many settings overnight, using the search methods above, and hands you a leaderboard in the morning. Useful, tireless, but it does not know your business, does not check for leakage, and will happily train on a feature that contains the answer.</div></div>
+<h3>What AutoML tools do</h3>
+<ol><li>Preprocess data (impute, encode).</li><li>Try several model families (linear, trees, boosting, sometimes neural nets).</li><li>Search hyperparameters (Bayesian or halving search with a time budget).</li><li>Build an <strong>ensemble</strong> (stack or blend) of the best models.</li></ol>
+<h3>Tools (not run here; not installed, API changes by version)</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Tool</th><th>Style</th><th>Note</th></tr></thead><tbody><tr><td>AutoGluon</td><td>stacks many models with multi-layer ensembles</td><td>strong tabular baselines, heavy on compute</td></tr><tr><td>FLAML</td><td>cost-aware, lightweight search with a time budget</td><td>good when the time budget is small</td></tr><tr><td>H2O AutoML</td><td>Java-based, cluster-friendly</td><td>leaderboard and stacked ensembles</td></tr><tr><td>auto-sklearn</td><td>scikit-learn pipelines with meta-learning</td><td>Linux-focused</td></tr></tbody></table></div>
+<p>A typical use looks like this (FLAML, not run here; check the docs for the current API):</p>
+<pre class="code lang-python"><code>from flaml import AutoML
+automl = AutoML()
+automl.fit(X_train=Xtr, y_train=ytr, task="classification", metric="roc_auc", time_budget=60)
+print(automl.best_estimator, automl.best_config)</code></pre>
+<h3>How to use AutoML well</h3>
+<ul><li>Use it as a <strong>baseline and an upper bound</strong>: "AutoML got 0.74, my hand-built model got 0.73, so my feature work is close to the ceiling for this data."</li><li>Always run the Chapter 10 sanity tests on its winner. An AutoML tool cannot know that <code>days_since_cancel_request</code> is leaked.</li><li>Give it the <strong>same validation scheme</strong> you would use yourself (group or time split, not random).</li><li>Remember the cost: ensembles are slow at prediction time and hard to explain. Many production teams then distil the answer into a simpler model.</li></ul>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Example</th><th>Where it appears</th></tr></thead><tbody><tr><td>Time budget</td><td>60 seconds to 1 hour</td><td>a notebook baseline before a project kickoff</td></tr><tr><td>Leaderboard</td><td>list of models with CV scores</td><td>a table in the model-selection document</td></tr><tr><td>Ensemble</td><td>stack of 5 boosted models</td><td>high-accuracy, high-latency solution</td></tr></tbody></table></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Treating AutoML as a replacement for understanding the data. It optimises the metric you give it on the split you give it; bad inputs produce confident garbage.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Name one good use of AutoML. Answer: A quick baseline or an upper bound to compare your own model against.</li><li>What must you still check on an AutoML winner? Answer: Leakage, validation design, latency and explainability.</li><li>Why can an AutoML ensemble be a problem in production? Answer: It is slow, large, and difficult to explain and maintain.</li></ol>
+<h2 id="s7-chapter-recap">Chapter recap</h2>
+<ul><li>Parameters are learned; hyperparameters are set by you before training and must be searched.</li><li>Sample scale-like hyperparameters (learning rate, L2) on a log scale.</li><li>Grid search costs the product of value counts; random search tests many more distinct values and is the better default as dimensions grow.</li><li>Tuning gave a real gain here (CV AUC 0.6827 to 0.729), but the top of the surface was flat: 9 trials were nearly as good as 40.</li><li>Successive halving used about a third of the work and got within 0.0035 AUC; Bayesian optimization (surrogate + expected improvement) helps when each trial is expensive.</li><li>The best of many trials is biased upward (noise data: 0.477 average, 0.577 best of 100); use a test set touched once or nested CV, and report the spread.</li><li>Optimization: learning rate matters most; GD diverges when lr &gt; 2/curvature; momentum and Adam help on ill-conditioned problems; scaling features helps all.</li><li>AutoML is a baseline and a ceiling check, not a substitute for sanity tests and good validation.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Tool</th><th>Command / formula</th></tr></thead><tbody><tr><td>Grid</td><td><code>GridSearchCV(model, {param: [values]}, cv=cv, scoring=...)</code></td></tr><tr><td>Random</td><td><code>RandomizedSearchCV(model, {param: stats.loguniform(a, b)}, n_iter=40, ...)</code></td></tr><tr><td>Halving</td><td><code>HalvingRandomSearchCV(..., factor=3, resource='n_samples')</code> (needs <code>enable_halving_search_cv</code>)</td></tr><tr><td>Grid fits</td><td><code>product(value counts) × folds + 1</code></td></tr><tr><td>Expected improvement</td><td><code>(μ − best)·Φ(z) + σ·φ(z)</code>, <code>z = (μ − best)/σ</code></td></tr><tr><td>GD stability</td><td><code>lr &lt; 2 / curvature</code></td></tr><tr><td>Nested CV</td><td>outer loop scores; inner loop (a search object) tunes</td></tr></tbody></table></div>
+<h2 id="s8-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 11.P.1 (easy)</span> Are <code>max_depth</code> and the leaf values of a tree parameters or hyperparameters?</p>
+<p><strong>Answer:</strong> <code>max_depth</code> is a hyperparameter; leaf values are parameters.</p>
+<p class="problem"><span class="pl">Problem 11.P.2 (easy)</span> A grid has 4 values of <code>C</code> and 5 values of <code>gamma</code>, with 3-fold CV. How many fits (no refit)?</p>
+<p><strong>Answer:</strong> 4 × 5 × 3 = 60.</p>
+<p class="problem"><span class="pl">Problem 11.P.3 (easy)</span> You sample the learning rate from <code>uniform(0.001, 0.1)</code>. What is wrong?</p>
+<p><strong>Answer:</strong> About 90% of samples fall above 0.01, so small rates are almost never tried. Use <code>loguniform(0.001, 0.1)</code>.</p>
+<p class="problem"><span class="pl">Problem 11.P.4 (what is the output?)</span> <code>stats.loguniform(1, 100)</code> gives a median sample of about?</p>
+<p><strong>Answer:</strong> The median of a log-uniform is the geometric mean: √(1 × 100) = 10.</p>
+<p class="problem"><span class="pl">Problem 11.P.5 (medium)</span> Successive halving with factor 2 starts with 64 candidates at 100 rows. List candidates and rows per round until one candidate remains.</p>
+<p><strong>Answer:</strong> 64 at 100; 32 at 200; 16 at 400; 8 at 800; 4 at 1,600; 2 at 3,200; 1 at 6,400. Each round costs 6,400 rows in total (64 × 100 = 32 × 200 = ...).</p>
+<p class="problem"><span class="pl">Problem 11.P.6 (medium)</span> GD on <code>L = ½ · 4 · w²</code> with lr = 0.6. Does it converge? Compute w after 2 steps from w = 1.</p>
+<p><strong>Answer:</strong> Factor per step = 1 − 0.6 × 4 = −1.4; |−1.4| &gt; 1, so it diverges. w₁ = −1.4, w₂ = 1.96.</p>
+<p class="problem"><span class="pl">Problem 11.P.7 (find the bug)</span> <code>RandomizedSearchCV(...).fit(X, y)</code> is run on the full dataset and then <code>roc_auc_score(y, search.predict_proba(X)[:, 1])</code> is printed as the final result. What is wrong?</p>
+<p><strong>Answer:</strong> The model was tuned and fitted on all of those rows, so the score is measured on training data. Hold out a test set (or use nested CV).</p>
+<p class="problem"><span class="pl">Problem 11.P.8 (scenario)</span> You have 20 trials of tuning, and the best CV AUC is 0.812 with a fold standard deviation of 0.02. A colleague's setting scored 0.815. Which do you choose?</p>
+<p><strong>Answer:</strong> They are within noise (0.003 is much less than 0.02). Choose the simpler, cheaper or more stable one.</p>
+<p class="problem"><span class="pl">Problem 11.P.9 (interview)</span> "Why is random search often better than grid search?"</p>
+<p><strong>Answer:</strong> Usually only a few hyperparameters matter. A grid tests only a few distinct values of each; random search tests a new value of every hyperparameter on every trial, so it explores the important ones more finely for the same budget. It also lets you choose any budget.</p>
+<p class="problem"><span class="pl">Problem 11.P.10 (interview)</span> "How do you get an honest performance estimate when you tune hyperparameters?"</p>
+<p><strong>Answer:</strong> Keep a test set untouched until the end, or use nested CV: the inner loop tunes, the outer loop scores. Report the mean and spread over the outer folds, and compare with an untuned default and a simple baseline.</p>
+<h2 id="s9-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me the difference between parameters and hyperparameters, and how grid search and random search work, using a small scikit-learn example with a gradient boosting or random forest model. Explain why random search often wins, why learning rates need a log scale, and how to count the number of model fits. Check my understanding with three questions, one at a time.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Explain Bayesian optimization (surrogate model, acquisition function, expected improvement, and the idea behind TPE in Optuna) in plain English with a tiny one-dimensional example computed step by step. Then give me 6 graded exercises about when to use random search, successive halving, or Bayesian optimization. Do not show answers until I ask.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me honest evaluation of tuned models: why the best-of-many-trials score is optimistic, how nested cross-validation works, and how to report a score with a spread. Use a numeric example with five outer-fold scores and compute the standard deviation and an interval with me, line by line. Then review my own tuning plan [PASTE HERE] and point out leakage or over-tuning risks.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles and learning ML optimization. Review gradient descent, momentum and Adam on a simple two-variable quadratic loss with a long narrow valley. Show why too large a learning rate diverges (the 2/curvature rule) and why feature scaling helps. Compute two or three steps by hand with me, then give me 8 graded exercises (easy to hard), with solutions at the end.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles and preparing for ML interviews. Run a mock interview on hyperparameter tuning and AutoML: grid versus random search, Bayesian optimization, successive halving, nested CV, over-tuning, reproducibility, and when to trust AutoML. Ask one question at a time, wait for my answer, then correct me kindly and give a short model answer in simple English. Ten questions, increasing difficulty.</pre></div><div class="readbtn"><button class="btn" data-read="study:ml:ch11">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch10.html">← Chapter 10: Error Analysis, Debugging Models, and Co</a><a class="btn" href="ch12.html">Chapter 12: Hard Data Situations →</a></div></div><script src="../../assets/study.js"></script></body></html>

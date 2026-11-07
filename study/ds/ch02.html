@@ -1,0 +1,253 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 2: Getting Trustworthy Data: Collection, Point-in-Time Sets, Quality, Labels and Privacy</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#6a2fd0"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Science in Practice</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 2</div><h1>Getting Trustworthy Data: Collection, Point-in-Time Sets, Quality, Labels and Privacy</h1><p>Most model failures start here, long before any algorithm runs. You will learn to build a training table that matches real life, to try to break it, and to treat people&#x27;s data with care.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-2-1-data-sources-and-point-in-time-training-sets">2.1 Data Sources and Point-in-Time Training Sets</a></li><li><a href="#s2-2-2-data-quality-checks-before-any-modelling">2.2 Data Quality Checks Before Any Modelling</a></li><li><a href="#s3-2-3-labels-and-ground-truth">2.3 Labels and Ground Truth</a></li><li><a href="#s4-2-4-privacy-and-ethics-in-data-use">2.4 Privacy and Ethics in Data Use</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>Think about a hospital that studies waiting times from its appointment log, but the log misses every patient who gave up and left without being seen. The results look great and the real waiting room is overflowing. Data science has the same trap. If the training data is built wrongly, the best model still fails in real use. In this chapter you will learn how to find the right data sources, how to build a training table so that every feature uses only information that existed at the prediction time (called <em>point-in-time correctness</em>), how to run quality checks that catch broken data, how to think about labels that are late, noisy or biased, and how to respect privacy law and ethics. You will leave with SQL and pandas code you can reuse on any project.</p>
+<p>We use the shop dataset from Chapter 1 (<code>from ds_common import *</code>).</p>
+<h2 id="s1-2-1-data-sources-and-point-in-time-training-sets">2.1 Data Sources and Point-in-Time Training Sets</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Imagine a teacher who prints an exam and, by mistake, includes the answer key on the back. Students who see the back score 100%, but they learned nothing. A training table that contains information from after the prediction time is the same: the model "sees the answer key". It will look brilliant in the notebook and fail in production, where the key does not exist.</div></div>
+<p><strong>Words you need</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th><th>Example</th></tr></thead><tbody><tr><td>Source system</td><td>Where a record is first created</td><td>The orders database of the shop</td></tr><tr><td>Event log (clickstream)</td><td>An append-only list of "something happened" rows</td><td>One row per page view</td></tr><tr><td>Warehouse</td><td>A central database copy built for analysis</td><td>Tables like <code>orders</code>, <code>customers</code></td></tr><tr><td>Prediction time (T)</td><td>The moment the prediction is made</td><td>2025-01-01</td></tr><tr><td>Point-in-time correct</td><td>Each feature uses only data from before T</td><td><code>orders_90d</code> counts orders before T only</td></tr><tr><td>Leakage</td><td>Information from after T (or the label itself) entering a feature</td><td><code>days_to_last</code> uses all orders</td></tr></tbody></table></div>
+<p><strong>Data sources and how they are generated.</strong> Always ask "what event creates a row?" and "what is missing by design?".</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Source</th><th>What creates a row</th><th>Missing by design</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Operational DB (orders)</td><td>A completed purchase</td><td>Abandoned carts, failed payments</td><td>Revenue, churn labels</td></tr><tr><td>Event log / clickstream</td><td>A click or screen view</td><td>Users who blocked tracking</td><td>Behaviour features</td></tr><tr><td>Warehouse tables</td><td>A nightly copy of other systems</td><td>Edits made after the copy</td><td>Reporting and training sets</td></tr><tr><td>Third-party / APIs</td><td>A vendor call</td><td>Anyone the vendor does not cover</td><td>Credit bureau scores, weather</td></tr><tr><td>Surveys</td><td>A person who answered</td><td>Non-responders (often unhappy users)</td><td>NPS, satisfaction</td></tr><tr><td>Sensors / monitoring</td><td>A measurement at fixed intervals</td><td>Gaps when the device is offline</td><td>Latency, IoT</td></tr><tr><td>Manual labels</td><td>A human decision</td><td>Cases nobody reviewed</td><td>Fraud confirmed by analysts</td></tr></tbody></table></div>
+<p>Notice the "missing by design" column. It is like a shop door counter that never records the customers who turned away at a locked door. The data cannot show what it was never able to record.</p>
+<p><strong>Point-in-time training set.</strong> Remember the timeline from Chapter 1. Features come from before T and the label from after T. Here is the SQL version (SQLite syntax; other databases differ in date functions). We load the shop tables into an in-memory SQLite database and build the table for T = 2025-01-01.</p>
+<p>Before you run it, ask yourself: how many rows should this return? It should equal the number of active customers from Chapter 1.</p>
+<pre class="code lang-python"><code>import sqlite3
+from ds_common import *
+
+c, o = make_data()
+con = sqlite3.connect(":memory:")
+c.assign(signup_date=c.signup_date.dt.strftime("%Y-%m-%d")).to_sql("customers", con, index=False)
+o.assign(order_ts=o.order_ts.dt.strftime("%Y-%m-%d")).to_sql("orders", con, index=False)
+
+sql = """
+WITH base AS (
+  SELECT c.customer_id, c.plan, c.channel,
+         CAST(julianday(:T) - julianday(c.signup_date) AS INT) AS tenure_days
+  FROM customers c WHERE c.signup_date &lt; :T
+),
+past AS (
+  SELECT customer_id,
+         COUNT(*) AS orders_90d,
+         SUM(amount) AS spend_90d,
+         CAST(julianday(:T) - julianday(MAX(order_ts)) AS INT) AS recency_days
+  FROM orders
+  WHERE order_ts &lt;  :T
+    AND order_ts &gt;= date(:T, '-90 day')
+  GROUP BY customer_id
+),
+fut AS (
+  SELECT DISTINCT customer_id FROM orders
+  WHERE order_ts &gt;= :T AND order_ts &lt; date(:T, '+60 day')
+)
+SELECT b.*, p.orders_90d, p.spend_90d, p.recency_days,
+       CASE WHEN f.customer_id IS NULL THEN 1 ELSE 0 END AS churn
+FROM base b
+JOIN past p USING (customer_id)          -- inner join = active customers only
+LEFT JOIN fut f USING (customer_id)
+"""
+d = pd.read_sql(sql, con, params={"T": "2025-01-01"})
+print(d.shape, round(d.churn.mean(), 3))
+print(d.head(3).round(1).to_string())</code></pre>
+<pre class="code lang-text"><code>(2562, 8) 0.254
+   customer_id  plan   channel  tenure_days  orders_90d  spend_90d  recency_days  churn
+0            1   pro  referral          666           3     2403.8             8      0
+1            3  free   organic          254           8     3828.1            37      1
+2            6   pro       ads          105           5     4034.3            34      0</code></pre>
+<p>Line by line. The <code>base</code> block lists customers who existed before T and computes tenure up to T. The <code>past</code> block has two guards, <code>order_ts &lt; :T</code> and <code>order_ts &gt;= date(:T, '-90 day')</code>: they say "only before T, and only the last 90 days". The <code>fut</code> block is the label window and is used only to create <code>churn</code>. <code>JOIN past</code> is an inner join, so customers with no order in the last 90 days drop out: this defines who is "active". <code>LEFT JOIN fut</code> keeps everyone and gives NULL when there was no future order, which we turn into <code>churn = 1</code>. We get 2,562 rows and a 25.4% churn rate, the same as the pandas helper (the code also checked that both methods agree: rows match and churn counts match).</p>
+<p><strong>Worked problems</strong></p>
+<p class="problem"><span class="pl">Problem 2.1.1</span> A feature is <code>orders_all</code> = the number of orders a customer ever made (all dates in the table), used to predict churn at T = 2025-01-01. A customer who churned on 2025-01-20 has 14 orders in total, 10 before T. A customer who kept ordering has 40 orders in total, 12 before T. Which numbers should the model see, and why?</p>
+<table class="steps"><tr><th>Formula</th><td>feature value must be computed from rows with <code>order_ts &lt; T</code>.</td></tr><tr><th>Plug in</th><td>Customer A: 10 orders before T. Customer B: 12 orders before T.</td></tr><tr><th>Compute</th><td>The leaky feature gives 14 vs 40, a gap of 26. The honest feature gives 10 vs 12, a gap of 2.</td></tr><tr><th>Answer</th><td>The model must see 10 and 12. The leaky values 14 and 40 include orders after T, so the churner looks "low" only because they stopped later.</td></tr><tr><th>Check</th><td>On January 1st nobody knows how many orders a customer will make later; if a feature value cannot be known on that date, it is leakage.</td></tr><tr><th>Why it matters</th><td>It means the model learns "customers who will order more in the future will order more in the future", which is true and useless.</td></tr></table>
+<p class="problem"><span class="pl">Problem 2.1.2</span> Measure the damage. Compare the AUC of a logistic regression on honest features (<code>orders_90d</code>, <code>recency_days</code>, <code>spend_90d</code>) with a version that adds <code>days_to_last</code> = (date of the customer's last order in the entire table) minus T.</p>
+<table class="steps"><tr><th>Step 1</th><td>Compute <code>days_to_last</code> from all orders, including those after T.</td></tr><tr><th>Step 2</th><td>Fit the same model on both feature sets, same 70/30 split, same seed.</td></tr><tr><th>Step 3</th><td>Compare.</td></tr></table>
+<pre class="code lang-python"><code>leaky = pd.read_sql("SELECT customer_id, MAX(order_ts) AS last_order FROM orders GROUP BY customer_id", con)
+leaky["days_to_last"] = (pd.to_datetime(leaky.last_order) - pd.Timestamp("2025-01-01")).dt.days
+dd = d.merge(leaky, on="customer_id")
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+
+def auc_for(cols, data):
+    tr, te = train_test_split(data, test_size=0.3, random_state=0, stratify=data.churn)
+    m = LogisticRegression(max_iter=2000).fit(tr[cols], tr.churn)
+    return round(roc_auc_score(te.churn, m.predict_proba(te[cols])[:, 1]), 3)
+
+print("honest AUC :", auc_for(["orders_90d", "recency_days", "spend_90d"], dd))
+print("leaky  AUC :", auc_for(["orders_90d", "recency_days", "spend_90d", "days_to_last"], dd))</code></pre>
+<pre class="code lang-text"><code>honest AUC : 0.882
+leaky  AUC : 0.972</code></pre>
+<ul><li><strong>Answer</strong> Adding one future-looking column raises AUC from 0.882 to 0.972, a jump of 0.090.</li><li><strong>Check</strong> <code>days_to_last</code> is positive only for customers who ordered after T, which is exactly the opposite of the label <code>churn</code>. A jump this big from one column is a smell.</li><li><strong>Why it matters</strong> In plain words: a 0.97 AUC looks like a triumph in the notebook. In production, where the future is unknown, you would get about 0.88. If you had promised 0.97 to a manager, you just lost credibility.</li></ul>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>time ----------------------------------------------------------------&gt;
+         |---- feature window (90 days) ----|T|---- label window (60 days) ----|
+         orders_90d, recency, spend           ^   churn = no order here
+                                              |
+        LEAK: any column that looks to the right of T</code></pre>
+<p><strong>Sampling.</strong> You rarely train on all data. Three common ways:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Method</th><th>How</th><th>Use when</th><th>Danger</th></tr></thead><tbody><tr><td>Random</td><td>Pick rows with equal chance</td><td>Rows are independent</td><td>Same customer in train and test</td></tr><tr><td>Stratified</td><td>Keep class shares equal in each part</td><td>Rare positives</td><td>Hides distribution shift</td></tr><tr><td>Time-based</td><td>Train on the past, test on the future</td><td>Anything with time (almost everything)</td><td>Fewer rows for training</td></tr></tbody></table></div>
+<p>A sample misrepresents the population when selection depends on the outcome, for example "only customers who answered our survey".</p>
+<p><strong>Join pitfalls.</strong> Four traps:</p>
+<ul><li><em>Fan-out</em>: joining a customer table to an address table with two addresses per customer duplicates the customer row. In our toy test, 2 customers became 3 rows after the join (<code>2 customers -&gt; 3 rows</code>), while distinct customers stayed 2. Then <code>SUM</code> or <code>COUNT</code> over customers double counts.</li><li><em>Many-to-many</em>: joining two tables on a key that is not unique in either side multiplies rows (3 × 4 = 12).</li><li><em>Inner vs left</em>: an inner join silently removes rows (it changed the population to "active customers" above, on purpose). Always print row counts before and after every join.</li><li><em>Time-misaligned joins</em>: joining today's customer profile (e.g., "current plan") to old rows leaks the future. Use the profile as it was at T (slowly changing dimension or snapshot table).</li></ul>
+<p><strong>Documenting.</strong> Keep a data dictionary: column name, meaning, unit, time zone, how it is created, known issues, owner. Define metrics once ("active customer = at least 1 order in 90 days") in a source-of-truth table or view.</p>
+<p><strong>Connection to the real job.</strong> Building this table is usually the longest step of a project. In interviews, "write SQL to build a churn training set" is a standard question; the examiner looks for the <code>&lt; T</code> guards.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Data Science: churn, fraud and credit training tables.</li><li>Data Engineering: feature tables with "as-of" joins and snapshots.</li><li>MLOps: feature stores exist mainly to guarantee point-in-time correctness.</li><li>Analytics: cohort reports where each user is measured from their signup date.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using a "current state" column (current plan, current city, lifetime orders) in a historical training table. It looks harmless, but it carries future information. Ask for every column: "what would this value have been on date T?".</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does <code>order_ts &lt; :T</code> protect against?</li></ol>
+<p>Answer: using information from after the prediction time (leakage).</p>
+<ol><li>A join changes 1,000 rows into 1,400. What likely happened?</li></ol>
+<p>Answer: fan-out from a non-unique key on the right table.</p>
+<ol><li>Why prefer time-based splits?</li></ol>
+<p>Answer: they copy real use, where the model predicts the future from the past.</p>
+<h2 id="s2-2-2-data-quality-checks-before-any-modelling">2.2 Data Quality Checks Before Any Modelling</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Before a bank audits its accounts it checks that the file is not empty, that account numbers are unique and that it is the right month. You do not trust it. A dataset deserves the same suspicion. The rule is: <em>never trust a dataset until you have tried to break it.</em></div></div>
+<p><strong>Six dimensions of quality.</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Dimension</th><th>Question</th><th>Example check</th><th>Example in our shop</th></tr></thead><tbody><tr><td>Completeness</td><td>Are values present, and why not?</td><td>Null rate by column and by segment</td><td><code>category</code> is null in 0.1%</td></tr><tr><td>Validity</td><td>Are values possible?</td><td>Ranges, formats, units, time zones</td><td><code>amount &lt;= 0</code></td></tr><tr><td>Uniqueness</td><td>Are keys unique?</td><td>Duplicate <code>order_id</code></td><td>300 duplicates</td></tr><tr><td>Consistency</td><td>Do two computations agree?</td><td>Sum of orders = finance total</td><td>difference 0.17%</td></tr><tr><td>Timeliness</td><td>Is the data final?</td><td>Complete counts for yesterday</td><td>59% complete same day</td></tr><tr><td>Stability</td><td>Did the distribution change silently?</td><td>Monthly mean amount</td><td>around 570-582</td></tr></tbody></table></div>
+<p><strong>Null reasons.</strong> A null can mean <em>not applicable</em> (a free plan has no discount code), <em>not recorded</em> (a sensor was off), or <em>error</em> (a bug dropped the field). They need different fixes, so always ask why.</p>
+<p>We now damage a copy of the orders on purpose, so you can see what the checks catch. Predict first: which of the checks below will be non-zero for the damaged table?</p>
+<pre class="code lang-python"><code>bad = o.copy()
+dup = bad.sample(300, random_state=1)
+bad = pd.concat([bad, dup], ignore_index=True)                    # 300 duplicate rows
+bad.loc[bad.sample(40, random_state=2).index, "amount"] = -99.0   # impossible values
+bad.loc[bad.sample(25, random_state=3).index, "order_ts"] = pd.Timestamp("2030-01-01")
+bad.loc[bad.sample(150, random_state=4).index, "category"] = None
+
+def quality_report(df, name="orders"):
+    r = {}
+    r["rows"] = len(df)
+    r["dup_order_id"] = int(df.order_id.duplicated().sum())
+    r["null_category_pct"] = round(df.category.isna().mean() * 100, 2)
+    r["amount&lt;=0"] = int((df.amount &lt;= 0).sum())
+    r["order_ts_in_future"] = int((df.order_ts &gt; END_DATE).sum())
+    r["orphan_customer_ids"] = int((~df.customer_id.isin(c.customer_id)).sum())
+    return pd.Series(r, name=name)
+print(pd.concat([quality_report(o, "clean"), quality_report(bad, "damaged")], axis=1).to_string())</code></pre>
+<pre class="code lang-text"><code>                        clean   damaged
+rows                 151719.0  152019.0
+dup_order_id              0.0     300.0
+null_category_pct         0.0       0.1
+amount&lt;=0                 0.0      40.0
+order_ts_in_future        0.0      25.0
+orphan_customer_ids       0.0       0.0</code></pre>
+<p>Line by line: <code>duplicated().sum()</code> counts rows whose key already appeared above. <code>isna().mean()</code> is the share of nulls (True counts as 1). <code>df.order_ts &gt; END_DATE</code> finds dates later than the last day we could possibly have data. <code>isin</code> checks that every order points to a real customer (an "orphan" has no parent). Four checks fire, one stays zero, which is also information: the foreign keys are intact.</p>
+<p><strong>Worked problems</strong></p>
+<p class="problem"><span class="pl">Problem 2.2.1</span> Reconcile with finance. The finance team says total order value is Rs 86,580,170. Your damaged table sums to Rs 86,723,834. How big is the gap in percent, and which defects could explain it?</p>
+<table class="steps"><tr><th>Formula</th><td>gap % = (yours - finance) / finance × 100</td></tr><tr><th>Plug in</th><td>(86,723,834 - 86,580,170) / 86,580,170 × 100</td></tr><tr><th>Compute</th><td>143,664 / 86,580,170 = 0.001659, so 0.17%</td></tr><tr><th>Answer</th><td>The damaged table is 0.17% too high. The 300 duplicated orders add money (about 300 × Rs 570 = Rs 171,000) and the 40 negative amounts subtract 40 × (570 + 99), roughly Rs 27,000; the net is close to +Rs 144,000.</td></tr><tr><th>Check</th><td>171,000 - 27,000 = 144,000, near the 143,664 observed.</td></tr><tr><th>Why it matters</th><td>A 0.17% gap looks small, yet it proves the pipeline is wrong. Reconciling to a trusted number is the cheapest test you have.</td></tr></table>
+<p class="problem"><span class="pl">Problem 2.2.2</span> Timeliness. We simulate that each order arrives in the warehouse 0 to 3 days after it happened. On 2025-04-20, how complete is the data for each of the last four days?</p>
+<pre class="code lang-text"><code>2025-04-20 complete on 04-20: 125 / 211 59.2 %
+2025-04-19 complete on 04-20: 191 / 223 85.7 %
+2025-04-18 complete on 04-20: 220 / 237 92.8 %
+2025-04-17 complete on 04-20: 229 / 229 100.0 %</code></pre>
+<ul><li><strong>Step 1</strong> For each day divide the rows already arrived by the final count.</li><li><strong>Step 2</strong> Compute: 125/211 = 0.592, 191/223 = 0.857, 220/237 = 0.928, 229/229 = 1.</li><li><strong>Answer</strong> "Today" is only 59% complete, yesterday 86%. Data older than 3 days is final.</li><li><strong>Check</strong> The delays we simulated were at most 3 days, so day 4 back must be 100%, and it is.</li><li><strong>Why it matters</strong> If your churn label uses "no order in the last 7 days" and you build it on yesterday's partial data, you will label many active customers as churners. Use a <em>finalisation lag</em>: only use data older than the lag.</li></ul>
+<p><strong>Stability over time.</strong> Compare simple summaries by month (mean amount, null rate, row count). Our mean order amounts for Jan to Apr 2025 are 580.6, 568.1, 576.0, 582.0: stable. A sudden jump to 1,160 in one month would suggest a currency or unit change. This is your "silent pipeline change" detector.</p>
+<p><strong>Automating.</strong> Write checks as code, run them every day: <code>pandera</code> (schema checks on DataFrames), <code>great_expectations</code> (declarative expectations), or plain SQL tests (<code>SELECT COUNT(*) ... HAVING COUNT(*) &gt; 1</code>). These libraries were not run here; the idea is the same as our <code>quality_report</code> function.</p>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>raw data --&gt; [schema check] --&gt; [row-count check] --&gt; [range check]
+                  |                    |                   |
+               fail: stop           fail: alert         fail: quarantine rows
+--&gt; [reconcile with finance] --&gt; [distribution vs last month] --&gt; training table</code></pre>
+<p><strong>Connection to the real job.</strong> Data engineers own the pipelines; you own the sanity of what you use. A good habit is a 10-line <code>quality_report</code> at the top of every notebook.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Data Engineering: data contracts and freshness SLAs.</li><li>Data Science: checks before training, plus drift checks after deployment.</li><li>Analytics: reconciling dashboards with finance.</li><li>Operations: validating that sensor gaps are not mistaken for "zero faults".</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Dropping duplicates blindly. Sometimes a repeated row is real (two identical purchases). Check the key: if <code>order_id</code> repeats, it is a duplicate; if only the other columns repeat, it may be real.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>A table's revenue is 0.5% above finance. What do you do?</li></ol>
+<p>Answer: investigate duplicates, test rows, currency and time zone issues until it reconciles.</p>
+<ol><li>What is a finalisation lag?</li></ol>
+<p>Answer: waiting some days before using data because late records are still arriving.</p>
+<ol><li>Null means what?</li></ol>
+<p>Answer: it depends: not applicable, not recorded, or error; find out which.</p>
+<h2 id="s3-2-3-labels-and-ground-truth">2.3 Labels and Ground Truth</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A label is a witness statement about what really happened. Some witnesses are late (the 12-month default arrives a year later), some disagree (two doctors read the same scan differently), and some only saw part of the street (we only see what happens to the customers we approved). Label quality caps model quality: a student cannot do better than a textbook with wrong answers.</div></div>
+<p><strong>Words you need</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th><th>Example</th></tr></thead><tbody><tr><td>Proxy label</td><td>A measurable stand-in for the real goal</td><td>"Clicked" for "liked"</td></tr><tr><td>Label noise</td><td>Some labels are simply wrong</td><td>A fraud case marked "genuine" by mistake</td></tr><tr><td>Label delay / censoring</td><td>The outcome is not yet known</td><td>Loan from last month: default within 12 months unknown</td></tr><tr><td>Selection bias in labels</td><td>Outcomes are seen only for a chosen subset</td><td>Defaults seen only for approved loans</td></tr><tr><td>Inter-annotator agreement</td><td>How much human labellers agree</td><td>Cohen's kappa</td></tr></tbody></table></div>
+<p><strong>Cohen's kappa.</strong> Two people label 100 items. They agree on 85, but part of that is luck. Kappa removes the luck: <code>kappa = (po - pe) / (1 - pe)</code>, where <code>po</code> is the observed agreement and <code>pe</code> is the agreement expected by chance from each person's label rates. 0 means no better than chance, 1 is perfect; values above about 0.6 are usually considered good, but the threshold depends on the problem.</p>
+<p><strong>Worked problems</strong></p>
+<p class="problem"><span class="pl">Problem 2.3.1</span> Annotator A and B label 100 tickets as "urgent" (1) or not (0). Both say urgent for 40. A says urgent and B not urgent for 10. A says not urgent and B urgent for 5. Both say not urgent for 45. Compute kappa.</p>
+<table class="steps"><tr><th>Formula</th><td><code>kappa = (po - pe) / (1 - pe)</code></td></tr><tr><th>Step 1</th><td><code>po</code> = (40 + 45) / 100 = 0.85.</td></tr><tr><th>Step 2</th><td>A says urgent for 50 of 100, so 0.50. B says urgent for 45 of 100, so 0.45.</td></tr><tr><th>Step 3</th><td><code>pe</code> = 0.50 × 0.45 + 0.50 × 0.55 = 0.225 + 0.275 = 0.50.</td></tr><tr><th>Compute</th><td>kappa = (0.85 - 0.50) / (1 - 0.50) = 0.35 / 0.50 = 0.70.</td></tr><tr><th>Answer</th><td>Kappa = 0.70. <code>sklearn.metrics.cohen_kappa_score</code> gives the same 0.7 (verified by code).</td></tr><tr><th>Check</th><td>If they agreed on everything, <code>po</code> = 1 and kappa = 1. If <code>po</code> = <code>pe</code>, kappa = 0. Ours is between them.</td></tr><tr><th>Why it matters</th><td>In plain words: even with 85% raw agreement, only 70% of the "above-chance" room is agreed. If kappa is low, your labelling guidelines are unclear and no model can learn a stable rule.</td></tr></table>
+<p class="problem"><span class="pl">Problem 2.3.2</span> Label delay. A bank wants to predict default within 12 months and has loans from Jan 2024 to Jun 2025. Today is end of June 2025. Which loan months have mature labels?</p>
+<pre class="code lang-text"><code>  month  months_observed  label_mature
+2024-11                7         False
+2024-12                6         False
+2025-01                5         False
+...
+2025-06                0         False</code></pre>
+<ul><li><strong>Step 1</strong> A label is mature if the loan has been observed for at least 12 months.</li><li><strong>Step 2</strong> For Jan 2024 loans we have 17 months, so mature; for Jun 2024, 12 months, mature; for Jul 2024, 11 months, not.</li><li><strong>Answer</strong> Only loans from Jun 2024 and earlier have final labels. Training on the later ones treats "not yet defaulted" as "good", which makes the model think risk is lower than it is.</li><li><strong>Check</strong> June 2024 to June 2025 is exactly 12 months, so it is the last mature month.</li><li><strong>Why it matters</strong> It means your newest data is the least trustworthy. You either wait, use a shorter proxy (default within 3 months) or treat the recent rows as censored with survival methods (Chapter 11).</li></ul>
+<p class="problem"><span class="pl">Problem 2.3.3</span> Selective labels. A bank approves only applicants with income score above -0.2 (in standard-deviation units). We simulate 20,000 applicants. What default rate does the training data show, versus the truth?</p>
+<pre class="code lang-text"><code>true default rate, everyone      : 0.1885
+default rate among approved only : 0.0652 (what the training data shows)
+approval share: 0.58</code></pre>
+<ul><li><strong>Step 1</strong> The model can only learn from approved applicants (58% of all).</li><li><strong>Step 2</strong> Their default rate is 6.52%, but the whole population's rate is 18.85%.</li><li><strong>Answer</strong> The training data understates risk by a factor of about 2.9 (18.85 / 6.52).</li><li><strong>Check</strong> 0.1885 / 0.0652 = 2.89.</li><li><strong>Why it matters</strong> A model trained only on approved applicants never sees the risky region, so it is overconfident there. <strong>Reject inference</strong> tries to guess outcomes for rejected applicants (for example, by reweighting or by small controlled approvals); it is covered again in Chapter 11.</li></ul>
+<p><strong>Human labelling and weak labels.</strong> For human labels, write clear guidelines with examples, double-label a sample and track kappa, audit a random 5% each week, and use <em>active learning</em> (let the model choose the most uncertain items for humans to label first) to save effort. <em>Weak supervision</em> (the Snorkel idea) writes heuristic rules such as "contains the word refund means billing ticket", combines their noisy votes, and trains on that. It is fast but inherits the rules' errors, so always validate on a small hand-labelled set. <strong>PU problems</strong> (positive-unlabelled) arise when only positives are known (confirmed fraud) and the rest are simply "not yet flagged"; treating all unlabelled rows as negative biases the model, so use methods that estimate the share of hidden positives.</p>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code>What we care about  -&gt;  What we can measure  -&gt;  What we label
+ "customer is happy"      "clicked / reviewed"     "stars &gt;= 4"
+        ^ each arrow loses information; label quality caps model quality</code></pre>
+<p><strong>Connection to the real job.</strong> In every project, spend an hour on "what does the label really mean, and when do we know it?". Ask the owner of the process, not only the table.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Credit: delayed and selective labels, reject inference.</li><li>Fraud: labels from analysts, only for flagged cases.</li><li>NLP: human-labelled tickets, kappa audits.</li><li>Medicine: label is a diagnosis, with disagreement between doctors.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Treating "no event yet" as "no event". For recent periods, the absence of a default or a purchase is not final. Always check the label maturity before using the newest rows.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Kappa is 0 and raw agreement is 80%. How?</li></ol>
+<p>Answer: chance agreement is also 80%, for example when almost all items are one class.</p>
+<ol><li>Why are approved-only labels risky?</li></ol>
+<p>Answer: the model never sees outcomes for rejected people, so risk is underestimated and biased.</p>
+<ol><li>What is censoring?</li></ol>
+<p>Answer: the outcome has not happened yet within the observed time, so the true label is unknown.</p>
+<h2 id="s4-2-4-privacy-and-ethics-in-data-use">2.4 Privacy and Ethics in Data Use</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Customer data is like the keys to someone's house that they lent you for one purpose. You may use the keys for that purpose, only as long as needed, and you must keep them safe. You do not copy them for a "maybe later" project.</div></div>
+<p><strong>Words you need</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th><th>Example</th></tr></thead><tbody><tr><td>PII (personally identifiable information)</td><td>Data that identifies a person alone or combined</td><td>Name, phone, Aadhaar, email, IP</td></tr><tr><td>Pseudonymisation</td><td>Replace identifiers by tokens; re-linking is possible with a key</td><td><code>b1f22c3870</code> instead of customer 1</td></tr><tr><td>Anonymisation</td><td>Remove identifiability so it cannot be reversed</td><td>Aggregates with large groups</td></tr><tr><td>Minimisation</td><td>Collect and keep only what is needed</td><td>Do not store date of birth if age band suffices</td></tr><tr><td>Purpose limitation</td><td>Use data only for the stated purpose</td><td>Support data not reused for ad targeting</td></tr><tr><td>k-anonymity</td><td>Every combination of quasi-identifiers appears at least k times</td><td>k = 15 for city × age band</td></tr></tbody></table></div>
+<p><strong>Laws.</strong> India's <strong>DPDP Act (Digital Personal Data Protection Act, 2023)</strong> and the EU's <strong>GDPR</strong> share core ideas: consent (a clear, specific agreement), purpose limitation, minimisation, the right to access and erase one's data, breach notification and extra care for children. Rules and timelines change, so check the current text and your company's legal team; this chapter is awareness, not legal advice.</p>
+<p><strong>Sensitive attributes and proxies.</strong> Caste, religion, gender, health and similar attributes carry high risk of unfair treatment. Even if you drop them, <em>proxy variables</em> can leak them: pincode can stand in for caste or religion, first name for gender and region, shopping basket for health. Test it: try to predict the sensitive attribute from your features. If you can, the model can use it indirectly.</p>
+<p><strong>Awareness: differential privacy and federated learning.</strong> Differential privacy adds calibrated random noise so that no single person's presence changes the published result much. Federated learning trains a model on devices or sites without moving raw data to one place. Both are advanced; you only need to know the names and the idea now.</p>
+<p><strong>Worked problems</strong></p>
+<p class="problem"><span class="pl">Problem 2.4.1</span> Pseudonymise customer ids with a keyed hash and check how identifiable a table is. We create a token with HMAC-SHA256 and a secret key, and generalise age into bands.</p>
+<pre class="code lang-python"><code>import hashlib, hmac
+SECRET = b"demo-secret-not-for-real-use"      # in real life: stored in a vault, never in code
+c["cust_token"] = [hmac.new(SECRET, str(i).encode(), hashlib.sha256).hexdigest()[:10]
+                   for i in c.customer_id]
+c["age_band"] = pd.cut(c.age, [17, 25, 35, 50, 70], labels=["18-25", "26-35", "36-50", "51-70"])
+print(c[["customer_id", "cust_token", "age_band"]].head(3).to_string(index=False))
+kc = c.groupby(["city", "age_band"], observed=True).size()
+print("smallest group (k) for city x age_band:", kc.min())
+kc2 = c.groupby(["city", "age", "plan", "channel"], observed=True).size()
+print("k for city x exact age x plan x channel:", kc2.min(), " groups of size 1:", int((kc2 == 1).sum()))</code></pre>
+<pre class="code lang-text"><code> customer_id cust_token age_band
+           1 b1f22c3870    18-25
+           2 fc2a3076b3    36-50
+           3 797f02a27e    26-35
+smallest group (k) for city x age_band: 15
+k for city x exact age x plan x channel: 1  groups of size 1: 226</code></pre>
+<ul><li><strong>Step 1</strong> A plain hash without a secret can be reversed by hashing all ids; a keyed hash cannot unless the key leaks. So the token is <em>pseudonymous</em>, not anonymous: whoever holds the key can re-link.</li><li><strong>Step 2</strong> With city and an age band, the smallest group is 15 people: k = 15.</li><li><strong>Step 3</strong> With city, exact age, plan and channel, 226 groups have size 1. Those people are unique in the table and easy to re-identify with outside knowledge.</li><li><strong>Answer</strong> The coarse table has k = 15 (safe by a common rule of thumb such as k at least 5 to 10); the detailed table has 226 unique people, so it must not be shared.</li><li><strong>Check</strong> 15 is the minimum over all groups in the first table, so every group has at least 15 members.</li><li><strong>Why it matters</strong> It means "we removed the names" is not enough. Combinations of ordinary columns can single out a person.</li></ul>
+<p class="problem"><span class="pl">Problem 2.4.2</span> A lending model uses <code>pincode</code>. A test shows a simple classifier can predict a sensitive group from pincode with 85% accuracy while chance is 50%. What do you conclude, and what do you do?</p>
+<table class="steps"><tr><th>Step 1</th><td>85% vs 50% means pincode is a strong proxy.</td></tr><tr><th>Step 2</th><td>The model can discriminate indirectly even if the sensitive column is deleted.</td></tr><tr><th>Answer</th><td>Treat pincode as sensitive. Options: remove or coarsen it, check approval and error rates by group, involve compliance, and document the business justification.</td></tr><tr><th>Check</th><td>If the proxy test had given 52%, there would be little concern.</td></tr><tr><th>Why it matters</th><td>Unfair credit decisions harm real people and can break the law; "we did not use the attribute" is not a defence.</td></tr></table>
+<p><strong>Connection to the real job.</strong> In real projects you will sign data access agreements, work in secured environments, mask columns and document the purpose of each dataset. Interviewers in BFSI and healthcare ask about this directly.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Banking: KYC data, credit models with fairness reviews.</li><li>Healthcare: patient data under strict consent and de-identification.</li><li>Telecom: location data minimisation.</li><li>Ad-tech: consent management for targeting.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Saying "the data is anonymised" when you only replaced names with ids. If a key exists, or if combinations of columns are unique, it is only pseudonymised. Responsible use also means not scraping or building face-recognition systems without a lawful basis.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Pseudonymisation vs anonymisation?</li></ol>
+<p>Answer: pseudonymised data can be re-linked using a key; anonymised data cannot.</p>
+<ol><li>What is a proxy variable?</li></ol>
+<p>Answer: a feature that stands in for a sensitive attribute, such as pincode for caste or religion.</p>
+<ol><li>What does k = 1 mean for a group?</li></ol>
+<p>Answer: one person is unique in that combination and easy to re-identify.</p>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>Know how every source creates its rows and what it misses by design.</li><li>A point-in-time correct table uses only data before T for features and only data after T for the label. One leaky column moved our AUC from 0.882 to 0.972.</li><li>Print row counts around every join; watch for fan-out and for current-state columns in historical tables.</li><li>Run quality checks: completeness, validity, uniqueness, consistency, timeliness, stability; reconcile with a trusted total.</li><li>Late-arriving data means "today" is incomplete; use a finalisation lag.</li><li>Labels are proxies; check delay (censoring), noise (kappa), and selection (approved-only data hid a 18.9% default rate behind 6.5%).</li><li>Pseudonymised is not anonymous; check group sizes (k) and proxy variables.</li><li>Know the DPDP Act and GDPR ideas: consent, purpose limitation, minimisation, erasure.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Idea</th><th>Pattern</th><th>Example</th></tr></thead><tbody><tr><td>Point-in-time filter</td><td><code>WHERE ts &lt; :T</code></td><td><code>order_ts &lt; '2025-01-01'</code></td></tr><tr><td>Label window</td><td><code>ts &gt;= :T AND ts &lt; :T + horizon</code></td><td>next 60 days</td></tr><tr><td>Row-count guard</td><td><code>len(before)</code> vs <code>len(after)</code></td><td>2 customers became 3 rows</td></tr><tr><td>Duplicate check</td><td><code>df.key.duplicated().sum()</code></td><td>300</td></tr><tr><td>Reconcile</td><td><code>(yours - finance) / finance</code></td><td>0.17%</td></tr><tr><td>Kappa</td><td><code>(po - pe) / (1 - pe)</code></td><td>(0.85 - 0.5)/0.5 = 0.7</td></tr><tr><td>k-anonymity</td><td><code>groupby(quasi_ids).size().min()</code></td><td>15</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 2.P.1</span> (easy) Which date filter belongs in a feature for prediction at T: <code>ts &lt;= T + 30</code>, <code>ts &lt; T</code>, or <code>ts &gt;= T</code>? <strong>Answer:</strong> <code>ts &lt; T</code>.</p>
+<p class="problem"><span class="pl">Problem 2.P.2</span> (easy) Table A has 500 customers, table B has 1,200 address rows for those customers (non-unique key). How many rows does <code>A.merge(B, on="customer_id")</code> return, assuming all customers appear? <strong>Answer:</strong> 1,200 rows (each address row matches one customer); customers are duplicated.</p>
+<p class="problem"><span class="pl">Problem 2.P.3</span> (easy) What is kappa if <code>po</code> = 0.9 and <code>pe</code> = 0.9? <strong>Answer:</strong> (0.9 - 0.9) / (1 - 0.9) = 0.</p>
+<p class="problem"><span class="pl">Problem 2.P.4</span> (medium) Your table's total is Rs 1,000,000 and finance says Rs 990,000. What is the percent gap? <strong>Answer:</strong> (1,000,000 - 990,000) / 990,000 = 1.01%.</p>
+<p class="problem"><span class="pl">Problem 2.P.5</span> (medium) What is the output? <code>kc.min()</code> where groups have sizes 15, 20 and 31. <strong>Answer:</strong> 15.</p>
+<p class="problem"><span class="pl">Problem 2.P.6</span> (medium) Find the bug: <code>features = orders.groupby("customer_id").amount.mean()</code> is merged to a training table as of T = 2025-01-01, using all orders. <strong>Answer:</strong> No date filter, so orders after T are included. Add <code>orders[orders.order_ts &lt; T]</code> first.</p>
+<p class="problem"><span class="pl">Problem 2.P.7</span> (medium) Of 2,000 loans from the past 6 months, a team trains a 12-month default model and gets very low default rate. Why? <strong>Answer:</strong> The labels are not mature; most loans have not had 12 months to default, so "not defaulted" is mostly "not yet".</p>
+<p class="problem"><span class="pl">Problem 2.P.8</span> (hard) In the detailed table, 226 of the 6,000 customers are unique in their combination of city, exact age, plan and channel. What share of the population is unique, and is that high? <strong>Answer:</strong> 226 / 6,000 = 3.8% unique. That is 226 people who could be singled out, which is too many for a public release; coarsen columns until k is at least 5 to 10.</p>
+<p class="problem"><span class="pl">Problem 2.P.9</span> (interview) "What is data leakage? Give two examples." <strong>Answer:</strong> Leakage is when a feature carries information that would not be available at prediction time, or the label itself. Examples: using lifetime order count to predict churn at T; using a "refund issued" flag to predict fraud, which is created after the fraud is found. It inflates offline scores and fails in production. Prevent it with a fixed T, point-in-time features, time-based splits and a hunt for "too good" features.</p>
+<p class="problem"><span class="pl">Problem 2.P.10</span> (interview) "Your fraud model's training labels come from analyst reviews, but analysts review only flagged transactions. What is the problem?" <strong>Answer:</strong> Selective labels: unflagged fraud is never labelled, so the model learns what the old rules flagged, not all fraud. Remedies: random audits of a small sample of unflagged transactions, importance weighting, feedback from chargebacks (a delayed but unbiased label), and exploration.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional at an Indian MNC moving into data science, and English is my second language. Teach me "point-in-time correct training sets and data leakage" step by step with a small SQL example on an orders table. Explain prediction time, feature window and label window with a timeline. After each step, ask me a question and wait. At the end, give me a customer-churn table to build and review my SQL.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Topic: "data quality checks before modelling: completeness, validity, uniqueness, consistency, timeliness, stability". Give me 8 graded exercises with small pandas DataFrames, from easy to hard, including late-arriving records and reconciliation with a finance total. Do not give solutions until I answer; then grade me and explain the gaps.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional new to data science. Topic: "labels and ground truth: label delay, censoring, selective labels, reject inference, Cohen's kappa, weak supervision". Quiz me one question at a time with small numerical examples. Wait for my answer, grade it, and explain with a real banking or fraud example. Ask 10 questions in total.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science in India. Review my data-handling plan for a project. Check for leakage, join fan-out, label maturity, selection bias in labels, personal data (PII), consent and purpose under the DPDP Act and GDPR ideas, and proxy variables for sensitive attributes. Give a prioritised list of risks in simple English with concrete fixes. My plan: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for data science interviews in India. Run a mock interview on "data collection, leakage, data quality, labels and privacy". Ask one question at a time, for example "write SQL for a point-in-time churn set" or "how do you handle delayed labels". After each answer give a score out of 10, a model answer, and a follow-up. Do 8 rounds.</pre></div><div class="readbtn"><button class="btn" data-read="study:ds:ch02">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch01.html">← Chapter 1: What a Data Scientist Actually Does</a><a class="btn" href="ch03.html">Chapter 3: Exploratory Data Analysis for Modelling →</a></div></div><script src="../../assets/study.js"></script></body></html>

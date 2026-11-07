@@ -1,0 +1,342 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 7: Exploratory Data Analysis, Step by Step</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#2b4fd6"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Analytics: Excel, pandas, Power BI</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 7</div><h1>Exploratory Data Analysis, Step by Step</h1><p>A complete worked analysis on a dataset you generate yourself, from first look to written insights.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-7-1-context-grain-and-the-first-look">7.1 Context, Grain and the First Look</a></li><li><a href="#s2-7-2-data-quality-scan-and-cleaning">7.2 Data Quality Scan and Cleaning</a></li><li><a href="#s3-7-3-missing-data-pattern-mechanism-treatment">7.3 Missing Data: Pattern, Mechanism, Treatment</a></li><li><a href="#s4-7-4-univariate-analysis-one-column-at-a-time">7.4 Univariate Analysis: One Column at a Time</a></li><li><a href="#s5-7-5-bivariate-and-multivariate-analysis">7.5 Bivariate and Multivariate Analysis</a></li><li><a href="#s6-7-6-from-hypotheses-to-documented-insights-and-profiling-tools">7.6 From Hypotheses to Documented Insights (and Profiling Tools)</a></li><li><a href="#s7-chapter-recap">Chapter recap</a></li><li><a href="#s8-practice-set">Practice set</a></li><li><a href="#s9-prompt-pack">Prompt pack</a></li></ol></details><p>Someone hands you a file and says, "Tell me what is in here." You do not yet know what the columns mean, which values are errors, or what questions are worth asking. Exploratory Data Analysis (EDA) is the habit of looking at the data carefully, in a fixed order, before you trust it or model it. In this chapter you will generate an online-shop dataset with known dirt in it (duplicates, a unit mistake, missing values, impossible quantities), then explore it step by step with real code and real output, exactly as you would on the job. By the end you will have a repeatable EDA routine and a list of insights written the way a senior analyst writes them.</p>
+<p>We use the same shop as Chapter 1. Because we built the data ourselves, we know the truth behind it. That lets us catch the traps that real data hides: at the end you will see an "insight" that turns out to be a false alarm.</p>
+<div class="callout blue"><div class="lab">PROFESSOR'S NOTE</div><div class="txt">Everything here was run with pandas 3.0.6, NumPy 2.5.3 and SciPy 1.18. The generator uses a fixed seed, so you will get the same numbers. <code>ydata-profiling</code>, <code>sweetviz</code>, <code>missingno</code>, <code>pandera</code>, <code>great_expectations</code> and <code>statsmodels</code> were not installed here, so they are only described, not run.</div></div>
+<h2 id="s1-7-1-context-grain-and-the-first-look">7.1 Context, Grain and the First Look</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Before you measure a room, ask what the room is for. Before you open a table, ask where it came from, what one row means, and what the columns mean. A table that was exported before payment confirmation is a different table from one exported after. Most wrong analyses start with a wrong guess about what a row is.</div></div>
+<p><strong>Questions to answer first (write them in your notebook)</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Question</th><th>Our dataset</th></tr></thead><tbody><tr><td>Where does the data come from?</td><td>A simulated online shop (we generate it)</td></tr><tr><td>What is one row? (the <strong>grain</strong>)</td><td>One order in <code>orders</code>; one customer in <code>customers</code></td></tr><tr><td>What period does it cover?</td><td>Customers who signed up between 1 January and end of June 2025</td></tr><tr><td>What are the columns?</td><td><code>order_id</code>, <code>customer_id</code>, <code>order_date</code>, <code>category</code>, <code>qty</code>, <code>amount</code>, <code>status</code></td></tr><tr><td>Which column is the key?</td><td><code>order_id</code> (should be unique)</td></tr><tr><td>What decision will it support?</td><td>Which categories and channels deserve attention, and is data quality good enough to report</td></tr></tbody></table></div>
+<p><strong>The generator.</strong> Save this as <code>gen.py</code>. It builds two tables and then <strong>injects dirt</strong>: 60 missing amounts, 15 impossible quantities (−1), 8 amounts multiplied by 100 (as if entered in paise instead of rupees), 12 duplicate rows, and some upper-case category names.</p>
+<pre class="code lang-python"><code>import numpy as np, pandas as pd
+
+def make_orders(seed=7, n_customers=1500):
+    rng = np.random.default_rng(seed)
+    cust = pd.DataFrame({
+        "customer_id": [f"C{i:04d}" for i in range(n_customers)],
+        "signup_date": pd.Timestamp("2025-01-01") + pd.to_timedelta(rng.integers(0, 180, n_customers), unit="D"),
+        "channel": rng.choice(["organic", "ads", "referral", "email"], n_customers, p=[.4, .3, .2, .1]),
+        "city": rng.choice(["Pune", "Mumbai", "Delhi", "Bengaluru", "Chennai"], n_customers, p=[.15, .25, .25, .25, .10]),
+    })
+    rows = []
+    oid = 1000
+    for r in cust.itertuples():
+        k = rng.poisson(1.6 if r.channel != "ads" else 1.1)
+        for _ in range(k):
+            od = r.signup_date + pd.Timedelta(days=int(rng.exponential(30)))
+            if od &gt; pd.Timestamp("2025-12-31"): continue
+            cat = rng.choice(["electronics", "fashion", "grocery", "home"], p=[.2, .35, .3, .15])
+            base = {"electronics": 6.8, "fashion": 6.0, "grocery": 5.0, "home": 6.3}[cat]
+            amount = round(float(rng.lognormal(base, 0.5)), 2)
+            qty = int(rng.integers(1, 5))
+            status = rng.choice(["delivered", "returned", "cancelled"], p=[.86, .08, .06])
+            rows.append((oid, r.customer_id, od, cat, qty, amount, status)); oid += 1
+    o = pd.DataFrame(rows, columns=["order_id", "customer_id", "order_date", "category", "qty", "amount", "status"])
+    idx = rng.choice(o.index, 60, replace=False); o.loc[idx, "amount"] = np.nan
+    idx = rng.choice(o.index, 15, replace=False); o.loc[idx, "qty"] = -1
+    idx = rng.choice(o.index, 8, replace=False); o.loc[idx, "amount"] *= 100
+    o = pd.concat([o, o.sample(12, random_state=1)], ignore_index=True)
+    o["category"] = o["category"].where(rng.random(len(o)) &gt; .05, o["category"].str.upper())
+    return cust, o.sample(frac=1, random_state=3).reset_index(drop=True)</code></pre>
+<p>(A few terms: a <em>seed</em> fixes the random numbers. <code>lognormal</code> makes right-skewed positive values, like order amounts. <code>poisson(k)</code> gives a random count with average k, here the number of orders per customer.)</p>
+<p><strong>Step 1: shape and types</strong></p>
+<pre class="code lang-python"><code>import pandas as pd, numpy as np
+from gen import make_orders
+cust, o = make_orders()
+print(o.shape, cust.shape)
+print(o.dtypes)</code></pre>
+<p>Predict: how many rows are in <code>orders</code>?</p>
+<pre class="code lang-text"><code>(2244, 7) (1500, 4)
+order_id                int64
+order_date     datetime64[us]
+...</code></pre>
+<p>(<code>customer_id</code>, <code>category</code>, <code>status</code> are <code>str</code>; <code>qty</code> is <code>int64</code>; <code>amount</code> is <code>float64</code>.) There are 2,244 order rows and 1,500 customers. The types look right, so no conversion is needed. <code>qty</code> is an integer, which means it has no missing values yet. That will change after cleaning.</p>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code> customers (1500 rows)  1 ──── * orders (2244 rows)
+ customer_id, signup_date,        order_id, customer_id, order_date,
+ channel, city                    category, qty, amount, status</code></pre>
+<p><strong>Connection to the real job.</strong> In the first meeting about a dataset, ask for the grain and the date range. Writing these down in a data dictionary (Chapter 14) prevents a lot of rework.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Analytics: understanding a new extract from a data warehouse.</li><li>Data Science: deciding which rows are training examples.</li><li>Data Engineering: checking that a pipeline output matches its documented grain.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Skipping the grain question. If <code>orders</code> had one row per order item, then counting rows would count items, not orders, and "average order value" would be wrong.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is the grain of <code>orders</code>? Answer: One order per row.</li><li>Why record the date range? Answer: Trends and totals depend on it; the last period may be incomplete.</li><li>What does a seed do? Answer: It makes random generation repeatable.</li></ol>
+<h2 id="s2-7-2-data-quality-scan-and-cleaning">7.2 Data Quality Scan and Cleaning</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A building inspector walks around with a checklist before painting. Our checklist for data: missing values, duplicates, impossible values, inconsistent categories, unit mistakes. Run it before any chart, because a chart of dirty data only looks professional.</div></div>
+<p><strong>The scan</strong></p>
+<pre class="code lang-python"><code>print(o.isna().sum())
+print("exact duplicate rows:", o.duplicated().sum())
+print("negative or zero qty:", (o.qty &lt;= 0).sum())
+print(o.category.value_counts())</code></pre>
+<pre class="code lang-text"><code>order_id        0
+customer_id     0
+order_date      0
+category        0
+qty             0
+amount         61
+status          0
+dtype: int64
+exact duplicate rows: 12
+negative or zero qty: 15
+category
+fashion        735
+grocery        661
+electronics    437
+home           310
+GROCERY         31
+FASHION         31
+ELECTRONICS     21
+HOME            18
+Name: count, dtype: int64</code></pre>
+<ul><li>61 amounts are missing (we injected 60; one more appeared because a duplicated row repeated a missing value).</li><li>12 duplicate rows, exactly the 12 we added.</li><li>15 quantities are zero or negative, impossible for an order.</li><li>The category has eight spellings for four categories, because of upper-case copies. Without a fix, a <code>groupby</code> would report eight categories.</li></ul>
+<p><strong>Step 2: clean, with a log of every decision</strong></p>
+<pre class="code lang-python"><code>o = o.drop_duplicates()
+o["category"] = o["category"].str.lower()
+o.loc[o.qty &lt;= 0, "qty"] = np.nan
+cat_median = o.groupby("category")["amount"].transform("median")
+o["ratio"] = o["amount"] / cat_median
+print(o.loc[o.ratio &gt;= 15, ["order_id", "category", "amount", "ratio"]].sort_values("ratio").round(1))
+o.loc[o.ratio &gt;= 15, "amount"] /= 100
+o = o.drop(columns="ratio")
+print(len(o), o.amount.isna().sum(), o.qty.isna().sum())</code></pre>
+<pre class="code lang-text"><code>      order_id     category    amount  ratio
+2226      2633      grocery    3566.0   23.4
+944       2072      fashion   21933.0   53.0
+752       1675         home   47982.0   92.3
+345       3043      grocery   15105.0   99.0
+595       2282  electronics  111473.0  131.6
+892       1796         home   89659.0  172.5
+659       1870      grocery   30409.0  199.4
+2232 60 15</code></pre>
+<p><strong>Why this method?</strong> A simple fixed threshold ("amount above 20,000 is an error") would be wrong. A grocery order of 3,566 is also impossible (grocery's median is about 152), but a threshold of 20,000 would miss it. Instead we compare each amount with the <strong>median of its own category</strong>. Anything at least 15 times its category median is flagged. We found 7 rows (we injected 8; we checked that one of the 8 landed on a row whose amount was already missing, so there is nothing left to see there).</p>
+<p><strong>Worked example 7.2.1</strong> Check one repair by hand.</p>
+<ul><li><strong>Formula</strong> repaired amount = recorded amount / 100 (a paise to rupees correction)</li><li><strong>Plug in</strong> Order 3043 (grocery) has amount 15,105.0 and ratio 99.0.</li><li><strong>Compute</strong> 15,105.0 / 100 = 151.05. The grocery median is 152.4, so 151.05 / 152.4 = 0.99, a typical grocery order. Also 15,105.0 / 152.4 = 99.1, close to the ratio 99.0 printed.</li><li><strong>Answer</strong> After the fix order 3043 has amount 151.05, an ordinary value.</li><li><strong>Check</strong> The ratio of 99 (almost exactly 100) is the signature of a paise error: a 100 times mistake gives ratios near 100 times the ordinary ratio of about 1.</li><li><strong>Why it matters</strong> The raw mean amount was 641.31 (with the errors). After repair it is 495.6. A 30% error in the average, from 7 rows out of 2,232.</li></ul>
+<p><strong>Decisions to write in your log</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Problem</th><th>Count</th><th>Decision</th></tr></thead><tbody><tr><td>Duplicate rows</td><td>12</td><td>Dropped (identical in all columns)</td></tr><tr><td>Category case</td><td>8 spellings</td><td>Lower-cased</td></tr><tr><td>Quantity of −1</td><td>15</td><td>Set to missing, not guessed</td></tr><tr><td>Amount 23 to 199 times its category median</td><td>7</td><td>Divided by 100 (assumed paise), flagged for the data owner</td></tr><tr><td>Missing amount</td><td>60</td><td>Left missing for now (see 7.3)</td></tr></tbody></table></div>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code> amount / category median
+ 1x ........ typical orders (cluster near 1)
+ 4-7x ...... large but plausible (kept)
+ 23x-200x .. data errors (fixed or flagged)</code></pre>
+<p><strong>Connection to the real job.</strong> The log above is what you attach to your analysis ("I made these 5 cleaning decisions"). A reviewer can disagree with a decision only if you wrote it down. In SQL the same scan is a few <code>COUNT</code> queries (the SQL document covers data quality checks).</p>
+<p><strong>Applications</strong></p>
+<ul><li>Analytics: every report starts with this scan.</li><li>Data Engineering: the same rules become automated tests in a pipeline (<code>pandera</code>, <code>great_expectations</code>, dbt tests).</li><li>Finance: unit mistakes (thousands vs units, paise vs rupees) are a classic audit finding.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Silently deleting "weird" rows. A big order might be real (a bulk purchase). Flag, ask, then decide. Never change data without a record.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why use the category median instead of one global threshold? Answer: Categories have very different normal sizes.</li><li>What is the signature of a paise-for-rupee error? Answer: A value about 100 times too large.</li><li>Why write a cleaning log? Answer: So others can review and reproduce your decisions.</li></ol>
+<h2 id="s3-7-3-missing-data-pattern-mechanism-treatment">7.3 Missing Data: Pattern, Mechanism, Treatment</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A missing value is a clue, not just a hole. A blank salary on a form may be a forgotten field, or it may be hiding because the salary is very high. The reason a value is missing decides how safely you can ignore it or fill it.</div></div>
+<p><strong>Three mechanisms (learn the names, interviewers ask)</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Meaning</th><th>Example</th><th>Safe to drop rows?</th></tr></thead><tbody><tr><td><strong>MCAR</strong>: Missing Completely At Random</td><td>Missingness has nothing to do with any data</td><td>A sensor drops 2% of readings at random</td><td>Yes, with a small loss of data</td></tr><tr><td><strong>MAR</strong>: Missing At Random</td><td>Missingness depends on <em>other observed</em> columns</td><td>Younger customers skip the income field more often</td><td>Not blindly; use the other columns to fill or model</td></tr><tr><td><strong>MNAR</strong>: Missing Not At Random</td><td>Missingness depends on the <em>missing value itself</em></td><td>Rich customers hide their income</td><td>No; any fill or drop biases results</td></tr></tbody></table></div>
+<p>You cannot prove which one you have; you look for evidence.</p>
+<p><strong>Step 3: does missing amount depend on other columns?</strong></p>
+<pre class="code lang-python"><code>print(o.assign(miss=o.amount.isna()).groupby("category")["miss"].mean().round(3))</code></pre>
+<pre class="code lang-text"><code>category
+electronics    0.029
+fashion        0.022
+grocery        0.030
+home           0.028
+Name: miss, dtype: float64</code></pre>
+<p><strong>Worked example 7.3.1</strong> Interpret the table.</p>
+<ul><li><strong>Formula</strong> missing rate = number of missing amounts in the group / number of orders in the group</li><li><strong>Plug in</strong> For example, fashion has 743 non-missing amounts out of 760 orders, hence 17 missing. 17 / 760 = 0.022.</li><li><strong>Compute</strong> The rates are 2.9%, 2.2%, 3.0%, 2.8%, all close to the overall 60 / 2232 = 2.7%.</li><li><strong>Answer</strong> Missing amounts show no clear link with category, which is consistent with MCAR.</li><li><strong>Check</strong> A chi-square test of missingness versus category gives p = 0.81 (not significant), supporting the same conclusion.</li><li><strong>Interpretation</strong> Consistent with MCAR does not prove it. We also checked status (cancelled 1.5%, delivered 2.8%, returned 2.3%), which looks similar given the small counts. In real data you would also check missing versus date, channel and city, and ask the system owner why a value could be absent.</li></ul>
+<p><strong>Treatment options</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Option</th><th>When</th><th>Cost</th></tr></thead><tbody><tr><td>Leave as missing and exclude from amount calculations</td><td>MCAR, small share</td><td>Slightly less data</td></tr><tr><td>Drop the rows</td><td>Row is useless without the value</td><td>Lose other columns' information</td></tr><tr><td>Fill with median of the group</td><td>Few missing, numeric, skewed</td><td>Shrinks variance</td></tr><tr><td>Predict (model-based imputation)</td><td>MAR, important column</td><td>Complex</td></tr><tr><td>Add a flag column <code>amount_missing</code></td><td>MNAR suspected</td><td>None, and keeps the clue</td></tr></tbody></table></div>
+<p>Here we choose "leave missing and exclude": <code>mean</code>, <code>sum</code> and <code>describe</code> skip <code>NaN</code> by default, and 2.7% is small. Always report it ("amount is missing for 2.7% of orders").</p>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code> missing rate by group:   electronics ##  fashion ##  grocery ##  home ##    (flat -&gt; MCAR-like)
+                          young       ########   older ##                    (varies -&gt; MAR)</code></pre>
+<p><strong>Connection to the real job.</strong> When survey, healthcare or banking data has missing values, the mechanism is the first question, because a wrong choice biases decisions. <code>missingno</code> (a plotting library, not run here) draws the missing pattern as a matrix, which helps you see this quickly.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Analytics: deciding whether a KPI can ignore blank rows.</li><li>Data Science: imputation strategy before modelling.</li><li>Healthcare and banking: missing lab values or income often carry meaning (MNAR).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Filling every missing value with the mean "to keep rows". It shrinks the spread, creates a fake spike at the mean and hides the reason for the gap.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does MAR mean? Answer: Missingness depends on other observed columns.</li><li>Why add a flag column? Answer: To keep the information that the value was missing.</li><li>Does a flat missing rate across groups prove MCAR? Answer: No, it is only consistent with MCAR.</li></ol>
+<h2 id="s4-7-4-univariate-analysis-one-column-at-a-time">7.4 Univariate Analysis: One Column at a Time</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Look at one column alone before relating it to others, like checking each ingredient before cooking. Ask: where is the middle, how spread out, is it symmetric, what are the extremes?</div></div>
+<p><strong>Words you need</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Meaning</th></tr></thead><tbody><tr><td>Distribution</td><td>How often each value (or range) occurs</td></tr><tr><td>Skewness</td><td>Lopsidedness. Positive: long tail to the right (a few huge values). 0: symmetric.</td></tr><tr><td>Kurtosis (excess)</td><td>How heavy the tails are compared with a bell curve. 0 for a normal bell, positive means more extreme values.</td></tr><tr><td>Quantile / percentile</td><td>The value below which a share of data falls. The 0.99 quantile is the 99th percentile.</td></tr></tbody></table></div>
+<pre class="code lang-python"><code>a = o["amount"].dropna()
+print(a.describe().round(1))
+print("skew", round(a.skew(), 2), "log-skew", round(np.log(a).skew(), 2), "kurtosis", round(a.kurt(), 2))
+print(a.quantile([.5, .9, .99]).round(1))
+print(pd.cut(a, bins=[0, 100, 250, 500, 1000, 5000]).value_counts().sort_index())</code></pre>
+<pre class="code lang-text"><code>count    2172.0
+mean      495.6
+std       410.3
+min        33.3
+25%       201.7
+50%       383.8
+75%       654.7
+max      3866.0
+Name: amount, dtype: float64
+skew 2.09 log-skew -0.16 kurtosis 7.42
+0.50     383.8
+0.90    1013.7
+0.99    1927.5
+Name: amount, dtype: float64
+amount
+(0, 100]        130
+(100, 250]      588
+(250, 500]      631
+(500, 1000]     598
+(1000, 5000]    225
+Name: count, dtype: int64</code></pre>
+<p><strong>Worked example 7.4.1</strong> Read the summary like an analyst.</p>
+<ul><li><strong>Formula</strong> Compare the mean with the median. If mean is clearly above median, the distribution has a right tail.</li><li><strong>Plug in</strong> Mean 495.6, median 383.8.</li><li><strong>Compute</strong> 495.6 − 383.8 = 111.8, so the mean is 29% above the median (111.8 / 383.8 = 0.291). Skewness is 2.09 (positive, strong). After <code>np.log</code> the skew is −0.16, almost symmetric.</li><li><strong>Answer</strong> Order amounts are right-skewed: most orders are modest and a few are large. The log of the amount is close to a bell shape, which is typical for money (the values multiply, they do not add).</li><li><strong>Check</strong> The bins add up: 130 + 588 + 631 + 598 + 225 = 2,172, equal to the count of non-missing amounts.</li><li><strong>Interpretation</strong> The typical order is about Rs 384. The mean (496) is pulled up by big orders, so for "typical" use the median. The 99th percentile is Rs 1,927: 1% of orders are above that. The kurtosis 7.42 says the tails are heavy compared with a normal curve.</li></ul>
+<p><strong>Outlier check after the repair.</strong> The IQR fence is Q3 + 1.5 × IQR = 654.7 + 1.5 × (654.7 − 201.7) = 654.7 + 679.5 = 1,334.2, and 99 values (4.6%) lie above it. Are they errors? No. A right-skewed distribution naturally has many values above a bell-curve-style fence. These are the electronics orders, which we see next. The lesson is that an "outlier by the IQR rule" is only a candidate, not a mistake. Look at where they come from.</p>
+<figure><img src="images/eda_amount_hist.png" alt="Left: histogram of order amount with a long right tail. Right: the same data on a log10 scale, close to symmetric" loading="lazy"/><figcaption>Left: histogram of order amount with a long right tail. Right: the same data on a log10 scale, close to symmetric</figcaption></figure>
+<p><em>How to read it: each bar counts how many orders fall in an amount range (horizontal axis). The left chart has a long tail to the right. On the right, the horizontal axis is log10(amount), so each step is a multiplication by ten, and the shape becomes nearly symmetric.</em></p>
+<p><strong>Connection to the real job.</strong> Skew explains why dashboards show "average order value" that nobody can reproduce by eye. Hospitals report the 90th-percentile waiting time rather than the average, for the same reason.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Product: session durations and order values are right-skewed; report median and percentiles.</li><li>Finance: log returns instead of raw returns.</li><li>Data Science: log-transform skewed features before linear models.</li><li>Operations: delivery times and appointment waiting times.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using the mean for skewed money data and presenting it as "typical". Show the median and a percentile too.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does positive skew mean? Answer: A long tail of large values to the right.</li><li>Why take the log of money values? Answer: It often makes the distribution close to symmetric.</li><li>Is every value above the IQR fence an error? Answer: No; it is only a candidate to check.</li></ol>
+<h2 id="s5-7-5-bivariate-and-multivariate-analysis">7.5 Bivariate and Multivariate Analysis</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">One column tells you what is typical. Two columns tell you whether they move together. Does the amount depend on the category? Does the channel change the return rate? This is where insights appear.</div></div>
+<p><strong>Tools</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Question</th><th>Tool</th></tr></thead><tbody><tr><td>Numeric by category</td><td><code>groupby(...).agg</code> (count, median, mean)</td></tr><tr><td>Category by category</td><td><code>pd.crosstab(a, b, normalize="index")</code></td></tr><tr><td>Numeric by numeric</td><td><code>df.corr()</code> (Pearson), <code>method="spearman"</code></td></tr><tr><td>Attach another table</td><td><code>merge</code> then group</td></tr><tr><td>Test a difference</td><td><code>scipy.stats</code>: <code>ttest_ind</code>, <code>mannwhitneyu</code>, <code>f_oneway</code>, <code>chi2_contingency</code></td></tr></tbody></table></div>
+<pre class="code lang-python"><code>print(o.groupby("category")["amount"].agg(["count", "median", "mean"]).round(1))
+print(pd.crosstab(o.category, o.status, normalize="index").round(3))
+print(o[["qty", "amount"]].corr().round(3))
+j = o.merge(cust, on="customer_id", how="left", validate="many_to_one")
+print(j.groupby("channel").agg(orders=("order_id", "count"), aov=("amount", "mean")).round(1))</code></pre>
+<pre class="code lang-text"><code>             count  median   mean
+category                         
+electronics    443   847.2  967.9
+fashion        743   413.6  461.8
+grocery        668   152.4  169.9
+home           318   517.7  600.8
+status       cancelled  delivered  returned
+category                                   
+electronics      0.081      0.851     0.068
+fashion          0.054      0.846     0.100
+grocery          0.054      0.871     0.075
+home             0.064      0.893     0.043
+          qty  amount
+qty     1.000   0.011
+amount  0.011   1.000
+          orders    aov
+channel                
+ads          475  489.7
+email        249  502.7
+organic     1013  499.5
+referral     495  490.0</code></pre>
+<p><strong>Worked example 7.5.1</strong> Insight 1: category drives amount.</p>
+<ul><li><strong>Formula</strong> ratio = median of one category / median of another</li><li><strong>Plug in</strong> Electronics median 847.2, grocery median 152.4.</li><li><strong>Compute</strong> 847.2 / 152.4 = 5.56.</li><li><strong>Answer</strong> A typical electronics order is about 5.6 times a typical grocery order. A Mann-Whitney test (a test that compares two groups without assuming a bell curve) on the 443 electronics and 668 grocery amounts gave a p-value near zero (8 × 10⁻¹⁷¹), so this is not chance.</li><li><strong>Check</strong> The means (967.9 and 169.9) give 5.7, consistent.</li><li><strong>Interpretation</strong> Category is the main driver of order size. Any revenue forecast should be built per category.</li></ul>
+<p><strong>Worked example 7.5.2</strong> Insight 2: channel does not change the order size.</p>
+<ul><li><strong>Plug in</strong> Average order value by channel: ads 489.7, email 502.7, organic 499.5, referral 490.0. The largest gap is 502.7 − 489.7 = 13.0 (2.6%).</li><li><strong>Compute</strong> One-way ANOVA across the four channels gave F = 0.116, p = 0.95 (a p of 0.95 means differences this small would appear by chance 95% of the time).</li><li><strong>Answer</strong> No evidence that the acquisition channel affects order size.</li><li><strong>Check</strong> If channel mattered, we would expect gaps of tens of percent, not 2.6%.</li><li><strong>Interpretation</strong> Do not spend effort optimising order value by channel. Differences in channel <em>volume</em> (organic brings 1,013 orders versus email 249) matter more. (Of course, volume partly reflects the shares we set in the generator: 40% organic, 10% email.)</li></ul>
+<p><strong>Worked example 7.5.3</strong> Insight 3: correlation between qty and amount is about zero.</p>
+<ul><li><strong>Formula</strong> Pearson correlation r measures straight-line association, from −1 to +1.</li><li><strong>Compute</strong> r = 0.011.</li><li><strong>Answer</strong> Quantity and amount are unrelated here. This looks odd (more units should cost more), and it is a <strong>data quality clue</strong>. In our generator the amount was drawn without using the quantity, so <code>amount</code> is the order total regardless of <code>qty</code>. In real data you would ask the owner: is <code>amount</code> per unit or per order? Never assume.</li><li><strong>Check</strong> <code>df[["qty", "amount"]].corr(method="spearman")</code> gave 0.02, the same conclusion.</li></ul>
+<p><strong>Worked example 7.5.4</strong> Insight 4 (a trap): returns by category.</p>
+<pre class="code lang-python"><code>from scipy import stats
+ct = pd.crosstab(o.category, o.status == "returned")
+chi2, p, dof, exp = stats.chi2_contingency(ct)
+print(round(chi2, 2), round(p, 4), dof)</code></pre>
+<pre class="code lang-text"><code>11.5 0.0093 3</code></pre>
+<ul><li><strong>Formula</strong> chi-square = Σ (observed − expected)² / expected, where expected = group size × overall return rate.</li><li><strong>Plug in</strong> The overall return rate is 173 / 2,232 = 7.75%. For fashion, expected returns = 760 × 0.0775 = 58.9, but we observed 76. For home, expected = 327 × 0.0775 = 25.3, observed 14.</li><li><strong>Compute</strong> Contributions: fashion (76 − 58.9)² / 58.9 = 4.96; home (14 − 25.3)² / 25.3 = 5.08. With the other small terms the total is 11.5 with 3 degrees of freedom, p = 0.0093.</li><li><strong>Answer</strong> The test says return rates differ by category (fashion 10.0% versus home 4.3%) with p = 0.0093.</li><li><strong>Check</strong> We can check the truth: in our generator every order is returned with probability 8% whatever the category. So this "significant" finding is a <strong>false alarm</strong>. A p of 0.009 happens by chance about 1 time in 100 tests, and when you look at many cuts of the data (category, channel, city, month, status), some will look significant by luck.</li><li><strong>Interpretation</strong> Treat this as a hypothesis to confirm on new data (next quarter), not as a fact to act on. This is the "multiple comparisons" problem, which Chapter 13 shows again for A/B tests.</li></ul>
+<p><strong>Time and customers</strong></p>
+<pre class="code lang-python"><code>m = o.groupby(o.order_date.dt.to_period("M")).agg(orders=("order_id", "count"), revenue=("amount", "sum")).round(0)
+per = o.groupby("customer_id")["order_id"].count()
+print(m)
+print(per.value_counts().sort_index())
+print("customers with &gt;=1 order:", len(per), "of", len(cust))
+print("repeat rate:", round((per &gt;= 2).mean(), 3))</code></pre>
+<pre class="code lang-text"><code>            orders  revenue
+order_date                 
+2025-01        144  76045.0
+2025-02        233  115867.0
+2025-03        348  162274.0
+2025-04        364  164132.0
+2025-05        390  194888.0
+2025-06        393  186105.0
+2025-07        222  114926.0
+2025-08         95   39809.0
+2025-09         31   16305.0
+2025-10          9    3485.0
+2025-11          2     648.0
+2025-12          1    2022.0
+order_id
+1    521
+2    358
+3    178
+4     77
+5     19
+6      5
+7      4
+Name: count, dtype: int64
+customers with &gt;=1 order: 1162 of 1500
+repeat rate: 0.552</code></pre>
+<p><strong>Worked example 7.5.5</strong> Insights 5 and 6.</p>
+<ul><li><strong>Compute (customers)</strong> 1,162 of 1,500 customers ordered at least once: 1162 / 1500 = 77.5%. Among them, 358 + 178 + 77 + 19 + 5 + 4 = 641 placed 2 or more orders: 641 / 1162 = 55.2% (matches the printed 0.552).</li><li><strong>Compute (months)</strong> Orders rise from 144 in January to 393 in June, then fall to 1 in December. This is <strong>not</strong> a business collapse. Our customers all signed up between January and June (the latest signup date is 29 June 2025), and each customer's orders happen within weeks of signing up. There are no new customers after June, so the orders fade out.</li><li><strong>Answer</strong> 77.5% of customers ordered, and 55.2% of those ordered again. The monthly decline after June is an artefact of how the data was collected, not a trend.</li><li><strong>Check</strong> Sum of monthly orders = 144 + 233 + 348 + 364 + 390 + 393 + 222 + 95 + 31 + 9 + 2 + 1 = 2,232, equal to the number of unique orders.</li><li><strong>Interpretation</strong> Always ask "does the data cover everyone for the whole period?" Here it covers a <em>cohort</em> (a group that started together). A cohort view (Chapter 12) is the right way to read it.</li></ul>
+<p><strong>Joining tables.</strong> We joined <code>orders</code> to <code>customers</code> with <code>validate="many_to_one"</code> (many orders per customer, one customer row). The channel column had 0 missing after the join, so every order matched a customer. That integrity check should appear in every EDA.</p>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code> median amount by category:
+ electronics ############################ 847
+ home        #################            518
+ fashion     ##############               414
+ grocery     #####                        152</code></pre>
+<p><strong>Connection to the real job.</strong> Steps 5 to 8 are what you present: "category drives order size; channel does not; return rate differences are probably noise; the monthly drop is a data coverage effect." Every one of those four statements saves the business from a wrong decision.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Marketing: which channel produces valuable customers?</li><li>Product: which segment retains better?</li><li>Finance: which category contributes to revenue and returns?</li><li>Operations: returns by supplier or warehouse.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Testing many slices and reporting the one with p below 0.05. If you run 20 independent tests at 5%, the chance of at least one false alarm is 1 − 0.95²⁰ = 64% (we computed it: 0.6415). Decide your questions first, or correct for multiple testing (Chapter 13).</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does r = 0.011 say? Answer: Almost no straight-line relationship.</li><li>Why is the monthly decline after June not a business trend? Answer: No customers signed up after June; the data stops adding new customers.</li><li>What did the paise error do to the mean? Answer: It raised it from about 496 to 641.</li></ol>
+<h2 id="s6-7-6-from-hypotheses-to-documented-insights-and-profiling-tools">7.6 From Hypotheses to Documented Insights (and Profiling Tools)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A detective writes down each claim, the evidence for it, and how sure she is. Your EDA should end the same way, not with "I made 30 charts".</div></div>
+<p><strong>The routine</strong> (copy this into every analysis)</p>
+<ol><li>Context: source, grain, period, owner.</li><li>Shape, dtypes, memory.</li><li>Quality scan: missing, duplicates, impossible values, inconsistent categories, units.</li><li>Cleaning log.</li><li>Missing-data mechanism.</li><li>Univariate: distribution, skew, outliers.</li><li>Bivariate: groups, cross-tabs, correlations, tests.</li><li>Time and customer views.</li><li>Hypotheses, checks, insights with confidence.</li></ol>
+<p><strong>Insight table (what you would send)</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>#</th><th>Insight</th><th>Evidence</th><th>Confidence</th><th>Action</th></tr></thead><tbody><tr><td>1</td><td>Seven amounts were 23 to 199 times their category median (paise error). Mean falls from 641 to 496 after repair</td><td>Ratio table</td><td>High</td><td>Ask data owner to fix the source; add a validation rule</td></tr><tr><td>2</td><td>12 duplicate orders and 8 category spellings</td><td>Counts</td><td>High</td><td>Deduplicate on <code>order_id</code>; standardise at entry</td></tr><tr><td>3</td><td>Amount is missing for 2.7% of orders, no link to category or status</td><td>Missing rates, chi-square p = 0.81</td><td>Medium</td><td>Exclude from totals; report the share</td></tr><tr><td>4</td><td>Order amount is right-skewed (skew 2.09); typical order Rs 384, mean Rs 496</td><td>describe, log skew</td><td>High</td><td>Report median and p90, not just mean</td></tr><tr><td>5</td><td>Category drives order size: electronics median 847 vs grocery 152</td><td>Medians, Mann-Whitney</td><td>High</td><td>Forecast per category</td></tr><tr><td>6</td><td>Channel does not change order size (ANOVA p = 0.95)</td><td>AOV by channel</td><td>High</td><td>Do not tune AOV by channel</td></tr><tr><td>7</td><td><code>qty</code> and <code>amount</code> are uncorrelated (r = 0.011): the meaning of <code>amount</code> is unclear</td><td>Correlation</td><td>Medium</td><td>Confirm definition (per unit or per order)</td></tr><tr><td>8</td><td>Return rate varies by category (4.3% to 10.0%, p = 0.009)</td><td>chi-square</td><td>Low</td><td>Treat as hypothesis; re-test next quarter</td></tr><tr><td>9</td><td>77.5% of customers ordered; 55.2% of them reordered</td><td>Counts</td><td>High</td><td>Use as cohort baseline (Chapter 12)</td></tr><tr><td>10</td><td>Monthly orders fall after June because the dataset has no signups after June</td><td>Max signup date 29 June</td><td>High</td><td>Do not report as a trend; use cohort views</td></tr></tbody></table></div>
+<p>Notice how insight 8 is labelled <strong>Low</strong> confidence: honesty about uncertainty is part of the craft.</p>
+<p><strong>Automated profiling tools (awareness, not run here).</strong></p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Tool</th><th>What it does</th></tr></thead><tbody><tr><td><code>ydata-profiling</code> (<code>ProfileReport(df)</code>)</td><td>One-click HTML report: types, missing, distributions, correlations, duplicates</td></tr><tr><td><code>sweetviz</code></td><td>Compare two datasets (train vs test)</td></tr><tr><td><code>missingno</code></td><td>Matrix and heatmap of missing values</td></tr><tr><td><code>pandera</code> / <code>great_expectations</code></td><td>Write data rules ("amount &gt; 0", "order_id unique") and fail the pipeline if broken</td></tr><tr><td><code>statsmodels</code></td><td>OLS and logistic regression with full statistical output, ANOVA, time series, power analysis</td></tr></tbody></table></div>
+<p>Use profilers as a first pass to save time, never as a substitute for thinking. They cannot tell you the grain, or that 99,999 is a placeholder.</p>
+<p><strong>Worked example 7.6.1</strong> Turn the routine into a reusable function.</p>
+<pre class="code lang-python"><code>def quick_scan(df, key):
+    return {
+        "rows": len(df),
+        "dup_keys": int(df[key].duplicated().sum()),
+        "missing_pct": (df.isna().mean() * 100).round(1).to_dict(),
+    }</code></pre>
+<ul><li><strong>Compute</strong> Run it on the raw <code>orders</code> table with <code>key="order_id"</code>. Real output: <code>{'rows': 2244, 'dup_keys': 12, 'missing_pct': {'order_id': 0.0, 'customer_id': 0.0, 'order_date': 0.0, 'category': 0.0, 'qty': 0.0, 'amount': 2.7, 'status': 0.0}}</code> (61 / 2244 = 0.0272).</li><li><strong>Answer</strong> A three-line health report you can paste at the start of any analysis.</li><li><strong>Check</strong> 61 / 2244 = 2.72%, which rounds to 2.7.</li><li><strong>Why it matters</strong> Automating the scan makes you faster and consistent. On a team, it becomes a shared standard.</li></ul>
+<p><strong>The picture</strong></p>
+<pre class="code lang-text"><code> Question → Scan → Clean (log) → Explore → Hypothesis → Test → Insight (with confidence) → Decision
+              ↑                                                   │
+              └──────────── new question appears ─────────────────┘</code></pre>
+<p><strong>Connection to the real job.</strong> The mastery test for this skill: "given an unknown messy dataset, produce a clean notebook with profiling, cleaning, 10 insights, charts and a one-page summary in under four hours". The ten insights above are the shape of that deliverable.</p>
+<p><strong>Applications</strong></p>
+<ul><li>Analytics: the handover document for every new dataset.</li><li>Data Science: EDA precedes every model; mistakes found here save weeks.</li><li>Data Engineering: rules found in EDA become data quality tests.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reporting everything you found. Ten insights with evidence and an action are good; 40 charts without a message are noise. Rank by impact and confidence.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why label confidence for each insight? Answer: Some findings are solid and some are only hypotheses; readers need to know the difference.</li><li>What can a profiler not tell you? Answer: The business meaning of columns, the grain, or whether a value is a placeholder.</li><li>What should follow a low-confidence insight? Answer: A planned re-test on new data.</li></ol>
+<h2 id="s7-chapter-recap">Chapter recap</h2>
+<ul><li>Start with context: source, grain, period, key, decision.</li><li>Quality scan before charts: missing, duplicates, impossible values, categories, units.</li><li>Compare each value with its own group's median to catch unit mistakes.</li><li>Missing data mechanisms: MCAR, MAR, MNAR; look at missing rates by other columns; keep a flag if unsure.</li><li>Univariate: describe, skew, log, quantiles; mean greater than median means a right tail.</li><li>Bivariate: grouped summaries, cross-tabs, correlation, tests; one significant test among many can be a false alarm.</li><li>Check the coverage of time: an incomplete period or a cohort-only dataset creates fake trends.</li><li>Write insights with evidence, confidence and action; label uncertain ones honestly.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Step</th><th>Code</th></tr></thead><tbody><tr><td>Shape, types</td><td><code>df.shape</code>, <code>df.dtypes</code>, <code>df.info()</code></td></tr><tr><td>Missing / duplicates</td><td><code>df.isna().sum()</code>, <code>df.duplicated().sum()</code></td></tr><tr><td>Group-relative outlier</td><td><code>df.amount / df.groupby("g").amount.transform("median")</code></td></tr><tr><td>Distribution</td><td><code>df.x.describe()</code>, <code>df.x.skew()</code>, <code>df.x.quantile([.5,.9,.99])</code></td></tr><tr><td>Group summary</td><td><code>df.groupby("g").x.agg(["count","median","mean"])</code></td></tr><tr><td>Cross-tab</td><td><code>pd.crosstab(a, b, normalize="index")</code></td></tr><tr><td>Test of independence</td><td><code>scipy.stats.chi2_contingency(table)</code></td></tr><tr><td>Join check</td><td><code>merge(..., validate="many_to_one")</code></td></tr></tbody></table></div>
+<h2 id="s8-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 1</span> A column has values 10, 12, 11, 13, 200. Mean and median? Which is typical?</p>
+<p><strong>Answer:</strong> Mean 49.2, median 12. The median is typical; 200 pulls the mean up.</p>
+<p class="problem"><span class="pl">Problem 2</span> After cleaning, <code>orders</code> has 2,232 rows and 60 missing amounts. What share is missing?</p>
+<p><strong>Answer:</strong> 60 / 2232 = 2.69%, about 2.7%.</p>
+<p class="problem"><span class="pl">Problem 3</span> The grocery median is 152.4. An order has grocery amount 3,566. Ratio and verdict?</p>
+<p><strong>Answer:</strong> 3566 / 152.4 = 23.4. Far above a plausible range for grocery, so flag it (likely paise error: 35.66, which is plausible).</p>
+<p class="problem"><span class="pl">Problem 4</span> Skewness is +2.1 and the mean is above the median. Describe the shape.</p>
+<p><strong>Answer:</strong> Right-skewed: a few large values stretch the right tail.</p>
+<p class="problem"><span class="pl">Problem 5</span> Fashion: 76 returns of 760 orders. Overall return rate 7.75%. What are the expected returns?</p>
+<p><strong>Answer:</strong> 760 × 0.0775 = 58.9. Observed 76 is 17.1 higher.</p>
+<p class="problem"><span class="pl">Problem 6</span> Find the bug: <code>df.groupby("category")["amount"].mean()</code> shows 8 categories for 4 real ones.</p>
+<p><strong>Answer:</strong> Inconsistent case. Normalise with <code>.str.lower()</code> (and <code>.str.strip()</code>) before grouping.</p>
+<p class="problem"><span class="pl">Problem 7</span> Find the bug: a report says "order volume collapsed 99% from June to December". The data holds only customers who signed up before July. What is wrong?</p>
+<p><strong>Answer:</strong> The dataset stops adding new customers; later months only contain orders from old signups. The "collapse" is a coverage artefact. Compare cohorts at the same age, not calendar months.</p>
+<p class="problem"><span class="pl">Problem 8</span> You run 10 independent tests at the 5% level when all nulls are true. Probability of at least one false alarm?</p>
+<p><strong>Answer:</strong> 1 − 0.95¹⁰ = 1 − 0.5987 = 0.401, about 40%.</p>
+<p class="problem"><span class="pl">Problem 9</span> Missing income is more common for customers under 25 (observed age). Which mechanism?</p>
+<p><strong>Answer:</strong> MAR: the missingness depends on another observed column (age).</p>
+<p class="problem"><span class="pl">Problem 10 (interview)</span> "You find a column where 5% of values are exactly 0 but the column is a price. What do you do?"</p>
+<p><strong>Answer:</strong> Check if 0 means "missing", "free" or a placeholder. Look at related columns (status, category, date) for patterns. Ask the data owner. Do not average the zeros as real prices. Report the count and treat them as missing if confirmed.</p>
+<p class="problem"><span class="pl">Problem 11 (interview)</span> "Walk me through your EDA process on a new dataset in five minutes."</p>
+<p><strong>Answer:</strong> Ask the grain, key and period. Check shape, dtypes, missing, duplicates, impossible values, category spellings and units. Write a cleaning log. Look at the distribution of key numbers (skew, percentiles). Compare groups and test differences. Check the time coverage. Summarise insights with evidence and confidence, and list open questions for the data owner.</p>
+<h2 id="s9-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional in India moving into data roles, and English is my second language. Teach me Chapter 7 topic: Exploratory Data Analysis as a fixed routine (context and grain, quality scan, cleaning log, missing data, univariate, bivariate, time coverage, documented insights). Walk me through it on a small made-up orders dataset, step by step, and ask me to decide what to do at each step before you reveal the answer.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Explain missing data mechanisms MCAR, MAR and MNAR with three everyday examples each, how to look for evidence in a DataFrame with pandas, and what to do for each. Then give me 6 short scenarios and ask me to classify them one at a time, with feedback.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Give me a messy dataset described in words (columns, a few sample rows, known problems) and ask me to plan an EDA. Then give me 8 specific "what does this output mean" questions about skewness, medians versus means, outliers by IQR, correlations and chi-square p-values, graded easy to hard. No solutions until I answer.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Review my EDA notebook summary for mistakes: missing checks, hidden assumptions, false alarms from multiple testing, incomplete time coverage, and weak insight wording. Rewrite my top three insights as: claim, evidence, confidence, action. My summary: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Run a mock interview on EDA and data quality: grain, duplicates, outliers, unit mistakes, missing data, skewed distributions and false discoveries. Ask 6 questions one at a time, grade each answer from 1 to 5, and show a model answer in simple English with one number-based example.</pre></div><div class="readbtn"><button class="btn" data-read="study:analyst:ch07">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch06.html">← Chapter 6: NumPy and Fast pandas</a><a class="btn" href="ch08.html">Chapter 8: Data Visualization: Principles, matplotl →</a></div></div><script src="../../assets/study.js"></script></body></html>

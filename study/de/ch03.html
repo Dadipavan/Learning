@@ -1,0 +1,240 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 3: File Formats, Storage and Lakehouse Table Formats</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#357a70"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Engineering &amp; Big Data</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 3</div><h1>File Formats, Storage and Lakehouse Table Formats</h1><p>How data is written to disk decides how fast, how cheap and how safe everything after it is.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-3-1-text-formats-csv-and-json-and-their-traps">3.1 Text Formats: CSV and JSON, and Their Traps</a></li><li><a href="#s2-3-2-columnar-formats-parquet-orc-avro-arrow">3.2 Columnar Formats: Parquet, ORC, Avro, Arrow</a></li><li><a href="#s3-3-3-compression-partitioning-and-the-small-file-problem">3.3 Compression, Partitioning and the Small-File Problem</a></li><li><a href="#s4-3-4-table-formats-delta-lake-iceberg-hudi">3.4 Table Formats: Delta Lake, Iceberg, Hudi</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>You will meet a surprising number of data problems that are not about SQL or Spark at all. They are about the file. A CSV with a comma inside a name breaks a load at 2 a.m. A folder with 50,000 tiny files makes a job ten times slower than it should be. A query scans 2 TB when it needed 20 GB because the files were not partitioned. In this chapter you will learn what CSV and JSON get wrong, why Parquet is the default for analytics, how compression and partitioning save money, why the small-file problem hurts, and how table formats such as Delta Lake and Iceberg add safe updates on top of plain files. We will measure effects with real code you can run, and one toy table format you can read in 20 lines.</p>
+<h2 id="s1-3-1-text-formats-csv-and-json-and-their-traps">3.1 Text Formats: CSV and JSON, and Their Traps</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A CSV file is a letter written by hand: anyone can read it, but there is no agreed handwriting. Is a blank an empty text or a missing value? Is <code>07</code> a number or a pin code? Text formats are friendly for humans and risky for machines.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Delimiter</td><td>The character that separates fields (comma, tab, pipe)</td></tr><tr><td>Quoting</td><td>Wrapping a field in <code>"</code> so special characters inside are safe</td></tr><tr><td>Encoding</td><td>How characters become bytes (UTF-8 is the safe default)</td></tr><tr><td>Schema</td><td>The names and types of the columns</td></tr><tr><td>JSON Lines (NDJSON)</td><td>One JSON object per line; can be split and streamed</td></tr></tbody></table></div>
+<h3>Predict, Run, Explain: what breaks in CSV and JSON</h3>
+<p>Before you run it: if you split a CSV text on newlines, how many lines do two records give when one record has a line break inside a field?</p>
+<pre class="code lang-python"><code>import csv, io, json
+tricky = [("1","Doe, John",'said "hi"',"007"), ("2","line\nbreak","x","1.50")]
+b = io.StringIO(); csv.writer(b).writerows(tricky); print(repr(b.getvalue()))
+naive = b.getvalue().split("\n"); print("naive split gives", len(naive)-1, "lines for 2 records")
+print("csv module read:", list(csv.reader(io.StringIO(b.getvalue()))))
+print("leading zero lost if cast to int:", int("007"))
+print("json float:", 0.1+0.2, "| big int:", json.loads('{"x": 12345678901234567890}')["x"])</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>'1,"Doe, John","said ""hi""",007\r\n2,"line\nbreak",x,1.50\r\n'
+naive split gives 3 lines for 2 records
+csv module read: [['1', 'Doe, John', 'said "hi"', '007'], ['2', 'line\nbreak', 'x', '1.50']]
+leading zero lost if cast to int: 7
+json float: 0.30000000000000004 | big int: 12345678901234567890</code></pre>
+<p><strong>Explain.</strong></p>
+<ul><li>The CSV writer put quotes only where needed: around <code>Doe, John</code> (a comma), around <code>said "hi"</code> (and doubled the inner quotes to <code>""</code>), and around the field with a line break. It left <code>007</code> alone.</li><li>Splitting on <code>\n</code> found 3 pieces for 2 records, because the line break inside "line\nbreak" is data, not a record end. A real parser (the <code>csv</code> module) reads it correctly. Never parse CSV with <code>split(",")</code>.</li><li><code>int("007")</code> is 7: the leading zeros are gone. Pin codes, phone numbers and IDs should stay as text. Spark's <code>inferSchema</code> and pandas guess types and can make this mistake.</li><li>Python's JSON parser kept the 20-digit integer, but many other tools (JavaScript, some warehouses) convert it to a float and lose digits. <code>0.1 + 0.2</code> shows binary float noise: store money as integers (paise) or decimals.</li><li><em>Interpretation:</em> text formats carry no types, no null rule, no guarantee. You must defend against all three.</li></ul>
+<h3>Common CSV and JSON pitfalls</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pitfall</th><th>Example</th><th>Defence</th></tr></thead><tbody><tr><td>Delimiter in data</td><td><code>Doe, John</code></td><td>proper quoting; use a real parser</td></tr><tr><td>Embedded newline</td><td>address with line break</td><td>parser with quote support</td></tr><tr><td>Encoding</td><td><code>Ã©</code> instead of <code>é</code></td><td>declare UTF-8, test with non-English names</td></tr><tr><td>Type guessing</td><td><code>007</code> becomes 7, <code>1e5</code> becomes 100000.0</td><td>explicit schema</td></tr><tr><td>Null vs empty</td><td><code>,,</code> could be empty text or missing</td><td>agree on a null token</td></tr><tr><td>Date formats</td><td><code>03/04/2024</code> is March or April?</td><td>ISO 8601: <code>2024-04-03</code></td></tr><tr><td>Header drift</td><td>a column is added in the middle</td><td>read by name, validate header</td></tr><tr><td>JSON nesting</td><td>arrays and objects inside objects</td><td>flatten or keep as struct</td></tr><tr><td>JSON array file</td><td>one giant <code>[...]</code> must be fully read</td><td>use JSON Lines</td></tr><tr><td>No schema</td><td>a field is a string today, a number tomorrow</td><td>schema check on ingest (Chapter 5)</td></tr></tbody></table></div>
+<p>JSON Lines looks like this, and each line is a complete record:</p>
+<pre class="code lang-text"><code>{"id": 0, "city": "Delhi"}
+{"id": 1, "city": "Pune"}
+{"id": 2, "city": "Pune"}</code></pre>
+<p class="problem"><span class="pl">Problem 3.1.1</span> A CSV has 3 columns. The row <code>101,Sharma, Raj,450</code> is read. How many fields does a naive split give, and what is the bug?</p>
+<table class="steps"><tr><th>Step 1</th><td>Splitting on commas gives <code>101</code>, <code>Sharma</code>, <code> Raj</code>, <code>450</code>: 4 fields.</td></tr><tr><th>Step 2</th><td>The schema has 3 columns, so the row looks like it has one too many. The source forgot to quote the name.</td></tr><tr><th>Answer</th><td>4 fields; the source file is malformed, so reject or quarantine it rather than guess.</td></tr><tr><th>Check</th><td>If the name were quoted (<code>101,"Sharma, Raj",450</code>), the parser would give 3 fields.</td></tr><tr><th>Why it matters</th><td>Guessing silently corrupts columns (the amount lands in the wrong column).</td></tr></table>
+<p class="problem"><span class="pl">Problem 3.1.2</span> A phone number <code>0987654321</code> is loaded as an integer and then exported. What is lost, and how many digits remain?</p>
+<table class="steps"><tr><th>Step 1</th><td>As a number: 987654321 (the leading 0 is not part of the value).</td></tr><tr><th>Step 2</th><td>Original had 10 digits, the exported one has 9.</td></tr><tr><th>Answer</th><td>One digit is lost; phone numbers, pin codes and account numbers are identifiers, not numbers, so use a string type.</td></tr><tr><th>Check</th><td><code>len("0987654321")</code> is 10 and <code>len(str(int("0987654321")))</code> is 9.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Most ingestion code starts with CSV or JSON from partners and APIs. The first thing a good pipeline does is write them to a typed format (Parquet) with an explicit schema, and reject bad lines to a quarantine folder.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> landing zones receive CSV/JSON, then convert.</li><li><strong>Data Analytics:</strong> Excel exports are CSV; know the encoding issues.</li><li><strong>GenAI:</strong> JSON Lines is the standard format for fine-tuning and evaluation datasets.</li><li><strong>API integration:</strong> JSON is the language of REST APIs.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Letting <code>inferSchema</code> decide types in production. Today's sample file says the column is an integer; tomorrow one row has "N/A" and the job fails, or worse, silently becomes null. Always give an explicit schema.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why not <code>line.split(",")</code>? Answer: commas and newlines can appear inside quoted fields.</li><li>Which format can be split and streamed line by line, JSON array or JSON Lines? Answer: JSON Lines.</li><li>How should an account number be stored? Answer: as text.</li></ol>
+<h2 id="s2-3-2-columnar-formats-parquet-orc-avro-arrow">3.2 Columnar Formats: Parquet, ORC, Avro, Arrow</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Row storage is a stack of index cards, each card holding everything about one customer. Columnar storage is a set of drawers, one drawer per attribute: all cities in one drawer, all amounts in another. To total all amounts you open one drawer, not every card.</div></div>
+<h3>How the formats differ</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Format</th><th>Layout</th><th>Best for</th><th>Notes</th></tr></thead><tbody><tr><td>Parquet</td><td>columnar, files split into row groups</td><td>analytics, data lakes, ML</td><td>default in Spark, DuckDB, Athena, BigQuery loads</td></tr><tr><td>ORC</td><td>columnar</td><td>Hive and older Hadoop ecosystems</td><td>similar ideas to Parquet</td></tr><tr><td>Avro</td><td>row-based, schema stored with data</td><td>streaming (Kafka), schema evolution</td><td>pairs with a Schema Registry</td></tr><tr><td>Arrow</td><td>in-memory columnar</td><td>passing data between tools without copying</td><td>not a storage file format by itself (the file form is called Feather / Arrow IPC)</td></tr><tr><td>CSV / JSON</td><td>text rows</td><td>exchange with humans and APIs</td><td>see 3.1</td></tr></tbody></table></div>
+<h3>Inside a Parquet file</h3>
+<figure><img src="images/de_parquet_layout.svg" alt="Parquet file layout: row groups containing column chunks, plus a footer with statistics" loading="lazy"/><figcaption>Parquet file layout: row groups containing column chunks, plus a footer with statistics</figcaption></figure>
+<p>How to read it: the file is cut into <strong>row groups</strong> (a block of rows, often around 128 MB). Inside each group, every column has its own <strong>column chunk</strong>, which is split into pages and compressed. The <strong>footer</strong> at the end holds the schema and, for every column chunk, the minimum value, maximum value and null count. A reader first reads the footer (the last bytes of the file), then fetches only the column chunks it needs.</p>
+<p>Two big tricks come from this layout:</p>
+<ul><li><strong>Column pruning:</strong> <code>SELECT amount</code> reads only the <code>amount</code> chunks.</li><li><strong>Predicate pushdown:</strong> for <code>WHERE amount &gt; 450</code>, if a row group's max is 300, the whole group is skipped using the footer statistics, without reading it.</li></ul>
+<p>Values in one column are alike, so Parquet also uses <strong>dictionary encoding</strong> (store each distinct city once, then a small number per row), <strong>run-length encoding</strong> (store "A, repeated 500 times") and then a general <strong>compression</strong> codec.</p>
+<h3>Predict, Run, Explain: why columns compress better</h3>
+<p>We do not have pyarrow installed here (the sandbox cannot download packages), so we simulate the idea with plain Python and <code>zlib</code> (the same family of compression as gzip). We make 20,000 rows, write them as CSV rows, then as column blocks, and compress both.</p>
+<p>Before you run it: will the column layout compress smaller than the row layout? Which single column will compress best?</p>
+<pre class="code lang-python"><code>import csv, io, zlib, random
+random.seed(7)
+N = 20000
+cities = ['Pune','Mumbai','Delhi','Chennai','Kolkata']
+rows = [(i, random.choice(cities), random.choice(['A','B','C']),
+         round(random.uniform(10,500),2), f"2024-01-{random.randint(1,28):02d}") for i in range(N)]
+csv_buf = io.StringIO(); csv.writer(csv_buf).writerows(rows); row_bytes = csv_buf.getvalue().encode()
+cols = list(zip(*rows))
+col_bytes = b"".join(("\n".join(map(str, c)) + "\n").encode() for c in cols)
+print("raw row-layout bytes   :", len(row_bytes))
+print("raw column-layout bytes:", len(col_bytes))
+print("zlib row-layout        :", len(zlib.compress(row_bytes, 6)))
+print("zlib column-layout     :", len(zlib.compress(col_bytes, 6)))
+for n, c in zip(['id','city','tier','amount','day'], cols):
+    b = ("\n".join(map(str, c)) + "\n").encode()
+    print(f"  col {n:7s} raw {len(b):7d} zlib {len(zlib.compress(b,6)):7d}")</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>raw row-layout bytes   : 658869
+raw column-layout bytes: 638869
+zlib row-layout        : 159095
+zlib column-layout     : 141110
+  col id      raw  108890 zlib   43755
+  col city    raw  135625 zlib   10963
+  col tier    raw   40000 zlib    5756
+  col amount  raw  134354 zlib   54869
+  col day     raw  220000 zlib   21266</code></pre>
+<p><strong>Explain.</strong></p>
+<ul><li>The raw sizes differ by 20,000 bytes (658,869 − 638,869) because the row layout carries one extra comma or newline per row and the column layout only a newline.</li><li>After compression the row layout is 159,095 bytes and the column layout 141,110 bytes. Savings: (159,095 − 141,110) / 159,095 = 17,985 / 159,095 = 11.3%.</li><li>Per column: <code>city</code> shrank from 135,625 to 10,963 bytes (8.1% of its raw size), <code>tier</code> from 40,000 to 5,756. <code>amount</code>, which is random decimals, compressed least (54,869 of 134,354, 41%). <strong>Check:</strong> adding the five separate column sizes gives 43,755 + 10,963 + 5,756 + 54,869 + 21,266 = 136,609 bytes, within 3% of the 141,110 bytes for the one-stream compression (the gap comes from how the compressor behaves on one long stream; we did not investigate it further). Low-variety columns win big.</li><li><em>Interpretation:</em> real Parquet uses dictionary and run-length encoding before compression, so it does far better than plain zlib on columns like <code>city</code>: a dictionary of 5 cities needs about 3 bits per row, which for 20,000 rows is 7.5 KB (20,000 × 3 / 8 = 7,500 bytes) against 135,625 bytes of text.</li></ul>
+<div class="callout cream"><div class="lab">KEY INSIGHT</div><div class="txt">For analytics, you pay for bytes scanned (in time on a lake, in money on serverless engines). Columnar layout plus compression plus pruning can cut bytes read by 10 to 100 times compared with CSV.</div></div>
+<p>Parquet with pyarrow looks like this. <strong>Not run here</strong> (pyarrow could not be installed in this sandbox); the calls are standard:</p>
+<pre class="code lang-python"><code>import pyarrow as pa, pyarrow.parquet as pq
+table = pa.Table.from_pylist([{"id": 1, "city": "Pune", "amount": 250.0}])
+pq.write_table(table, "orders.parquet", compression="zstd")
+print(pq.ParquetFile("orders.parquet").metadata)        # row groups, rows, footer info
+only_amount = pq.read_table("orders.parquet", columns=["amount"])   # column pruning
+filtered = pq.read_table("orders.parquet", filters=[("amount", "&gt;", 100)])  # predicate pushdown</code></pre>
+<p>And with DuckDB, which can query a Parquet file with SQL (also <strong>not run here</strong>):</p>
+<pre class="code lang-sql"><code>SELECT city, SUM(amount) FROM 'orders.parquet' GROUP BY city;
+COPY (SELECT * FROM 'orders.csv') TO 'orders.parquet' (FORMAT PARQUET, COMPRESSION ZSTD);</code></pre>
+<h3>Avro and schema evolution</h3>
+<p>Avro is <em>row</em> oriented and stores its schema (a JSON description) with the data. That suits a stream of whole messages. With a <strong>Schema Registry</strong> (a service that stores versions of each schema), a Kafka message carries only a small schema id. Rules for safe evolution: adding a field <strong>with a default</strong> is backward compatible (new readers can read old data); removing a field that had no default breaks readers. Parquet also allows adding columns (old files simply return null for them), but renaming and changing types need care.</p>
+<p class="problem"><span class="pl">Problem 3.2.1</span> A Parquet file has 10 row groups. A query has <code>WHERE order_date = '2024-03-15'</code>. The footer shows that only 1 row group has min ≤ 2024-03-15 ≤ max. How much data is read versus a full scan, if each group is 128 MB and the query reads 2 of 20 columns?</p>
+<table class="steps"><tr><th>Formula</th><td>bytes read ≈ matching groups × group size × (columns read / total columns)</td></tr><tr><th>Plug in</th><td>1 × 128 MB × (2 / 20)</td></tr><tr><th>Compute</th><td>128 × 0.1 = 12.8 MB</td></tr><tr><th>Answer</th><td>About 12.8 MB, against 10 × 128 = 1,280 MB for a full scan of all columns, which is 100 times less. (This assumes equal column sizes. Real columns differ.)</td></tr><tr><th>Check</th><td>1/10 of the groups times 2/20 of the columns is 1/100.</td></tr><tr><th>Why it matters</th><td>Sorting data by the filter column before writing makes min/max ranges narrow, so pushdown works. Unsorted data has every group span the full range and nothing is skipped.</td></tr></table>
+<p class="problem"><span class="pl">Problem 3.2.2</span> A column <code>city</code> has 5 distinct values over 1,000,000 rows. Roughly how many bits per row does dictionary encoding need, and how many bytes in total (ignoring the dictionary)?</p>
+<table class="steps"><tr><th>Step 1</th><td>5 values need ⌈log₂ 5⌉ = 3 bits (2 bits cover only 4 values).</td></tr><tr><th>Step 2</th><td>1,000,000 × 3 bits = 3,000,000 bits = 375,000 bytes.</td></tr><tr><th>Answer</th><td>About 375 KB, against about 6.8 MB as text (average 6.8 bytes per city name, per our sample above).</td></tr><tr><th>Check</th><td>135,625 bytes for 20,000 rows is 6.78 bytes per row; × 1,000,000 = 6.78 MB.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Typical rule: land raw files as they come (bronze), but store everything downstream as Parquet (or Delta/Iceberg, which use Parquet inside) with zstd or snappy compression. Kafka topics use Avro or Protobuf with a registry.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> Parquet in the lake, Avro on Kafka.</li><li><strong>Data Analytics:</strong> Athena or BigQuery external tables over Parquet are cheaper than CSV.</li><li><strong>Machine Learning:</strong> training reads feature columns only; Parquet gives fast loading into pandas or Spark.</li><li><strong>MLOps:</strong> Arrow moves data between pandas, Spark and model servers without copies.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Expecting Parquet to speed up a query that reads all columns of unsorted data. Gains come from pruning, pushdown and compression. If you read everything, you get only the compression benefit.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does the Parquet footer hold? Answer: schema plus min/max/null stats per column chunk.</li><li>Which format fits Kafka messages with a schema registry? Answer: Avro (or Protobuf).</li><li>What is predicate pushdown? Answer: skipping row groups using min/max statistics before reading data.</li></ol>
+<h2 id="s3-3-3-compression-partitioning-and-the-small-file-problem">3.3 Compression, Partitioning and the Small-File Problem</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A library has books (data), a catalogue (metadata) and shelves labelled by year (partitions). If you want 2024 books, you walk to the 2024 shelf. If every page of every book is a separate sheet in a separate envelope (small files), you spend all day opening envelopes.</div></div>
+<h3>Compression codecs</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Codec</th><th>Speed</th><th>Size</th><th>Splittable alone?</th><th>Typical use</th></tr></thead><tbody><tr><td>snappy</td><td>very fast</td><td>medium</td><td>not by itself, but fine inside Parquet</td><td>default for Parquet in Spark</td></tr><tr><td>zstd</td><td>fast</td><td>smaller than snappy</td><td>inside Parquet yes</td><td>good modern default for cold and warm data</td></tr><tr><td>gzip</td><td>slow</td><td>small</td><td>no (a single .gz file cannot be split for parallel read)</td><td>archives, final delivery</td></tr><tr><td>lz4</td><td>extremely fast</td><td>larger</td><td>inside Parquet yes</td><td>real-time, Kafka</td></tr></tbody></table></div>
+<p>"Splittable" matters: a 5 GB <code>.csv.gz</code> file must be read by one task, so a cluster of 100 cores waits for one core. Inside Parquet, compression is applied per column page, so the file is still splittable at row-group boundaries.</p>
+<h3>Hive-style partitioning</h3>
+<p>Store data in folders named by a column value:</p>
+<pre class="code lang-text"><code>orders/
+  day=2024-01-01/part-0000.parquet
+  day=2024-01-02/part-0000.parquet
+  ...</code></pre>
+<p>A query with <code>WHERE day = '2024-01-05'</code> opens only that folder. This is <strong>partition pruning</strong>.</p>
+<h3>Predict, Run, Explain: partitions and the small-file problem</h3>
+<p>We write 20,000 rows split by day (28 days), and read one day. Then we compare one 20,000-line file against the same lines split across 2,000 tiny files. Before you run it: how many folders and rows will the day query read? Will 2,000 files be 2,000 times slower than one?</p>
+<pre class="code lang-python"><code>import os, tempfile, time, random
+random.seed(7)
+N = 20000
+rows = [(i, random.choice(['Pune','Mumbai','Delhi']), random.randint(1,28)) for i in range(N)]
+# partition by day
+base = tempfile.mkdtemp()
+for i, city, d in rows:
+    p = f"{base}/day=2024-01-{d:02d}"; os.makedirs(p, exist_ok=True)
+    with open(p + "/part.csv", "a") as f: f.write(f"{i},{city},{d}\n")
+parts = sorted(os.listdir(base)); print("partitions:", len(parts), parts[:3])
+n = sum(1 for _ in open(f"{base}/day=2024-01-05/part.csv"))
+print(f"query day=2024-01-05 reads 1 of {len(parts)} folders, {n} of {N} rows")
+# small files: same lines, 1 file vs 2000 files
+lines = [f"{i},{c},{d}\n" for i, c, d in rows]
+d1 = tempfile.mkdtemp(); open(d1 + "/one.csv", "w").writelines(lines)
+d2 = tempfile.mkdtemp()
+for k in range(2000): open(f"{d2}/p{k}.csv", "w").writelines(lines[k*10:(k+1)*10])
+def readall(d):
+    t = time.perf_counter(); n = 0
+    for fn in os.listdir(d):
+        with open(os.path.join(d, fn)) as f: n += sum(1 for _ in f)
+    return n, time.perf_counter() - t
+for lab, d in (("1 file", d1), ("2000 files", d2)):
+    n, t = readall(d); print(f"{lab:11s} lines={n} read_time={t*1000:.1f} ms")</code></pre>
+<p>Real output of exactly this code:</p>
+<pre class="code lang-text"><code>partitions: 28 ['day=2024-01-01', 'day=2024-01-02', 'day=2024-01-03']
+query day=2024-01-05 reads 1 of 28 folders, 716 of 20000 rows
+1 file      lines=20000 read_time=5.6 ms
+2000 files  lines=20000 read_time=3395.1 ms</code></pre>
+<p><strong>Explain.</strong></p>
+<ul><li>The day query touched 716 of 20,000 rows: 716 / 20,000 = 3.58%, close to the 1/28 = 3.57% you expect from 28 equal days. Pruning avoids reading the rest.</li><li>The same 20,000 lines took 5.6 ms from one file and 3,395.1 ms from 2,000 files: 3,395.1 / 5.6 = 606 times slower. The data size is identical. Every file costs an open, a metadata lookup and a task. On this laptop each file costs about 1.7 ms (3,395.1 / 2,000 = 1.70 ms); your machine will differ, but the pattern holds. On cloud object storage each file costs a network request of tens of milliseconds, and Spark schedules a task per file, so the damage is far worse.</li><li><em>Interpretation:</em> total work is <code>files × cost per file + bytes / throughput</code>. With tiny files the first term dominates. Aim for files of roughly 128 MB to 1 GB.</li></ul>
+<p><strong>Fixing small files (compaction):</strong> periodically run a job that reads many small files and writes fewer large ones (Spark <code>repartition</code>/<code>coalesce</code>, Delta <code>OPTIMIZE</code>, Iceberg <code>rewrite_data_files</code>). Prevent them by batching writes, not writing every minute into 1,000 partitions, and by tuning the number of output files.</p>
+<p><strong>Choosing a partition column.</strong> Good: low cardinality (few distinct values), used in filters, and gives files of decent size, such as date. Bad: <code>customer_id</code> (millions of folders), or a column no one filters on.</p>
+<p class="problem"><span class="pl">Problem 3.3.1</span> Daily data is 200 GB. You partition by <code>day</code> and <code>country</code> (50 countries). How big is an average file if each partition writes one file? Is it good?</p>
+<table class="steps"><tr><th>Formula</th><td>average file = daily size / (number of partitions that day)</td></tr><tr><th>Plug in</th><td>200 GB / 50</td></tr><tr><th>Compute</th><td>4 GB per file</td></tr><tr><th>Answer</th><td>4 GB average. Skew matters, but this is large, so split each partition into several files (for example 8, giving 512 MB each: 4 GB / 8 = 0.5 GB). That is fine.</td></tr><tr><th>Check</th><td>50 × 8 × 0.5 GB = 200 GB.</td></tr><tr><th>Why it matters</th><td>If instead you partition by <code>day</code>, <code>country</code>, <code>city</code> (about 5,000 pairs), then each file is 200 GB / 5,000 = 40 MB, and you have the small-file problem.</td></tr></table>
+<p class="problem"><span class="pl">Problem 3.3.2</span> An hourly job writes 1 file per partition into 24 hourly folders, each folder gets 500 MB a day in total. How many files per day, and what size each? After one year, how many files?</p>
+<table class="steps"><tr><th>Step 1</th><td>24 files per day, each 500 MB / 24 = 20.8 MB if volume is even.</td></tr><tr><th>Step 2</th><td>24 × 365 = 8,760 files in a year in this single table.</td></tr><tr><th>Answer</th><td>24 files/day of about 21 MB (too small) and 8,760 per year. Compact each day into 1 file of 500 MB: 365 files per year.</td></tr><tr><th>Check</th><td>365 × 500 MB = 182.5 GB a year of data either way; only the file count changes.</td></tr></table>
+<h3>Object storage: S3, ADLS, GCS</h3>
+<p>Cloud lakes live in <strong>object storage</strong>: Amazon S3, Azure Data Lake Storage Gen2 (ADLS), Google Cloud Storage (GCS). An object is a file plus metadata, addressed by a key (path). They are cheap, durable, and scale without limit, but are not a file system: renaming a "folder" is really copy-and-delete of every object, and listing millions of keys is slow.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Topic</th><th>Practice</th></tr></thead><tbody><tr><td>Layout</td><td><code>s3://company-lake/bronze/orders/ingest_date=2024-06-01/</code> (zone, dataset, partition)</td></tr><tr><td>Naming</td><td>lowercase, no spaces, stable; avoid millions of tiny files per prefix</td></tr><tr><td>Lifecycle policy</td><td>move to cheaper storage class after N days, delete temp data, expire old versions</td></tr><tr><td>Permissions</td><td>least privilege via IAM (AWS), RBAC (Azure), IAM (GCP); separate raw and curated buckets; no public buckets</td></tr><tr><td>Durability</td><td>built in; turn on versioning for accident recovery</td></tr></tbody></table></div>
+<h3>Connection to the real job</h3>
+<p>You will tune file sizes and partition columns on almost every lake project, and cost reports often point to "one table scans too much". Ask "is this table partitioned by what people filter on?"</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> compaction jobs, lifecycle rules, layout conventions.</li><li><strong>Data Analytics:</strong> queries on Athena/BigQuery external tables become cheaper with partition filters.</li><li><strong>FinOps:</strong> serverless engines bill per bytes scanned, so partition pruning is cost control.</li><li><strong>Machine Learning:</strong> reading training data by date range uses the same partitions.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Partitioning by a high-cardinality column such as <code>user_id</code>, creating millions of folders and tiny files. Partition by date (or similar), and use clustering or sorting inside files for the rest.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why is a single 5 GB .gz CSV slow on a cluster? Answer: gzip text cannot be split, so one task reads it all.</li><li>Ideal file size range? Answer: about 128 MB to 1 GB.</li><li>What is partition pruning? Answer: reading only the folders that match the filter.</li></ol>
+<h2 id="s4-3-4-table-formats-delta-lake-iceberg-hudi">3.4 Table Formats: Delta Lake, Iceberg, Hudi</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Plain files in a lake are like paper pages in a folder: you can add pages, but to change one sentence you must reprint the page, and if two people do it at once you get a mess. A table format adds a <strong>ledger</strong> (a log of "page added, page removed") so that changes are all-or-nothing and you can see the folder as it looked yesterday.</div></div>
+<h3>Why they exist</h3>
+<p>A lake of Parquet files has no transactions. A job that writes 100 files and fails at 60 leaves a half-written table that readers can see. You cannot do <code>UPDATE</code>, <code>DELETE</code> or <code>MERGE</code> safely. Table formats fix this by keeping <strong>immutable data files</strong> plus a <strong>commit log</strong> (metadata). A reader first reads the log to find which files make up the current version.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Feature</th><th>Meaning</th></tr></thead><tbody><tr><td>ACID on lakes</td><td>a commit becomes visible all at once</td></tr><tr><td>Time travel</td><td>read the table as of a version or timestamp</td></tr><tr><td>Schema evolution</td><td>add, rename, drop columns tracked in metadata</td></tr><tr><td>Upserts / MERGE</td><td>update rows by rewriting affected files (or writing delete files)</td></tr><tr><td>Compaction</td><td>merge small files, remove old ones</td></tr></tbody></table></div>
+<p>The three main formats: <strong>Delta Lake</strong> (born at Databricks; <code>_delta_log</code> folder of JSON and checkpoint files), <strong>Apache Iceberg</strong> (metadata tree of manifest files; engine-neutral; hidden partitioning), <strong>Apache Hudi</strong> (strong for incremental upserts and streaming ingestion). All three store data in Parquet. A <strong>catalog</strong> is the directory that maps a table name to its current metadata: Hive Metastore, Unity Catalog, AWS Glue, Nessie (Git-like versions), and the Iceberg REST catalog.</p>
+<h3>Predict, Run, Explain: a toy table format</h3>
+<p>This toy is <strong>not</strong> Delta Lake. It shows the core idea in a few lines: data files never change, and an ordered log of <code>add</code>/<code>remove</code> actions defines each version. Before you run it: after the UPDATE of id 2 from Delhi to Mumbai, which files make up the table? Can we still read version 0?</p>
+<pre class="code lang-python"><code>import json, os, tempfile
+root = tempfile.mkdtemp(); os.makedirs(root + "/_log")
+def write_file(name, rows): json.dump(rows, open(f"{root}/{name}", "w"))
+def commit(version, actions): json.dump(actions, open(f"{root}/_log/{version:03d}.json", "w"))
+def snapshot(as_of=None):
+    files = set()
+    for fn in sorted(os.listdir(root + "/_log")):
+        v = int(fn[:3])
+        if as_of is not None and v &gt; as_of: break
+        for a in json.load(open(f"{root}/_log/{fn}")):
+            (files.add if a["op"] == "add" else files.discard)(a["file"])
+    rows = []
+    for f in sorted(files): rows += json.load(open(f"{root}/{f}"))
+    return sorted(files), rows
+write_file("f1.json", [{"id":1,"city":"Pune"}, {"id":2,"city":"Delhi"}]); commit(0, [{"op":"add","file":"f1.json"}])
+write_file("f2.json", [{"id":3,"city":"Goa"}]);                           commit(1, [{"op":"add","file":"f2.json"}])
+# UPDATE id=2 -&gt; Mumbai: never edit a file. Rewrite f1 without id 2, write f3, commit both together.
+write_file("f1b.json", [{"id":1,"city":"Pune"}])
+write_file("f3.json",  [{"id":2,"city":"Mumbai"}])
+commit(2, [{"op":"remove","file":"f1.json"}, {"op":"add","file":"f1b.json"}, {"op":"add","file":"f3.json"}])
+for v in (0, 1, 2, None):
+    files, rows = snapshot(v); print("version", v, "files", files, "rows", [(r['id'], r['city']) for r in rows])</code></pre>
+<p>Real output (from running the same logic):</p>
+<pre class="code lang-text"><code>version 0 files ['f1.json'] rows [(1, 'Pune'), (2, 'Delhi')]
+version 1 files ['f1.json', 'f2.json'] rows [(1, 'Pune'), (2, 'Delhi'), (3, 'Goa')]
+version 2 files ['f1b.json', 'f2.json', 'f3.json'] rows [(1, 'Pune'), (3, 'Goa'), (2, 'Mumbai')]
+version None files ['f1b.json', 'f2.json', 'f3.json'] rows [(1, 'Pune'), (3, 'Goa'), (2, 'Mumbai')]</code></pre>
+<p><strong>Explain.</strong></p>
+<ul><li>Version 2's single commit removes <code>f1.json</code> and adds two files. Readers who read the log up to version 1 still see <code>f1.json</code>, which was never deleted from disk. That is <strong>time travel</strong>: version 0 still shows Delhi.</li><li>A crash between <code>write_file</code> calls and <code>commit(2, ...)</code> leaves orphan files that no version references. The table is unchanged: that is <strong>atomicity</strong>. Orphans are removed later by a cleanup job (Delta <code>VACUUM</code>, Iceberg <code>expire_snapshots</code>).</li><li>The final snapshot (<code>None</code> = latest) equals version 2. <strong>Check:</strong> the row count is 3 in versions 1 and 2, as expected for 1 update and 0 inserts after version 1.</li><li><em>Interpretation:</em> real formats add checkpoints (a summary of the log so that readers do not replay thousands of commits), statistics per file for skipping, and optimistic concurrency (two writers both try to write commit N; one wins, the other retries).</li></ul>
+<p>In Spark with Delta it looks like this (<strong>not run here</strong>):</p>
+<pre class="code lang-sql"><code>MERGE INTO silver.customers t USING updates s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET *
+WHEN NOT MATCHED THEN INSERT *;
+SELECT * FROM silver.customers VERSION AS OF 3;        -- time travel
+OPTIMIZE silver.customers;                             -- compaction</code></pre>
+<p class="problem"><span class="pl">Problem 3.4.1</span> A table has 1,000 files after 1,000 commits and each commit adds 1 file. A reader replays the log. How many log entries without a checkpoint, and with a checkpoint every 10 commits when the latest commit is number 1,000?</p>
+<table class="steps"><tr><th>Step 1</th><td>Without a checkpoint the reader replays all 1,000 commits.</td></tr><tr><th>Step 2</th><td>With a checkpoint at commit 1,000 (a multiple of 10), the reader reads the checkpoint (1 file) and zero later commits.</td></tr><tr><th>Answer</th><td>1,000 entries versus about 1 checkpoint read (at most 9 extra commits in other cases).</td></tr><tr><th>Check</th><td>The worst case is 9 commits after the latest checkpoint, since checkpoints come every 10.</td></tr></table>
+<p class="problem"><span class="pl">Problem 3.4.2</span> Choose a format: (a) streaming upserts from a database into a lake with a Databricks team; (b) a multi-engine setup using Spark, Trino and Snowflake reading the same tables; (c) heavy record-level updates on a large lake with incremental pulls.</p>
+<table class="steps"><tr><th>Step 1</th><td>(a) Delta Lake is the native fit.</td></tr><tr><th>Step 2</th><td>(b) Iceberg is designed for engine neutrality.</td></tr><tr><th>Step 3</th><td>(c) Hudi's design focuses on record-level upserts and incremental queries.</td></tr><tr><th>Answer</th><td>(a) Delta, (b) Iceberg, (c) Hudi. In practice all three keep converging, and many platforms can read more than one, so check what your engine supports.</td></tr><tr><th>Check</th><td>These are the usual associations, not rules. Verify features in the current documentation, since all three move fast.</td></tr></table>
+<h3>Query engines over lake data</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Engine</th><th>What it is</th><th>Use</th></tr></thead><tbody><tr><td>Spark SQL</td><td>distributed engine (Chapter 9)</td><td>big ETL</td></tr><tr><td>Trino / Presto</td><td>distributed SQL on many sources, no storage of its own</td><td>interactive queries over lakes</td></tr><tr><td>Athena</td><td>serverless Presto/Trino on S3, pay per bytes scanned</td><td>ad-hoc lake queries on AWS</td></tr><tr><td>DuckDB</td><td>in-process analytic engine (like SQLite for analytics)</td><td>local work, learning, tests, small to medium data</td></tr><tr><td>ClickHouse</td><td>columnar OLAP database</td><td>fast aggregations, logs, product analytics</td></tr><tr><td>Druid / Pinot</td><td>real-time OLAP stores</td><td>user-facing dashboards with sub-second queries on streams</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> MERGE-based CDC apply, GDPR deletes, compaction.</li><li><strong>Machine Learning:</strong> time travel gives reproducible training sets ("the table as of model v7 training").</li><li><strong>Analytics:</strong> one governed copy for BI and ML.</li><li><strong>MLOps:</strong> dataset versioning without copying data.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting maintenance. Without compaction and cleanup, a table format accumulates small files and old versions, and queries slow down while storage cost grows. Schedule <code>OPTIMIZE</code>/<code>VACUUM</code> (Delta) or rewrite/expire (Iceberg).</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What two things make a table format? Answer: immutable data files plus a commit log.</li><li>Why can readers still see old data after an update? Answer: old files stay until cleanup; the log lets you read an earlier version.</li><li>What is a catalog? Answer: the directory mapping table names to their current metadata.</li></ol>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>CSV and JSON have no types and many traps: quoting, encoding, leading zeros, nulls. Always give an explicit schema and parse with a real parser.</li><li>Parquet is columnar with row groups, column chunks and a footer of min/max stats, enabling column pruning and predicate pushdown.</li><li>Avro is row-based with a schema, ideal for Kafka plus a Schema Registry.</li><li>Column layouts compress better because neighbours are alike (dictionary and run-length encoding).</li><li>Partition by low-cardinality filter columns (like date). Prune partitions to cut bytes scanned.</li><li>Small files are slow: cost is files × per-file overhead. Compact to roughly 128 MB to 1 GB.</li><li>Object storage is cheap and durable but not a file system. Use layout conventions, lifecycle rules and least-privilege permissions.</li><li>Delta, Iceberg and Hudi add ACID, time travel and MERGE to lake files via a commit log; run compaction and cleanup.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Rule</th></tr></thead><tbody><tr><td>Bytes read</td><td>matching groups × group size × (columns read / total columns)</td></tr><tr><td>Files cost</td><td>files × per-file overhead + bytes / throughput</td></tr><tr><td>Target file size</td><td>128 MB to 1 GB</td></tr><tr><td>Dictionary bits</td><td>⌈log₂ distinct values⌉ per row</td></tr><tr><td>Partition column</td><td>low cardinality, used in filters (date)</td></tr><tr><td>Maintenance</td><td>OPTIMIZE / VACUUM (Delta), rewrite / expire (Iceberg)</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p><strong>1.</strong> (easy) Which format is human readable and has no types: Parquet, CSV, Avro? <strong>Answer:</strong> CSV.</p>
+<p><strong>2.</strong> (easy) A column has 4 distinct values. How many bits per row for dictionary encoding? <strong>Answer:</strong> ⌈log₂ 4⌉ = 2 bits.</p>
+<p><strong>3.</strong> What is printed? <code>int("0042")</code> <strong>Answer:</strong> 42. The leading zeros disappear.</p>
+<p><strong>4.</strong> A table is 1.2 TB in Parquet with 60 columns of similar size. A query reads 3 columns. About how much is read (ignoring pruning by rows)? <strong>Answer:</strong> 1.2 TB × 3 / 60 = 0.06 TB = 60 GB.</p>
+<p><strong>5.</strong> Find the bug: <code>df.write.partitionBy("customer_id").parquet(path)</code> on 5 million customers. <strong>Answer:</strong> 5 million folders and tiny files. Partition by date; use sorting or bucketing for customer_id.</p>
+<p><strong>6.</strong> A daily job writes 400 GB across 1,600 files. Average file size? <strong>Answer:</strong> 400 GB / 1,600 = 0.25 GB = 250 MB. Healthy.</p>
+<p><strong>7.</strong> The same job after a change writes 400 GB across 80,000 files. Size and problem? <strong>Answer:</strong> 400,000 MB / 80,000 = 5 MB each: small-file problem. Compact or reduce output partitions.</p>
+<p><strong>8.</strong> Why does Parquet min/max skipping fail on unsorted data? <strong>Answer:</strong> each row group then contains values across the full range, so min/max cannot exclude any group.</p>
+<p><strong>9.</strong> (interview) "What is the difference between a data lake and a lakehouse?" <strong>Answer:</strong> A lake is files in object storage with no transactions or table semantics. A lakehouse adds a table format (Delta, Iceberg, Hudi) giving ACID, schema enforcement, time travel and MERGE, so one copy of data serves both BI and ML.</p>
+<p><strong>10.</strong> (interview) "Explain Parquet internals." <strong>Answer:</strong> Columnar file made of row groups; each has one chunk per column, split into compressed pages with dictionary or run-length encoding; the footer has schema and min/max/null stats. Readers prune columns, push predicates down to skip groups, and read in parallel by row group.</p>
+<p><strong>11.</strong> (scenario) A nightly Spark job on 3 TB of <code>.csv.gz</code> takes 5 hours on 100 cores although most cores are idle. Why and what do you do? <strong>Answer:</strong> gzip text is not splittable, so each file is read by one task and a few huge files cause a long tail. Convert once to Parquet (zstd/snappy), partition by date, target 128 MB to 1 GB files, and read the Parquet in later jobs.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Explain the traps of CSV and JSON files (quoting, encoding, leading zeros, null versus empty, type guessing) with small Python examples. Show the wrong version and its result, then the fix. Then give me 6 practice problems with a corrupted CSV, no solutions, and review my answers one by one.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Explain how a Parquet file is laid out (row groups, column chunks, pages, footer statistics, dictionary and run-length encoding) with an analogy first. Then give me a calculation exercise about column pruning and predicate pushdown with real numbers, and wait for my answer before showing the steps.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: partitioning strategy, file sizes and the small-file problem in a data lake on S3 or ADLS. Describe a realistic scenario with daily volume and cardinalities, ask me to choose partition columns and compute file sizes, then critique my choice and explain compaction, lifecycle policies and cost.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am learning data engineering. Topic: Delta Lake, Apache Iceberg and Apache Hudi table formats (commit log, time travel, MERGE, compaction, catalogs). Explain with a ledger analogy, walk me through what happens on an UPDATE and on a failed write, then quiz me one question at a time on when to choose which format.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am applying for data engineering roles. Run a mock interview about file formats and lakehouse storage: Parquet internals, Avro and schema registry, compression and splittability, partitioning, small files, Delta versus Iceberg, DuckDB and Athena. Ask 8 questions one at a time, grade each answer 1 to 5, and show a model answer in simple English. My answers: [PASTE HERE]</pre></div><div class="readbtn"><button class="btn" data-read="study:de:ch03">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch02.html">← Chapter 2: Data Modeling for Analytics</a><a class="btn" href="ch04.html">Chapter 4: Ingestion Patterns →</a></div></div><script src="../../assets/study.js"></script></body></html>

@@ -1,0 +1,290 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 16: Project Lab, Part 2: An Analytics Case Study and a Query-Optimization Lab</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">SQL &amp; Databases Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 16</div><h1>Project Lab, Part 2: An Analytics Case Study and a Query-Optimization Lab</h1><p>Two more portfolio projects: answer twenty questions about a clinic and write findings you can defend, then take five slow queries and make them fast, with the plans and timings to prove it.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-16-1-project-a-20-question-sql-analytics-case-study-with-a-findings-report">16.1 Project: A 20-Question SQL Analytics Case Study with a Findings Report</a></li><li><a href="#s2-16-2-project-a-query-optimization-lab-from-slow-to-fast">16.2 Project: A Query-Optimization Lab, from Slow to Fast</a></li><li><a href="#s3-chapter-recap">Chapter recap</a></li><li><a href="#s4-practice-set">Practice set</a></li><li><a href="#s5-prompt-pack">Prompt pack</a></li></ol></details><p>Chapter 15 gave you the working method and three projects. This chapter adds two projects that show two different strengths. The first, a 20-question case study, shows that you can turn a pile of tables into a short report that separates real findings from noise. This is the daily work of a data analyst. The second, a query-optimization lab, shows that you understand why a query is slow, can read a query plan, and can fix it and measure the fix. We use the working method of section 15.1 (question, success criteria, layout, checks, README) without repeating it. All code was run with Python 3 and SQLite 3.50. Timings depend on the machine, so read them as ratios, not as promises.</p>
+<h2 id="s1-16-1-project-a-20-question-sql-analytics-case-study-with-a-findings-report">16.1 Project: A 20-Question SQL Analytics Case Study with a Findings Report</h2>
+<h3>Goal and why employers care</h3>
+<p>Question: <strong>a clinic loses money and patient time to missed appointments and long waits. What do the data say, and what should the clinic try first?</strong> Interviews and take-home tests for analyst roles are almost always this shape: a dataset, a list of questions, and a request for "your recommendations". Employers watch three things: correct SQL, sensible checking, and honest writing. A report that says "this difference may be noise" earns more trust than one that shouts every number.</p>
+<h3>Skills used</h3>
+<ul><li><code>GROUP BY</code>, <code>HAVING</code>, boolean sums: <em>Aggregation, GROUP BY, HAVING and FILTER</em> (Chapter 3).</li><li>Joins to doctors and patients: <em>Joins</em> (Chapter 4).</li><li>Bucketing with <code>CASE</code> and dates with <code>julianday</code> and <code>strftime</code>: <em>CASE, Strings, Dates and Times, JSON and Arrays</em> (Chapter 6).</li><li><code>RANK</code>, <code>LAG</code>, <code>ROW_NUMBER</code>: <em>Window Functions in Depth</em> (Chapter 8).</li><li>Data-quality thinking: <em>Analytics SQL Patterns</em> (Chapter 12).</li></ul>
+<h3>Data</h3>
+<p>Hospital-clinic appointments, generated. 12 doctors in 4 departments, 1,500 patients, 6,000 appointments in 2024. We plant two patterns: the longer ahead an appointment was booked, the more likely a no-show; and Monday has longer waits. Your SQL should find them. Save as <code>data/generate_data.py</code>.</p>
+<pre class="code lang-python"><code>import sqlite3, random, sys
+from datetime import date, timedelta
+random.seed(5)
+con = sqlite3.connect(sys.argv[1])
+con.executescript("""
+DROP TABLE IF EXISTS appointments; DROP TABLE IF EXISTS patients; DROP TABLE IF EXISTS doctors;
+CREATE TABLE doctors (doctor_id INTEGER PRIMARY KEY, name TEXT NOT NULL, department TEXT NOT NULL);
+CREATE TABLE patients (patient_id INTEGER PRIMARY KEY, age INTEGER NOT NULL, gender TEXT NOT NULL, city TEXT NOT NULL);
+CREATE TABLE appointments (
+  appt_id INTEGER PRIMARY KEY, patient_id INTEGER NOT NULL REFERENCES patients,
+  doctor_id INTEGER NOT NULL REFERENCES doctors,
+  booked_on TEXT NOT NULL, appt_date TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('attended','no_show','cancelled')),
+  wait_minutes INTEGER, fee REAL NOT NULL);
+""")
+depts = ["General","Cardiology","Orthopedics","Pediatrics"]
+con.executemany("INSERT INTO doctors VALUES (?,?,?)", [(i, f"Dr. {chr(64+i)}", depts[(i-1)%4]) for i in range(1,13)])
+con.executemany("INSERT INTO patients VALUES (?,?,?,?)",
+  [(i, random.randint(1,85), random.choice("MF"), random.choice(["North","South","East","West"])) for i in range(1,1501)])
+fees = {"General":300,"Cardiology":800,"Orthopedics":600,"Pediatrics":400}
+rows = []
+for a in range(1, 6001):
+    d = random.randint(1,12); dep = depts[(d-1)%4]
+    lead = random.choice([0,1,2,3,5,7,10,14,21,30])
+    appt = date(2024,1,1) + timedelta(days=random.randint(0,364))
+    booked = appt - timedelta(days=lead)
+    p_no = 0.06 + 0.012*lead + (0.05 if dep == "Pediatrics" else 0)
+    r = random.random()
+    if r &lt; p_no: st = "no_show"
+    elif r &lt; p_no + 0.08: st = "cancelled"
+    else: st = "attended"
+    wait = max(0, int(random.gauss(22 + 3*(d%4) + (10 if appt.weekday() == 0 else 0), 9))) if st == "attended" else None
+    rows.append((a, random.randint(1,1500), d, booked.isoformat(), appt.isoformat(), st, wait, fees[dep]))
+con.executemany("INSERT INTO appointments VALUES (?,?,?,?,?,?,?,?)", rows); con.commit()
+print(con.execute("select count(*) from appointments").fetchone())</code></pre>
+<pre class="code lang-text"><code>(6000,)</code></pre>
+<p>Note that <code>wait_minutes</code> is <code>NULL</code> for visits that did not happen. Remember that when averaging.</p>
+<h3>Architecture</h3>
+<pre class="code lang-text"><code>generate_data.py --&gt; clinic.db --&gt; sql/01_checks.sql --&gt; sql/02_questions.sql (Q1..Q20)
+                                                              |
+                                      tests/test_results.py --+--&gt; report/findings.md</code></pre>
+<h3>Step-by-step build</h3>
+<ol><li><strong>Check the data first</strong> (Q1 and Q2). Never start with the interesting questions.</li></ol>
+<pre class="code lang-sql"><code>SELECT (SELECT COUNT(*) FROM appointments) appts,
+       (SELECT COUNT(DISTINCT patient_id) FROM appointments) patients_seen,
+       (SELECT COUNT(*) FROM doctors) doctors;
+
+SELECT status, COUNT(*) n, ROUND(100.0*COUNT(*)/(SELECT COUNT(*) FROM appointments),1) pct
+FROM appointments GROUP BY status ORDER BY n DESC;</code></pre>
+<pre class="code lang-text"><code>appts  patients_seen  doctors
+-----  -------------  -------
+6000   1479           12
+
+status    n     pct
+--------  ----  ----
+attended  4428  73.8
+no_show   1057  17.6
+cancelled 515   8.6</code></pre>
+<p>Check: 4428 + 1057 + 515 = 6000. Of 1,500 patients, 1,479 came at least once, so 21 never booked. Not a bug, just a fact.</p>
+<ol><li><strong>The main question: who misses appointments?</strong> Q5 (department) and Q7 (booking lead time in bands). Predict before running: does a long wait between booking and visit raise no-shows?</li></ol>
+<pre class="code lang-sql"><code>-- Q5 No-show rate by department
+SELECT d.department, ROUND(100.0*SUM(a.status='no_show')/COUNT(*),1) no_show_pct, COUNT(*) n
+FROM appointments a JOIN doctors d USING(doctor_id)
+GROUP BY d.department ORDER BY no_show_pct DESC;
+
+-- Q7 No-show rate by lead-time band
+SELECT CASE WHEN lead&lt;=2 THEN '0-2 days' WHEN lead&lt;=7 THEN '3-7 days'
+            WHEN lead&lt;=14 THEN '8-14 days' ELSE '15+ days' END band,
+       ROUND(100.0*SUM(status='no_show')/COUNT(*),1) no_show_pct, COUNT(*) n
+FROM (SELECT status, CAST(julianday(appt_date)-julianday(booked_on) AS INTEGER) lead FROM appointments)
+GROUP BY band ORDER BY MIN(lead);</code></pre>
+<pre class="code lang-text"><code>department   no_show_pct  n
+-----------  -----------  ----
+Pediatrics   21.7         1472
+Orthopedics  16.4         1485
+General      16.4         1507
+Cardiology   16.0         1536
+
+band       no_show_pct  n
+---------  -----------  ----
+0-2 days   7.9          1754
+3-7 days   13.3         1830
+8-14 days  21.0         1229
+15+ days   35.0         1187</code></pre>
+<p>The lead-time effect is large and steady: 7.9% to 35.0%, a factor of 4.4, with at least 1,187 appointments in every band. Pediatrics is 5 points above the others on about 1,500 appointments, so it is also believable.</p>
+<ol><li><strong>Waiting time</strong> (Q8 to Q12). Use only attended visits. The median needs a window function because SQLite has no <code>MEDIAN</code>.</li></ol>
+<pre class="code lang-sql"><code>-- Q9 Average wait by weekday (SQLite: %w gives 0 = Sunday ... 1 = Monday)
+SELECT strftime('%w',appt_date) dow, ROUND(AVG(wait_minutes),1) avg_wait
+FROM appointments WHERE status='attended' GROUP BY dow ORDER BY avg_wait DESC LIMIT 3;
+
+-- Q11 Median wait
+SELECT wait_minutes AS median_wait FROM (
+  SELECT wait_minutes, ROW_NUMBER() OVER (ORDER BY wait_minutes) rn, COUNT(*) OVER () c
+  FROM appointments WHERE status='attended') WHERE rn=(c+1)/2;
+
+-- Q12 Share waiting over 45 minutes
+SELECT ROUND(100.0*SUM(wait_minutes&gt;45)/COUNT(*),1) pct_over_45, SUM(wait_minutes&gt;45) n
+FROM appointments WHERE status='attended';</code></pre>
+<pre class="code lang-text"><code>dow  avg_wait
+---  --------
+1    36.5
+0    26.3
+6    26.1
+
+median_wait
+-----------
+27
+
+pct_over_45  n
+-----------  ---
+4.5          200</code></pre>
+<p>Monday (<code>1</code>) waits 36.5 minutes against 26.3 for the next highest day (Sunday), a gap of 10 minutes. The median is 27 minutes. Q8 by department gives Orthopedics 32.1, Cardiology 29.2, General 25.9, Pediatrics 22.9.</p>
+<ol><li><strong>Money</strong> (Q13, Q14) and <strong>repeat no-shows</strong> (Q16, Q17).</li></ol>
+<pre class="code lang-sql"><code>-- Q14 Money lost to no-shows versus money earned
+SELECT SUM(fee) lost_to_no_shows,
+       (SELECT SUM(fee) FROM appointments WHERE status='attended') earned
+FROM appointments WHERE status='no_show';
+
+-- Q16, Q17 Patients with 2+ no-shows, and their share of all no-shows
+SELECT COUNT(*) patients FROM (SELECT patient_id FROM appointments
+  WHERE status='no_show' GROUP BY patient_id HAVING COUNT(*)&gt;=2);
+SELECT ROUND(100.0*SUM(c)/(SELECT COUNT(*) FROM appointments WHERE status='no_show'),1) pct_of_no_shows
+FROM (SELECT COUNT(*) c FROM appointments WHERE status='no_show' GROUP BY patient_id HAVING COUNT(*)&gt;=2);</code></pre>
+<pre class="code lang-text"><code>lost_to_no_shows  earned
+----------------  -------
+545300.0          2340600.0
+
+patients
+--------
+229
+
+pct_of_no_shows
+---------------
+49.5</code></pre>
+<p>Lost fees are 545,300 against 2,340,600 earned: of all fees that were booked and not cancelled, 545300 / (545300 + 2340600) = 18.9% were lost. And 229 patients (about 15% of 1,500) cause 49.5% of no-shows, but be careful: in this data every patient has the same no-show chance, so people who happen to have 2 or more are simply the unlucky ones. Do not call them "serial offenders" without more evidence.</p>
+<ol><li><strong>The other questions</strong> are variants of the same shapes. This table lists all 20 with the real answers.</li></ol>
+<div class="tablewrap"><table class="data"><thead><tr><th>#</th><th>Question</th><th>Answer from the data</th></tr></thead><tbody><tr><td>1</td><td>Rows, patients, doctors</td><td>6,000; 1,479; 12</td></tr><tr><td>2</td><td>Status split</td><td>73.8% attended, 17.6% no-show, 8.6% cancelled</td></tr><tr><td>3</td><td>Three busiest months</td><td>May 540, July 536, August 520</td></tr><tr><td>4</td><td>Busiest weekday</td><td>Monday 911, Sunday 863, Friday 861</td></tr><tr><td>5</td><td>No-show by department</td><td>Pediatrics 21.7%, others 16.0 to 16.4%</td></tr><tr><td>6</td><td>No-show by lead days</td><td>7.2% at 0 days up to 37.6% at 30 days</td></tr><tr><td>7</td><td>Lead-time bands</td><td>7.9%, 13.3%, 21.0%, 35.0%</td></tr><tr><td>8</td><td>Wait by department</td><td>Orthopedics 32.1 minutes is the longest</td></tr><tr><td>9</td><td>Wait by weekday</td><td>Monday 36.5 minutes</td></tr><tr><td>10</td><td>Longest-wait doctors</td><td>Dr. C 32.4, Dr. K 32.1, Dr. G 31.8</td></tr><tr><td>11</td><td>Median wait</td><td>27 minutes</td></tr><tr><td>12</td><td>Waiting over 45 minutes</td><td>4.5% (200 visits)</td></tr><tr><td>13</td><td>Fees earned by department</td><td>Cardiology 920,000 is the largest</td></tr><tr><td>14</td><td>Lost to no-shows</td><td>545,300</td></tr><tr><td>15</td><td>No-show by age group</td><td>18.9% (0-17), 18.3%, 16.6%, 16.7% (60+)</td></tr><tr><td>16</td><td>Patients with 2+ no-shows</td><td>229</td></tr><tr><td>17</td><td>Their share of no-shows</td><td>49.5%</td></tr><tr><td>18</td><td>Month with biggest change in no-show rate</td><td>October, 16.2%, down 2.4 points</td></tr><tr><td>19</td><td>Top doctor per department (attended)</td><td>F, E, K, D (385, 401, 380, 356)</td></tr><tr><td>20</td><td>Same-day bookings</td><td>9.7% of all; no-show 7.2% against 18.7% for the rest</td></tr></tbody></table></div>
+<p>Reconcile: department fees in Q13 add up to 920,000 + 669,600 + 409,600 + 341,400 = 2,340,600, equal to the <code>earned</code> column in Q14.</p>
+<ol><li><strong>Write the findings report</strong> (<code>report/findings.md</code>). One page, in this order: the three findings with numbers, the recommendations, the limits.</li></ol>
+<pre class="code lang-text"><code># Clinic findings, 2024 (6,000 appointments)
+1. Booking far ahead drives no-shows: 7.9% when booked 0-2 days ahead, 35.0% at 15+ days.
+2. Monday waits are 10 minutes longer than other days (36.5 vs about 26).
+3. 545,300 in fees was lost to no-shows (18.9% of booked, non-cancelled fees).
+Recommend: reminder calls for appointments booked 15+ days ahead; add one Monday slot
+for the longest-wait department; test, do not assume, that reminders help.
+Limits: synthetic data; no cause is proven; age differences (about 2 points on ~1,400
+visits) are too small to act on; one year only.</code></pre>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li>All 20 questions have a query, a result and a one-line answer.</li><li>Status counts add to 6,000; department fees add to total fees.</li><li>Each finding in the report shows its group size.</li><li>At least one difference is explicitly labelled as too small to trust.</li><li>The report has recommendations that each point to a finding, and a limits section.</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Averaging <code>NULL</code> waits as zero.</strong> If you replaced <code>NULL</code> with 0 the average would drop. Detect: count rows with <code>COUNT(wait_minutes)</code> versus <code>COUNT(*)</code>.</li><li><strong>Comparing groups of very different size.</strong> A 40% rate on 10 visits means little. Always print <code>n</code> next to a rate.</li><li><strong>Reading noise as a pattern.</strong> Age groups differ by about 2 points. With about 1,400 visits per group the usual random wobble of a rate near 18% is about 1 point (<code>√(0.18 × 0.82 / 1400) ≈ 0.010</code>), so a 2-point gap is borderline. Say so.</li><li><strong>Causation language.</strong> "Long lead causes no-shows" needs an experiment. Write "is associated with".</li><li><strong>Wrong weekday numbering.</strong> SQLite <code>%w</code> starts at 0 for Sunday; other databases differ (Chapter 14). Detect: check one known date by hand.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Add a <code>reminders</code> table and compare no-shows with and without a reminder, with group sizes.</li><li>Build a rule-based risk score (lead band plus department) and test how many no-shows the top 20% of scores catch.</li><li>Re-run the study on a PostgreSQL copy and list every query you had to change (Chapter 14).</li></ol>
+<h3>Interview talking points</h3>
+<ol><li><em>How do you decide whether a difference is real?</em> First look at group size. Then compare the gap with the usual random wobble of that rate. Large, steady, many-group patterns (like lead time) are credible; a small gap on one split is not.</li><li><em>Why separate attended visits when computing waits?</em> Visits that did not happen have no wait. Putting them in as zero would make waits look shorter than they are.</li><li><em>What would you do after the report?</em> Propose a small test, such as reminders for long-lead bookings in one department, and measure no-shows against a comparison group before rolling it out.</li></ol>
+<h3>README outline</h3>
+<p>Title with the finding; question; data and generator; how to run; the 20-question table with answers; three findings; checks (sums reconcile); the report link; limits; extensions.</p>
+<h2 id="s2-16-2-project-a-query-optimization-lab-from-slow-to-fast">16.2 Project: A Query-Optimization Lab, from Slow to Fast</h2>
+<h3>Goal and why employers care</h3>
+<p>Question: <strong>why is this query slow, what is the smallest change that fixes it, and how do I prove the fix?</strong> Anyone can add an index at random. Employers want someone who measures first, reads the plan, changes one thing at a time, and also counts the cost of the fix. This lab is the best way to practise the measure-first method of <em>Indexes, EXPLAIN and Query Optimization</em> (Chapter 10).</p>
+<h3>Skills used</h3>
+<ul><li>B-tree indexes, composite, covering: Chapter 10, sections on indexes.</li><li>Reading plans: <code>EXPLAIN QUERY PLAN</code> (SQLite's version of <code>EXPLAIN</code>, Chapter 10).</li><li>Sargable filters (a filter the index can use) and <code>EXISTS</code>: <em>Subqueries and CTEs</em> (Chapter 5).</li><li>Timing method and checking that the result did not change.</li></ul>
+<h3>Data</h3>
+<p>200,000 orders over two years and 20,000 customers. Generated with a seed so the table always holds the same rows. Save as <code>data/setup.py</code>.</p>
+<pre class="code lang-python"><code>import sqlite3, random, sys
+from datetime import date, timedelta
+random.seed(1)
+con = sqlite3.connect(sys.argv[1])
+con.executescript("""
+DROP TABLE IF EXISTS orders; DROP TABLE IF EXISTS customers;
+CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, name TEXT, city TEXT, email TEXT);
+CREATE TABLE orders (order_id INTEGER PRIMARY KEY, customer_id INTEGER, order_date TEXT, status TEXT, amount REAL);
+""")
+cities = ["Pune","Delhi","Mumbai","Chennai","Kolkata","Jaipur","Surat","Indore"]
+con.executemany("INSERT INTO customers VALUES (?,?,?,?)",
+  [(i, f"Customer {i}", random.choice(cities), f"user{i}@example.com") for i in range(1, 20001)])
+base = date(2023,1,1); st = ["paid"]*85 + ["refunded"]*5 + ["cancelled"]*10
+rows = [(i, random.randint(1,20000), (base+timedelta(days=random.randint(0,729))).isoformat(),
+         random.choice(st), round(random.uniform(5,500),2)) for i in range(1, 200001)]
+con.executemany("INSERT INTO orders VALUES (?,?,?,?,?)", rows); con.commit()
+print(con.execute("select count(*) from orders").fetchone(), con.execute("select count(*) from customers").fetchone())</code></pre>
+<pre class="code lang-text"><code>(200000,) (20000,)</code></pre>
+<h3>Architecture</h3>
+<pre class="code lang-text"><code>setup.py --&gt; lab.db --&gt; bench.py "before" --&gt; (apply ONE fix) --&gt; bench.py "after"
+                              |                                        |
+                       plan + best-of-5 ms                       plan + best-of-5 ms
+                              +----------------&gt; results table + README</code></pre>
+<h3>Step-by-step build</h3>
+<ol><li><strong>Write the measuring helper.</strong> Time each query five times and keep the best (the best run has the least interference from other programs). Print the plan with it. Save as <code>bench.py</code>; the five queries are named Q1 to Q5.</li></ol>
+<pre class="code lang-python"><code>import sqlite3, time
+con = sqlite3.connect("lab.db")
+def timeit(sql, n=5):
+    best = 1e9
+    for _ in range(n):
+        t = time.perf_counter(); rows = con.execute(sql).fetchall()
+        best = min(best, time.perf_counter() - t)
+    return best * 1000, rows
+def report(label, sql, n=5):
+    ms, rows = timeit(sql, n)
+    print(f"[{label}] best of {n}: {ms:9.2f} ms   result={rows[0] if rows else None}")
+    for r in con.execute("EXPLAIN QUERY PLAN " + sql): print("    plan:", r[3])
+
+Q1 = "SELECT * FROM orders WHERE customer_id = 777"
+Q2_BEFORE = "SELECT COUNT(*) FROM orders WHERE substr(order_date,1,7)='2024-03'"
+Q2_AFTER  = "SELECT COUNT(*) FROM orders WHERE order_date&gt;='2024-03-01' AND order_date&lt;'2024-04-01'"
+Q3_BEFORE = ("SELECT COUNT(*) FROM customers c WHERE c.customer_id&lt;=300 AND "
+             "(SELECT COUNT(*) FROM orders o WHERE o.customer_id=c.customer_id AND o.status='paid')&gt;0")
+Q3_AFTER  = ("SELECT COUNT(*) FROM customers c WHERE c.customer_id&lt;=300 AND "
+             "EXISTS (SELECT 1 FROM orders o WHERE o.customer_id=c.customer_id AND o.status='paid')")
+Q4 = ("SELECT order_id,order_date,amount FROM orders WHERE status='paid' "
+      "ORDER BY order_date DESC, order_id DESC LIMIT 10")
+Q5 = ("SELECT customer_id, SUM(amount) s FROM orders WHERE status='paid' AND order_date&gt;='2024-01-01' "
+      "GROUP BY customer_id ORDER BY s DESC LIMIT 5")</code></pre>
+<ol><li><strong>Baseline.</strong> With only primary keys, run the five queries. Predict: which will be slowest, and what will the plan word be? (Q3 asks for "has at least one paid order" but is written as a count inside a loop, for only the first 300 customers, because for all 20,000 it would run for minutes.)</li></ol>
+<pre class="code lang-text"><code>[Q1 one customer] best of 5:      4.30 ms   result=(2261, 777, '2023-01-23', 'paid', 445.99)
+    plan: SCAN orders
+[Q2 month via substr()] best of 5:     10.81 ms   result=(8487,)
+    plan: SCAN orders
+[Q3 correlated COUNT, 300 customers] best of 1:   1603.07 ms   result=(300,)
+    plan: SEARCH c USING INTEGER PRIMARY KEY (rowid&lt;?)
+    plan: CORRELATED SCALAR SUBQUERY 1
+    plan: SCAN o
+[Q4 latest 10 paid] best of 5:     12.25 ms   result=(198707, '2024-12-30', 88.14)
+    plan: SCAN orders
+    plan: USE TEMP B-TREE FOR ORDER BY
+[Q5 top spenders 2024] best of 5:     31.15 ms   result=(19943, 4865.79)
+    plan: SCAN orders
+    plan: USE TEMP B-TREE FOR GROUP BY
+    plan: USE TEMP B-TREE FOR ORDER BY</code></pre>
+<p><code>SCAN orders</code> means "read every row, like reading a whole ledger to find one name". Q3 is the worst: for each of the 300 customers the inner query does a full <code>SCAN o</code> of 200,000 rows, about 60 million row reads in total.</p>
+<ol><li><strong>Fix one thing at a time, and re-measure after each.</strong></li></ol>
+<pre class="code lang-sql"><code>CREATE INDEX ix_orders_cust_status ON orders(customer_id, status);   -- Q1 and Q3
+CREATE INDEX ix_orders_date        ON orders(order_date);             -- Q2
+CREATE INDEX ix_orders_status_date ON orders(status, order_date);     -- Q4
+CREATE INDEX ix_orders_cover       ON orders(status, order_date, customer_id, amount);  -- Q5</code></pre>
+<p>Results after each (plans abridged to the key line):</p>
+<pre class="code lang-text"><code>Q1  0.01 ms   SEARCH orders USING INDEX ix_orders_cust_status (customer_id=?)
+Q3  0.12 ms   SEARCH o USING COVERING INDEX ix_orders_cust_status (customer_id=? AND status=?)
+Q3  0.06 ms   same plan, rewritten with EXISTS
+Q2  8.82 ms   SCAN orders USING COVERING INDEX ix_orders_date      &lt;- substr() hides the column
+Q2  0.15 ms   SEARCH orders USING COVERING INDEX ix_orders_date (order_date&gt;? AND order_date&lt;?)
+Q4  0.01 ms   SEARCH orders USING INDEX ix_orders_status_date (status=?)   (no temp B-tree)
+Q5  19.82 ms  SEARCH orders USING COVERING INDEX ix_orders_cover (status=? AND order_date&gt;?)
+              USE TEMP B-TREE FOR GROUP BY / FOR ORDER BY</code></pre>
+<p>Look at Q2 carefully. Adding the index alone moved it from 10.81 to 8.82 ms, almost no gain, because <code>substr(order_date,1,7)</code> wraps the column in a function and the index cannot be searched. The plan still says <code>SCAN</code>. Only the rewrite to a date range (called <strong>sargable</strong>, from "search ARGument able") made it a <code>SEARCH</code> and gave 0.15 ms.</p>
+<ol><li><strong>The summary table.</strong> This is the main exhibit in your README. Speed-up = before / after.</li></ol>
+<div class="tablewrap"><table class="data"><thead><tr><th>Query</th><th>Problem</th><th>Fix</th><th>Before (ms)</th><th>After (ms)</th><th>Speed-up</th></tr></thead><tbody><tr><td>Q1 one customer</td><td>full scan</td><td>index on <code>customer_id</code></td><td>4.30</td><td>0.01</td><td>about 430x</td></tr><tr><td>Q2 one month</td><td>function on column</td><td>range filter + index</td><td>10.81</td><td>0.15</td><td>about 72x</td></tr><tr><td>Q3 has-paid-order loop</td><td>scan inside a loop</td><td>index; <code>EXISTS</code></td><td>1603.07</td><td>0.06</td><td>about 27,000x</td></tr><tr><td>Q4 latest 10 paid</td><td>scan + sort</td><td>composite index</td><td>12.25</td><td>0.01</td><td>about 1,200x</td></tr><tr><td>Q5 top spenders</td><td>scan + group</td><td>covering index</td><td>31.15</td><td>19.82</td><td>1.6x</td></tr></tbody></table></div>
+<p>Q1 and Q4 have timer limits: 0.01 ms is near the clock's resolution, so say "much faster than 1 ms", not "430x exactly". Q5 shows an honest small win: the index removed the full scan but the grouping and sorting still happen, as the two <code>TEMP B-TREE</code> lines say.</p>
+<ol><li><strong>Count the cost.</strong> Indexes make writes slower. Bulk-insert 200,000 rows into an in-memory table with 0, 1 and 4 of those indexes (best of 3):</li></ol>
+<pre class="code lang-text"><code>0 extra indexes: bulk insert of 200,000 rows =      96 ms
+1 extra indexes: bulk insert of 200,000 rows =     200 ms
+4 extra indexes: bulk insert of 200,000 rows =     583 ms</code></pre>
+<p>Four indexes made the load about 6 times slower (583 / 96 = 6.1). Whether that is acceptable depends on the work: a reporting table loaded once a night loves indexes; a table written constantly may not.</p>
+<ol><li><strong>Check the answers did not change.</strong> Every "after" result equals its "before" result (8487 rows in March, 300 customers, same top spender). A fast wrong answer is worthless.</li></ol>
+<h3>Evaluation and acceptance criteria</h3>
+<ul><li>Each of the five queries has a before plan, an after plan, before and after timings, and an identical result.</li><li>At least one query is fixed by rewriting (Q2), and at least one by an index alone (Q1).</li><li>The README states the timing method (best of 5) and the machine caveat.</li><li>The write cost of the indexes is measured and discussed.</li><li>One failed or weak fix is reported honestly (Q5 at 1.6x).</li></ul>
+<h3>Common pitfalls</h3>
+<ol><li><strong>Function on an indexed column</strong> (<code>substr</code>, <code>LOWER</code>, date functions). Detect: the plan still says <code>SCAN</code>. Fix: compare the raw column to a range or build an expression index.</li><li><strong>Wrong column order in a composite index.</strong> <code>(status, order_date)</code> helps <code>WHERE status=... ORDER BY order_date</code>; the reverse order would not. Detect: the plan shows <code>USE TEMP B-TREE FOR ORDER BY</code>.</li><li><strong><code>ORDER BY</code> with ties.</strong> In my first run of Q4 without the tie-breaker <code>order_id</code>, the "latest" row was id 1007 before the index and id 85648 after it. Many orders share the date 2024-12-30, so the database may return any of them. Add a unique tie-breaker column.</li><li><strong>Timing a cold, one-time run.</strong> The first run may include disk caching. Detect: repeat; take the best of several.</li><li><strong>Adding every index you can think of.</strong> Detect: measure bulk-load time and index count; drop indexes the plans never use.</li></ol>
+<h3>Three extensions</h3>
+<ol><li>Add a <code>LIKE 'abc%'</code> query and a <code>LIKE '%abc'</code> query; compare plans and explain why only one can use an index.</li><li>Create a partial index on <code>status='paid'</code> and measure its size against the full index (Chapter 10).</li><li>Repeat the lab on PostgreSQL with <code>EXPLAIN ANALYZE</code> and compare the plan words (not run here).</li></ol>
+<h3>Interview talking points</h3>
+<ol><li><em>A query is slow. What do you do first?</em> Measure it and read the plan. I look for a full scan, a sort I did not expect, or a function wrapped around a column. I change one thing, then measure again.</li><li><em>Why did the index not help the <code>substr()</code> query?</em> The index is sorted by the raw date text. A function on the column hides that order, so the database must compute the function for every row. Writing a date range lets it jump straight to the right place.</li><li><em>What is the cost of an index?</em> Every insert, update and delete must also update each index, and the index takes disk space. In my lab four indexes made a bulk load about six times slower.</li></ol>
+<h3>README outline</h3>
+<p>Title with best speed-up; question; data and setup; timing method; summary table; before and after plans for each query; write-cost test; lessons (sargable, column order, tie-breaker); limits (single machine, SQLite, synthetic data); extensions.</p>
+<h2 id="s3-chapter-recap">Chapter recap</h2>
+<ul><li>A case study answers a list of questions, but the product is the one-page report: findings with group sizes, recommendations, limits.</li><li>Always print the group size next to a rate. Small groups and small gaps are noise until proven otherwise.</li><li>Average only the rows where the value exists; <code>NULL</code> waits are not zeros.</li><li>A median needs a window function in SQLite: <code>ROW_NUMBER</code> and <code>COUNT(*) OVER ()</code>.</li><li>Optimization is measure, read the plan, change one thing, measure again, and check the result is identical.</li><li><code>SCAN</code> means every row is read; <code>SEARCH ... USING INDEX</code> means the database jumped to the right place.</li><li>A function on an indexed column blocks the index; rewrite the filter as a range.</li><li>Indexes cost write time and space: measure both sides.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Code idea</th></tr></thead><tbody><tr><td>Rate with group size</td><td><code>ROUND(100.0*SUM(cond)/COUNT(*),1), COUNT(*)</code></td></tr><tr><td>Bucket a number</td><td><code>CASE WHEN x&lt;=2 THEN '0-2' ... END</code></td></tr><tr><td>Median in SQLite</td><td><code>ROW_NUMBER() OVER (ORDER BY x)</code> and <code>rn=(c+1)/2</code></td></tr><tr><td>Show the plan</td><td><code>EXPLAIN QUERY PLAN &lt;query&gt;</code></td></tr><tr><td>Sargable month filter</td><td><code>d&gt;='2024-03-01' AND d&lt;'2024-04-01'</code></td></tr><tr><td>Composite for filter + sort</td><td><code>CREATE INDEX i ON t(filter_col, sort_col)</code></td></tr><tr><td>Stable top-N</td><td>add a unique tie-breaker to <code>ORDER BY</code></td></tr></tbody></table></div>
+<h2 id="s4-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 16.P.1</span> (easy) 1,057 of 6,000 appointments are no-shows. What percent is that? <strong>Answer:</strong> 1057 / 6000 = 0.17617, so 17.6%.</p>
+<p class="problem"><span class="pl">Problem 16.P.2</span> (easy) What does <code>SCAN orders</code> in a plan mean, and what is the better word to see? <strong>Answer:</strong> The database reads every row of the table. <code>SEARCH orders USING INDEX ...</code> is better because it jumps to matching rows.</p>
+<p class="problem"><span class="pl">Problem 16.P.3</span> (easy) A table has 100 visits and 20 have <code>wait_minutes</code> NULL. Waits of the other 80 add to 2,400 minutes. What is <code>AVG(wait_minutes)</code>? What would it be if NULL were treated as 0? <strong>Answer:</strong> <code>AVG</code> ignores NULL: 2400 / 80 = 30. Treating NULL as 0 gives 2400 / 100 = 24, which wrongly understates the wait.</p>
+<p class="problem"><span class="pl">Problem 16.P.4</span> (medium) Rewrite for an index: <code>WHERE strftime('%Y', order_date) = '2024'</code>. <strong>Answer:</strong> <code>WHERE order_date &gt;= '2024-01-01' AND order_date &lt; '2025-01-01'</code>. The raw column is compared with a range, so an index on <code>order_date</code> can be searched.</p>
+<p class="problem"><span class="pl">Problem 16.P.5</span> (medium) Which index best serves <code>WHERE status='paid' ORDER BY order_date DESC LIMIT 10</code>? <strong>Answer:</strong> <code>CREATE INDEX i ON orders(status, order_date)</code>. The first column handles the equality filter and the second is already sorted, so no sort is needed.</p>
+<p class="problem"><span class="pl">Problem 16.P.6</span> (medium) Find the bug: "Afternoon visits have a 20% no-show rate against 14% in the morning, so move all visits to the morning." The afternoon has 15 visits. <strong>Answer:</strong> 20% of 15 is 3 visits, far too few to trust. Also this shows association, not cause. Get more data or a test before acting.</p>
+<p class="problem"><span class="pl">Problem 16.P.7</span> (interview) Your index made one report 50 times faster but the nightly load now takes twice as long. What do you do? <strong>Answer:</strong> Measure both. Options: drop indexes the plans do not use, make the index partial, drop and recreate it around the bulk load, or accept the trade if the report gain matters more. Decide with numbers, and write them down.</p>
+<p class="problem"><span class="pl">Problem 16.P.8</span> (interview, scenario) A manager asks, "Reminders cost money. Do they reduce no-shows?" You only have this year's data with no reminder column. What do you answer? <strong>Answer:</strong> The data cannot answer it. We can show that no-shows rise with booking lead time and suggest a small test: send reminders to a random half of long-lead bookings in one department, then compare no-show rates with group sizes.</p>
+<h2 id="s5-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data analyst roles. I am building a 20-question SQL case study on a dataset of clinic appointments (status, booking lead time, waiting minutes, fees). Help me choose good questions in easy, medium and hard order, and teach me how to write the one-page findings report with numbers, recommendations and limits. Ask me one question at a time and check my understanding.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data analyst roles. Review my findings report from a SQL case study. Check each claim for group size, noise versus real pattern, causal wording that goes too far, and numbers that do not reconcile. Rewrite the weakest paragraph in simple English and tell me what a hiring manager would still ask. My report and my queries: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data analyst roles. Teach me to read SQLite EXPLAIN QUERY PLAN output: SCAN, SEARCH, COVERING INDEX, USE TEMP B-TREE and CORRELATED SCALAR SUBQUERY. Use a 200,000-row orders table with real numbers, explain each plan line in plain words, and after every idea ask me to predict the plan for a new query before showing it.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data analyst roles. Review my query-optimization lab: my five slow queries, the plans, the timings, the indexes and my summary table. Tell me where my method is weak (timing, ties, one change at a time, result checks, write cost) and which fix I should have tried instead. My lab notes: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for data analyst interviews. Run a mock interview on my two projects, a clinic analytics case study and a query-optimization lab. Ask me eight questions one at a time, from easy to hard, about my choices, my checks and my limits. After each answer, score me out of 5, show what I missed, and give a short model answer in simple English.</pre></div><div class="readbtn"><button class="btn" data-read="study:sql:ch16">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch15.html">← Chapter 15: Project Lab, Part 1: Funnels, Cohorts, R</a><a class="btn" href="appendix.html">Appendix: Cheat Sheet →</a></div></div><script src="../../assets/study.js"></script></body></html>

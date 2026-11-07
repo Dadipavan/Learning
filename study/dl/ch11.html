@@ -1,0 +1,351 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 11: Transformers from Scratch</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Deep Learning &amp; Computer Vision</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 11</div><h1>Transformers from Scratch</h1><p>Self-attention with real numbers, multi-head attention, positional encodings, and a complete tiny GPT forward pass in NumPy.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-11-1-self-attention-by-hand">11.1 Self-Attention by Hand</a></li><li><a href="#s2-11-2-causal-masking-and-multi-head-attention">11.2 Causal Masking and Multi-Head Attention</a></li><li><a href="#s3-11-3-positional-encodings-telling-the-model-word-order">11.3 Positional Encodings: Telling the Model Word Order</a></li><li><a href="#s4-11-4-the-transformer-block-and-a-complete-tiny-gpt">11.4 The Transformer Block and a Complete Tiny GPT</a></li><li><a href="#s5-11-5-a-mini-gpt-in-pytorch-not-run-here">11.5 A Mini-GPT in PyTorch (Not Run Here)</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p>Almost every modern AI system you will meet at work is a transformer: the language models behind chatbots, the vision models in Chapter 12, the speech and image generators in Chapter 13. In Chapter 10 you saw why recurrent networks struggled: they read one word at a time and forget. A transformer reads all the words at once and lets each word look directly at every other word. This chapter builds that idea from the bottom. First you will compute self-attention by hand with a 3-word sentence and tiny numbers. Then you will scale it up to multiple heads, add word-order information, and run a complete two-layer GPT forward pass in NumPy that you can read in one screen. By the end you will be able to explain every tensor shape in a transformer, which is a classic interview test. How these models are <em>used</em> (prompts, APIs, fine-tuning) lives in the GenAI document: see <code>study/genai/03_how_llms_work.md</code>. Here we build the engine.</p>
+<div class="callout blue"><div class="lab">PROFESSOR'S NOTE</div><div class="txt">All NumPy code and outputs in this chapter were really run. The PyTorch mini-GPT in Section 11.5 is marked "not run here" because PyTorch is not installed in the environment that wrote this document. Run it yourself and compare with the NumPy version.</div></div>
+<h2 id="s1-11-1-self-attention-by-hand">11.1 Self-Attention by Hand</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Imagine a meeting with three people. Each person has a question in mind ("who knows about the delivery schedule?"), a name badge describing what they know, and some actual information to share. Each person compares their question with everyone's badge, decides how much to listen to each, and then writes a summary that is a weighted mix of what people said. That is self-attention. The question is the <strong>query</strong>, the badge is the <strong>key</strong>, the information is the <strong>value</strong>.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Token</td><td>One piece of the input (a word or part of a word; for images, a patch)</td></tr><tr><td>Embedding</td><td>A vector of numbers that represents one token</td></tr><tr><td><code>d</code> (or <code>d_model</code>)</td><td>The length of that vector (the "width" of the model)</td></tr><tr><td>Query <code>Q</code>, Key <code>K</code>, Value <code>V</code></td><td>Three different vectors made from each token by three weight matrices</td></tr><tr><td>Score</td><td>How well a query matches a key (a dot product)</td></tr><tr><td>Softmax</td><td>Turns a list of scores into positive weights that add up to 1 (see your Math PDF)</td></tr></tbody></table></div>
+<h3>How it works</h3>
+<p>Start with a matrix <code>X</code> with one row per token. Three learned weight matrices turn it into three new matrices:</p>
+<pre class="code lang-text"><code>Q = X·Wq      K = X·Wk      V = X·Wv
+scores  = Q·Kᵀ / √d_k
+weights = softmax(scores)   (softmax over each row)
+output  = weights · V</code></pre>
+<p>Row <code>i</code> of <code>scores</code> says how much token <code>i</code> matches every token <code>j</code>. Softmax makes each row a set of weights that add to 1. The output for token <code>i</code> is the weighted average of all value vectors. The division by <code>√d_k</code> (where <code>d_k</code> is the length of a key vector) is explained in Problem 11.1.2.</p>
+<p><strong>The running example for this chapter:</strong> three tokens "the", "cat", "sat", each a 2-number vector, so <code>d = 2</code>. In real models <code>d</code> is 768 or 4096; the arithmetic is identical, only larger.</p>
+<p class="problem"><span class="pl">Problem 11.1.1</span> Compute self-attention for <code>X = [[1,0],[0,1],[1,1]]</code> with <code>Wq = [[1,0],[0,1]]</code>, <code>Wk = [[1,1],[0,1]]</code>, <code>Wv = [[2,0],[0,3]]</code>.</p>
+<table class="steps"><tr><th>Formula</th><td><code>Q = X·Wq</code>, <code>K = X·Wk</code>, <code>V = X·Wv</code>, then <code>softmax(Q·Kᵀ/√2)·V</code>.</td></tr><tr><th>Step 1</th><td><code>Q = X</code> (because <code>Wq</code> is the identity): rows <code>(1,0), (0,1), (1,1)</code>. <code>K = X·Wk</code>: row 1 is <code>(1·1+0·0, 1·1+0·1) = (1,1)</code>; row 2 is <code>(0,1)</code>; row 3 is <code>(1, 1+1) = (1,2)</code>. <code>V = X·Wv</code>: rows <code>(2,0), (0,3), (2,3)</code>.</td></tr><tr><th>Step 2</th><td>Scores <code>Q·Kᵀ</code>. Row 1: <code>(1,0)·(1,1) = 1</code>, <code>(1,0)·(0,1) = 0</code>, <code>(1,0)·(1,2) = 1</code>. Row 2: <code>1, 1, 2</code>. Row 3: <code>2, 1, 3</code>.</td></tr><tr><th>Step 3</th><td>Divide by <code>√2 = 1.4142</code>. Row 1 becomes <code>(0.7071, 0, 0.7071)</code>.</td></tr><tr><th>Step 4</th><td>Softmax of row 1: <code>e^0.7071 = 2.0281</code>, <code>e^0 = 1</code>, <code>e^0.7071 = 2.0281</code>. The sum is <code>5.0562</code>. Weights: <code>2.0281/5.0562 = 0.4011</code>, <code>1/5.0562 = 0.1978</code>, <code>0.4011</code>.</td></tr><tr><th>Step 5</th><td>Output row 1 <code>= 0.4011·(2,0) + 0.1978·(0,3) + 0.4011·(2,3) = (0.8022+0+0.8022, 0+0.5934+1.2033) = (1.6044, 1.7967)</code>.</td></tr><tr><th>Answer</th><td>"the" attends 40% to itself, 20% to "cat", 40% to "sat", and its new vector is <code>(1.6044, 1.7967)</code>.</td></tr><tr><th>Check</th><td>Each weight row must add to 1: <code>0.4011 + 0.1978 + 0.4011 = 1.0000</code>. The code prints the same.</td></tr><tr><th>Interpretation</th><td>The output for "the" is no longer just about "the". It is a blend of the whole sentence, mixed according to how well the query matched each key. This is how a word like "it" can pull in information from the noun it refers to.</td></tr></table>
+<p>Before you run it, predict: row 3 has the biggest score for token 3 (3 versus 2 and 1). Will its weight on itself be above or below 0.5?</p>
+<pre class="code lang-python"><code>import numpy as np
+np.set_printoptions(precision=4, suppress=True)
+def softmax(z, axis=-1):
+    z = z - z.max(axis=axis, keepdims=True)       # subtract max: avoids overflow
+    e = np.exp(z); return e / e.sum(axis=axis, keepdims=True)
+X  = np.array([[1.,0.],[0.,1.],[1.,1.]])
+Wq = np.array([[1.,0.],[0.,1.]])
+Wk = np.array([[1.,1.],[0.,1.]])
+Wv = np.array([[2.,0.],[0.,3.]])
+Q, K, V = X@Wq, X@Wk, X@Wv
+S = Q @ K.T / np.sqrt(2)
+A = softmax(S)
+print("scaled scores\n", S); print("weights\n", A, A.sum(1)); print("output\n", A @ V)</code></pre>
+<pre class="code lang-text"><code>scaled scores
+ [[0.7071 0.     0.7071]
+ [0.7071 0.7071 1.4142]
+ [1.4142 0.7071 2.1213]]
+weights
+ [[0.4011 0.1978 0.4011]
+ [0.2483 0.2483 0.5035]
+ [0.284  0.14   0.576 ]] [1. 1. 1.]
+output
+ [[1.6044 1.7967]
+ [1.5035 2.2552]
+ [1.7199 2.148  ]]</code></pre>
+<p><strong>Line by line:</strong> <code>softmax</code> subtracts the row maximum first. This does not change the answer (the same number is removed from top and bottom) but stops <code>exp</code> from overflowing; real libraries do the same. <code>Q @ K.T</code> gives all 9 scores at once. <code>A @ V</code> is the weighted average for all tokens at once. Row 3 puts <code>0.576</code> on itself: above 0.5, as predicted. Our hand numbers match.</p>
+<p class="problem"><span class="pl">Problem 11.1.2</span> Why divide by <code>√d_k</code>? Look at what happens to the size of a dot product as <code>d_k</code> grows.</p>
+<table class="steps"><tr><th>Step 1</th><td>If query and key entries are random numbers with mean 0 and variance 1, a dot product of length <code>d</code> is a sum of <code>d</code> such products. The sum of <code>d</code> independent terms of variance 1 has variance <code>d</code>, so its standard deviation is <code>√d</code>.</td></tr><tr><th>Step 2</th><td>So with <code>d = 64</code> the scores spread about 8 units; with <code>d = 512</code> about 22. Softmax of numbers that far apart gives one weight near 1 and the rest near 0. Then the gradient is nearly zero (you saw this "saturation" in Chapter 4).</td></tr><tr><th>Step 3</th><td>Dividing by <code>√d</code> brings the standard deviation back to 1. Run the check below.</td></tr><tr><th>Answer</th><td>The scale keeps scores at a stable size so softmax stays soft and learning continues.</td></tr><tr><th>Check</th><td>Measured standard deviations: 2.0 (d=4), 8.03 (d=64), 22.54 (d=512), close to <code>√d</code> = 2, 8, 22.6. After dividing, all are 1.0.</td></tr><tr><th>Interpretation</th><td>Without scaling, big models would train badly. A tiny detail, a big effect.</td></tr></table>
+<pre class="code lang-python"><code>rng = np.random.default_rng(0)
+for d in (4, 64, 512):
+    q = rng.standard_normal((20000, d)); k = rng.standard_normal((20000, d))
+    dots = (q * k).sum(1)
+    print(d, "std of dot", dots.std().round(2), " scaled", (dots / np.sqrt(d)).std().round(2))
+z = np.array([1., 2., 3.]) * 8
+print(softmax(z), softmax(z / 8))</code></pre>
+<pre class="code lang-text"><code>4 std of dot 2.0  scaled 1.0
+64 std of dot 8.03  scaled 1.0
+512 std of dot 22.54  scaled 1.0
+[0.     0.0003 0.9997] [0.09   0.2447 0.6652]</code></pre>
+<p>The last line shows the problem: scores <code>(8, 16, 24)</code> give weights <code>(0, 0.0003, 0.9997)</code> (almost one-hot, no gradient), while <code>(1, 2, 3)</code> gives a healthy <code>(0.09, 0.2447, 0.6652)</code>.</p>
+<figure><img src="images/self_attention.svg" alt="Self-attention: each token's query is compared with every key, softmax gives weights, and the weights mix the values" loading="lazy"/><figcaption>Self-attention: each token's query is compared with every key, softmax gives weights, and the weights mix the values</figcaption></figure>
+<p>How to read it: three tokens go in. Each makes a query (<code>q</code>), a key (<code>k</code>) and a value (<code>v</code>). The grid in the middle is the score matrix, one cell per (query token, key token) pair. Each row is passed through softmax so it sums to 1. The right side shows each output as the weighted sum of the three value vectors.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Query/key score</td><td><code>Q @ K.T</code></td><td>The heart of every LLM, ViT and CLIP text encoder</td></tr><tr><td>Softmax weights</td><td>Row <code>(0.40, 0.20, 0.40)</code></td><td>Attention maps you can plot to explain a model</td></tr><tr><td><code>Wq, Wk, Wv</code></td><td>Three <code>d×d</code> matrices</td><td>Most of the parameters in a transformer layer</td></tr><tr><td>Scale <code>1/√d_k</code></td><td>Constant</td><td>A reason models train stably</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Language models:</strong> a word's meaning depends on other words ("bank" in "river bank" versus "bank loan").</li><li><strong>Vision:</strong> every image patch attends to every other patch (Chapter 12).</li><li><strong>Speech and time series:</strong> a time step attends to relevant earlier steps.</li><li><strong>Recommendation:</strong> a user's history items attend to each other to build a taste vector.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Mixing up the softmax axis. Softmax must be taken over the <em>keys</em> (each row sums to 1). If you softmax over the wrong axis, the code still runs and the shapes still match, but the model is wrong. Always print <code>weights.sum(-1)</code> and check it is all 1.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What do the rows of the weight matrix sum to? Answer: 1 each.</li><li>Which matrix is multiplied by the weights: Q, K or V? Answer: V.</li><li>Why subtract the row maximum inside softmax? Answer: to avoid overflow in <code>exp</code>; the result does not change.</li></ol>
+<h2 id="s2-11-2-causal-masking-and-multi-head-attention">11.2 Causal Masking and Multi-Head Attention</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A model that writes text one word at a time must not peek at the future words. It is like an exam: the answer to question 3 cannot use the answer key to question 4. A <strong>mask</strong> blocks the forbidden cells. Separately, one attention pattern is not enough: one person may track grammar, another may track who is who. <strong>Multi-head attention</strong> runs several smaller attentions side by side so each can specialise.</div></div>
+<h3>Causal mask</h3>
+<p>Before softmax, set every score above the diagonal (a token looking at a later token) to <code>−∞</code>. Then <code>e^(−∞) = 0</code>, so those weights become exactly 0 and the remaining weights still sum to 1. Models that generate text (GPT style) use this; models that only read (BERT style) do not.</p>
+<p class="problem"><span class="pl">Problem 11.2.1</span> Apply a causal mask to the scores of Problem 11.1.1.</p>
+<table class="steps"><tr><th>Formula</th><td><code>scaled score[i][j] = −∞ if j &gt; i</code>, then softmax per row.</td></tr><tr><th>Step 1</th><td>Row 1 can see only token 1, so its weights are <code>(1, 0, 0)</code>.</td></tr><tr><th>Step 2</th><td>Row 2 sees tokens 1 and 2 with scores <code>(0.7071, 0.7071)</code>: equal, so weights <code>(0.5, 0.5, 0)</code>.</td></tr><tr><th>Step 3</th><td>Row 3 sees all three, so it is unchanged: <code>(0.284, 0.14, 0.576)</code>.</td></tr><tr><th>Answer</th><td>The causal weight matrix is <code>[[1,0,0],[0.5,0.5,0],[0.284,0.14,0.576]]</code>, and the output for token 1 is just its own value <code>(2, 0)</code>; for token 2 it is <code>0.5·(2,0) + 0.5·(0,3) = (1, 1.5)</code>.</td></tr><tr><th>Check</th><td>The earlier code run printed exactly these outputs: <code>[[2, 0], [1, 1.5], [1.7199, 2.148]]</code>.</td></tr><tr><th>Interpretation</th><td>Token 3 sees the whole past, token 1 sees only itself. During training, one pass computes the "predict the next word" task for every position at once, and the mask guarantees no cheating.</td></tr></table>
+<pre class="code lang-python"><code>mask = np.triu(np.ones((3, 3), bool), 1)         # True above the diagonal
+Sm = np.where(mask, -np.inf, S)
+print(softmax(Sm)); print(softmax(Sm) @ V)</code></pre>
+<pre class="code lang-text"><code>[[1.    0.    0.   ]
+ [0.5   0.5   0.   ]
+ [0.284 0.14  0.576]]
+[[2.    0.    ]
+ [1.    1.5   ]
+ [1.7199 2.148 ]]</code></pre>
+<h3>Multi-head attention</h3>
+<p>Instead of one attention with <code>d</code>-wide vectors, split the width into <code>H</code> heads of size <code>d_h = d / H</code>. Each head has its own view of <code>Q, K, V</code>. Concatenate the head outputs and mix them with one more matrix <code>Wo</code>.</p>
+<p class="problem"><span class="pl">Problem 11.2.2</span> Trace the tensor shapes for batch <code>B=2</code>, <code>T=5</code> tokens, <code>d=8</code>, <code>H=2</code> heads.</p>
+<table class="steps"><tr><th>Step 1</th><td>Input <code>x</code> is <code>(B, T, d) = (2, 5, 8)</code>. <code>x·Wq</code> is still <code>(2, 5, 8)</code>.</td></tr><tr><th>Step 2</th><td>Reshape to <code>(B, T, H, d_h) = (2, 5, 2, 4)</code> and swap axes to <code>(B, H, T, d_h) = (2, 2, 5, 4)</code>. Each head is now its own small attention problem.</td></tr><tr><th>Step 3</th><td>Scores <code>q·kᵀ</code> have shape <code>(B, H, T, T) = (2, 2, 5, 5)</code>: one <code>T×T</code> grid per head per example.</td></tr><tr><th>Step 4</th><td>Weights times <code>v</code> give <code>(2, 2, 5, 4)</code>. Swap back and reshape (concatenate) to <code>(2, 5, 8)</code>. Multiply by <code>Wo</code> (<code>8×8</code>) to get <code>(2, 5, 8)</code>.</td></tr><tr><th>Answer</th><td>Input and output shapes are identical, <code>(2, 5, 8)</code>, so layers can be stacked.</td></tr><tr><th>Check</th><td>The code prints each shape. Parameters: four <code>d×d</code> matrices (<code>Wq, Wk, Wv, Wo</code>) give <code>4d²</code>: 256 for <code>d=8</code>, and 2,359,296 for <code>d=768</code> (BERT-base width), independent of the number of heads.</td></tr><tr><th>Interpretation</th><td>More heads do not add parameters; they split the same width into several smaller viewpoints. The <code>(T, T)</code> grid is why long inputs get expensive (Section 11.4).</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+np.set_printoptions(precision=4, suppress=True)
+def softmax(z, axis=-1):
+    z = z - z.max(axis=axis, keepdims=True); e = np.exp(z); return e/e.sum(axis=axis, keepdims=True)
+rng = np.random.default_rng(0)
+B, T, D, H = 2, 5, 8, 2
+x = rng.standard_normal((B, T, D))
+Wq, Wk, Wv, Wo = [rng.standard_normal((D, D)) * 0.3 for _ in range(4)]
+def split_heads(t):                       # (B,T,D) -&gt; (B,H,T,dh)
+    return t.reshape(B, T, H, D // H).transpose(0, 2, 1, 3)
+q, k, v = split_heads(x @ Wq), split_heads(x @ Wk), split_heads(x @ Wv)
+s = q @ k.transpose(0, 1, 3, 2) / np.sqrt(D // H)
+print("scores", s.shape)
+a = softmax(s)
+print("attention", a.shape, "row sums", a.sum(-1).min(), a.sum(-1).max())
+heads = a @ v
+print("per-head output", heads.shape)
+concat = heads.transpose(0, 2, 1, 3).reshape(B, T, D)
+print("concatenated", concat.shape)
+out = concat @ Wo
+print("final", out.shape)
+print("params of one attention layer, D=8:", 4*D*D, "; D=768:", 4*768*768)</code></pre>
+<pre class="code lang-text"><code>scores (2, 2, 5, 5)
+attention (2, 2, 5, 5) row sums 0.9999999999999998 1.0000000000000002
+per-head output (2, 2, 5, 4)
+concatenated (2, 5, 8)
+final (2, 5, 8)
+params of one attention layer, D=8: 256 ; D=768: 2359296</code></pre>
+<p>The row sums are 1 up to floating-point rounding (<code>0.9999999999999998</code>), which is normal.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Causal mask</td><td><code>triu(ones, 1)</code> set to <code>−inf</code></td><td>GPT-style generation and training</td></tr><tr><td>No mask</td><td>all cells visible</td><td>BERT, ViT, CLIP image encoder</td></tr><tr><td>Heads</td><td>12 heads of size 64 for <code>d=768</code></td><td>Reading model configs (<code>num_heads</code>)</td></tr><tr><td><code>(B,H,T,T)</code></td><td>Attention tensor</td><td>The memory problem that FlashAttention fixes</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>Text generation (GenAI):</strong> causal mask in every chat model.</li><li><strong>Text understanding:</strong> unmasked attention for classification and search embeddings.</li><li><strong>Interpretability:</strong> visualising head patterns to debug why a model made an error.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reshaping <code>(B, T, D)</code> straight to <code>(B, H, T, d_h)</code> without the transpose. It runs without error, but you have mixed tokens and heads: the first "head" now holds pieces of different tokens. Always reshape to <code>(B, T, H, d_h)</code> first, then transpose.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What value does the causal mask put on forbidden scores? Answer: <code>−∞</code>, so softmax gives 0.</li><li>For <code>d=768</code> and 12 heads, what is <code>d_h</code>? Answer: 64.</li><li>Do more heads (same <code>d</code>) mean more parameters in attention? Answer: no, still <code>4d²</code>.</li></ol>
+<h2 id="s3-11-3-positional-encodings-telling-the-model-word-order">11.3 Positional Encodings: Telling the Model Word Order</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">If you cut a sentence into word cards and throw them on a table, self-attention treats the pile the same no matter the order: "dog bites man" and "man bites dog" look identical. We must stamp each card with its position. It is like numbering the pages of a book before shuffling.</div></div>
+<p class="problem"><span class="pl">Problem 11.3.1</span> Show that attention alone ignores order.</p>
+<table class="steps"><tr><th>Step 1</th><td>Take the 3 tokens of Problem 11.1.1 and reorder them as rows <code>(2, 0, 1)</code>.</td></tr><tr><th>Step 2</th><td>Compute attention on the reordered input and compare with reordering the original output.</td></tr><tr><th>Answer</th><td>They are identical (the test printed <code>True</code> when I ran it): shuffling the input just shuffles the output the same way.</td></tr><tr><th>Check</th><td>Only the <em>content</em> of each row matters, never its place.</td></tr><tr><th>Interpretation</th><td>Word order must be injected from outside. There are three common ways.</td></tr></table>
+<h3>Method 1: sinusoidal (the original paper)</h3>
+<p>Add to each token's embedding a fixed vector built from sines and cosines of different speeds. For position <code>pos</code> and pair index <code>i</code>:</p>
+<pre class="code lang-text"><code>PE[pos, 2i]   = sin(pos / 10000^(2i/d))
+PE[pos, 2i+1] = cos(pos / 10000^(2i/d))</code></pre>
+<p>Early dimensions change fast (like the seconds hand of a clock), later ones slowly (the hour hand). Together they give each position a unique pattern, like a time of day.</p>
+<p class="problem"><span class="pl">Problem 11.3.2</span> Compute <code>PE</code> for positions 0 to 3 with <code>d = 4</code>.</p>
+<table class="steps"><tr><th>Formula</th><td>pairs <code>i=0</code> (columns 0,1, divisor <code>10000^0 = 1</code>) and <code>i=1</code> (columns 2,3, divisor <code>10000^(2/4) = 100</code>).</td></tr><tr><th>Step 1</th><td>Position 0: <code>sin(0)=0, cos(0)=1, sin(0)=0, cos(0)=1</code> gives <code>(0, 1, 0, 1)</code>.</td></tr><tr><th>Step 2</th><td>Position 1: <code>sin(1)=0.8415, cos(1)=0.5403, sin(0.01)=0.01, cos(0.01)=1.0</code> gives <code>(0.8415, 0.5403, 0.01, 1.0)</code>.</td></tr><tr><th>Step 3</th><td>Position 2: <code>sin(2)=0.9093, cos(2)=−0.4161, sin(0.02)=0.02, cos(0.02)=0.9998</code>.</td></tr><tr><th>Answer</th><td>The table printed below matches. Columns 0-1 spin quickly; columns 2-3 barely move.</td></tr><tr><th>Check</th><td>Every <code>sin/cos</code> pair lies on a circle: <code>0.8415² + 0.5403² = 0.7081 + 0.2919 = 1</code>.</td></tr><tr><th>Interpretation</th><td>Position 1 and position 2 get different vectors, so the model can tell them apart.</td></tr></table>
+<h3>Method 2: learned positions</h3>
+<p>Make a table <code>pos_embedding[position]</code> of trainable vectors, exactly like word embeddings. GPT-2 and BERT do this. Simple, but the model has no vectors for positions longer than the table.</p>
+<h3>Method 3: RoPE and ALiBi (modern models)</h3>
+<p><strong>RoPE</strong> (rotary position embedding) does not add anything. It <em>rotates</em> each <code>(q, k)</code> pair of numbers by an angle that grows with position. The dot product of a rotated query and rotated key then depends only on the <em>distance</em> between the two tokens. <strong>ALiBi</strong> adds a penalty to the score that grows with distance: <code>score − slope × distance</code>. Many open models use RoPE; it is the default idea worth knowing.</p>
+<p class="problem"><span class="pl">Problem 11.3.3</span> Show that RoPE depends on relative distance. Take <code>q = (1, 2)</code>, <code>k = (0.5, −1)</code>. Rotate <code>q</code> by angle <code>m</code> radians and <code>k</code> by angle <code>n</code> radians, then take the dot product.</p>
+<table class="steps"><tr><th>Formula</th><td>rotation by angle <code>a</code>: <code>(x, y) → (x·cos a − y·sin a, x·sin a + y·cos a)</code>.</td></tr><tr><th>Step 1</th><td>Plain dot product, no rotation: <code>1·0.5 + 2·(−1) = −1.5</code>.</td></tr><tr><th>Step 2</th><td>Positions <code>(3, 1)</code>, distance 2. Positions <code>(10, 8)</code>, distance 2. Positions <code>(100, 98)</code>, distance 2.</td></tr><tr><th>Step 3</th><td>By geometry, a dot product equals <code>|q||k|cos(angle between)</code>. Rotating both by the same amount keeps the angle between them, only the difference <code>m − n</code> matters.</td></tr><tr><th>Answer</th><td>All three give <code>−1.194375</code>.</td></tr><tr><th>Check</th><td>By hand: <code>|q||k| = √5 × √1.25 = 2.5</code>. The angle between them is <code>(−63.43° + n·57.30°) − (63.43° + m·57.30°)</code>, with <code>m − n = 2</code> this is <code>−126.87° − 114.59° = −241.46°</code>, and <code>cos(−241.46°) = −0.4777</code>. So <code>2.5 × (−0.4777) = −1.194</code>.</td></tr><tr><th>Interpretation</th><td>The model sees "these two tokens are 2 apart" regardless of where in the text they are. That helps it handle long texts better than fixed tables.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+np.set_printoptions(precision=4, suppress=True)
+def sinpe(T, d):
+    pos = np.arange(T)[:, None]; i = np.arange(d // 2)[None, :]
+    ang = pos / 10000 ** (2 * i / d)
+    pe = np.zeros((T, d)); pe[:, 0::2] = np.sin(ang); pe[:, 1::2] = np.cos(ang)
+    return pe
+print(sinpe(4, 4))
+pe = sinpe(50, 16)
+print(round(pe[5] @ pe[8], 4), round(pe[20] @ pe[23], 4), round(pe[5] @ pe[20], 4))
+def rot(v, pos, theta=1.0):
+    c, s = np.cos(pos * theta), np.sin(pos * theta)
+    return np.array([c * v[0] - s * v[1], s * v[0] + c * v[1]])
+q = np.array([1., 2.]); k = np.array([0.5, -1.])
+for m, n in [(3, 1), (10, 8), (100, 98)]:
+    print("rope positions", m, n, "dot", round(rot(q, m) @ rot(k, n), 6))
+print("plain dot", q @ k)
+T = 4; slope = 0.5
+dist = np.arange(T)[:, None] - np.arange(T)[None, :]
+print(np.where(dist &gt;= 0, -slope * dist, -np.inf))</code></pre>
+<pre class="code lang-text"><code>[[ 0.      1.      0.      1.    ]
+ [ 0.8415  0.5403  0.01    1.    ]
+ [ 0.9093 -0.4161  0.02    0.9998]
+ [ 0.1411 -0.99    0.03    0.9996]]
+5.5431 5.5431 4.2192
+rope positions 3 1 dot -1.194375
+rope positions 10 8 dot -1.194375
+rope positions 100 98 dot -1.194375
+plain dot -1.5
+[[-0.  -inf -inf -inf]
+ [-0.5 -0.  -inf -inf]
+ [-1.  -0.5 -0.  -inf]
+ [-1.5 -1.  -0.5 -0. ]]</code></pre>
+<p><strong>Line by line:</strong> the sinusoidal dot products <code>5.5431</code> for positions <code>(5,8)</code> and <code>(20,23)</code> are equal (same distance 3) and differ from <code>(5,20)</code>: the table itself carries a relative-distance signal. The ALiBi matrix is the bias added to scores: zero for the token itself, <code>−0.5</code> per step back, <code>−∞</code> (the causal mask) for the future.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Method</th><th>Used by</th><th>Strength</th><th>Weakness</th></tr></thead><tbody><tr><td>Sinusoidal</td><td>original Transformer</td><td>No parameters</td><td>Weaker on long texts</td></tr><tr><td>Learned</td><td>BERT, GPT-2</td><td>Simple</td><td>Fixed maximum length</td></tr><tr><td>RoPE</td><td>many open LLMs</td><td>Relative distance, good extension</td><td>More code</td></tr><tr><td>ALiBi</td><td>some LLMs</td><td>Cheap, extends to longer text</td><td>Fixed penalty shape</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>LLM context extension:</strong> changing RoPE scaling lets a model read longer texts (check the model's documentation; details vary).</li><li><strong>Vision transformers:</strong> learned 2-D position tables for patches (Chapter 12).</li><li><strong>Time series transformers:</strong> time-of-day features act as positional encodings.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting that position information must be added at the <em>input</em> (sinusoidal or learned) or inside attention (RoPE, ALiBi). A transformer with neither works as a bag of words and will fail on tasks that depend on order, without any error message.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why does a plain transformer need positional information? Answer: attention treats the input as an unordered set.</li><li>What does RoPE's dot product depend on? Answer: only the distance between the two positions.</li><li>What happens to ALiBi's penalty as distance grows? Answer: it grows linearly, so far tokens get lower scores.</li></ol>
+<h2 id="s4-11-4-the-transformer-block-and-a-complete-tiny-gpt">11.4 The Transformer Block and a Complete Tiny GPT</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A transformer block is two workers in a row. The first (attention) lets tokens talk to each other. The second (the feed-forward network) lets each token think alone about what it heard. Around each worker sit a <strong>residual</strong> (a bypass: add the input back, so nothing is lost) and a <strong>layer norm</strong> (a volume knob that keeps the numbers in a sane range). Stack the block many times: you have a GPT.</div></div>
+<h3>Parts</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Part</th><th>What it does</th><th>Reminder</th></tr></thead><tbody><tr><td>Layer norm</td><td>For each token, subtract its mean and divide by its standard deviation over the <code>d</code> numbers, then scale and shift</td><td>Like batch norm from Chapter 3, but per token, so it works with any batch size</td></tr><tr><td>Residual</td><td><code>x + f(x)</code></td><td>The skip idea from Chapter 6 (ResNet)</td></tr><tr><td>Feed-forward network (FFN)</td><td><code>W2 · gelu(W1 · x)</code> with width usually <code>4d</code></td><td>Two dense layers; GELU is a smooth ReLU</td></tr><tr><td>Pre-norm</td><td>Layer norm <em>before</em> attention/FFN</td><td>More stable than the original post-norm in deep models</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 11.4.1</span> Layer-normalise the token vector <code>(1, 2, 3, 6)</code>.</p>
+<table class="steps"><tr><th>Formula</th><td><code>(x − mean) / √(variance + ε)</code>, with <code>ε = 1e-5</code> to avoid dividing by zero.</td></tr><tr><th>Step 1</th><td>Mean <code>= (1+2+3+6)/4 = 3</code>. Variance <code>= ((−2)² + (−1)² + 0² + 3²)/4 = (4+1+0+9)/4 = 3.5</code>.</td></tr><tr><th>Step 2</th><td><code>√3.5 = 1.8708</code>. So <code>(1−3)/1.8708 = −1.069</code>, <code>(2−3)/1.8708 = −0.5345</code>, <code>0</code>, <code>(6−3)/1.8708 = 1.6036</code>.</td></tr><tr><th>Answer</th><td><code>(−1.069, −0.5345, 0, 1.6036)</code>.</td></tr><tr><th>Check</th><td>The code output below matches; the result has mean 0 (the numbers sum to zero).</td></tr><tr><th>Interpretation</th><td>Whatever the size of the incoming numbers, each token leaves the layer norm on the same scale. Training stays stable.</td></tr></table>
+<h3>The tiny GPT</h3>
+<p>Now assemble everything. This model has vocabulary <code>V = 11</code>, context <code>T = 6</code>, width <code>d = 16</code>, 4 heads, FFN width 64 and 2 layers. The weights are random (no training), so the <em>shapes and logic</em> are what matter. Read <code>block</code> first, it is the whole idea.</p>
+<p>Before you run it, predict: for an untrained model that guesses uniformly over 11 tokens, what should the loss be close to? (Hint: <code>ln 11</code>.)</p>
+<pre class="code lang-python"><code>import numpy as np
+np.set_printoptions(precision=4, suppress=True)
+def softmax(z, axis=-1):
+    z = z - z.max(axis=axis, keepdims=True); e = np.exp(z); return e / e.sum(axis=axis, keepdims=True)
+def layernorm(x, g, b, eps=1e-5):
+    m = x.mean(-1, keepdims=True); v = x.var(-1, keepdims=True)
+    return g * (x - m) / np.sqrt(v + eps) + b
+gelu = lambda x: 0.5 * x * (1 + np.tanh(np.sqrt(2 / np.pi) * (x + 0.044715 * x**3)))
+
+print("LN of [1,2,3,6]:", layernorm(np.array([[1., 2., 3., 6.]]), 1, 0))
+
+rng = np.random.default_rng(1)
+V, T, D, H, F, L = 11, 6, 16, 4, 64, 2      # vocab, context, width, heads, FFN width, layers
+def n(*shape): return rng.standard_normal(shape) * 0.1
+P = {"tok": n(V, D), "pos": n(T, D), "gf": np.ones(D), "bf": np.zeros(D), "blocks": []}
+for _ in range(L):
+    P["blocks"].append(dict(Wqkv=n(D, 3*D), Wo=n(D, D), W1=n(D, F), b1=np.zeros(F), W2=n(F, D), b2=np.zeros(D),
+                            g1=np.ones(D), be1=np.zeros(D), g2=np.ones(D), be2=np.zeros(D)))
+
+def block(x, p):
+    B, T, D = x.shape; dh = D // H
+    h = layernorm(x, p["g1"], p["be1"])                       # pre-norm
+    q, k, v = np.split(h @ p["Wqkv"], 3, -1)
+    sp = lambda t: t.reshape(B, T, H, dh).transpose(0, 2, 1, 3)
+    q, k, v = sp(q), sp(k), sp(v)
+    s = q @ k.transpose(0, 1, 3, 2) / np.sqrt(dh)
+    s = np.where(np.triu(np.ones((T, T), bool), 1), -np.inf, s)   # causal mask
+    o = (softmax(s) @ v).transpose(0, 2, 1, 3).reshape(B, T, D)
+    x = x + o @ p["Wo"]                                       # residual 1
+    h = layernorm(x, p["g2"], p["be2"])
+    return x + gelu(h @ p["W1"] + p["b1"]) @ p["W2"] + p["b2"]    # residual 2
+
+def gpt(ids):
+    x = P["tok"][ids] + P["pos"][:ids.shape[1]]
+    for p in P["blocks"]: x = block(x, p)
+    return layernorm(x, P["gf"], P["bf"]) @ P["tok"].T         # weight tying
+
+ids = rng.integers(0, V, (3, T))
+logits = gpt(ids); print("logits", logits.shape)
+pr = softmax(logits); tgt = np.roll(ids, -1, 1)
+loss = -np.log(np.take_along_axis(pr, tgt[..., None], -1)).mean()
+print("loss", round(loss, 4), " ln(V) =", round(np.log(V), 4))
+count = lambda o: sum(count(i) for i in (o.values() if isinstance(o, dict) else o)) if isinstance(o, (dict, list)) else o.size
+print("parameters", count(P))
+ids2 = ids.copy(); ids2[:, -1] = (ids2[:, -1] + 1) % V
+print("earlier positions unchanged:", np.allclose(gpt(ids)[:, :-1], gpt(ids2)[:, :-1]))
+print("last position changed:", not np.allclose(gpt(ids)[:, -1], gpt(ids2)[:, -1]))
+seq = np.array([[3]])
+for _ in range(5):
+    seq = np.concatenate([seq, gpt(seq)[:, -1].argmax(-1)[:, None]], 1)
+print("greedy generation from token 3:", seq)</code></pre>
+<pre class="code lang-text"><code>LN of [1,2,3,6]: [[-1.069  -0.5345  0.      1.6036]]
+logits (3, 6, 11)
+loss 2.5271  ln(V) = 2.3979
+parameters 6736
+earlier positions unchanged: True
+last position changed: True
+greedy generation from token 3: [[3 0 0 0 9 9]]</code></pre>
+<p class="problem"><span class="pl">Problem 11.4.2</span> Explain every output line.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>logits (3, 6, 11)</code>: for each of 3 sequences and 6 positions, one score for each of 11 vocabulary tokens. The "next token" prediction at every position, in one pass.</td></tr><tr><th>Step 2</th><td><code>loss 2.5271</code> versus <code>ln 11 = 2.3979</code>. An untrained model is close to uniform guessing, so its loss is near <code>ln V</code>. A loss far above (say 10) at the start of real training points to a bug (e.g. bad initialisation); this is the same sanity check from Chapter 4.</td></tr><tr><th>Step 3</th><td>Parameters. Token table <code>11·16 = 176</code>; positions <code>6·16 = 96</code>; per block <code>16·48 + 16·16 + 16·64 + 64 + 64·16 + 16 + 4·16 = 3,216</code>; two blocks <code>6,432</code>; final layer norm <code>32</code>. Total <code>176 + 96 + 6432 + 32 = 6,736</code>.</td></tr><tr><th>Step 4</th><td>The causality test: changing the last input token does not change any earlier logits. That is the mask working.</td></tr><tr><th>Answer</th><td>The tiny GPT is correct in shape and in behaviour. Its generated text is meaningless (<code>[3 0 0 0 9 9]</code>) because the weights are random; training (Chapter 3 recipe with cross-entropy on the next token) is what makes it write.</td></tr><tr><th>Check</th><td><code>parameters 6736</code> equals the hand count.</td></tr><tr><th>Interpretation</th><td>GPT-2 small is exactly this recipe with <code>d=768</code>, 12 heads, 12 layers, <code>V ≈ 50,000</code>: about 124 million parameters. No new ideas, just bigger numbers.</td></tr></table>
+<figure><img src="images/transformer_block.svg" alt="One pre-norm transformer block: layer norm, attention, residual add, layer norm, feed-forward, residual add" loading="lazy"/><figcaption>One pre-norm transformer block: layer norm, attention, residual add, layer norm, feed-forward, residual add</figcaption></figure>
+<p>How to read it: data flows bottom to top. The straight line on the left of each box is the residual path; the block adds its result onto that path. Layer norm sits at the <em>start</em> of each sub-block (pre-norm).</p>
+<h3>Cost and speed: complexity, KV cache, FlashAttention, GQA, MoE</h3>
+<p><strong>Attention cost.</strong> The score matrix is <code>T × T</code> per head, so compute and memory grow with the <em>square</em> of the text length.</p>
+<p><strong>KV cache.</strong> When generating, each new token needs the keys and values of all earlier tokens. They do not change, so we store ("cache") them and compute only the new token's <code>k</code> and <code>v</code>. Think of keeping a running log instead of re-reading the whole log each time.</p>
+<p class="problem"><span class="pl">Problem 11.4.3</span> Verify that the KV cache gives the same answer and count the savings; then size the memory.</p>
+<table class="steps"><tr><th>Step 1</th><td>Process 6 tokens one by one, storing <code>k</code> and <code>v</code> each step. At step 6 compare with recomputing everything.</td></tr><tr><th>Step 2</th><td>Without a cache, step <code>t</code> recomputes <code>t</code> key/value projections: <code>1+2+...+6 = 21</code>. With a cache: <code>6</code>.</td></tr><tr><th>Step 3</th><td>Cache memory <code>= 2 (K and V) × layers × heads × head_dim × tokens × bytes</code>. For 32 layers, 32 heads, head dim 128, 4,096 tokens, fp16 (2 bytes): <code>2·32·32·128·4096·2 = 2,147,483,648</code> bytes.</td></tr><tr><th>Answer</th><td>The cache is exact (same output). For one 4,096-token conversation it takes about 2.1 GB, which is why serving many users is a memory problem.</td></tr><tr><th>Check</th><td>The code confirms <code>cache == recompute: True</code>, <code>21</code> versus <code>6</code>, and 2,147 MB.</td></tr><tr><th>Interpretation</th><td>This is the same trade-off as a shop keeping a running stock tally instead of recounting every shelf for each sale: you spend memory to save time. For GenAI serving, see the GenAI document.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+def softmax(z): z = z - z.max(); e = np.exp(z); return e / e.sum()
+rng = np.random.default_rng(0)
+d = 4
+Wq, Wk, Wv = [rng.standard_normal((d, d)) for _ in range(3)]
+xs = rng.standard_normal((6, d))
+def recompute_last(xs):
+    q, k, v = xs @ Wq, xs @ Wk, xs @ Wv
+    return softmax(q[-1] @ k.T / np.sqrt(d)) @ v
+Kc, Vc = [], []
+for t in range(6):                       # one new token per step
+    Kc.append(xs[t] @ Wk); Vc.append(xs[t] @ Wv)     # only the NEW k and v are computed
+    out = softmax((xs[t] @ Wq) @ np.array(Kc).T / np.sqrt(d)) @ np.array(Vc)
+print("cache == recompute:", np.allclose(out, recompute_last(xs)))
+print("K,V projections without cache:", sum(range(1, 7)), " with cache:", 6)
+for T in (1024, 8192, 32768):
+    print(T, "tokens: score matrix per head in fp16 =", round(T*T*2/1e6, 1), "MB")
+kv = 2 * 32 * 32 * 128 * 4096 * 2
+print("KV cache, 32 layers, 32 heads, head dim 128, 4096 tokens, fp16:", round(kv/1e6), "MB")
+print("with 8 KV heads (GQA):", round(kv/4/1e6), "MB")</code></pre>
+<pre class="code lang-text"><code>cache == recompute: True
+K,V projections without cache: 21  with cache: 6
+1024 tokens: score matrix per head in fp16 = 2.1 MB
+8192 tokens: score matrix per head in fp16 = 134.2 MB
+32768 tokens: score matrix per head in fp16 = 2147.5 MB
+KV cache, 32 layers, 32 heads, head dim 128, 4096 tokens, fp16: 2147 MB
+with 8 KV heads (GQA): 537 MB</code></pre>
+<p>Reading the second block: going from 1,024 to 32,768 tokens (32 times longer) makes the score matrix 1,024 times bigger. That is the quadratic cost.</p>
+<p>Three more ideas, at concept level:</p>
+<ul><li><strong>FlashAttention</strong> computes the exact same attention, but processes it in small tiles that stay in the GPU's fast on-chip memory and never writes the full <code>T×T</code> matrix to slow memory. It is faster and uses far less memory, with identical results. It is a memory-traffic fix, not an approximation.</li><li><strong>Grouped-query attention (GQA)</strong> lets several query heads share one key/value head. With 8 KV heads instead of 32 the cache is 4 times smaller (537 MB above), with little quality loss.</li><li><strong>Mixture of experts (MoE)</strong> replaces the FFN with several FFNs ("experts") and a small <strong>router</strong> that picks the top 2 for each token and mixes their outputs with the router's softmax weights. The model has many parameters but each token uses only a few, so it is cheaper per token.</li></ul>
+<h3>Encoder, decoder, encoder-decoder, and the families</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Type</th><th>Mask</th><th>Trained to</th><th>Examples</th><th>Use</th></tr></thead><tbody><tr><td>Encoder</td><td>none</td><td>fill in hidden words</td><td>BERT</td><td>classification, embeddings, search</td></tr><tr><td>Decoder</td><td>causal</td><td>predict the next token</td><td>GPT family</td><td>text generation, chat</td></tr><tr><td>Encoder-decoder</td><td>encoder none; decoder causal plus cross-attention to the encoder</td><td>map input sequence to output sequence</td><td>T5, BART, Whisper</td><td>translation, summarisation, speech to text</td></tr><tr><td>Vision</td><td>none, over image patches</td><td>classify, or self-supervised</td><td>ViT (Chapter 12)</td><td>images</td></tr><tr><td>Multimodal</td><td>two encoders</td><td>match images and text</td><td>CLIP (Chapter 12)</td><td>search, zero-shot labelling</td></tr></tbody></table></div>
+<p><strong>Cross-attention</strong> is attention where queries come from one sequence (the decoder) and keys and values from another (the encoder output). It is how Whisper's text decoder looks at the audio.</p>
+<h3>Real-world mapping</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Concept</th><th>Example</th><th>Where it appears in the job</th></tr></thead><tbody><tr><td>Parameter count</td><td>6,736 here; about 124 M for GPT-2 small</td><td>Estimating GPU memory (<code>params × bytes</code>)</td></tr><tr><td>KV cache</td><td>2.1 GB for one 4k conversation</td><td>Capacity planning for an LLM service</td></tr><tr><td><code>T²</code> scores</td><td>134 MB per head at 8k</td><td>Why long context is costly; FlashAttention</td></tr><tr><td>Loss at start <code>≈ ln V</code></td><td>2.52 versus 2.40</td><td>A sanity check when starting a training run</td></tr></tbody></table></div>
+<h3>Applications</h3>
+<ul><li><strong>GenAI engineering:</strong> capacity planning, latency (first-token time versus tokens per second), batching.</li><li><strong>NLP:</strong> BERT-style encoders for classification and search embeddings.</li><li><strong>MLOps:</strong> estimating memory for serving from layers, heads and context length, as above.</li><li><strong>Speech:</strong> Whisper-style encoder-decoder for transcription.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Treating FlashAttention or the KV cache as approximations. Both give the same numbers as the plain method (we tested the cache). They only change <em>how</em> the work is done.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What does a residual connection add? Answer: it adds the block's input back to its output, <code>x + f(x)</code>.</li><li>If context length doubles, how does the attention score matrix size change? Answer: four times bigger.</li><li>Why does GQA shrink the KV cache? Answer: fewer key/value heads are stored.</li></ol>
+<h2 id="s5-11-5-a-mini-gpt-in-pytorch-not-run-here">11.5 A Mini-GPT in PyTorch (Not Run Here)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You have just built every gear by hand. PyTorch gives you the same gears with automatic gradients, so you can <em>train</em> the machine. Karpathy's "Zero to Hero" videos and the nanoGPT project are the standard path: type this along with them.</div></div>
+<div class="callout blue"><div class="lab">PROFESSOR'S NOTE</div><div class="txt">Not run here (PyTorch is not installed in the writing environment). The code is short and standard; the shapes mirror the NumPy version. Run it on CPU with a small text file (a few hundred KB) and you can watch the loss fall.</div></div>
+<pre class="code lang-python"><code># not run here
+import torch, torch.nn as nn, torch.nn.functional as F
+
+class Block(nn.Module):
+    def __init__(self, d, heads):
+        super().__init__()
+        self.ln1, self.ln2 = nn.LayerNorm(d), nn.LayerNorm(d)
+        self.attn = nn.MultiheadAttention(d, heads, batch_first=True)
+        self.ffn = nn.Sequential(nn.Linear(d, 4*d), nn.GELU(), nn.Linear(4*d, d))
+    def forward(self, x):
+        T = x.size(1)
+        mask = torch.triu(torch.ones(T, T, dtype=torch.bool, device=x.device), 1)  # True = blocked
+        h = self.ln1(x)
+        x = x + self.attn(h, h, h, attn_mask=mask, need_weights=False)[0]
+        return x + self.ffn(self.ln2(x))
+
+class MiniGPT(nn.Module):
+    def __init__(self, vocab, ctx=64, d=128, heads=4, layers=4):
+        super().__init__()
+        self.tok, self.pos = nn.Embedding(vocab, d), nn.Embedding(ctx, d)
+        self.blocks = nn.Sequential(*[Block(d, heads) for _ in range(layers)])
+        self.ln_f, self.head = nn.LayerNorm(d), nn.Linear(d, vocab, bias=False)
+    def forward(self, ids, targets=None):
+        x = self.tok(ids) + self.pos(torch.arange(ids.size(1), device=ids.device))
+        logits = self.head(self.ln_f(self.blocks(x)))
+        loss = None if targets is None else F.cross_entropy(logits.flatten(0, 1), targets.flatten())
+        return logits, loss</code></pre>
+<p>A training loop is the one from Chapter 5 (<code>AdamW</code>, learning-rate warmup then cosine decay from Chapter 3, gradient clipping). The data: take a text file, map characters to integers, and cut random windows of length 64; the target is the same window shifted by one. After a few thousand steps the model writes text that looks like the training file. Expected behaviour (not measured here): the starting loss is near <code>ln(vocab)</code>, as in our NumPy demo.</p>
+<p>A word on <strong>tokenisation</strong>: real models split text into sub-word tokens (for example with BPE, byte-pair encoding, which repeatedly merges the most frequent pair of symbols). That topic is in <code>study/genai/01_nlp_foundations.md</code>; characters are fine for this exercise.</p>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is the training target for position <code>t</code>? Answer: the token at position <code>t+1</code>.</li><li>Which two things must the loss and the data windows agree on? Answer: the target is the input shifted by one position.</li><li>What loss value should you see before any learning with a vocabulary of 65 characters? Answer: about <code>ln 65 ≈ 4.17</code>.</li></ol>
+<h2 id="s6-chapter-recap">Chapter recap</h2>
+<ul><li>Self-attention: each token makes a query, key and value; scores <code>Q·Kᵀ/√d_k</code>; softmax per row; output is the weighted average of values.</li><li>The <code>√d_k</code> scale keeps scores at standard deviation 1; without it softmax saturates and learning stalls.</li><li>A causal mask (<code>−∞</code> above the diagonal) stops a token from seeing the future; GPT uses it, BERT does not.</li><li>Multi-head attention splits <code>d</code> into <code>H</code> smaller heads; shapes are <code>(B,H,T,T)</code> for scores; parameters stay <code>4d²</code>.</li><li>Attention ignores order, so add positions: sinusoidal, learned, RoPE (rotation; depends on distance) or ALiBi (distance penalty).</li><li>A block is layer norm, attention, residual, layer norm, FFN, residual; a GPT is a stack of blocks plus a token table and a final projection.</li><li>Costs: attention grows with <code>T²</code>; the KV cache trades memory for time (exact); FlashAttention is exact and memory-friendly; GQA and MoE reduce cache and compute.</li><li>Families: encoder (BERT), decoder (GPT), encoder-decoder (T5, Whisper), ViT and CLIP (next chapter).</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Formula or pattern</th></tr></thead><tbody><tr><td>Attention</td><td><code>softmax(Q·Kᵀ/√d_k)·V</code></td></tr><tr><td>Causal mask</td><td><code>scores[j &gt; i] = −∞</code></td></tr><tr><td>Head size</td><td><code>d_h = d / H</code></td></tr><tr><td>Attention params</td><td><code>4d²</code> (Wq, Wk, Wv, Wo)</td></tr><tr><td>FFN params</td><td><code>2·d·4d + biases</code></td></tr><tr><td>Layer norm</td><td><code>(x − μ)/√(σ² + ε)·γ + β</code></td></tr><tr><td>KV cache bytes</td><td><code>2 × layers × heads × d_h × tokens × bytes</code></td></tr><tr><td>Sinusoidal PE</td><td><code>sin/cos(pos / 10000^(2i/d))</code></td></tr></tbody></table></div>
+<h2 id="s7-practice-set">Practice set</h2>
+<p><strong>1.</strong> (easy) Scores for one query against three keys are <code>(2, 0, 0)</code>. Compute the softmax weights. <strong>Answer:</strong> <code>e² = 7.389</code>, <code>e⁰ = 1</code>, <code>1</code>. Sum <code>9.389</code>. Weights <code>(0.787, 0.1065, 0.1065)</code>, which add to 1.</p>
+<p><strong>2.</strong> (easy) What is <code>d_h</code> for <code>d = 512</code> and <code>H = 8</code>? How many numbers are in one head's score matrix for <code>T = 10</code>? <strong>Answer:</strong> <code>d_h = 64</code>; the score matrix is <code>10 × 10 = 100</code> numbers per head per example.</p>
+<p><strong>3.</strong> (what is the output?) With scores <code>(1, 1, 1)</code> and values <code>(1,0), (0,1), (2,2)</code>, what is the attention output? <strong>Answer:</strong> equal weights <code>1/3</code> each, so output <code>((1+0+2)/3, (0+1+2)/3) = (1, 1)</code>.</p>
+<p><strong>4.</strong> (computation) Parameters of one attention layer plus FFN (width <code>4d</code>, with biases) for <code>d = 64</code>. <strong>Answer:</strong> attention <code>4·64² = 16,384</code> (no biases). FFN: <code>64·256 + 256 + 256·64 + 64 = 16,384 + 256 + 16,384 + 64 = 33,088</code>. Total <code>49,472</code>.</p>
+<p><strong>5.</strong> (find the bug) A learner writes <code>weights = softmax(scores, axis=0)</code> for a <code>(T, T)</code> score matrix and finds the model "works but is odd". What is wrong? <strong>Answer:</strong> softmax must be over the key axis (<code>axis=-1</code>), so that each query's weights add to 1. With <code>axis=0</code> columns sum to 1 instead; shapes are fine, so no error appears.</p>
+<p><strong>6.</strong> (computation) Layer-normalise <code>(2, 4, 6)</code> (ignore <code>ε</code>). <strong>Answer:</strong> mean 4, variance <code>(4+0+4)/3 = 2.667</code>, std <code>1.633</code>. Result <code>(−1.2247, 0, 1.2247)</code>.</p>
+<p><strong>7.</strong> (computation) KV cache size: 24 layers, 16 heads, head dim 64, 2,048 tokens, fp16. <strong>Answer:</strong> <code>2·24·16·64·2048·2 = 201,326,592</code> bytes, about 201 MB per sequence.</p>
+<p><strong>8.</strong> (scenario) Your LLM service runs out of GPU memory when 40 users chat at once, though one user is fine. What is the likely cause and two fixes? <strong>Answer:</strong> each user needs its own KV cache, which scales with users × tokens. Fixes: grouped-query attention (smaller cache), quantised cache or weights (Chapter 14), shorter maximum context, limiting concurrent requests, paged cache management in the serving engine.</p>
+<p><strong>9.</strong> (find the bug) A tiny GPT's loss starts at 14.0 for a vocabulary of 11. What do you suspect? <strong>Answer:</strong> the expected start is near <code>ln 11 = 2.4</code>. A loss of 14 means the logits are huge: weights initialised too large, no final layer norm, or a missing <code>1/√d_k</code>. Check initial scales, as in Chapter 4.</p>
+<p><strong>10.</strong> (interview) "Why divide by √d_k in attention?" <strong>Answer:</strong> a dot product of two random <code>d_k</code>-long vectors has standard deviation <code>√d_k</code>; large scores make softmax almost one-hot with near-zero gradients. Dividing keeps the variance near 1.</p>
+<p><strong>11.</strong> (interview) "What is the difference between BERT and GPT architecturally, and how does each get trained?" <strong>Answer:</strong> BERT is an encoder with no mask and sees both sides; trained by predicting masked words. GPT is a decoder with a causal mask; trained to predict the next token. BERT gives good embeddings for classification and search; GPT generates text.</p>
+<p><strong>12.</strong> (interview) "Attention is quadratic in sequence length. What helps?" <strong>Answer:</strong> FlashAttention (exact, memory-efficient), sliding-window or sparse attention patterns, grouped-query attention for the cache, and shorter contexts via retrieval (see the RAG chapters in <code>study/genai/</code>).</p>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles; English is my second language, so use simple words. Teach me self-attention (queries, keys, values, scaled dot product, softmax) from scratch with a 3-token example and 2-number vectors. Show every multiplication. After each step, ask me one question to check understanding and wait for my answer before continuing. Finish by asking me to explain why we divide by the square root of d_k.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. The topic is multi-head attention and tensor shapes in a transformer. Give me 8 graded exercises (easy to hard) on tracking shapes through (B, T, D) to (B, H, T, d_h) to scores (B, H, T, T) and back, plus parameter counting. Do not give solutions yet. When I send my answers, check each one and explain mistakes with real numbers.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Quiz me on positional encodings in transformers: why they are needed, sinusoidal, learned, RoPE and ALiBi. Ask one question at a time, starting easy and getting harder, and wait for my answer. After each answer, tell me whether I am right, correct me kindly, and give a small numeric example when it helps. Stop after 10 questions and summarise my weak spots.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Review my from-scratch transformer block code for bugs in shapes, the causal mask, the softmax axis, layer norm and residual connections. Tell me what is wrong, why it is wrong, and show the fix with a tiny numeric test I can run. My code: [PASTE HERE]. Also suggest two sanity checks I should add, such as a causality test and the starting-loss check.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles and I am preparing for interviews. Run a mock interview on transformers: self-attention, causal masking, multi-head attention, positional encodings, KV cache, FlashAttention, GQA and mixture of experts. Ask one question at a time, grade my answer from 1 to 5 against a strong answer, show the strong answer, then ask a follow-up that probes memory and speed trade-offs. Do 8 questions.</pre></div><div class="readbtn"><button class="btn" data-read="study:dl:ch11">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch10.html">← Chapter 10: Sequence Models: RNN, LSTM, GRU, Seq2Seq</a><a class="btn" href="ch12.html">Chapter 12: Vision Transformers, Self-Supervised Vis →</a></div></div><script src="../../assets/study.js"></script></body></html>
