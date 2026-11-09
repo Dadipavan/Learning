@@ -1,0 +1,194 @@
+
+<h2>20.13 Performance and pitfalls</h2>
+<h3>Where time and memory actually go</h3>
+<ul><li><strong>Round trips and syncs.</strong> Every network call and every SQLite commit has a fixed cost (a commit forces a disk sync). Batch, page, and reuse connections.</li><li><strong>Parsing and memory.</strong> CSV and JSON are parsed character by character, and a DataFrame is often several times bigger than its file. Read fewer columns, use smaller dtypes (<code>category</code>, <code>int32</code>), and chunk.</li><li><strong>Waiting.</strong> An HTTP loop is mostly idle; threads or <code>httpx.AsyncClient</code> help, within the provider's limits.</li></ul>
+<pre class="code lang-python"><code>import os, sqlite3, tempfile, time
+
+rows = [(i, f"name{i}", i * 0.5) for i in range(3000)]
+
+def insert_seconds(per_row_commit):
+    con = sqlite3.connect(os.path.join(tempfile.mkdtemp(), "t.db"))
+    con.execute("create table t(id integer, name text, v real)")
+    t0 = time.perf_counter()
+    if per_row_commit:
+        for r in rows:
+            con.execute("insert into t values (?, ?, ?)", r)
+            con.commit()
+    else:
+        with con:
+            con.executemany("insert into t values (?, ?, ?)", rows)
+    elapsed = time.perf_counter() - t0
+    assert con.execute("select count(*) from t").fetchone()[0] == 3000
+    con.close()
+    return elapsed
+
+slow, fast = insert_seconds(True), insert_seconds(False)
+print("same 3000 rows, commit per row is slower than one batch:", slow &gt; fast)</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>The function writes the same 3,000 rows into a real file database, once with a commit after each row and once with one <code>executemany</code> inside one transaction.</li><li>The <code>assert</code> proves both variants stored all rows, so the comparison is fair.</li><li>I print a yes/no result because absolute timings depend on your disk and operating system; the figure below shows what was measured on the study machine for 5,000 rows.</li></ol>
+<figure><img src="images/lib20_sqlite_insert.png" alt="Bar chart of the time to insert 5000 rows into SQLite using a commit per row, one transaction with a loop, and executemany" loading="lazy"/><figcaption>Measured once on the study machine (it varies by machine and disk).</figcaption></figure>
+<p><strong>How to read it:</strong> each bar is the time to insert the same 5,000 rows. The vertical axis is logarithmic, so each gridline is ten times the last. The red bar commits after every row and is hundreds of times slower (or worse) than the other two. The orange bar loops inside one transaction. The green bar uses <code>executemany</code> in one transaction, which is the fastest or about equal to the loop, because the statement is prepared once. The fix costs one line (<code>with con:</code>).</p>
+<h3>Pitfall lab: five failures on purpose</h3>
+<pre class="code lang-python"><code>import io, json, os, sqlite3, tempfile
+import numpy as np
+import pandas as pd
+from bs4 import BeautifulSoup
+
+raw = "zip,qty\n02134,5\n90210,7\n"
+print(pd.read_csv(io.StringIO(raw))["zip"].tolist())
+print(pd.read_csv(io.StringIO(raw), dtype={"zip": str})["zip"].tolist())
+
+try:
+    json.dumps({"n": np.int64(5)})
+except TypeError as e:
+    print("TypeError:", e)
+print(json.dumps({"x": float("nan")}), json.dumps({"n": int(np.int64(5)), "x": None}))
+
+path = os.path.join(tempfile.mkdtemp(), "t.db")
+con = sqlite3.connect(path)
+con.execute("create table t(a)")
+con.commit()
+con.execute("insert into t values (1)")
+con.close()
+print("rows after forgetting commit:", sqlite3.connect(path).execute("select count(*) from t").fetchone()[0])
+
+try:
+    BeautifulSoup("<p>hi</p>", "html.parser").find("table").find_all("tr")
+except AttributeError as e:
+    print("AttributeError:", e)
+
+c2 = sqlite3.connect(":memory:")
+c2.execute("create table keep(id integer primary key, v text)")
+pd.DataFrame({"id": [1], "v": ["a"]}).to_sql("keep", c2, if_exists="replace", index=False)
+print("primary-key flags after to_sql replace:", [r[5] for r in c2.execute("pragma table_info(keep)")])</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>Zip codes with a leading zero are read as integers, so <code>02134</code> becomes <code>2134</code>. With <code>dtype={"zip": str}</code> they survive.</li><li><code>json.dumps</code> refuses NumPy integers (they are not Python <code>int</code>), and it writes <code>NaN</code> for a float nan, which is <strong>not valid JSON</strong> and breaks strict parsers. Convert to plain Python types and use <code>None</code> (JSON <code>null</code>) for missing values.</li><li>The insert was never committed before <code>close()</code>, so the reopened database has zero rows. The data is silently lost.</li><li><code>find</code> returned <code>None</code> for the missing table; calling <code>.find_all</code> on it raised <code>AttributeError</code>.</li><li><code>to_sql(if_exists="replace")</code> drops the table and recreates it from the DataFrame, so the primary key and any constraints are gone (flags 0 and 0, where the original had 1 on <code>id</code>).</li></ol>
+<h3>Common mistakes, with symptom and fix</h3>
+<p>Three more are shown earlier: <code>yaml.load</code> (20.3), no <code>timeout</code> (20.7) and secrets in logs (20.11).</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE 1: encoding and newlines</div><div class="txt"><strong>Wrong:</strong> <code>open("export.csv")</code> then <code>csv.reader(f)</code>. <strong>Symptom:</strong> accented names turn into <code>Ã©</code> or the script crashes on another computer; on Windows, blank lines appear between rows. The default encoding depends on the machine. <strong>Fix:</strong> <code>open("export.csv", newline="", encoding="utf-8")</code> (or the encoding the provider documents).</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 2: SQL built with an f-string</div><div class="txt"><strong>Wrong:</strong> <code>con.execute(f"select * from users where name = '{name}'")</code>. <strong>Symptom:</strong> a name such as <code>O'Brien</code> crashes the query, and a crafted name returns or destroys other rows (SQL injection). <strong>Fix:</strong> <code>con.execute("select * from users where name = ?", (name,))</code>.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 3: forgetting to commit</div><div class="txt"><strong>Wrong:</strong> <code>con.execute("insert ..."); con.close()</code>. <strong>Symptom:</strong> the script prints no error, but the next run finds an empty table. <strong>Fix:</strong> <code>with con: con.execute("insert ...")</code> (commits on success, rolls back on error). Remember that <code>with con</code> does not close the connection; call <code>con.close()</code> yourself, or use <code>contextlib.closing</code>.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 4: codes read as numbers</div><div class="txt"><strong>Wrong:</strong> <code>pd.read_csv("zips.csv")</code>. <strong>Symptom:</strong> zip code <code>02134</code> becomes <code>2134</code>, a product id <code>1E5</code> becomes the float 100000.0, and a join to another table silently matches nothing. <strong>Fix:</strong> <code>pd.read_csv("zips.csv", dtype={"zip": str})</code>. Identifiers are labels, not numbers.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 5: page-number pagination on live data</div><div class="txt"><strong>Wrong:</strong> <code>for page in range(1, 50): get(url, params={"page": page})</code>. <strong>Symptom:</strong> the final table has duplicates and some missing rows, and the counts differ on every run. <strong>Fix:</strong> use the cursor or <code>updated_since</code> parameter when the API offers one, and de-duplicate on the primary key with an upsert.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 6: trusting that the element exists</div><div class="txt"><strong>Wrong:</strong> <code>soup.find("span", class_="price").text</code>. <strong>Symptom:</strong> <code>AttributeError: 'NoneType' object has no attribute 'text'</code> the day the site changes its layout, or on one product with no price. <strong>Fix:</strong> a helper such as <code>text_or_none</code> from 20.8, counting how many items had missing fields, and failing the job if the missing share suddenly jumps.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 7: to_sql with replace and an index column</div><div class="txt"><strong>Wrong:</strong> <code>df.to_sql("orders", con, if_exists="replace")</code>. <strong>Symptom:</strong> the table loses its primary key, indexes and column types, and an extra <code>index</code> column appears. <strong>Fix:</strong> create the table yourself with constraints, then <code>df.to_sql("orders", con, if_exists="append", index=False)</code>, or load a staging table and upsert (Recipe 8).</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 8: loading everything, committing everything</div><div class="txt"><strong>Wrong:</strong> <code>df = pd.read_csv("40_million_rows.csv")</code>, or a commit inside a row loop. <strong>Symptom:</strong> <code>MemoryError</code> or the process killed by the operating system; a load that takes hours. <strong>Fix:</strong> <code>chunksize=</code>, <code>usecols=</code> and <code>dtype=</code> when reading; one transaction per batch of thousands of rows when writing.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 9: retrying a POST that is not idempotent</div><div class="txt"><strong>Wrong:</strong> a retry policy that repeats <code>POST /payments</code> after a timeout. <strong>Symptom:</strong> the first request had actually succeeded, so the customer is charged twice. <strong>Fix:</strong> retry only GET, PUT and DELETE by default; for POST send an idempotency key header if the API supports one, or look up the result before repeating.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 10: swallowing every error</div><div class="txt"><strong>Wrong:</strong> <code>try: load(row) except Exception: pass</code>. <strong>Symptom:</strong> the job reports success while half the rows are missing, and nobody can tell why. <strong>Fix:</strong> catch the specific exceptions you expect, log the reason with the record key, count rejects, and fail the run when the reject rate passes a threshold.</div></div>
+
+<h2>20.14 Cross-library integration</h2>
+<p>The skill of data access is hand-offs. Each library hands a plain Python object to the next, and the cleanest hand-offs use the simplest types: <code>list[dict]</code>, <code>DataFrame</code>, <code>bytes</code> and <code>str</code>.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>From</th><th>To</th><th>Hand-off</th></tr></thead><tbody>
+<tr><td><code>requests</code> / <code>httpx</code></td><td>pandas</td><td><code>pd.DataFrame(r.json()["items"])</code> or <code>pd.json_normalize(r.json())</code></td></tr>
+<tr><td>BeautifulSoup</td><td>pandas</td><td>list of row lists, then <code>pd.DataFrame(rows, columns=header)</code></td></tr>
+<tr><td><code>sqlite3</code> / SQLAlchemy</td><td>pandas</td><td><code>pd.read_sql_query(sql, con, params=...)</code></td></tr>
+<tr><td>pandas</td><td>SQL</td><td><code>df.to_sql(name, con, if_exists="append", index=False)</code></td></tr>
+<tr><td>pandas</td><td>Excel</td><td><code>with pd.ExcelWriter(p) as w: df.to_excel(w, ...)</code>, then openpyxl for styling</td></tr>
+<tr><td>pandas</td><td>Parquet</td><td><code>df.to_parquet(p)</code> and <code>pd.read_parquet(p, columns=...)</code></td></tr>
+<tr><td>files (csv/json/yaml)</td><td>validation</td><td>dict per record into a dataclass or pydantic model</td></tr>
+<tr><td>validation</td><td>database</td><td>validated objects to tuples (<code>astuple</code>) for <code>executemany</code></td></tr>
+<tr><td><code>logging</code></td><td>everything</td><td>one logger per module; log counts at every stage boundary</td></tr>
+<tr><td><code>pathlib</code></td><td>everything</td><td>pass <code>Path</code> objects; pandas, openpyxl, sqlite3 and <code>open</code> accept them</td></tr>
+</tbody></table></div>
+<h3>Worked example: HTML + API + SQL in one logged pipeline</h3>
+<pre class="code lang-python"><code>import json, logging, sqlite3, sys
+import pandas as pd
+from bs4 import BeautifulSoup
+
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(levelname)s %(message)s", force=True)
+log = logging.getLogger("pipeline")
+
+HTML = ("<table><tr><th>sku</th><th>price</th></tr><tr><td>A</td><td>$1.50</td></tr>"
+        "<tr><td>B</td><td>$2.00</td></tr><tr><td>C</td><td>oops</td></tr></table>")
+API = '[{"sku": "A", "units": 10}, {"sku": "B", "units": 4}, {"sku": "D", "units": 7}]'
+
+def extract_prices(html):
+    rows = [[c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
+            for tr in BeautifulSoup(html, "html.parser").find_all("tr")]
+    df = pd.DataFrame(rows[1:], columns=rows[0])
+    df["price"] = pd.to_numeric(df["price"].str.lstrip("$"), errors="coerce")
+    return df
+
+prices = extract_prices(HTML)
+units = pd.DataFrame(json.loads(API))
+log.info("extracted %d price rows and %d unit rows", len(prices), len(units))
+
+bad = prices[prices["price"].isna()]
+if len(bad):
+    log.warning("dropping %d price rows without a valid price: %s", len(bad), bad["sku"].tolist())
+prices = prices.dropna(subset=["price"])
+
+merged = prices.merge(units, on="sku", how="outer", indicator=True)
+log.info("join result: %s", merged["_merge"].astype(str).value_counts().sort_index().to_dict())
+both = merged[merged["_merge"] == "both"].drop(columns="_merge")
+
+con = sqlite3.connect(":memory:")
+both.to_sql("revenue_base", con, index=False)
+out = pd.read_sql_query("select sku, price * units as revenue from revenue_base order by sku", con)
+log.info("loaded %d rows", len(out))
+print(out)</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>Two sources: a scraped HTML table and an API's JSON text. Both are inline strings, so the example runs anywhere.</li><li><code>extract_prices</code> turns table rows into a DataFrame. <code>to_numeric(errors="coerce")</code> converts the bad price <code>oops</code> into <code>NaN</code> instead of failing.</li><li>The invalid row is logged as a WARNING with the sku (not silently dropped), then removed.</li><li>An outer merge with <code>indicator=True</code> adds a <code>_merge</code> column that says whether each key was in both tables, left only or right only. Logging the counts is a cheap, powerful check on a join: sku D has units but no price, and C was dropped earlier.</li><li>Only the matched rows go to SQLite with <code>to_sql</code>; the revenue is computed in SQL and read back with <code>read_sql_query</code>.</li><li>The log lines are the audit trail of one run: how much came in, how much was dropped, how many joined, how many were loaded.</li></ol>
+
+<h2>20.15 How to solve any data-access problem: the playbook</h2>
+<h3>The decision flow</h3>
+<ol><li><strong>Where does it live?</strong> Prefer a database or API, then a file download, then scraping.</li><li><strong>How big?</strong> Fits in about a quarter of RAM: read whole. Otherwise chunk, stream, or use a columnar format.</li><li><strong>How does it change?</strong> Never: load once. Otherwise pick watermark, cursor or changed-since.</li><li><strong>How much do you trust it?</strong> Validate at the boundary and keep rejects.</li><li><strong>What can fail?</strong> Network (timeouts, retries, 429), format (encoding, delimiter, schema drift), process (use transactions and idempotent writes).</li><li><strong>How will you know it worked?</strong> Counts, sums and key sets compared between source and target.</li></ol>
+<h3>Seven recurring problem patterns, each solved</h3>
+<p class="problem"><span class="pl">Problem 20.15.1</span> <strong>The file will not parse.</strong> A supplier file raises <code>UnicodeDecodeError</code> at byte 2 and then loads as one column. Fix it.</p>
+<table class="steps"><tr><th>Diagnose</th><td>Print <code>open(p, "rb").read(200)</code>. UTF-8 is wrong; semicolons mean the delimiter is not a comma.</td></tr><tr><th>Fix</th><td><code>pd.read_csv(p, sep=";", encoding="cp1252", decimal=",")</code> (Recipe 6).</td></tr><tr><th>Verify</th><td>Column count, no <code>?</code> or <code>Ã</code> in text, a numeric sum against the supplier's total.</td></tr></table>
+<p class="problem"><span class="pl">Problem 20.15.2</span> <strong>Too big for memory.</strong> A 40,000,000-row CSV must be summarised by region. How many chunks with <code>chunksize=500_000</code>, and what do you keep?</p>
+<table class="steps"><tr><th>Count</th><td>40,000,000 / 500,000 = 80 chunks.</td></tr><tr><th>Keep</th><td>Only a running dictionary of region totals (20.11, Example 4). Add <code>usecols</code> and a <code>category</code> dtype, or convert once to Parquet.</td></tr><tr><th>Limit</th><td>Sum, count, min and max combine across chunks; a median does not.</td></tr></table>
+<p class="problem"><span class="pl">Problem 20.15.3</span> <strong>The request fails sometimes.</strong> An API returns 503 about one call in ten. You allow 5 retries, base delay 0.5 s, doubling. What is the longest total wait without jitter?</p>
+<table class="steps"><tr><th>Delays</th><td>0.5, 1, 2, 4, 8 seconds, total 15.5 seconds.</td></tr><tr><th>Add</th><td>Jitter (each wait between 0 and its value), a total deadline, and a log line per retry.</td></tr><tr><th>Never retry</th><td>400, 401, 403, 404.</td></tr></table>
+<p class="problem"><span class="pl">Problem 20.15.4</span> <strong>I only want what is new.</strong> The source has 2,000,000 orders and about 3,000 change per day. What does a nightly watermark load touch?</p>
+<table class="steps"><tr><th>Work</th><td>About 3,000 rows plus the boundary row and any overlap, against 2,000,000 for a full reload: 3,000 / 2,000,000 = 0.15 per cent.</td></tr><tr><th>Needs</th><td>An indexed <code>updated_at</code> in the source, an upsert in the target, a state table (Recipe 4).</td></tr><tr><th>Blind spot</th><td>Deletes. Ask for a soft-delete flag or compare keys periodically.</td></tr></table>
+<p class="problem"><span class="pl">Problem 20.15.5</span> <strong>Nested and messy JSON.</strong> Each of 1,000 orders holds 1 to 6 lines. What shape does <code>json_normalize(orders, record_path="lines", meta=["id"])</code> give?</p>
+<table class="steps"><tr><th>Shape</th><td>One row per line: between 1,000 and 6,000 rows; line fields plus <code>id</code> as columns.</td></tr><tr><th>Trap</th><td>Orders with an empty list vanish (Recipe 9); join the parent table back if needed.</td></tr></table>
+<p class="problem"><span class="pl">Problem 20.15.6</span> <strong>Garbage in.</strong> Validation rejects 120 of 10,000 records. What is the reject rate, and what should the job do?</p>
+<table class="steps"><tr><th>Rate</th><td>120 / 10,000 = 1.2 per cent.</td></tr><tr><th>Action</th><td>Load 9,880, write 120 to a rejects file with reasons, log the rate, and stop with an alert above a threshold (say 5 per cent): a jump means the source changed.</td></tr></table>
+<p class="problem"><span class="pl">Problem 20.15.7</span> <strong>Writes are slow.</strong> A load commits once per row for 1,000,000 rows. You commit every 10,000 rows instead. How many commits are saved?</p>
+<table class="steps"><tr><th>Count</th><td>1,000,000 before; 1,000,000 / 10,000 = 100 after; 999,900 saved, each of them a disk sync.</td></tr><tr><th>Mind</th><td><code>executemany</code> per batch inside one transaction, and an idempotent load so a failed batch can be repeated. If the source changes shape (<code>total</code> becomes <code>amount</code>), required-field validation catches it instead of loading NULLs.</td></tr></table>
+<h3>How to verify a load</h3>
+<ul><li><strong>Counts and totals:</strong> rows read = rows loaded + rows rejected; one numeric sum matches in source and target.</li><li><strong>Keys and samples:</strong> compare id sets in both directions; eyeball 3 random rows from each side.</li><li><strong>Idempotence:</strong> run the job twice; the second run must change nothing.</li></ul>
+<h3>How to debug</h3>
+<ul><li><strong>Look at the raw thing:</strong> <code>r.status_code</code>, <code>r.text[:300]</code>, the first bytes of a file, <code>repr()</code> of a suspicious string.</li><li><strong>Shrink the problem:</strong> one page, one file, <code>nrows=5</code>. <strong>Turn on detail:</strong> <code>logging.getLogger("urllib3").setLevel(logging.DEBUG)</code>.</li><li><strong>Ask the database:</strong> <code>explain query plan</code> says whether an index is used.</li></ul>
+<pre class="code lang-python"><code>import sqlite3
+
+con = sqlite3.connect(":memory:")
+con.execute("create table events(id integer primary key, user_id integer, kind text)")
+con.executemany("insert into events(user_id, kind) values (?, ?)", [(i % 100, "click") for i in range(5000)])
+q = "select count(*) from events where user_id = ?"
+
+def plan():
+    return con.execute("explain query plan " + q, (7,)).fetchall()[0][3]
+
+print(plan())
+con.execute("create index ix_events_user on events(user_id)")
+print(plan())
+print(con.execute(q, (7,)).fetchone()[0])
+print(repr("caf\u00e9\u00a0x"), repr("  padded \n"))
+src_ids, dst_ids = {1, 2, 3, 4}, {1, 2, 4, 9}
+print("missing in target:", sorted(src_ids - dst_ids), "| unexpected in target:", sorted(dst_ids - src_ids))</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>The first plan scans the whole table; after <code>create index</code> the plan searches the index and touches only matching rows. Reading a plan is the quickest way to explain a slow query. The count for user 7 is 50.</li><li><code>repr</code> shows a non-breaking space as <code>\xa0</code> and the newline as <code>\n</code>; both are invisible in <code>print</code> and a classic reason why two "equal" keys do not match.</li><li>Set differences in both directions are the fastest reconciliation.</li></ol>
+
+<h2>20.16 Going deeper: internals, memory, speed and what interviewers ask</h2>
+<h3>Internals worth knowing</h3>
+<ul><li><strong>sqlite3 transactions.</strong> In the default (legacy) mode Python opens a transaction before <code>INSERT</code>, <code>UPDATE</code> and <code>DELETE</code>, so you must commit; since Python 3.12 <code>connect(autocommit=...)</code> gives explicit control. SQLite allows many readers but one writer; WAL mode (<code>pragma journal_mode = wal</code>) lets readers continue while a writer works. Typing is by <em>affinity</em>: a declared type is a preference unless the table is <code>STRICT</code> (below).</li><li><strong>requests and httpx.</strong> <code>requests</code> sits on urllib3, which keeps a connection pool per host; a <code>Session</code> reuses it (HTTP keep-alive). <code>requests</code> blocks one thread per reply; <code>httpx.AsyncClient</code> overlaps thousands of waits in one thread. Threads also work for I/O because Python releases the GIL while waiting on a socket.</li><li><strong>pandas 3.</strong> Strings default to a <code>str</code> dtype (Arrow-backed when pyarrow is installed) and copy-on-write is always on: <code>sub = df[["a"]]</code> behaves as an independent copy, so changing <code>sub</code> never changes <code>df</code> and defensive <code>.copy()</code> calls are no longer needed.</li><li><strong>Parquet and memory.</strong> A file holds row groups, each with one compressed, dictionary-encoded column chunk per column, and a footer with the schema and min/max statistics. Repeated strings become millions of Python objects unless you use <code>category</code> or Arrow strings (20.10 showed about 5 MB shrink to 0.1 MB on the study machine).</li></ul>
+<pre class="code lang-python"><code>import sqlite3
+
+con = sqlite3.connect(":memory:")
+con.execute("create table loose(n integer, s text)")
+con.execute("insert into loose values ('42', 7)")
+con.execute("insert into loose values ('abc', 'x')")
+print(con.execute("select n, typeof(n), s, typeof(s) from loose").fetchall())
+
+con.execute("create table strict_t(n integer) strict")
+try:
+    con.execute("insert into strict_t values ('abc')")
+except sqlite3.IntegrityError as e:
+    print("strict table says:", e)</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>The first table is normal. Inserting the text <code>'42'</code> into an integer column converts it to the integer 42, because it looks like a number. The integer 7 in a text column is stored as the text <code>'7'</code>.</li><li>The text <code>'abc'</code> cannot become an integer, so SQLite stores it as text in an integer column and does not complain. This is why a column typed INTEGER can still contain words.</li><li>A <code>STRICT</code> table (SQLite 3.37 and later) refuses such values with an error. Use it for tables where type safety matters.</li></ol>
+<h3>What interviewers probe</h3>
+<ul><li><strong>Idempotency:</strong> "What if your job runs twice?" Upsert on a natural key, a transaction per batch, the watermark advanced in the same transaction. Retries give at-least-once delivery; add idempotent writes for an exactly-once effect.</li><li><strong>Late data and deletes:</strong> overlap windows, event time versus ingestion time, periodic reconciliation; a watermark cannot see deletes (soft deletes or change data capture can).</li><li><strong>Pagination:</strong> offset versus cursor, and why a large offset gets slow (the database still walks past the skipped rows).</li><li><strong>Security and failure design:</strong> parameter binding, secrets in the environment, least-privilege users; timeouts everywhere, retry only the retryable, backoff with jitter, dead-letter files.</li><li><strong>Formats and scale:</strong> why Parquet over CSV (types, compression, column pruning, predicate pushdown), when CSV is still right, and what changes at 10x data (chunking, columnar files, a database server, a distributed engine).</li></ul>

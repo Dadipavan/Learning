@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 6: Orchestration with Apache Airflow (and Its Alternatives)</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Engineering &amp; Big Data</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 6</div><h1>Orchestration with Apache Airflow (and Its Alternatives)</h1><p>Running many dependent jobs on time, in order, with retries, alerts and safe re-runs.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-6-1-the-ideas-dags-schedules-data-intervals-retries">6.1 The Ideas: DAGs, Schedules, Data Intervals, Retries</a></li><li><a href="#s2-6-2-airflow-in-practice-code-components-and-best-practices">6.2 Airflow in Practice: Code, Components and Best Practices</a></li><li><a href="#s3-6-3-alternatives-event-driven-triggers-and-lineage">6.3 Alternatives, Event-Driven Triggers and Lineage</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>By now you can write one script that loads orders, one that checks quality, one that builds a mart. But who runs them every night, in the right order, and what happens if step 2 fails? A person with a cron table and a lot of worry? That does not scale to 200 jobs. An <strong>orchestrator</strong> is the program that knows the order, the schedule, the retry rules and the history of every run. Apache Airflow is the most widely used one, and you will meet it in most data engineering interviews. In this chapter you will learn the ideas (DAG, task, schedule, data interval, catchup, backfill, idempotent task), run a small scheduler of your own to see them move, read real Airflow code, and compare Airflow with Dagster, Prefect, Azure Data Factory and others.</p>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 6: Orchestration with Apache Airflow (and Its Alternatives)</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Engineering &amp; Big Data</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 6</div><h1>Orchestration with Apache Airflow (and Its Alternatives)</h1><p>Running many dependent jobs on time, in order, with retries, alerts and safe re-runs.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-6-1-the-ideas-dags-schedules-data-intervals-retries">6.1 The Ideas: DAGs, Schedules, Data Intervals, Retries</a></li><li><a href="#s2-6-2-airflow-in-practice-code-components-and-best-practices">6.2 Airflow in Practice: Code, Components and Best Practices</a></li><li><a href="#s3-6-3-alternatives-event-driven-triggers-and-lineage">6.3 Alternatives, Event-Driven Triggers and Lineage</a></li><li><a href="#s4-6-4-airflow-in-production-sensors-mapping-assets-pools-and-backfills">6.4 Airflow in Production: Sensors, Mapping, Assets, Pools and Backfills</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>By now you can write one script that loads orders, one that checks quality, one that builds a mart. But who runs them every night, in the right order, and what happens if step 2 fails? A person with a cron table and a lot of worry? That does not scale to 200 jobs. An <strong>orchestrator</strong> is the program that knows the order, the schedule, the retry rules and the history of every run. Apache Airflow is the most widely used one, and you will meet it in most data engineering interviews. In this chapter you will learn the ideas (DAG, task, schedule, data interval, catchup, backfill, idempotent task), run a small scheduler of your own to see them move, read real Airflow code, and compare Airflow with Dagster, Prefect, Azure Data Factory and others.</p>
 <p>Honest note: Airflow is not installed in this sandbox and cannot be downloaded here, so every Airflow snippet is labelled <strong>not run here</strong>. The mini scheduler we run is our own teaching toy, not Airflow.</p>
 <h2 id="s1-6-1-the-ideas-dags-schedules-data-intervals-retries">6.1 The Ideas: DAGs, Schedules, Data Intervals, Retries</h2>
 <div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A cooking plan: wash rice, cook rice, make curry, serve. "Cook rice" cannot start before "wash rice". The plan is a list of steps plus arrows saying "this before that", with no loops (you never wash rice again because you served). A <strong>DAG</strong> (Directed Acyclic Graph) is exactly such a plan: <em>directed</em> because arrows have a direction, <em>acyclic</em> because there are no cycles.</div></div>
@@ -181,10 +181,162 @@ def revenue_by_city(clean_orders): ...</code></pre>
 <div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Scheduling dependent pipelines by clock guesses. Use real dependencies, so that a slow night does not corrupt the next job.</div></div>
 <p><strong>Check yourself</strong></p>
 <ol><li>Task-based or asset-based: Airflow versus Dagster? Answer: Airflow is task-based, Dagster is asset-based.</li><li>When is cron enough? Answer: one simple script with no dependencies and low stakes.</li><li>What is OpenLineage? Answer: an open standard for emitting lineage metadata from jobs.</li></ol>
-<h2 id="s4-chapter-recap">Chapter recap</h2>
+<h2 id="s4-6-4-airflow-in-production-sensors-mapping-assets-pools-and-backfills">6.4 Airflow in Production: Sensors, Mapping, Assets, Pools and Backfills</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A small Airflow install is a calendar with alarm clocks. A production install is an airport: limited gates (worker slots), flights that wait for other flights (sensors and assets), flights that fan out into many (mapped tasks), and a control tower that must cope when a hundred delayed flights land at once (backfills). This section covers the controls of the tower.</div></div>
+<div class="callout cream"><div class="lab">AIRFLOW 3 NOTES</div><div class="txt">Airflow 3 (released 2025) cleaned up old names. In Airflow 3 the old context value <code>execution_date</code> and the old DAG argument <code>schedule_interval</code> are gone: use <code>logical_date</code> (or the <code>data_interval_start</code> and <code>data_interval_end</code> values) and <code>schedule=</code>. Datasets were renamed Assets. New DAG code imports from <code>airflow.sdk</code> (<code>from airflow.sdk import dag, task</code>). The default for <code>catchup</code> is now false. Also, the old SLA feature was removed, so alert on lateness with your own check or a newer deadline feature (check your version's documentation). All Airflow code in this chapter is <strong>not run here</strong>; Airflow is not installed in this sandbox. The plain Python simulations below are real and were run.</div></div>
+<h3>Sensors against deferrable operators</h3>
+<p>A <strong>sensor</strong> is a task that waits for something: a file to land, a partition to exist, another DAG to finish. A classic sensor in <code>poke</code> mode occupies a <strong>worker slot</strong> the whole time it waits, sleeping between checks. A <strong>deferrable operator</strong> hands the wait to a small separate service (the triggerer) that can watch thousands of waits with one process, and frees the slot until the event happens.</p>
+<p class="problem"><span class="pl">Problem 6.4.1</span> Your cluster has 32 worker slots. Every morning 40 partner files are expected between 02:00 and 06:00, and each has a poke-mode sensor starting at 02:00. Files arrive on average 3 hours later. What happens at 02:00, and how does deferral change it?</p>
+<table class="steps"><tr><th>Poke mode</th><td>40 sensors want a slot, only 32 exist. 32 sensors run and wait, 8 are queued. Nothing else (extract, load) can run on those slots until sensors finish.</td></tr><tr><th>Slot-hours</th><td>If each sensor waits 3 hours: 40 × 3 = 120 slot-hours wasted on waiting, every day.</td></tr><tr><th>Deferrable</th><td>Each sensor defers: its slot is released immediately. The triggerer watches all 40 with one process. A slot is used only for the few seconds after the file arrives.</td></tr><tr><th>Answer</th><td>Poke mode starves the cluster (the whole pool is stuck waiting); deferral keeps the 32 slots free for real work.</td></tr><tr><th>Check</th><td>Alternative if you stay with poke mode: <code>mode="reschedule"</code> releases the slot between checks, at the cost of more scheduler load. Or use an event trigger from the bucket (Section 6.3).</td></tr></table>
+<pre class="code lang-text"><code># not run here: needs Airflow and the Amazon provider
+from airflow.providers.amazon.aws.sensors.s3 import S3KeySensor
+wait_file = S3KeySensor(
+    task_id="wait_file",
+    bucket_name="shopkart-landing",
+    bucket_key="partner/{{ ds }}/orders.csv",
+    deferrable=True,            # frees the worker slot while waiting
+    timeout=6 * 3600,           # give up after 6 hours so it cannot wait forever
+)</code></pre>
+<h3>Dynamic task mapping: one task per file</h3>
+<p>Sometimes you do not know in advance how many tasks you need: today three files, tomorrow thirty. <strong>Dynamic task mapping</strong> lets a task produce a list at run time and creates one <em>mapped task instance</em> per item with <code>.expand()</code>. Each instance succeeds, fails and retries on its own. Not run here:</p>
+<pre class="code lang-text"><code># not run here: Airflow 3 style
+import pendulum
+from airflow.sdk import dag, task
+
+@dag(schedule="@daily", start_date=pendulum.datetime(2024, 6, 1), catchup=False)
+def partner_files():
+    @task
+    def list_files(ds=None):
+        return [f"partner/{ds}/part-{i}.csv" for i in range(3)]   # 3 today, maybe 30 tomorrow
+    @task
+    def load_one(path):
+        print("loading", path)
+        return 1
+    @task
+    def summarise(counts):
+        print("loaded", sum(counts), "files")      # receives the list of all results
+    summarise(load_one.expand(path=list_files()))
+
+partner_files()</code></pre>
+<p>The same fan-out and fan-in in plain Python, with one mapped instance failing once and being retried alone (this runs):</p>
+<pre class="code lang-python"><code>files = [f"part-{i}.csv" for i in range(5)]
+attempts = {f: 0 for f in files}
+
+def load_one(path):
+    attempts[path] += 1
+    if path == "part-3.csv" and attempts[path] == 1:
+        raise ConnectionError("source hiccup")          # fails on its first try only
+    return 100                                           # rows loaded
+
+results = {}
+for map_index, f in enumerate(files):                    # fan out: one instance per file
+    for try_no in range(1, 4):                           # retries=2 means up to 3 tries
+        try:
+            results[map_index] = load_one(f); break
+        except ConnectionError:
+            print(f"map_index {map_index} ({f}) failed on try {try_no}, retrying")
+print("instances:", len(results), "attempts per file:", list(attempts.values()))
+print("fan in, total rows:", sum(results.values()))</code></pre>
+<pre class="code lang-text"><code>map_index 3 (part-3.csv) failed on try 1, retrying
+instances: 5 attempts per file: [1, 1, 1, 2, 1]
+fan in, total rows: 500</code></pre>
+<p><strong>Explain.</strong> Five instances ran, and only instance 3 needed a second attempt; the other four were not touched. With a single task looping over files, the retry would have restarted all five files and, unless the load were idempotent, double counted four of them.</p>
+<h3>Assets: run when the data is ready, not when the clock says</h3>
+<p>An <strong>asset</strong> (a dataset, in older versions) is a named piece of data such as <code>s3://shopkart/silver/orders</code>. A producer task declares that it updates the asset (<code>outlets</code>); a consumer DAG is scheduled on the asset instead of a time. Then Problem 6.3.2, where B guessed that A finishes by 3:00, disappears: B starts when A has actually updated the asset. Not run here:</p>
+<pre class="code lang-text"><code># not run here
+from airflow.sdk import Asset, dag, task
+silver_orders = Asset("s3://shopkart/silver/orders")
+
+@dag(schedule="@daily")
+def produce_silver():
+    @task(outlets=[silver_orders])
+    def build(): ...
+    build()
+
+@dag(schedule=[silver_orders])        # runs after the asset is updated, not at a fixed hour
+def build_gold():
+    @task
+    def aggregate(): ...
+    aggregate()</code></pre>
+<h3>Pools, retries and a safe backfill</h3>
+<p>A <strong>pool</strong> is a named set of slots that limits how many tasks may use a shared resource at once, for example 5 slots for the production Postgres replica. Tasks name their pool; Airflow queues the rest. Retries (Section 6.2) are safe only when the task is idempotent. A <strong>backfill</strong> re-creates runs for past data intervals. The three rules: use the logical date or data interval in the code, overwrite the partition for that interval, and limit parallelism with <code>max_active_runs</code> and a pool.</p>
+<p>The simulation shows what a backfill from June 1 to June 5 creates, and why <code>now()</code> breaks it. Before you run it: how many runs, and in how many rounds if two may run at once?</p>
+<pre class="code lang-python"><code>from datetime import date, timedelta
+import math
+
+start, end = date(2024, 6, 1), date(2024, 6, 5)
+runs = []
+d = start
+while d &lt;= end:
+    runs.append((d, d + timedelta(days=1)))               # (logical date, interval end)
+    d += timedelta(days=1)
+for logical, interval_end in runs:
+    print(f"run logical_date={logical}  covers [{logical}, {interval_end})")
+max_active_runs = 2
+print("runs:", len(runs), " rounds with max_active_runs=2:", math.ceil(len(runs) / max_active_runs))
+
+# the same backfill with two loaders; sales_by_day[day] holds that day's revenue
+source = {date(2024, 6, 1) + timedelta(days=i): 1000 + 100 * i for i in range(5)}
+
+def good_task(table, logical):                            # overwrite the partition for the logical date
+    table[logical] = source[logical]
+
+bad_calls = []
+def bad_task(table, logical, today=date(2024, 6, 20)):    # uses "today" instead of the logical date
+    table[today] = table.get(today, 0) + source[logical]
+    bad_calls.append(logical)
+
+good, bad = {}, {}
+for logical, _ in runs:
+    good_task(good, logical); bad_task(bad, logical)
+good_task(good, date(2024, 6, 3))                         # rerun one day: no change
+print("good table:", {str(k): v for k, v in good.items()})
+print("bad table :", {str(k): v for k, v in bad.items()})
+print("good total", sum(good.values()), "source total", sum(source.values()))</code></pre>
+<pre class="code lang-text"><code>run logical_date=2024-06-01  covers [2024-06-01, 2024-06-02)
+run logical_date=2024-06-02  covers [2024-06-02, 2024-06-03)
+run logical_date=2024-06-03  covers [2024-06-03, 2024-06-04)
+run logical_date=2024-06-04  covers [2024-06-04, 2024-06-05)
+run logical_date=2024-06-05  covers [2024-06-05, 2024-06-06)
+runs: 5  rounds with max_active_runs=2: 3
+good table: {'2024-06-01': 1000, '2024-06-02': 1100, '2024-06-03': 1200, '2024-06-04': 1300, '2024-06-05': 1400}
+bad table : {'2024-06-20': 6000}
+good total 6000 source total 6000</code></pre>
+<p><strong>Explain.</strong> Five days give five runs; two at a time take 3 rounds (2 + 2 + 1). The good loader keys its write on the logical date, so the rerun of June 3 leaves the table unchanged and the total matches the source: 1000 + 1100 + 1200 + 1300 + 1400 = 6,000. The bad loader writes everything under one date (the day the backfill happened to run) and sums the days into a single row, so the history is lost.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Backfilling 365 days with no <code>max_active_runs</code> and no pool. The scheduler launches as many runs as it can, the source database receives hundreds of parallel queries, and the on-call phone rings. Always set the limits first, test on 3 days, then widen the range.</div></div>
+<h3>Three failure diagnoses</h3>
+<p class="problem"><span class="pl">Problem 6.4.2</span> The new DAG file is merged but does not show in the UI. What do you check, in order?</p>
+<table class="steps"><tr><th>Step 1</th><td>Import errors: the UI shows a banner and the CLI command <code>airflow dags list-import-errors</code> lists them. A typo or a missing package is the usual cause.</td></tr><tr><th>Step 2</th><td>Is the file in the DAGs folder that the scheduler reads (deployment sync done)? Does it contain the words <code>dag</code> and <code>airflow</code>, and does the DAG object exist at module level?</td></tr><tr><th>Step 3</th><td>Is the DAG paused? New DAGs may start paused depending on configuration.</td></tr><tr><th>Answer</th><td>Almost always step 1. Prevent it with the CI import test from Section 6.2.</td></tr></table>
+<p class="problem"><span class="pl">Problem 6.4.3</span> A task has been "queued" for 90 minutes, nothing is failing, the scheduler is healthy. Why?</p>
+<table class="steps"><tr><th>Step 1</th><td>Open the task's details: the reason names the limit that is full: pool, DAG concurrency, <code>max_active_tasks</code> or the global parallelism.</td></tr><tr><th>Step 2</th><td>Count the holders: for example a pool of 5 slots where 5 long sensors wait (Problem 6.4.1).</td></tr><tr><th>Answer</th><td>A full pool or a worker shortage. Fix: deferrable sensors, a larger pool, or split resources into separate pools so that waiting tasks cannot starve real work.</td></tr></table>
+<p class="problem"><span class="pl">Problem 6.4.4</span> Revenue for the 1st of the month is doubled after a retry. The load task did <code>INSERT INTO sales SELECT ... WHERE day = '{{ ds }}'</code> and failed after the insert, in the notification step, so the whole task was retried. What is wrong and what is the fix?</p>
+<table class="steps"><tr><th>Cause</th><td>A plain insert is not idempotent and the retry ran it twice: 2 × the revenue.</td></tr><tr><th>Fix</th><td>Delete-then-insert for that day in one transaction, or <code>MERGE</code> on the key. Also split the notification into its own task so that its failure does not rerun the load.</td></tr><tr><th>Check</th><td>Run the task twice by hand and compare row counts for the day: they must match.</td></tr></table>
+<h3>The same pipeline in Dagster and Prefect (not run here)</h3>
+<p>Both express "extract, clean, aggregate" without a scheduler-centric file. The ideas differ: Dagster declares the <em>assets</em> and their dependencies, Prefect turns normal Python functions into tracked, retryable tasks.</p>
+<pre class="code lang-text"><code># not run here: Dagster
+from dagster import asset, Definitions, ScheduleDefinition, define_asset_job
+@asset
+def raw_orders(): return [{"id": 1, "amount": 100}]
+@asset
+def clean_orders(raw_orders): return [r for r in raw_orders if r["amount"] &gt;= 0]
+@asset
+def revenue(clean_orders): return sum(r["amount"] for r in clean_orders)
+daily = ScheduleDefinition(job=define_asset_job("daily", selection="*"), cron_schedule="0 2 * * *")
+defs = Definitions(assets=[raw_orders, clean_orders, revenue], schedules=[daily])
+
+# not run here: Prefect
+from prefect import flow, task
+@task(retries=2, retry_delay_seconds=30)
+def extract(): return [{"id": 1, "amount": 100}]
+@task
+def clean(rows): return [r for r in rows if r["amount"] &gt;= 0]
+@flow
+def daily_orders(): return sum(r["amount"] for r in clean(extract()))</code></pre>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Whatever the tool, the same five habits keep pipelines alive: idempotent tasks, the logical date (never now), bounded parallelism (pools and max active runs), waits that do not hold slots, and an import test in CI. Learn the habits once, then map them to the syntax of the tool at your job.</div></div>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
 <ul><li>An orchestrator runs tasks in dependency order (a DAG), on a schedule, with retries, alerts, history and backfills.</li><li>A run's logical date is the start of its data interval; it runs after the interval ends. Use it, never <code>now()</code>.</li><li><code>catchup=True</code> creates a run for every past interval; set it and <code>max_active_runs</code> explicitly.</li><li>Idempotent, date-keyed tasks make retries and backfills safe.</li><li>Airflow parts: scheduler, metadata DB, executor and workers, web server, DAG folder.</li><li>TaskFlow turns Python functions into tasks; XCom carries only small values; sensors should reschedule; pools limit concurrency.</li><li>Keep the DAG file light and put heavy work in workers or external engines; test DAGs with an import test and unit tests of the logic.</li><li>Dagster (assets), Prefect, Mage, ADF, Step Functions, Argo and cron are alternatives; choose by complexity and platform; use data-aware triggers; lineage via OpenLineage and catalogs.</li></ul>
 <div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Rule</th></tr></thead><tbody><tr><td>Catch-up runs</td><td>complete intervals between start_date and now</td></tr><tr><td>Backfill time</td><td>⌈runs / parallel runs⌉ × time per run</td></tr><tr><td>Dependency</td><td><code>a &gt;&gt; b &gt;&gt; c</code></td></tr><tr><td>Templated date</td><td><code>{{ ds }}</code></td></tr><tr><td>Task body</td><td>overwrite or MERGE by logical date</td></tr><tr><td>XCom</td><td>ids and paths only</td></tr></tbody></table></div>
-<h2 id="s5-practice-set">Practice set</h2>
+<h2 id="s6-practice-set">Practice set</h2>
 <p><strong>1.</strong> (easy) What does DAG stand for? <strong>Answer:</strong> Directed Acyclic Graph.</p>
 <p><strong>2.</strong> (easy) Which date does <code>{{ ds }}</code> hold for the run that processes June 5th data? <strong>Answer:</strong> <code>2024-06-05</code> (the logical date; it runs on June 6th).</p>
 <p><strong>3.</strong> A weekly DAG (<code>@weekly</code>) with start_date 2024-01-07 and catchup=True; now is 2024-02-04 00:00. Number of runs? <strong>Answer:</strong> intervals start Jan 7, 14, 21, 28 and each ends a week later; the interval starting Jan 28 ends Feb 4 (now), so it is complete: 4 runs.</p>
@@ -196,9 +348,17 @@ def revenue_by_city(clean_orders): ...</code></pre>
 <p><strong>9.</strong> (interview) "How do you make an Airflow pipeline safe to re-run?" <strong>Answer:</strong> Idempotent tasks keyed by logical date (partition overwrite or MERGE), no use of <code>now()</code>, state and data updated atomically, retries for transient errors, and tests for a double-run producing the same result.</p>
 <p><strong>10.</strong> (interview) "Airflow versus Dagster?" <strong>Answer:</strong> Airflow is task-centric with the largest ecosystem and many managed offerings. Dagster is asset-centric (you declare data products and their dependencies), with strong local development, testing and lineage. Choose Airflow for ecosystem and hiring pool; Dagster when asset freshness and developer experience are the priority.</p>
 <p><strong>11.</strong> (scenario) Your nightly DAG missed the 6 a.m. report deadline twice this week. How do you investigate and prevent it? <strong>Answer:</strong> Look at task durations over time (the Gantt view or logs) to find the slow task; check queueing (pool or executor slots), upstream late arrival, and data growth. Fix by parallelising or optimising the slow task, adjusting pools, or starting earlier through a data-aware trigger; add an SLA/freshness alert before 6 a.m. rather than after.</p>
-<h2 id="s6-prompt-pack">Prompt pack</h2>
+<p><strong>12.</strong> (easy) Which names are removed in Airflow 3: <code>execution_date</code>, <code>logical_date</code>, <code>schedule_interval</code>, <code>schedule</code>? <strong>Answer:</strong> <code>execution_date</code> and <code>schedule_interval</code>; use <code>logical_date</code> and <code>schedule</code>.</p>
+<p><strong>13.</strong> (easy) A pool has 8 slots, 20 tasks are ready, each takes 10 minutes. How long do they take? <strong>Answer:</strong> ceil(20 / 8) = 3 rounds × 10 minutes = 30 minutes (8, 8 then 4 tasks).</p>
+<p><strong>14.</strong> (medium) A backfill covers 2024-01-01 to 2024-03-31 inclusive for a daily DAG. How many runs? <strong>Answer:</strong> January 31 + February 29 (2024 is a leap year) + March 31 = 91 runs.</p>
+<p><strong>15.</strong> (medium) With <code>max_active_runs=4</code> and each run taking 6 minutes, how long does the 91-run backfill take at best? <strong>Answer:</strong> ceil(91 / 4) = 23 rounds × 6 minutes = 138 minutes (2 hours 18 minutes).</p>
+<p><strong>16.</strong> (medium) 25 poke sensors each wait 4 hours on a 16-slot pool. Slot-hours spent waiting? What do deferrable sensors save? <strong>Answer:</strong> 25 × 4 = 100 slot-hours. Deferral releases nearly all of them (only seconds of slot time after each event).</p>
+<p><strong>17.</strong> (medium, find the bug) A mapped task <code>load_one.expand(path=list_files())</code> gets an empty list on a holiday. What happens to the downstream <code>summarise</code>? <strong>Answer:</strong> zero mapped instances are created (they are skipped), and by default a task downstream of a skipped upstream is skipped too, so <code>summarise</code> does not run. Decide whether that is right; if a zero-file day should still produce a report, change the trigger rule of <code>summarise</code> or handle the empty list explicitly.</p>
+<p><strong>18.</strong> (hard) A DAG with <code>retries=3</code> and <code>retry_delay=5 min</code> and a task that fails permanently: how long until the DAG run is marked failed, ignoring run time? <strong>Answer:</strong> the task tries 4 times (1 original and 3 retries) with 3 waits of 5 minutes: 15 minutes of waiting.</p>
+<p><strong>19.</strong> (interview) "How do you make a pipeline safe to backfill?" <strong>Answer:</strong> code reads only the data interval and logical date, writes by overwriting or merging the partition for that interval, has no hidden state such as now(), limits parallelism with max active runs and pools, and a rerun of any day gives the same result; verify by running a day twice and comparing counts and sums.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me Apache Airflow concepts: DAG, task, operator, schedule, data interval, logical date, catchup and backfill. Use a daily orders pipeline with real dates, and explain why a run for June 1 starts on June 2. Then ask me 3 questions one at a time about data intervals and catchup counts.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: writing idempotent Airflow tasks and safe backfills. Show a non-idempotent task, the double-counting bug after a retry, and the fix using partition overwrite or MERGE by logical date. Then give me 6 graded exercises where I must find the idempotency bug, with no solutions. I will paste my answers: [PASTE HERE]</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am learning data engineering. Explain the Airflow architecture (scheduler, metadata database, executor, workers, web server), XComs, sensors, pools, dynamic task mapping and the TaskFlow API. Use a restaurant analogy. Then write a short TaskFlow DAG for me to review and ask me to list its 3 weaknesses.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: choosing between cron, Airflow, Dagster, Prefect, Azure Data Factory, AWS Step Functions and Argo Workflows. Give me 6 realistic company situations and ask me to choose and justify each one in 2 sentences. Then critique my reasoning and say when each tool would be a poor choice.</pre></div>
-<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am applying for data engineer roles. Run a mock interview on orchestration: Airflow design, scheduling semantics, retries, backfills, idempotency, testing DAGs, event-driven triggers and lineage. Ask 8 questions one at a time. After each answer, score it 1 to 5, give a model answer in simple English, and one follow-up. My answers: [PASTE HERE]</pre></div><div class="readbtn"><button class="btn" data-read="study:de:ch06">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch05.html">← Chapter 5: Data Quality and Testing</a><a class="btn" href="ch07.html">Chapter 7: dbt, the Tool That Turns SQL into a Test →</a></div></div><script src="../../assets/study.js"></script></body></html>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am applying for data engineer roles. Run a mock interview on orchestration: Airflow design, scheduling semantics, retries, backfills, idempotency, testing DAGs, event-driven triggers and lineage. Ask 8 questions one at a time. After each answer, score it 1 to 5, give a model answer in simple English, and one follow-up. My answers: [PASTE HERE]</pre></div><div class="readbtn"><button class="btn" data-read="study:de:ch06">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch05.html">← Chapter 5: Data Quality and Testing</a><a class="btn" href="ch07.html">Chapter 7: dbt, the Tool That Turns SQL into a Tested Software Project →</a></div></div><script src="../../assets/study.js"></script></body></html>

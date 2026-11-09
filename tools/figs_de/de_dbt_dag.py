@@ -1,0 +1,21 @@
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common import *
+fig, ax = canvas(9.5, 4.8)
+ax.text(1, 49, "dbt lineage: ref() draws the arrows, and picks the schema for each environment", fontsize=10.5, color=BLUE, weight="bold")
+box(ax, 1, 31, 15, 8, "source\nraw_orders", GREY)
+box(ax, 1, 12, 15, 8, "source\nraw_customers", GREY)
+box(ax, 26, 31, 15, 8, "stg_orders", TEAL)
+box(ax, 26, 12, 15, 8, "stg_customers", TEAL)
+box(ax, 51, 21.5, 15, 8, "fct_orders", BLUE)
+box(ax, 76, 31, 20, 8, "mart_revenue_by_city", PURPLE, fs=9)
+box(ax, 76, 12, 20, 8, "mart_customer_ltv", PURPLE, fs=9)
+arrow(ax, 16.3, 35, 25.7, 35); arrow(ax, 16.3, 16, 25.7, 16)
+arrow(ax, 41.3, 35, 50.7, 27.5); arrow(ax, 41.3, 16, 50.7, 24)
+arrow(ax, 66.3, 27.5, 75.7, 34); arrow(ax, 66.3, 24, 75.7, 17)
+ax.text(1, 44, "{{ ref('stg_orders') }} in dev  ->  dev_alice.stg_orders", fontsize=8.5, color=ORANGE)
+ax.text(1, 41.5, "same text in prod ->  analytics.stg_orders", fontsize=8.5, color=ORANGE)
+ax.text(1, 4, "state:modified+ : if stg_customers changes, build it, fct_orders and both marts (red dashed outline)", fontsize=8.5, color=RED)
+for x, y, w in [(26, 12, 15), (51, 21.5, 15), (76, 31, 20), (76, 12, 20)]:
+    ax.add_patch(FancyBboxPatch((x, y), w, 8, boxstyle="round,pad=0.3,rounding_size=1.2", ec=RED, fc="none", lw=2.4, ls="--"))
+fig.savefig("de_dbt_dag.png", dpi=110, bbox_inches="tight")

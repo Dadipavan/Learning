@@ -1,0 +1,253 @@
+
+<h2>23.10 Cross-Library Integration</h2>
+<p>The tools in this chapter are designed to snap together. The table shows the seams where most real work happens.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>From</th><th>To</th><th>How they connect</th></tr></thead><tbody>
+<tr><td>argparse / Typer</td><td>dataclass</td><td>Parse flags, then build one frozen <code>Config</code>; pass the config, not the namespace, to the code</td></tr>
+<tr><td>YAML file</td><td>dataclass</td><td><code>Config(**yaml.safe_load(text))</code>; DVC's <code>params.yaml</code> is the same file</td></tr>
+<tr><td>pandas</td><td>pytest</td><td>Small DataFrames in fixtures; compare with <code>pandas.testing.assert_frame_equal</code></td></tr>
+<tr><td>scikit-learn</td><td>joblib</td><td>Save a fitted <code>Pipeline</code> with <code>joblib.dump</code>; speed up search with <code>n_jobs</code></td></tr>
+<tr><td>joblib bundle</td><td>FastAPI</td><td>Load once in <code>lifespan</code>; validate the request with a pydantic model</td></tr>
+<tr><td>logging</td><td>tests</td><td><code>caplog</code> (pytest) or <code>assertLogs</code> (unittest) check that important events are logged</td></tr>
+<tr><td>logging</td><td>MLflow / JSON metrics</td><td>Logs are for humans and time ordering; metrics and parameters go to the tracker</td></tr>
+<tr><td>CLI</td><td>Airflow / Prefect / cron</td><td>Make the job a command with exit codes; the scheduler only runs the command</td></tr>
+<tr><td>pyproject.toml</td><td>everything</td><td>One file holds dependencies, the script entry point, pytest and mypy settings</td></tr>
+<tr><td>environment variables</td><td>Docker, schedulers</td><td>Secrets and paths enter from outside; the code reads <code>os.environ</code> once into a settings object</td></tr>
+<tr><td>Dockerfile</td><td>requirements / uv.lock</td><td>The image installs exactly the locked versions</td></tr>
+<tr><td>DVC</td><td>git</td><td>Git holds code and small pointer files; DVC holds the big data; both are tied to the same commit</td></tr>
+</tbody></table></div>
+<p>Here is the common shape: a batch scoring job that uses a dataclass for configuration, pathlib for paths, logging for the story, joblib for the model, pandas for the data, an atomic write for the result and an exit code for the scheduler. The model is trained in the first lines only so that the block is standalone.</p>
+@@py
+import io
+import logging
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+stream = io.StringIO()
+logging.basicConfig(stream=stream, level=logging.INFO, format="%(levelname)s %(message)s", force=True)
+log = logging.getLogger("score_job")
+
+@dataclass(frozen=True)
+class JobConfig:
+    model_path: Path
+    input_csv: Path
+    output_csv: Path
+    threshold: float = 0.5
+
+def run(cfg):
+    model = joblib.load(cfg.model_path)
+    df = pd.read_csv(cfg.input_csv)
+    log.info("read %d rows from %s", len(df), cfg.input_csv.name)
+    if df.isna().any().any():
+        log.error("input has missing values")
+        return 1
+    df["score"] = model.predict_proba(df[["age", "spend"]].to_numpy())[:, 1].round(3)
+    df["flag"] = (df["score"] >= cfg.threshold).astype(int)
+    tmp = cfg.output_csv.with_suffix(".tmp")
+    df.to_csv(tmp, index=False)
+    tmp.replace(cfg.output_csv)
+    log.info("wrote %d rows, %d flagged", len(df), df["flag"].sum())
+    return 0
+
+with tempfile.TemporaryDirectory() as d:
+    d = Path(d)
+    rng = np.random.default_rng(0)
+    Xt = np.column_stack([rng.uniform(18, 80, 300), rng.uniform(5, 100, 300)])
+    yt = (Xt[:, 1] > 60).astype(int)
+    joblib.dump(make_pipeline(StandardScaler(), LogisticRegression()).fit(Xt, yt), d / "m.joblib")
+
+    pd.DataFrame({"age": [30, 45, 52, 61], "spend": [10.0, 90.0, 70.0, 20.0]}).to_csv(d / "in.csv", index=False)
+    cfg = JobConfig(d / "m.joblib", d / "in.csv", d / "out.csv")
+    print("exit", run(cfg))
+    print(pd.read_csv(d / "out.csv")[["age", "spend", "flag"]].to_string(index=False))
+    print(sorted(p.name for p in d.iterdir()))
+
+    pd.DataFrame({"age": [30, None], "spend": [10.0, 90.0]}).to_csv(d / "bad.csv", index=False)
+    print("exit", run(JobConfig(d / "m.joblib", d / "bad.csv", d / "out2.csv")))
+print(stream.getvalue(), end="")
+@@end
+<ol><li>The model is a <code>Pipeline</code> (scaler plus classifier) saved as one object, avoiding pitfall 5.</li>
+<li><code>JobConfig</code> collects all paths and the threshold in one frozen object; <code>run</code> never reads global state.</li>
+<li>Logging goes into a <code>StringIO</code> so we can print it at the end; a real job would log to a file or stdout. <code>force=True</code> replaces any earlier logging setup.</li>
+<li>The job validates input before scoring, logs an error and returns exit code 1 instead of crashing with a vague pandas error. The scheduler sees the non-zero code and can alert or retry.</li>
+<li>Output is written to a <code>.tmp</code> name and moved with <code>replace</code> (atomic). The directory listing shows no leftover temporary file.</li>
+<li>The printed results: exit 0, the four scored rows with flags (only high-spend customers are flagged, matching how we generated labels), the directory listing, exit 1 for the bad file, and the log lines in the order they were produced.</li></ol>
+
+<h2>23.11 How to Solve Any Engineering and MLOps Problem: A Playbook</h2>
+<h3>The decision flow</h3>
+<ol><li><strong>Name the surprise.</strong> Wrong result, crash, slow, different on another machine, or "I cannot reproduce it"? Each has a different first move.</li>
+<li><strong>Reproduce it small.</strong> Make a failing test or a ten-line script. If you cannot reproduce it, you cannot know you fixed it.</li>
+<li><strong>Find the layer.</strong> Use the toolkit figure: code (Write), behaviour (Test), install (Package), interface (Serve), runtime (Ship), history (Track).</li>
+<li><strong>Change one thing, observe, repeat.</strong> Bisect: halve the possibilities (comment out half the pipeline, <code>git bisect</code>, try an older version).</li>
+<li><strong>Fix, then lock it in</strong> with a regression test, a log line or a validation check so the same surprise cannot return unseen.</li></ol>
+<div class="tablewrap"><table class="data"><thead><tr><th>Symptom</th><th>First move</th><th>Likely tools</th></tr></thead><tbody>
+<tr><td>Works here, fails there</td><td>Print versions and paths on both</td><td><code>sys.executable</code>, <code>importlib.metadata</code>, <code>pip list</code>, Docker</td></tr>
+<tr><td>Passes alone, fails in suite (or randomly)</td><td>Shuffle order, look for shared state, time, randomness</td><td>fixtures, seeds, injected clock</td></tr>
+<tr><td>Wrong or empty output, no error</td><td>Log row counts at each stage; add assertions</td><td>logging, validation function</td></tr>
+<tr><td>Slow</td><td>Profile, then fix the biggest cost</td><td><code>cProfile</code>, <code>timeit</code>, joblib, caching</td></tr>
+<tr><td>Fails only in production</td><td>Capture the failing input and replay it in a test</td><td>logs, TestClient, regression test</td></tr>
+<tr><td>Cannot tell which run produced which model</td><td>Record params, data hash, versions with every run</td><td>JSON lines, MLflow, DVC</td></tr>
+<tr><td>Secrets or settings scattered</td><td>One settings object read from the environment</td><td>dataclass, env vars</td></tr>
+<tr><td>Hard for others to run</td><td>Make install and test two commands</td><td>pyproject.toml, uv, README</td></tr>
+</tbody></table></div>
+<h3>Pattern 1: "It works on my machine"</h3>
+<p>The cause is almost always a different interpreter, a different version, or an unpinned dependency. Compare what is installed against what the project requires.</p>
+@@py
+import importlib.metadata as md
+
+REQUIRED = {"numpy": (2, 0), "pandas": (3, 0), "scikit-learn": (1, 5), "not-a-real-package": (1, 0)}
+
+def parse(version):
+    return tuple(int(p) for p in version.split(".")[:2])
+
+for dist, minimum in REQUIRED.items():
+    try:
+        have = md.version(dist)
+    except md.PackageNotFoundError:
+        print(f"{dist}: MISSING")
+        continue
+    status = "ok" if parse(have) >= minimum else f"TOO OLD (need {minimum[0]}.{minimum[1]})"
+    print(f"{dist}: {have} {status}")
+@@end
+<ol><li><code>REQUIRED</code> lists minimum versions as tuples, which compare correctly (<code>(1, 10) &gt; (1, 9)</code>, unlike the strings <code>"1.10"</code> and <code>"1.9"</code>).</li>
+<li><code>md.version</code> reads the installed version or raises <code>PackageNotFoundError</code>, which we report as MISSING instead of crashing.</li>
+<li>The output shows each real library as ok, plus the invented package as MISSING. Run such a check at the start of a job and print the result into the log; it is the first thing to ask a colleague for.</li></ol>
+<h3>Pattern 2: the test that fails only sometimes</h3>
+<p>Expose order dependence on purpose by running the tests in several shuffled orders. The pytest plugin <code>pytest-randomly</code> does this automatically; here is the idea in plain Python.</p>
+@@py
+import io
+import random
+import unittest
+
+STATE = {"count": 0}
+
+class T(unittest.TestCase):
+    def test_one(self):
+        STATE["count"] += 1
+        self.assertEqual(STATE["count"], 1)         # hidden dependence on order
+
+    def test_two(self):
+        STATE["count"] += 1
+        self.assertGreaterEqual(STATE["count"], 1)
+
+tests = [T("test_one"), T("test_two")]
+outcomes = []
+for seed in range(4):
+    STATE["count"] = 0
+    order = tests[:]
+    random.Random(seed).shuffle(order)
+    res = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.TestSuite(order))
+    outcomes.append((tuple(t._testMethodName for t in order), len(res.failures)))
+for order, failures in outcomes:
+    print(order, "failures:", failures)
+print("order dependent:", len({f for _, f in outcomes}) > 1)
+@@end
+<ol><li>Both tests touch the shared dictionary; <code>test_one</code> only passes if it runs first.</li>
+<li>We run the same two tests in four seeded orders (the seeds make the experiment repeatable) and record the order and number of failures.</li>
+<li>Whenever <code>test_two</code> runs first, <code>test_one</code> fails. The last line shows whether the failure count changed with the order, which is proof of shared state. The fix is a fresh state per test (pitfall 14).</li></ol>
+<h3>Pattern 3: the job "succeeds" but the output is wrong</h3>
+<p>Silent wrongness (a join that drops rows, a filter that removes everything) is the most dangerous failure. Add cheap checks between stages that fail loudly.</p>
+@@py
+import pandas as pd
+
+def check_stage(name, df, min_rows, key=None):
+    if len(df) < min_rows:
+        raise ValueError(f"{name}: only {len(df)} rows, expected at least {min_rows}")
+    if key is not None and df[key].duplicated().any():
+        raise ValueError(f"{name}: duplicate values in {key}")
+    print(f"{name}: {len(df)} rows ok")
+
+orders = pd.DataFrame({"order_id": [1, 2, 3, 4], "customer": ["a", "b", "z", "a"]})
+customers = pd.DataFrame({"customer": ["a", "b"], "segment": ["gold", "basic"]})
+
+check_stage("orders", orders, 4, key="order_id")
+joined = orders.merge(customers, on="customer", how="inner")       # silently drops customer "z"
+try:
+    check_stage("joined", joined, min_rows=len(orders))
+except ValueError as exc:
+    print("caught:", exc)
+@@end
+<ol><li><code>check_stage</code> encodes two expectations: a minimum row count and a unique key. Raising an exception stops the pipeline at the stage that broke.</li>
+<li>The inner join keeps only customers present in both tables. Order 3 belongs to customer <code>z</code>, who is not in the customers table, so one row disappears without any error from pandas.</li>
+<li>The orders check passes (<code>orders: 4 rows ok</code>); the joined check catches the loss: <code>joined: only 3 rows, expected at least 4</code>. In a real job also log the counts at every stage so you can see where rows vanish.</li></ol>
+<h3>Pattern 4: it is slow</h3>
+<p>Profile before optimising. <code>cProfile</code> counts every function call and the time inside it. We print call counts (stable) rather than times (which vary).</p>
+@@py
+import cProfile
+import pstats
+
+def slow_unique(items):
+    out = []
+    for x in items:
+        if x not in out:                  # list membership is linear: O(n) each time
+            out.append(x)
+    return out
+
+def fast_unique(items):
+    return list(dict.fromkeys(items))     # hash lookup: O(1) each time, keeps order
+
+def pipeline():
+    data = [i % 500 for i in range(5000)]
+    return slow_unique(data), fast_unique(data)
+
+prof = cProfile.Profile()
+prof.runcall(pipeline)
+stats = pstats.Stats(prof)
+rows = {k[2]: v for k, v in stats.stats.items() if k[2] in ("slow_unique", "fast_unique", "pipeline")}
+print({name: rows[name][1] for name in sorted(rows)})
+print(slow_unique([3, 1, 3, 2]) == fast_unique([3, 1, 3, 2]))
+@@end
+<ol><li>Two functions give the same result; the first does a linear scan of a list for every item, so its cost grows with the square of the input size.</li>
+<li><code>runcall</code> profiles a single call; <code>pstats.Stats</code> holds the numbers. In day-to-day use call <code>stats.sort_stats("cumulative").print_stats(10)</code> to see which functions take the most time, and read the top rows.</li>
+<li>We print the number of calls for our three functions (each was called once, so every value is 1). The check on the last line confirms both give identical results, which is the proof you demand before swapping one for the other.</li>
+<li>The fix pattern: replace repeated linear searches with a set or dict, use vectorised pandas or numpy operations instead of Python loops, cache repeated work, and only then reach for parallelism.</li></ol>
+<h3>Pattern 5: failure in production, replay it as a test</h3>
+<p>The cheapest way to fix a production bug permanently is to capture the exact input, write a failing test, then fix.</p>
+@@py
+import io
+import unittest
+
+def parse_amount(text):
+    text = text.replace("$", "").replace(",", "").strip()
+    if text.startswith("(") and text.endswith(")"):        # the fix: accounting negatives "(12.50)"
+        return -float(text[1:-1])
+    return float(text)
+
+class TestRegression(unittest.TestCase):
+    def test_accounting_negative_from_incident_2291(self):
+        self.assertEqual(parse_amount("($12.50)"), -12.5)
+
+    def test_old_behaviour_still_works(self):
+        self.assertEqual(parse_amount("$1,200.00"), 1200.0)
+
+res = unittest.TextTestRunner(stream=io.StringIO()).run(unittest.defaultTestLoader.loadTestsFromTestCase(TestRegression))
+print(res.testsRun, res.wasSuccessful())
+@@end
+<ol><li>Imagine production crashed with <code>ValueError</code> on the input <code>"($12.50)"</code> found in the log. Step one is the test named after the incident: it fails before the fix.</li>
+<li>The fix handles brackets as negative amounts. The second test pins the old behaviour so the fix cannot break it.</li>
+<li>Both pass: <code>2 True</code>. The incident number in the test name is a cheap way to leave a trail for the next engineer.</li></ol>
+<h3>Pattern 6: which run produced this model?</h3>
+<p>Use Recipe C: every run writes parameters, a data fingerprint, library versions and metrics. To answer "which run?" later, read <code>runs.jsonl</code> with <code>pd.read_json(path, lines=True)</code> and filter. If the answer is "I do not know", the fix is to start logging today; history cannot be reconstructed afterwards.</p>
+<h3>Pattern 7: settings and secrets scattered</h3>
+<p>Use Example 17: one frozen settings dataclass read once from <code>os.environ</code>, with secrets hidden in <code>repr</code>, validated at start-up. Pass the object down; never read <code>os.environ</code> deep inside functions, because it makes tests and reasoning hard.</p>
+<h3>Pattern 8: hard for others to run</h3>
+<p>Checklist (verify each from a clean clone in a new folder): the README has two commands (install, test); <code>pyproject.toml</code> lists every dependency; tests pass with no network and no private files; the CLI prints <code>--help</code>; a <code>.gitignore</code> keeps data, models and secrets out; the Dockerfile builds. If any step needs a message to a colleague, document or automate it.</p>
+<h3>How to verify any fix</h3>
+<ul><li>A test that failed before and passes now (regression test).</li>
+<li>The same command run twice gives the same result (idempotent, deterministic).</li>
+<li>Run in a fresh environment (new venv or container), not only in your tired one.</li>
+<li>Compare before and after on the same inputs: row counts, metrics, a data hash.</li></ul>
+<h3>How to debug</h3>
+<ul><li><strong>Read the traceback from the bottom.</strong> The last line is the error; the nearest frame in your code is where to look.</li>
+<li><code>breakpoint()</code> drops into the debugger at that line (<code>n</code> next, <code>s</code> step in, <code>p x</code> print, <code>c</code> continue); with pytest use <code>pytest --pdb</code> to stop at the first failure.</li>
+<li>Print the <em>type, shape and first rows</em> of the objects at the boundary between two steps: <code>type(x)</code>, <code>df.shape</code>, <code>df.head(3)</code>.</li>
+<li>Turn on DEBUG logging for one module: <code>logging.getLogger("mypkg.io").setLevel("DEBUG")</code>.</li>
+<li>Run <code>python -X dev</code> to enable extra runtime warnings, and <code>python -W error</code> to turn warnings into exceptions while you hunt a deprecation.</li>
+<li>Minimise: delete code until the bug disappears; the last thing you deleted is related.</li></ul>

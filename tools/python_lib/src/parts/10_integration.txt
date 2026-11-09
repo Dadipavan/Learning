@@ -1,0 +1,126 @@
+
+<h2>19.10 Cross-Library Integration</h2>
+<p>Scikit-learn rarely works alone. This section shows the handshakes with the libraries around it. The first three examples are run; the rest are short notes.</p>
+<h3>pandas and SQL in, scikit-learn out</h3>
+<p>A typical job: query a table, build features, fit. Here an in-memory SQLite database stands in for a warehouse. With pandas 3, text columns arrive with the new <code>str</code> dtype, and scikit-learn's encoders and selectors accept that.</p>
+@@PY
+import sqlite3
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer, make_column_selector
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import OneHotEncoder
+
+rng = np.random.default_rng(0)
+con = sqlite3.connect(":memory:")
+n = 800
+pd.DataFrame({"plan": rng.choice(["basic", "plus", "pro"], n),
+              "age": rng.integers(18, 70, n),
+              "visits": rng.poisson(5, n)}).assign(
+    bought=lambda d: ((d["visits"] > 5) ^ (rng.random(n) < 0.15)).astype(int)
+).to_sql("customers", con, index=False)
+
+df = pd.read_sql("SELECT plan, age, visits, bought FROM customers", con)
+print(df["plan"].dtype, df["age"].dtype)
+
+X, y = df.drop(columns="bought"), df["bought"]
+prep = ColumnTransformer([("cat", OneHotEncoder(handle_unknown="ignore"),
+                           make_column_selector(dtype_include=object))],
+                         remainder="passthrough")
+pipe = make_pipeline(prep, HistGradientBoostingClassifier(random_state=0))
+print("cv accuracy:", cross_val_score(pipe, X, y, cv=5).mean().round(3))
+@@END
+<ol>
+<li>We create an in-memory SQLite database and write a small <code>customers</code> table into it, with a purchase flag that depends on the number of visits plus 15% label noise.</li>
+<li><code>pd.read_sql</code> runs a query and returns a DataFrame. The printed dtypes show <code>plan</code> as the pandas 3 <code>str</code> dtype and <code>age</code> as <code>int64</code>.</li>
+<li><code>make_column_selector(dtype_include=object)</code> picks the text columns by dtype, so the pipeline does not hard-code names; it still matches pandas 3 <code>str</code> columns in this scikit-learn version.</li>
+<li><code>remainder="passthrough"</code> sends the numeric columns on unchanged.</li>
+<li>The whole thing is cross-validated as one object. The best possible accuracy is about 0.85 because 15% of the labels were flipped on purpose; the 0.798 we get is a little below that ceiling.</li>
+</ol>
+<h3>matplotlib and seaborn: plots from results</h3>
+@@PY
+import os
+import tempfile
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.datasets import load_wine
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import ConfusionMatrixDisplay, confusion_matrix
+from sklearn.model_selection import cross_val_predict
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+data = load_wine()
+pipe = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
+pred = cross_val_predict(pipe, data.data, data.target, cv=5)
+cm = confusion_matrix(data.target, pred)
+
+fig, axes = plt.subplots(1, 2, figsize=(8, 3.5))
+ConfusionMatrixDisplay(cm, display_labels=data.target_names).plot(ax=axes[0], colorbar=False)
+sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False, ax=axes[1],
+            xticklabels=data.target_names, yticklabels=data.target_names)
+with tempfile.TemporaryDirectory() as d:
+    fig.savefig(os.path.join(d, "cm.png"), dpi=80)
+    print("saved:", os.path.getsize(os.path.join(d, "cm.png")) > 1000)
+print(cm.diagonal().sum(), "of", cm.sum(), "correct")
+@@END
+<ol>
+<li>Out-of-fold predictions give an honest confusion matrix.</li>
+<li>scikit-learn's own <code>ConfusionMatrixDisplay</code> draws on a matplotlib axis you supply, so it fits into your own figure layout.</li>
+<li>seaborn's <code>heatmap</code> draws the same matrix from the raw array, with more control over colour and annotation format (<code>fmt="d"</code> prints integers).</li>
+<li>Saving to a temporary file keeps the example clean; in a notebook you would simply show the figure.</li>
+</ol>
+<h3>Serving a model over HTTP</h3>
+<p>A model becomes useful when another program can call it. The Python chapter on APIs (Chapter 12) covers FastAPI and Flask, which are the usual choices. To keep this example self-contained and runnable, we use the standard library server on a free local port and call it with <code>requests</code>.</p>
+@@PY
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import requests
+from sklearn.datasets import load_iris
+from sklearn.linear_model import LogisticRegression
+
+iris = load_iris()
+model = LogisticRegression(max_iter=300).fit(iris.data, iris.target)
+
+class Handler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        pred = model.predict([body["features"]])[0]
+        out = json.dumps({"species": str(iris.target_names[pred])}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+    def log_message(self, *args):
+        pass
+
+server = HTTPServer(("127.0.0.1", 0), Handler)       # port 0 = pick any free port
+threading.Thread(target=server.serve_forever, daemon=True).start()
+url = f"http://127.0.0.1:{server.server_port}/predict"
+
+for row in ([5.0, 3.4, 1.5, 0.2], [6.7, 3.0, 5.2, 2.3]):
+    print(requests.post(url, json={"features": row}, timeout=5).json())
+server.shutdown()
+@@END
+<ol>
+<li>The model is trained once when the server starts, not on every request.</li>
+<li>The handler reads the JSON body (using the <code>Content-Length</code> header), calls <code>predict</code> with one row, and answers with JSON.</li>
+<li><code>HTTPServer(("127.0.0.1", 0), ...)</code> binds to a free port on the local machine only. A daemon thread serves requests in the background.</li>
+<li><code>requests.post(url, json=...)</code> sends the request and <code>.json()</code> decodes the reply. Two flowers give two species names.</li>
+<li>In production you would load a saved pipeline from disk once at start-up, validate input with a schema, and run the server behind a proper framework.</li>
+</ol>
+<h3>Quick notes on the rest</h3>
+<ul>
+<li><strong>NumPy and SciPy.</strong> Estimators accept NumPy arrays and SciPy sparse matrices (<code>scipy.sparse.csr_matrix</code>); text vectorisers and one-hot encoders return sparse matrices by default. Search distributions come from <code>scipy.stats</code> (<code>loguniform</code>, <code>randint</code>).</li>
+<li><strong>pandas.</strong> DataFrames in, names preserved in <code>feature_names_in_</code>; <code>set_output(transform="pandas")</code> to get DataFrames out. Use <code>df[["col"]]</code> for one feature. Under pandas 3 copy-on-write, <code>X_train = df[cols]</code> is a safe independent object, so the old <code>SettingWithCopyWarning</code> no longer applies; still, do not modify X after fitting and expect the model to notice.</li>
+<li><strong>joblib.</strong> Used for parallelism inside scikit-learn (<code>n_jobs</code>) and for saving models. You can change the backend with <code>joblib.parallel_config</code>.</li>
+<li><strong>statsmodels.</strong> Use it when you need coefficients with p-values and confidence intervals (see the Statistics document). Use scikit-learn for prediction and validation.</li>
+<li><strong>XGBoost and LightGBM</strong> (<em>not run here</em>). Both ship scikit-learn-compatible classes (<code>XGBClassifier</code>, <code>LGBMClassifier</code>), so they work inside <code>Pipeline</code>, <code>cross_val_score</code> and <code>GridSearchCV</code> unchanged.</li>
+<li><strong>Polars</strong> (<em>not run here</em>). Recent scikit-learn can return Polars frames with <code>set_output(transform="polars")</code> and accepts Polars input in many places; check the version notes of your install.</li>
+<li><strong>Deep learning.</strong> <code>skorch</code> wraps PyTorch models in the scikit-learn interface (not run here); otherwise export features from scikit-learn and train in PyTorch.</li>
+</ul>

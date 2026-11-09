@@ -1,0 +1,104 @@
+<p>It is Monday morning and a retail team hands you a file: three million sales lines, each with a price, a quantity and a store number. They want every price turned into a z-score within its store, the ten biggest baskets flagged, and the distance between every pair of stores computed from their coordinates. You write a <code>for</code> loop, press run, and go to make tea. The tea is cold before the loop finishes. A colleague rewrites the same logic in six lines of NumPy and it finishes while the kettle is still boiling.</p>
+<p>That gap is not magic. It is the difference between asking Python to do one tiny thing three million times and asking compiled code to do one big thing once. NumPy makes the second way possible, and pandas, SciPy, scikit-learn, PyTorch and matplotlib are all built on its array.</p>
+<p>By the end of this chapter you will create arrays of any shape, select exactly the elements you want, broadcast, summarise along any axis, do linear algebra, use reproducible random numbers, avoid view and copy traps, and solve everyday tasks without loops. Everything printed here ran on Python 3.14 and NumPy 2.5.3. Timings were measured on one laptop and will differ on yours.</p>
+
+<h2>16.1 What NumPy Is, When to Use It, and the Mental Model</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A Python list is a shopping bag of separate boxes: each item is its own object with its own label. A NumPy array is an egg carton: every slot has the same size and type, they sit side by side in one block, and so the library can scan the whole carton in a single sweep. Same-type, side-by-side, one block: that is the whole secret of its speed.</div></div>
+<h3>What it is</h3>
+<p><strong>NumPy</strong> (Numerical Python) gives you one main object, the <strong>ndarray</strong> (n-dimensional array): a grid of numbers that all share one <strong>dtype</strong> (data type), stored in one flat block of memory. Around that object it provides thousands of fast functions that work on whole arrays at once. Working on a whole array at once, with no Python loop, is called <strong>vectorisation</strong>.</p>
+<h3>When to use it, and when not to</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Use NumPy when</th><th>Think twice when</th></tr></thead><tbody>
+<tr><td>You have numbers (or booleans) in bulk and want maths on all of them</td><td>Your data is mixed text, dates and numbers in named columns: use pandas (the next chapter of this Handbook), which sits on top of NumPy</td></tr>
+<tr><td>You need matrices, linear algebra, random numbers, image pixels</td><td>You have a handful of values: a plain list is fine and simpler</td></tr>
+<tr><td>You want to replace a loop over rows with one expression</td><td>Each step depends on the previous one (a recursion): a loop, or a tool such as Numba, may be the right answer</td></tr>
+<tr><td>You feed numbers to scikit-learn, SciPy, PyTorch</td><td>Data is bigger than memory: use chunking, Dask, or a database (see the Data Engineering document)</td></tr>
+<tr><td>You need a fixed-size table of one type</td><td>You need to append one item at a time millions of times: collect in a list, convert once</td></tr>
+</tbody></table></div>
+<h3>Install, version check and import convention</h3>
+<p>Install with <code>pip install numpy</code> (inside a virtual environment, see Chapter 9). The universal import is <code>import numpy as np</code>. Never use <code>from numpy import *</code>: it overwrites Python names such as <code>sum</code>, <code>min</code>, <code>max</code> and <code>abs</code> with different functions and causes bugs that are very hard to see.</p>
+<p class="problem"><span class="pl">Problem 16.1.1</span> Check which NumPy you have, and see the speed difference between a list and an array on a tiny sum of squares.</p>
+<table class="steps"><tr><th>Idea</th><td>Print <code>np.__version__</code>. Then compute the same sum of squares with a list comprehension and with one array expression, and confirm they agree.</td></tr></table>
+<py>
+import numpy as np
+print("major version:", np.__version__.split(".")[0])
+values = [1.5, 2.0, 3.5, 4.0]
+as_list = sum(v * v for v in values)
+arr = np.array(values)
+as_array = (arr * arr).sum()
+print(as_list, as_array, as_list == as_array)
+print(type(arr), arr.dtype, arr.shape)
+</py>
+<p><strong>Line by line.</strong></p>
+<ol><li>The version string looks like <code>2.5.3</code>. Splitting on dots and taking the first part tells you the major version, which is 2 here.</li><li><code>arr * arr</code> multiplies all four pairs in one step; <code>.sum()</code> adds them. Both ways give 34.5.</li><li>The last line shows the three facts every array carries: its type (<code>numpy.ndarray</code>), its dtype (<code>float64</code>) and its shape (<code>(4,)</code>, a one-dimensional array of four items).</li></ol>
+<h3>The mental model</h3>
+<figure><img src="images/lib16_anatomy.png" alt="Diagram of an ndarray: a header holding dtype, shape and strides, pointing to one flat memory buffer, viewed as a 2 by 3 table" loading="lazy"/><figcaption>An ndarray is a small header (dtype, shape, strides) plus a pointer to one flat buffer of bytes. The 2 x 3 table is only a way of reading that buffer.</figcaption></figure>
+<p><strong>How to read it:</strong> the six boxes are the real data, side by side in memory, four bytes each (<code>int32</code>). The header holds instructions: <em>shape</em> says "show this as 2 rows and 3 columns"; <em>strides</em> say how many bytes to jump to the next row (12) or column (4). Because the header is separate from the data, NumPy can show the same bytes in another shape, order or slice without copying.</p>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">An array = one buffer of same-type numbers + a header (dtype, shape, strides). Reshaping, transposing and slicing usually change only the header. Arithmetic, sorting and fancy indexing create new buffers.</div></div>
+
+<h2>16.2 The ndarray: Attributes, dtypes and Memory Layout</h2>
+<p>Before you create arrays in bulk, learn to read one. These attributes answer most "why is my array behaving oddly" questions.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it tells you (plain English)</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>a.shape</code></td><td>Tuple of sizes per axis</td><td><code>np.ones((2,3)).shape</code> gives <code>(2, 3)</code></td></tr>
+<tr><td><code>a.ndim</code></td><td>Number of axes</td><td><code>np.ones((2,3)).ndim</code> gives <code>2</code></td></tr>
+<tr><td><code>a.size</code></td><td>Total number of elements</td><td><code>np.ones((2,3)).size</code> gives <code>6</code></td></tr>
+<tr><td><code>a.dtype</code></td><td>Type of every element</td><td><code>np.array([1,2]).dtype</code> gives <code>int64</code></td></tr>
+<tr><td><code>a.itemsize</code></td><td>Bytes per element</td><td><code>np.float32(1).itemsize</code> gives <code>4</code></td></tr>
+<tr><td><code>a.nbytes</code></td><td>Total bytes of the data buffer</td><td><code>np.zeros(10).nbytes</code> gives <code>80</code></td></tr>
+<tr><td><code>a.strides</code></td><td>Bytes to step along each axis</td><td><code>np.zeros((2,3)).strides</code> gives <code>(24, 8)</code></td></tr>
+<tr><td><code>a.flags</code></td><td>Contiguity, writeable, owns data</td><td><code>a.flags['C_CONTIGUOUS']</code></td></tr>
+<tr><td><code>a.base</code></td><td>The array whose memory this one borrows, or <code>None</code></td><td><code>a[1:].base is a</code></td></tr>
+<tr><td><code>a.T</code></td><td>Transpose (a view)</td><td><code>np.ones((2,3)).T.shape</code> gives <code>(3, 2)</code></td></tr>
+<tr><td><code>a.astype(t)</code></td><td>New array converted to dtype <code>t</code> (always a copy by default)</td><td><code>np.array([1.7]).astype(int)</code> gives <code>[1]</code></td></tr>
+<tr><td><code>a.copy()</code></td><td>Independent copy of data</td><td><code>b = a.copy()</code></td></tr>
+<tr><td><code>a.view(t)</code></td><td>Same bytes read as another dtype</td><td><code>np.float32(1).view(np.int32)</code></td></tr>
+<tr><td><code>a.tolist()</code></td><td>Convert to nested Python lists of Python numbers</td><td><code>np.arange(3).tolist()</code></td></tr>
+<tr><td><code>a.item()</code></td><td>One element as a Python scalar</td><td><code>np.array([7]).item()</code></td></tr>
+<tr><td><code>np.iinfo(t)</code>, <code>np.finfo(t)</code></td><td>Limits of an integer or float type</td><td><code>np.iinfo(np.int8).max</code> gives <code>127</code></td></tr>
+<tr><td><code>np.result_type(a, b)</code></td><td>Which dtype an operation would produce</td><td><code>np.result_type(np.int8, np.float32)</code></td></tr>
+</tbody></table></div>
+<h3>The dtypes you will actually meet</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>dtype</th><th>Bytes</th><th>Range or meaning</th><th>Typical use</th></tr></thead><tbody>
+<tr><td><code>bool</code></td><td>1</td><td>True or False</td><td>Masks from comparisons</td></tr>
+<tr><td><code>int8, uint8</code></td><td>1</td><td>-128..127, 0..255</td><td>Image pixels (uint8), small codes</td></tr>
+<tr><td><code>int32, int64</code></td><td>4, 8</td><td>about +/-2.1 billion, +/-9.2 quintillion</td><td>Counts, indexes (int64 is the usual default)</td></tr>
+<tr><td><code>float32</code></td><td>4</td><td>about 7 decimal digits</td><td>Deep learning, big images, half the memory</td></tr>
+<tr><td><code>float64</code></td><td>8</td><td>about 15-16 decimal digits</td><td>Default for decimals, statistics</td></tr>
+<tr><td><code>complex128</code></td><td>16</td><td>real + imaginary parts</td><td>Signal processing (FFT)</td></tr>
+<tr><td><code>datetime64[ns]</code></td><td>8</td><td>timestamps</td><td>Time series (pandas uses it)</td></tr>
+<tr><td><code>object</code></td><td>8 (pointer)</td><td>any Python objects</td><td>Avoid: no speed benefit</td></tr>
+</tbody></table></div>
+<p class="problem"><span class="pl">Problem 16.2.1</span> Inspect an array, change its dtype, and see how much memory it uses.</p>
+<table class="steps"><tr><th>Idea</th><td>Create a 1000 by 1000 float64 array, read its attributes, then convert to float32 and uint8 and compare <code>nbytes</code>.</td></tr></table>
+<py>
+import numpy as np
+a = np.zeros((1000, 1000))
+print(a.shape, a.ndim, a.size, a.dtype)
+print(a.itemsize, a.nbytes, a.strides)
+b = a.astype(np.float32)
+c = a.astype(np.uint8)
+print(a.nbytes, b.nbytes, c.nbytes)
+print(np.array([1, 2, 3]).dtype, np.array([1, 2.5]).dtype, np.array([1, "a"]).dtype)
+</py>
+<p><strong>Line by line.</strong></p>
+<ol><li>Each float64 takes 8 bytes, so the buffer is 8,000,000 bytes (8 MB). Strides <code>(8000, 8)</code>: to go down one row, jump 1000 items of 8 bytes; to go right, jump 8.</li><li><code>astype</code> returns new arrays. float32 halves memory to 4 MB, uint8 cuts it to 1 MB.</li><li>The last line shows <strong>type promotion</strong> on creation: all ints give <code>int64</code>; a mix of int and float becomes <code>float64</code>; a mix with text becomes a string dtype (<code>&lt;U21</code>), which is rarely what you want.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>np.array([200, 100], dtype=np.uint8) + np.array([100, 100], dtype=np.uint8)</code> and trusting the answer. <strong>Symptom:</strong> you get <code>[44 200]</code>, because 300 does not fit in 0..255 and silently <em>wraps around</em>. <strong>Fix:</strong> convert before arithmetic: <code>a.astype(np.int32) + b</code>. Integer overflow in NumPy arrays gives no warning.</div></div>
+<h3>Memory layout: C order and F order</h3>
+<p>A 2D array must be flattened into one line of memory. <strong>C order</strong> (row-major, the default) stores row 0 first, then row 1. <strong>Fortran order</strong> (column-major) stores column 0 first. It matters because walking along memory is fast and jumping around is slow, and because some libraries expect one order.</p>
+<figure><img src="images/lib16_layout.png" alt="Two 2 by 3 grids numbered by memory position: C order numbers along rows, Fortran order numbers down columns" loading="lazy"/><figcaption>The number in each cell is its position in memory. In C order, neighbours in a row are neighbours in memory. In F order, neighbours in a column are.</figcaption></figure>
+<p><strong>How to read it:</strong> the left grid counts 0,1,2 along the first row and then 3,4,5 along the second, so moving right is a step of one slot (4 bytes) and moving down jumps three slots (12 bytes). The right grid counts down each column first, so the two step sizes swap. Same table of values, two different physical orders.</p>
+<p class="problem"><span class="pl">Problem 16.2.2</span> Show that a transpose copies nothing, only swaps the strides, and that a non-contiguous array can be made contiguous.</p>
+<table class="steps"><tr><th>Idea</th><td>Make a 2 by 3 <code>int32</code> array, transpose it, compare strides and flags, then call <code>np.ascontiguousarray</code>.</td></tr></table>
+<py>
+import numpy as np
+a = np.arange(6, dtype=np.int32).reshape(2, 3)
+t = a.T
+print(a.strides, t.strides)
+print(a.flags["C_CONTIGUOUS"], t.flags["C_CONTIGUOUS"], t.flags["F_CONTIGUOUS"])
+print(t.base is a, np.shares_memory(a, t))
+c = np.ascontiguousarray(t)
+print(c.strides, np.shares_memory(a, c))
+print(t.ravel(), t.ravel(order="K"))
+</py>
+<p><strong>Line by line.</strong></p>
+<ol><li>Original strides are <code>(12, 4)</code> as in the figure. The transpose has <code>(4, 12)</code>: the same bytes, read with the step sizes swapped.</li><li>The transpose is no longer C-contiguous but is F-contiguous, because reading it column by column walks memory in order.</li><li><code>ascontiguousarray</code> really copies, giving strides <code>(8, 4)</code> for the new 3 by 2 shape, and it no longer shares memory.</li><li><code>ravel()</code> flattens in logical (row-by-row) order, so the transposed array gives <code>[0 3 1 4 2 5]</code>. <code>order="K"</code> means "whatever order is in memory", giving <code>[0 1 2 3 4 5]</code>.</li></ol>
+<div class="callout green"><div class="lab">WHY IT MATTERS</div><div class="txt">Walking memory in order is friendly to the CPU cache, so a reduction along a strided axis can be slower (it depends on shape and machine). When a function is slow on a transposed or sliced array, check <code>flags</code> and consider <code>np.ascontiguousarray</code>.</div></div>

@@ -1,0 +1,196 @@
+
+<h2>18.13 Cross-Library Integration</h2>
+<p>The libraries share NumPy arrays, so integration is mostly about moving data cleanly. Three patterns cover most real work.</p>
+<h3>Pandas to SciPy: one test per group</h3>
+@@PY
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+rng = np.random.default_rng(12)
+df = pd.DataFrame({
+    "city": np.repeat(["Oslo", "Lima", "Pune"], 60),
+    "variant": np.tile(["control", "new"], 90),
+    "minutes": np.concatenate([rng.normal(m, 6, 60) for m in (30, 34, 28)]),
+})
+df.loc[df["variant"] == "new", "minutes"] -= 3.0
+
+rows = []
+for city, g in df.groupby("city"):
+    a = g.loc[g["variant"] == "control", "minutes"]
+    b = g.loc[g["variant"] == "new", "minutes"]
+    r = stats.ttest_ind(b, a, equal_var=False)
+    rows.append({"city": city, "diff": b.mean() - a.mean(), "p": r.pvalue})
+out = pd.DataFrame(rows)
+out["p_adj"] = stats.false_discovery_control(out["p"])
+print(out.round(3).to_string(index=False))
+print("city dtype:", df["city"].dtype)
+@@END
+<ol><li>The table has a text column (<code>city</code>), a group column and a numeric column. In pandas 3 the text column has the dedicated <code>str</code> dtype, shown on the last line.</li><li>Pandas Series go straight into SciPy; they are converted to NumPy arrays internally. We never loop over rows, only over the 3 groups.</li><li>Collecting results into a list of dictionaries and building one DataFrame at the end is the clean pattern (appending rows to a DataFrame inside a loop is slow).</li><li>With three simultaneous tests we adjust the p-values with <code>false_discovery_control</code>.</li></ol>
+<h3>SciPy to scikit-learn: distributions as search spaces, sparse matrices as features</h3>
+@@PY
+import numpy as np
+from scipy import stats, sparse
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import RandomizedSearchCV
+
+rng = np.random.default_rng(0)
+X = sparse.random_array((400, 50), density=0.1, rng=rng, format="csr")
+w = rng.normal(size=50)
+y = X @ w + rng.normal(0, 0.1, 400)
+
+search = RandomizedSearchCV(Ridge(), {"alpha": stats.loguniform(1e-3, 1e2)},
+                            n_iter=12, cv=3, random_state=0)
+search.fit(X, y)
+print("input is sparse:", sparse.issparse(X), " nnz =", X.nnz)
+print("best alpha: %.4f   cv R2: %.3f" % (search.best_params_["alpha"], search.best_score_))
+@@END
+<ol><li>A scikit-learn estimator accepts a SciPy sparse matrix directly, so a text-feature matrix never needs to be made dense.</li><li><code>stats.loguniform(1e-3, 1e2)</code> is a frozen SciPy distribution. <code>RandomizedSearchCV</code> calls its <code>rvs</code> method, so any distribution from section 18.2 can define a search range. Log-uniform is right for scale-like settings such as regularisation strengths.</li><li>The best settings and scores are the search result; the exact alpha depends on the random draws, which are seeded.</li></ol>
+<h3>SciPy with statsmodels and joblib</h3>
+<p>statsmodels (not run here) accepts NumPy arrays and pandas DataFrames, and its results can be post-processed with SciPy: for instance <code>stats.t.ppf</code> for custom intervals, or <code>stats.probplot(res.resid, plot=ax)</code> for a residual Q-Q plot. To spread many independent bootstraps over cores, wrap the work with <code>joblib.Parallel</code>; give each task its own seed so results stay reproducible.</p>
+@@PY
+import numpy as np
+from joblib import Parallel, delayed
+
+data = np.random.default_rng(0).lognormal(1.2, 0.5, 300)
+
+def boot_median(seed):
+    r = np.random.default_rng(seed)
+    return np.median(r.choice(data, size=data.size, replace=True))
+
+meds = Parallel(n_jobs=2)(delayed(boot_median)(s) for s in range(400))
+print("n resamples:", len(meds), " 95%% interval: (%.3f, %.3f)" % tuple(np.percentile(meds, [2.5, 97.5])))
+again = Parallel(n_jobs=2)(delayed(boot_median)(s) for s in range(400))
+print("reproducible:", meds == again)
+@@END
+<ol><li>Each job gets a different integer seed (0 to 399), so the 400 resamples differ from each other but the whole run repeats exactly.</li><li><code>Parallel(n_jobs=2)</code> runs tasks in separate worker processes; for work this light, the start-up cost can exceed the gain. Parallelise heavy tasks, not tiny ones.</li></ol>
+
+<h2>18.14 How to Solve Any SciPy/statsmodels Problem</h2>
+<h3>The decision flow</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Ask yourself</th><th>If yes, reach for</th></tr></thead><tbody>
+<tr><td>Do I need a probability, quantile or random draw?</td><td><code>stats</code> distribution: <code>cdf, sf, ppf, rvs</code></td></tr>
+<tr><td>Is a difference real or luck?</td><td><code>stats</code> test chosen by data type, plus an interval and effect size</td></tr>
+<tr><td>Do I need uncertainty and no formula exists?</td><td><code>stats.bootstrap</code> or <code>permutation_test</code></td></tr>
+<tr><td>Do I have a formula with unknown constants?</td><td><code>optimize.curve_fit</code> (or <code>least_squares</code>)</td></tr>
+<tr><td>Do I want the best inputs?</td><td><code>minimize</code> (smooth), <code>linprog</code>/<code>milp</code> (linear), <code>differential_evolution</code> (rugged)</td></tr>
+<tr><td>Do I need a total over a range or a changing system?</td><td><code>integrate.quad</code>, <code>trapezoid</code>, <code>solve_ivp</code></td></tr>
+<tr><td>Do I need values between or smoother than my points?</td><td><code>interpolate</code> or <code>signal.savgol_filter</code></td></tr>
+<tr><td>Is it a repeating pattern or noise in time?</td><td><code>fft</code>, <code>signal.welch</code>, <code>find_peaks</code>, <code>butter</code></td></tr>
+<tr><td>Is it about who is close or similar?</td><td><code>spatial.KDTree</code>, <code>cdist</code>, <code>cluster</code></td></tr>
+<tr><td>Do I need coefficients with p-values and intervals?</td><td>statsmodels (<code>OLS, GLM, ARIMA</code>) or the manual NumPy version</td></tr>
+<tr><td>Is the matrix mostly zeros or huge?</td><td><code>sparse</code> and <code>sparse.linalg</code></td></tr>
+</tbody></table></div>
+<h3>Six recurring problem patterns, each solved</h3>
+<p><strong>Pattern 1: "What is the chance?"</strong> Name the distribution, then use <code>sf</code> or <code>cdf</code>.</p>
+@@PY
+from scipy import stats
+# A server answers in a lognormal time with median 200 ms and shape 0.4. P(slower than 500 ms)?
+d = stats.lognorm(s=0.4, scale=200)
+print("P(>500 ms) = %.4f   99th percentile = %.0f ms" % (d.sf(500), d.ppf(0.99)))
+@@END
+<ol><li>For a lognormal, <code>scale</code> is the median. <code>sf(500)</code> is the tail beyond 500; <code>ppf(0.99)</code> is the value 99% of requests stay under.</li></ol>
+<p><strong>Pattern 2: "Is it different?"</strong> Check the shape, choose the test, report effect and interval.</p>
+@@PY
+import numpy as np
+from scipy import stats
+rng = np.random.default_rng(21)
+before = rng.lognormal(3.0, 0.5, 40)
+after = before * rng.lognormal(-0.15, 0.2, 40)          # same users measured twice
+diff = np.log(after) - np.log(before)
+print("normal log-differences? shapiro p = %.2f" % stats.shapiro(diff).pvalue)
+t = stats.ttest_1samp(diff, 0.0)
+ci = t.confidence_interval()
+print("paired on log scale: p = %.2g, mean ratio %.2f (CI %.2f to %.2f)" % (t.pvalue, np.exp(diff.mean()), np.exp(ci.low), np.exp(ci.high)))
+@@END
+<ol><li>Same users twice means paired data. The ratios are skewed, but their logs are normal, so a one-sample t-test on the log-differences works, and exponentiating gives a ratio with an interval.</li></ol>
+<p><strong>Pattern 3: "How sure am I?"</strong> If the statistic has no formula, bootstrap it.</p>
+@@PY
+import numpy as np
+from scipy import stats
+rng = np.random.default_rng(4)
+x = rng.exponential(5, 50)
+r = stats.bootstrap((x,), lambda s: np.percentile(s, 90), n_resamples=3000, random_state=0)
+print("p90 = %.2f, 95%% CI (%.2f, %.2f)" % (np.percentile(x, 90), *r.confidence_interval))
+@@END
+<ol><li>The 90th percentile has no tidy standard-error formula, but the bootstrap works for any function of the sample. Default method BCa handles the skew.</li></ol>
+<p><strong>Pattern 4: "What are the best inputs?"</strong> Write the objective as a function of one array, add limits, minimise.</p>
+@@PY
+import numpy as np
+from scipy import optimize
+# Split 100 units between 3 channels with diminishing returns a*sqrt(x); maximise total return.
+a = np.array([3.0, 2.0, 1.0])
+res = optimize.minimize(lambda x: -(a * np.sqrt(x)).sum(), x0=[30, 30, 40], bounds=[(0, 100)] * 3,
+                        constraints=[{"type": "eq", "fun": lambda x: x.sum() - 100}], method="SLSQP")
+print(res.x.round(1), "return %.2f" % -res.fun)
+print("theory (x proportional to a^2):", (100 * a ** 2 / (a ** 2).sum()).round(1))
+@@END
+<ol><li>The equality constraint keeps the total at 100. Lagrange theory says the best split is proportional to a squared, which the numerical answer matches: a good verification.</li></ol>
+<p><strong>Pattern 5: "Accumulate or evolve."</strong> Total over a range: integrate. Something changing by a rule: <code>solve_ivp</code>.</p>
+@@PY
+import numpy as np
+from scipy import integrate
+# Drug concentration decays at rate 0.3/h; a 10-unit dose is given each 4 h in a continuous 'pump' approximation.
+sol = integrate.solve_ivp(lambda t, c: 10 / 4 - 0.3 * c, (0, 24), [0.0], t_eval=[24], rtol=1e-8)
+print("c(24h) = %.3f   steady state = %.3f" % (sol.y[0, 0], 10 / 4 / 0.3))
+@@END
+<ol><li>Inflow minus decay gives dc/dt = 2.5 - 0.3 c. The level climbs toward the steady state 2.5/0.3 = 8.33; after 24 hours it has nearly arrived.</li></ol>
+<p><strong>Pattern 6: "Find structure in a signal or in space."</strong> Frequencies via FFT; neighbours via KDTree.</p>
+@@PY
+import numpy as np
+from scipy import fft, spatial
+rng = np.random.default_rng(1)
+sales = 50 + 8 * np.sin(2 * np.pi * np.arange(364) / 52) + rng.normal(0, 2, 364)   # daily data with a 52-day cycle
+f = fft.rfftfreq(364, 1.0)
+print("cycle length: %.0f days" % (1 / f[1:][np.argmax(np.abs(fft.rfft(sales - sales.mean()))[1:])]))
+pts = rng.uniform(size=(1000, 2))
+print("pairs closer than 0.02:", len(spatial.KDTree(pts).query_pairs(0.02)))
+@@END
+<ol><li>Remove the mean, transform, ignore the zero-frequency bin, and invert the peak frequency to get a period (here 52 days exactly divides 364 days, so there is no leakage).</li><li><code>query_pairs</code> lists every pair of points within a radius without comparing all pairs.</li></ol>
+<h3>How to verify</h3>
+<ul><li><strong>Recover a known answer.</strong> Simulate data with known parameters, run your method, and see whether it finds them (as in most examples above).</li><li><strong>Compute it two ways.</strong> <code>quad</code> against <code>cdf</code>; permutation p against formula p; <code>solve</code> then multiply back.</li><li><strong>Check boundaries.</strong> Probabilities between 0 and 1; fitted distributions with positive support for positive data; the optimum respects constraints (<code>res.success</code>, then test constraints yourself).</li><li><strong>Plot it.</strong> A fit you have not plotted is a guess.</li></ul>
+<h3>How to debug</h3>
+<ol><li><strong>Read the result object.</strong> <code>res.success</code>, <code>res.message</code>, <code>res.status</code>; <code>print(res)</code> shows everything.</li><li><strong>Shrink the problem.</strong> Run on 10 points, then 100, then all.</li><li><strong>Check shapes and dtypes.</strong> <code>x.shape</code>, <code>x.dtype</code>, <code>np.isnan(x).sum()</code>. NaN silently poisons many statistics; use <code>nan_policy="omit"</code> where offered or drop them first.</li><li><strong>Change the start.</strong> For optimisers try three different <code>x0</code>; if the answers differ, the problem has several local minima.</li><li><strong>Turn warnings into errors while debugging:</strong> <code>warnings.simplefilter("error")</code>. A "covariance could not be estimated" warning from <code>curve_fit</code> means the fit failed, even if numbers came out.</li><li><strong>Compare to a simpler method</strong> (<code>np.polyfit</code> for a line, a histogram for a distribution).</li></ol>
+
+<h2>18.15 Going Deeper: Internals, Memory, Speed, Interviews</h2>
+<h3>How distribution objects work</h3>
+<p>Every SciPy continuous distribution subclasses <code>rv_continuous</code>. You supply one function, <code>_pdf</code> (or <code>_cdf</code>), and the base class derives the rest numerically: cdf by integrating the pdf, ppf by root-finding on the cdf, rvs by inverting the cdf. Distributions with closed forms override these methods for speed. You can define your own:</p>
+@@PY
+import numpy as np
+from scipy import stats
+
+class Triangle(stats.rv_continuous):
+    "Density 2x on [0, 1]"
+    def _pdf(self, x):
+        return 2 * x
+
+tri = Triangle(a=0, b=1, name="tri")
+print("cdf(0.5) = %.4f   (exact 0.25)" % tri.cdf(0.5))
+print("ppf(0.25) = %.4f  (exact 0.5)" % tri.ppf(0.25))
+print("mean = %.4f   (exact 2/3)" % tri.mean())
+print("sample mean = %.3f" % tri.rvs(size=2000, random_state=1).mean())
+@@END
+<ol><li><code>a</code> and <code>b</code> are the support limits. Only <code>_pdf</code> is defined.</li><li>The cdf and mean come from numerical integration, ppf from root-finding, and rvs from inverting the cdf. This works but is slow; defining <code>_cdf</code> and <code>_ppf</code> yourself speeds it up greatly.</li></ol>
+<h3>Optimiser internals in one paragraph</h3>
+<p><code>minimize</code> is a front door to several algorithms. BFGS builds an approximation of the inverse curvature from successive gradients (cost grows with the square of the number of variables). L-BFGS-B stores only a short history of steps, so it scales to thousands of variables and supports bounds. SLSQP solves a sequence of quadratic problems with linearised constraints. Nelder-Mead moves a simplex and uses no derivatives, but is slow and can stall in more than about 10 variables. <code>linprog</code> with <code>method="highs"</code> uses the HiGHS simplex or interior-point solver, and <code>curve_fit</code> calls Levenberg-Marquardt (unbounded) or a trust-region method (bounded). Convergence is controlled by <code>tol</code> and <code>options</code>; a run that hits <code>maxiter</code> returns <code>success=False</code>.</p>
+<h3>Memory: sparse formats and dtypes</h3>
+@@PY
+import numpy as np
+from scipy import sparse
+
+rng = np.random.default_rng(0)
+n = 5000
+r = rng.integers(0, n, 50000); c = rng.integers(0, n, 50000)
+coo = sparse.coo_array((np.ones(50000), (r, c)), shape=(n, n))
+csr = coo.tocsr()
+lil = coo.tolil()
+mb = lambda b: round(b / 1e6, 2)
+print("dense float64 :", mb(n * n * 8), "MB")
+print("COO           :", mb(coo.data.nbytes + coo.row.nbytes + coo.col.nbytes), "MB")
+print("CSR           :", mb(csr.data.nbytes + csr.indices.nbytes + csr.indptr.nbytes), "MB")
+print("index dtype   :", csr.indices.dtype, " nnz after duplicates summed:", csr.nnz)
+@@END
+<ol><li>COO stores three numbers per entry (value, row, column). CSR replaces the row array by a short pointer array of length n + 1, so it is smaller and gives fast row operations.</li><li>The last line prints the index dtype (64-bit here, because the inputs were 64-bit). 32-bit indices would take half the index memory, so check <code>.indices.dtype</code> on very large matrices.</li><li>Converting COO to CSR sums duplicate coordinates, so <code>nnz</code> can be below the number of entries you inserted (random pairs collided here).</li><li>LIL (a list of rows) is the flexible format for editing individual elements but is slow and heavy for arithmetic, so convert before computing.</li></ol>
+<h3>Speed: where the time goes</h3>
+<ul><li>FFT cost is about n log n, but only for lengths with small prime factors; a length that is a large prime can be far slower. <code>fft.next_fast_len(n)</code> and zero-padding, or choosing a good length, fix it.</li><li>Dense linear algebra calls optimised BLAS/LAPACK libraries; time scales with n cubed for solve, so doubling the size costs about 8 times.</li><li>KDTree build is about n log n and a query about log n in low dimensions, degrading toward brute force as dimension grows.</li><li>Distribution methods have per-call overhead. For a hot loop, pull the maths out (<code>scipy.special.ndtr</code> for the normal cdf) or vectorise.</li><li>Many functions accept <code>workers</code> for parallelism; BLAS threading is controlled by environment variables such as <code>OMP_NUM_THREADS</code>.</li></ul>
+<h3>What interviewers probe</h3>
+<ol><li><strong>"What does a p-value mean?"</strong> Probability, under the null, of a statistic at least as extreme as observed. Not the probability the null is true.</li><li><strong>"Why Welch rather than Student?"</strong> Equal variances are rarely guaranteed; Welch loses almost nothing when they are equal.</li><li><strong>"Why is <code>solve</code> better than <code>inv</code>?"</strong> One LU factorisation (about 2n<sup>3</sup>/3 operations) with smaller rounding error, while inversion costs more and amplifies error through the condition number.</li><li><strong>"Bootstrap versus formula?"</strong> The bootstrap needs no distribution formula and works for medians, ratios and percentiles, but needs a reasonably representative sample and fails for extremes such as the maximum.</li><li><strong>"What if <code>curve_fit</code> fails?"</strong> Better <code>p0</code>, bounds, rescale parameters to similar magnitudes, check the model is identifiable (two parameters doing the same job make <code>pcov</code> infinite).</li><li><strong>"KDTree in 500 dimensions?"</strong> Distances concentrate and pruning fails; use approximate nearest-neighbour methods.</li><li><strong>"Aliasing?"</strong> Frequencies above half the sampling rate fold back to lower ones; sample faster or low-pass filter before sampling.</li></ol>

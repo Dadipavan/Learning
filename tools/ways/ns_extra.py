@@ -1,0 +1,11 @@
+deliv = o[o.status == "delivered"]
+rev_total = o.revenue.sum()
+n_orders = len(o)
+aov = deliv.net.mean()
+cat_rev = o.groupby("category").revenue.sum().sort_values(ascending=False)
+city_rev = o.groupby("city").revenue.sum().sort_values(ascending=False)
+month_rev = o.groupby(o.order_date.dt.month).revenue.sum()
+ret_rate = (o.status == "returned").mean()
+late_rate = o.late.mean()
+per_cust = o.groupby("customer_id").size()
+repeat_share = (per_cust >= 2).mean()

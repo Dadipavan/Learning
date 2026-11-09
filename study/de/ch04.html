@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 4: Ingestion Patterns</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Engineering &amp; Big Data</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 4</div><h1>Ingestion Patterns</h1><p>How to copy data from the outside world into your platform: completely, incrementally, safely, and again after a failure.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-4-1-full-load-vs-incremental-load-and-the-watermark">4.1 Full Load vs Incremental Load and the Watermark</a></li><li><a href="#s2-4-2-apis-pagination-rate-limits-retries-files-and-webhooks">4.2 APIs, Pagination, Rate Limits, Retries, Files and Webhooks</a></li><li><a href="#s3-4-3-change-data-capture-backfills-and-late-arriving-data">4.3 Change Data Capture, Backfills and Late-Arriving Data</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>Every pipeline starts with a hard question: "How do I get the data in without missing anything, without duplicating anything, and without hurting the source?" A new order arrives, an old order is changed, a customer is deleted, an API returns page 3 twice, a job crashes halfway. This chapter gives you the patterns that answer those cases: full load, incremental load with a watermark, change data capture (CDC), API pagination and retries, file drops and webhooks. You will write and run a working incremental loader in Python and SQLite, break it on purpose, and fix it. By the end you will be able to design an ingestion job that you can re-run at any time and trust.</p>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 4: Ingestion Patterns</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Engineering &amp; Big Data</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 4</div><h1>Ingestion Patterns</h1><p>How to copy data from the outside world into your platform: completely, incrementally, safely, and again after a failure.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-4-1-full-load-vs-incremental-load-and-the-watermark">4.1 Full Load vs Incremental Load and the Watermark</a></li><li><a href="#s2-4-2-apis-pagination-rate-limits-retries-files-and-webhooks">4.2 APIs, Pagination, Rate Limits, Retries, Files and Webhooks</a></li><li><a href="#s3-4-3-change-data-capture-backfills-and-late-arriving-data">4.3 Change Data Capture, Backfills and Late-Arriving Data</a></li><li><a href="#s4-4-4-python-for-data-engineering-generators-and-chunked-reads">4.4 Python for Data Engineering: Generators and Chunked Reads</a></li><li><a href="#s5-4-5-typed-records-concurrency-and-safe-retries">4.5 Typed Records, Concurrency and Safe Retries</a></li><li><a href="#s6-4-6-an-idempotent-loader-function">4.6 An Idempotent Loader Function</a></li><li><a href="#s7-4-7-log-based-cdc-in-depth-events-tombstones-snapshots-and-the-outbox">4.7 Log-Based CDC in Depth: Events, Tombstones, Snapshots and the Outbox</a></li><li><a href="#s8-chapter-recap">Chapter recap</a></li><li><a href="#s9-practice-set">Practice set</a></li><li><a href="#s10-prompt-pack">Prompt pack</a></li></ol></details><p>Every pipeline starts with a hard question: "How do I get the data in without missing anything, without duplicating anything, and without hurting the source?" A new order arrives, an old order is changed, a customer is deleted, an API returns page 3 twice, a job crashes halfway. This chapter gives you the patterns that answer those cases: full load, incremental load with a watermark, change data capture (CDC), API pagination and retries, file drops and webhooks. You will write and run a working incremental loader in Python and SQLite, break it on purpose, and fix it. By the end you will be able to design an ingestion job that you can re-run at any time and trust.</p>
 <p>Our running example is the ShopKart <code>orders</code> table: it has <code>id</code>, <code>amount</code> and <code>updated_at</code>.</p>
 <h2 id="s1-4-1-full-load-vs-incremental-load-and-the-watermark">4.1 Full Load vs Incremental Load and the Watermark</h2>
 <div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You keep a diary of your friend's bank statement. The <em>full load</em> way is to photocopy the whole statement every night. The <em>incremental</em> way is to write down only the lines after the last line you already have. The "last line you already have" is the <strong>watermark</strong>.</div></div>
@@ -187,10 +187,375 @@ after replaying events 3,4 again: [(1, 'Asha', 'Mumbai'), (3, 'Meena', 'Kochi')]
 <div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using <code>datetime.now()</code> inside a pipeline task to decide what to load. A backfill then loads the wrong period. Use the logical date given by the scheduler.</div></div>
 <p><strong>Check yourself</strong></p>
 <ol><li>Which CDC type sees hard deletes with the smallest source load? Answer: log-based.</li><li>What decides final state for out-of-order events? Answer: the log position (LSN), not arrival time.</li><li>How do you make a daily load safe to re-run? Answer: overwrite or merge its own partition by logical date.</li></ol>
-<h2 id="s4-chapter-recap">Chapter recap</h2>
+<h2 id="s4-4-4-python-for-data-engineering-generators-and-chunked-reads">4.4 Python for Data Engineering: Generators and Chunked Reads</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A list is a truck: it carries every item at once, so it needs a road (memory) wide enough for all of them. A <strong>generator</strong> is a conveyor belt: one item passes at a time, and the belt never holds more than that. Data engineers move files far larger than memory, so the belt is the default tool.</div></div>
+<p>A <strong>generator</strong> is a function that uses <code>yield</code> instead of <code>return</code>. Each time the caller asks for the next item, the function runs until the next <code>yield</code>, hands the value over and pauses. An <strong>iterator</strong> is any object you can loop over one step at a time; generators are the easiest way to build one. The rule for this section: <em>read lazily, process in pieces, combine small partial results.</em></p>
+<h3>Worked example 1: how many chunks?</h3>
+<p class="problem"><span class="pl">Problem 4.4.1</span> A partner sends a 10 GB CSV file with about 50,000,000 rows. Your worker has 2 GB of memory free, so you read it in chunks of about 100 MB. How many chunks, and how many rows per chunk?</p>
+<table class="steps"><tr><th>Idea</th><td>Chunks = file size / chunk size, rounded up (the last chunk may be smaller).</td></tr><tr><th>Units</th><td>Use 1 GB = 1,024 MB, so the file is 10 × 1,024 = 10,240 MB.</td></tr><tr><th>Compute</th><td>10,240 / 100 = 102.4, rounded up to 103 chunks.</td></tr><tr><th>Rows</th><td>50,000,000 rows / 10,240 MB is about 4,883 rows per MB, so a 100 MB chunk holds about 488,000 rows.</td></tr><tr><th>Answer</th><td>103 chunks of about 488,000 rows. Peak memory is about the chunk size times a small overhead factor (parsed text is often 2 to 5 times its size on disk), so plan for 200 to 500 MB, not 10 GB.</td></tr><tr><th>Check</th><td>102 full chunks hold 102 × 100 = 10,200 MB; the remaining 40 MB is chunk 103.</td></tr></table>
+<h3>Worked example 2: a generator against a list, measured</h3>
+<p>We write a 200,000-row ShopKart orders file, then total the amounts two ways. Before you run it: which version do you think needs less memory, and roughly how much less?</p>
+<pre class="code lang-python"><code>import csv, os, tempfile, tracemalloc
+path = os.path.join(tempfile.mkdtemp(), "orders.csv")
+with open(path, "w", newline="") as f:
+    w = csv.writer(f); w.writerow(["order_id", "city", "amount"])
+    for i in range(200_000):
+        w.writerow([f"O{i}", ["Pune", "Delhi", "Mumbai", "Chennai"][i % 4], 100 + i % 900])
+
+def read_all(p):                      # the truck: every row at once
+    with open(p, newline="") as f:
+        return list(csv.DictReader(f))
+
+def read_lazy(p):                     # the conveyor belt: one row at a time
+    with open(p, newline="") as f:
+        for row in csv.DictReader(f):
+            yield row
+
+def measure(make_rows):
+    tracemalloc.start()
+    total = sum(int(r["amount"]) for r in make_rows(path))
+    peak = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+    return total, peak
+
+t1, p1 = measure(read_all)
+t2, p2 = measure(read_lazy)
+print("same total:", t1 == t2, t1)
+print("list peak is more than 50 times the generator peak:", p1 &gt; 50 * p2)
+print("generator peak under 1 MB:", p2 &lt; 1_000_000)</code></pre>
+<pre class="code lang-text"><code>same total: True 109830000
+list peak is more than 50 times the generator peak: True
+generator peak under 1 MB: True</code></pre>
+<p><strong>Explain.</strong> Both versions read the same file and add the same 200,000 numbers, so the totals match. The list version builds 200,000 dictionaries before it adds anything, so its peak grows with the file. The generator version holds one dictionary at a time, so its peak stays tiny no matter how long the file is. We print true/false comparisons instead of byte counts because exact byte counts differ between Python versions. <strong>Check:</strong> the total is the sum over 200,000 rows of 100 + i mod 900. Each full cycle of 900 rows adds 900 × 100 + (0 + 1 + ... + 899) = 90,000 + 404,550 = 494,550. There are 222 full cycles (199,800 rows) and then 200 more rows adding 200 × 100 + (0 + ... + 199) = 20,000 + 19,900 = 39,900, so 222 × 494,550 + 39,900 = 109,790,100 + 39,900 = 109,830,000. That equals the printed total.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Wrapping a generator in <code>list(...)</code> "just to look at it". That turns the conveyor belt back into a truck, and the job that worked on 1 MB crashes on 10 GB. Use <code>itertools.islice(gen, 5)</code> to peek at the first five items instead. Also remember a generator can be consumed only once: a second loop over the same generator sees nothing.</div></div>
+<h3>Worked example 3: pandas in chunks, combining partial results</h3>
+<p>pandas can read a file in pieces with <code>chunksize</code>. The trap is combining the pieces: you must combine <em>sums and counts</em>, never averages of averages (the same lesson as Practice 4 of Chapter 15). Here the average order amount per city is computed chunk by chunk and checked against reading everything at once.</p>
+<pre class="code lang-python"><code>import numpy as np, pandas as pd, io
+rng = np.random.default_rng(7)
+n = 20_000
+df = pd.DataFrame({"city": rng.choice(["Pune", "Delhi", "Mumbai"], n, p=[0.5, 0.3, 0.2]),
+                   "amount": rng.integers(50, 500, n)})
+text = df.to_csv(index=False)
+
+sums, counts = {}, {}
+for chunk in pd.read_csv(io.StringIO(text), chunksize=3_000):      # 7 chunks
+    g = chunk.groupby("city")["amount"].agg(["sum", "count"])
+    for city, row in g.iterrows():
+        sums[city] = sums.get(city, 0) + int(row["sum"])
+        counts[city] = counts.get(city, 0) + int(row["count"])
+chunked = {c: round(sums[c] / counts[c], 3) for c in sorted(sums)}
+full = df.groupby("city")["amount"].mean().round(3).to_dict()
+print("chunked:", chunked)
+print("full   :", dict(sorted(full.items())))
+print("equal:", chunked == dict(sorted(full.items())))
+print("rows seen:", sum(counts.values()))</code></pre>
+<pre class="code lang-text"><code>chunked: {'Delhi': 276.74, 'Mumbai': 275.854, 'Pune': 275.814}
+full   : {'Delhi': 276.74, 'Mumbai': 275.854, 'Pune': 275.814}
+equal: True
+rows seen: 20000</code></pre>
+<p><strong>Explain.</strong> 20,000 rows at 3,000 per chunk is 6 full chunks and a seventh of 2,000. Each chunk contributes a sum and a count per city. At the end the average is total sum divided by total count, which is exactly what the one-shot read computes. If you had averaged the seven chunk averages, a small last chunk would count as much as a big one and the answer would drift.</p>
+<h3>Memory control with dtypes</h3>
+<p>Before parallelism, shrink the data. A pandas column of Python strings (<code>object</code>) stores each value separately. A <code>category</code> column stores each distinct value once and a small integer code per row. Integers default to 64 bits (8 bytes); if the values fit in 32 bits (up to 2,147,483,647) you can halve the cost.</p>
+<pre class="code lang-python"><code>import numpy as np, pandas as pd
+rng = np.random.default_rng(1)
+n = 1_000_000
+df = pd.DataFrame({"qty": rng.integers(1, 20, n), "city": rng.choice(["Pune", "Delhi", "Mumbai"], n)})
+print("qty int64 bytes:", df["qty"].memory_usage(index=False))
+small = df["qty"].astype("int8")
+print("qty int8  bytes:", small.memory_usage(index=False))
+cat = df["city"].astype("category")
+print("city as category is smaller than as text:", cat.memory_usage(deep=True, index=False) &lt; df["city"].memory_usage(deep=True, index=False))
+print("category codes dtype:", cat.cat.codes.dtype)</code></pre>
+<pre class="code lang-text"><code>qty int64 bytes: 8000000
+qty int8  bytes: 1000000
+city as category is smaller than as text: True
+category codes dtype: int8</code></pre>
+<p><strong>Explain.</strong> One million rows times 8 bytes is 8,000,000 bytes for <code>int64</code>; times 1 byte is 1,000,000 for <code>int8</code> (valid for values from −128 to 127; our quantities are 1 to 19). Three cities fit easily in an 8-bit code. The same idea in Parquet is called dictionary encoding (Chapter 3).</p>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Three levers keep a single machine alive on big data: <strong>read lazily</strong> (generators, <code>chunksize</code>), <strong>store small</strong> (right-sized dtypes, categories, only the columns you need), and <strong>combine partial results</strong> (sums and counts, not averages).</div></div>
+<h3>Going deeper: single-node engines (not run here)</h3>
+<p>When pandas runs out of memory, the next step is usually not a cluster but a faster single-node engine. <strong>DuckDB</strong> runs SQL on files directly and spills to disk when memory is short. <strong>Polars</strong> has a lazy mode that plans the whole query first, pushes filters and column selection into the file read and can stream the result. Neither package is installed in the sandbox used to write this book, so these snippets are not run here; treat them as the shape of the code.</p>
+<pre class="code lang-text"><code># not run here: needs `pip install duckdb polars`
+import duckdb
+duckdb.sql("""
+    COPY (SELECT city, SUM(amount) AS revenue FROM 'orders.csv' GROUP BY city)
+    TO 'revenue_by_city.parquet' (FORMAT PARQUET)
+""")
+import polars as pl
+(pl.scan_csv("orders.csv")                 # lazy: nothing is read yet
+   .group_by("city").agg(pl.col("amount").sum().alias("revenue"))
+   .sink_parquet("revenue_by_city.parquet"))   # streams the result to disk</code></pre>
+<p>A rough rule: pandas for data that fits comfortably in memory (under about a quarter of RAM), DuckDB or Polars up to a few hundred GB on one big machine, Spark when the data or the compute must be spread over many machines (Chapters 9 and 10).</p>
+<h2 id="s5-4-5-typed-records-concurrency-and-safe-retries">4.5 Typed Records, Concurrency and Safe Retries</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Ingestion code spends most of its life waiting: for the network, for the API, for the disk. A cashier who serves one customer and then waits for that customer to find their wallet is slow. Concurrency means serving the next customer while the first is searching. It helps when the work is <em>waiting</em>; it does not help when the work is <em>computing</em>.</div></div>
+<h3>Typed records: catch bad data at the door</h3>
+<p>A <strong>type hint</strong> is a note such as <code>amount_paise: int</code> that tools and readers can check. A <strong>dataclass</strong> is a class that stores named fields without boilerplate. Adding a check in <code>__post_init__</code> turns it into a tiny contract (Chapter 5): a record that breaks the rules cannot even be created. The <code>pydantic</code> library does this with less code and also converts types (for example the text <code>"25000"</code> into the integer 25000). It is not installed here, so the pydantic version is shown as text only.</p>
+<pre class="code lang-python"><code>from dataclasses import dataclass
+from typing import Optional
+
+ALLOWED = {"PAID", "SHIPPED", "REFUNDED"}
+
+@dataclass(frozen=True)
+class Order:
+    order_id: str
+    amount_paise: int
+    status: str
+    coupon: Optional[str] = None
+
+    def __post_init__(self):
+        if not isinstance(self.amount_paise, int) or self.amount_paise &lt; 0:
+            raise ValueError(f"amount_paise must be a non-negative int, got {self.amount_paise!r}")
+        if self.status not in ALLOWED:
+            raise ValueError(f"status {self.status!r} not in {sorted(ALLOWED)}")
+
+raw = [{"order_id": "O1", "amount_paise": 25000, "status": "PAID"},
+       {"order_id": "O2", "amount_paise": "1,250.50", "status": "PAID"},
+       {"order_id": "O3", "amount_paise": 900, "status": "LOST"}]
+good, bad = [], []
+for r in raw:
+    try: good.append(Order(**r))
+    except ValueError as e: bad.append((r["order_id"], str(e)))
+print("good:", [o.order_id for o in good])
+for oid, why in bad: print("quarantine", oid, "-&gt;", why)</code></pre>
+<pre class="code lang-text"><code>good: ['O1']
+quarantine O2 -&gt; amount_paise must be a non-negative int, got '1,250.50'
+quarantine O3 -&gt; status 'LOST' not in ['PAID', 'REFUNDED', 'SHIPPED']</code></pre>
+<pre class="code lang-text"><code># not run here: needs `pip install pydantic`
+from pydantic import BaseModel, Field
+from typing import Literal, Optional
+class Order(BaseModel):
+    order_id: str
+    amount_paise: int = Field(ge=0)          # "25000" is converted to 25000; "1,250.50" fails
+    status: Literal["PAID", "SHIPPED", "REFUNDED"]
+    coupon: Optional[str] = None</code></pre>
+<p><strong>Explain.</strong> O1 passes. O2 fails because a string is not an int; O3 fails because "LOST" is not an allowed status. The failures go to a quarantine list with a reason, exactly the pattern from Chapter 5, and the load continues with the good record.</p>
+<h3>Worked example 4: pulling 500 pages, one at a time or together</h3>
+<p>An API returns 100 orders per page, 500 pages in total. Each call takes about 0.2 seconds of waiting. Sequential time is 500 × 0.2 = 100 seconds. With 50 calls in flight at once, the 500 pages complete in 500 / 50 = 10 rounds of 0.2 seconds, about 2 seconds. The code below uses <code>asyncio</code> (Python's built-in single-thread concurrency) with a <strong>semaphore</strong>, a counter that allows only 50 tasks inside the guarded block at a time. We use 0.01 seconds per fake call so that the demo is quick.</p>
+<pre class="code lang-python"><code>import asyncio, time
+
+active = 0
+max_active = 0
+
+async def fetch_page(n, sem):
+    global active, max_active
+    async with sem:                       # at most 50 inside at once
+        active += 1; max_active = max(max_active, active)
+        await asyncio.sleep(0.01)         # stands in for the network wait
+        active -= 1
+        return {"page": n, "rows": 100}
+
+async def main():
+    sem = asyncio.Semaphore(50)
+    t0 = time.perf_counter()
+    pages = await asyncio.gather(*(fetch_page(n, sem) for n in range(1, 501)))
+    return pages, time.perf_counter() - t0
+
+pages, elapsed = asyncio.run(main())
+print("pages:", len(pages), "rows:", sum(p["rows"] for p in pages))
+print("in order:", [p["page"] for p in pages] == list(range(1, 501)))
+print("max in flight:", max_active)
+print("faster than sequential (5 s):", elapsed &lt; 5.0)</code></pre>
+<pre class="code lang-text"><code>pages: 500 rows: 50000
+in order: True
+max in flight: 50
+faster than sequential (5 s): True</code></pre>
+<p><strong>Explain.</strong> <code>gather</code> returns results in the order the tasks were given even though they finish in a different order, so page 1 is still first. The semaphore caps the concurrency at 50, which protects the API from a burst. <strong>Check:</strong> 500 pages × 100 rows = 50,000 rows.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Thinking more concurrency always means more speed. If the API allows 60 requests per minute (Problem 4.2.1), 500 pages still need at least 500 / 60 = 8.3 minutes, whatever your concurrency. The rate limit, not your code, is the bottleneck. Concurrency only helps up to the server's limit; beyond it you collect HTTP 429 errors.</div></div>
+<h3>Threads, processes or asyncio?</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Work is mostly...</th><th>Use</th><th>Why</th></tr></thead><tbody><tr><td>Waiting on the network, with an async client (<code>httpx</code>, <code>aiohttp</code>)</td><td><code>asyncio</code></td><td>thousands of waits cost almost nothing</td></tr><tr><td>Waiting, with a blocking library (<code>requests</code>, a database driver)</td><td><code>ThreadPoolExecutor</code></td><td>threads wait in parallel; Python releases its lock (the GIL) while waiting on I/O</td></tr><tr><td>Computing (parsing, hashing, compressing)</td><td><code>ProcessPoolExecutor</code> or a cluster</td><td>separate processes avoid the GIL, which lets only one thread run Python code at a time</td></tr></tbody></table></div>
+<pre class="code lang-python"><code>from concurrent.futures import ThreadPoolExecutor
+import time
+
+def slow_lookup(customer_id):             # a blocking call, 0.05 s each
+    time.sleep(0.05)
+    return customer_id, f"C{customer_id:03d}"
+
+ids = list(range(1, 21))
+t0 = time.perf_counter()
+with ThreadPoolExecutor(max_workers=5) as pool:
+    results = list(pool.map(slow_lookup, ids))     # keeps the input order
+elapsed = time.perf_counter() - t0
+print(results[:3], "...", results[-1])
+print("20 calls x 0.05 s = 1.0 s sequential; threaded under 0.6 s:", elapsed &lt; 0.6)</code></pre>
+<pre class="code lang-text"><code>[(1, 'C001'), (2, 'C002'), (3, 'C003')] ... (20, 'C020')
+20 calls x 0.05 s = 1.0 s sequential; threaded under 0.6 s: True</code></pre>
+<p><strong>Explain.</strong> 20 calls with 5 workers is 4 rounds of 0.05 s, about 0.2 s plus a little overhead. The test uses a loose bound (0.6 s) so that a slow machine does not fail it.</p>
+<p class="problem"><span class="pl">Problem 4.5.1</span> You must call a customer-lookup API for 12,000 customers. Each call waits 0.25 s. With 40 concurrent workers and an API limit of 100 calls per second, how long does it take, and what limits you?</p>
+<table class="steps"><tr><th>Concurrency bound</th><td>12,000 calls / 40 workers = 300 rounds; 300 × 0.25 s = 75 s.</td></tr><tr><th>Rate bound</th><td>12,000 calls / 100 per second = 120 s.</td></tr><tr><th>Answer</th><td>Both limits apply, so the time is the larger one: 120 s. The API limit is the bottleneck. Raising workers from 40 to 80 would not help; the throughput of 40 workers is 40 / 0.25 = 160 calls per second, already above 100.</td></tr><tr><th>Check</th><td>At 100 calls per second and 0.25 s per call, only 100 × 0.25 = 25 calls need to be in flight; 25 workers would do.</td></tr></table>
+<h2 id="s6-4-6-an-idempotent-loader-function">4.6 An Idempotent Loader Function</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of a light switch that you can press "ON" ten times: the light is on, once. A loader that you can run ten times and that leaves the table in the same state is idempotent. Pipelines fail, retries happen and the scheduler runs old dates again, so every loader must behave like the ON button, not like a doorbell.</div></div>
+<p>Section 4.1 gave you the idea; here is the shape of a production loader function. It has four properties: (1) it writes inside one <strong>transaction</strong>, so either the whole batch is stored or none of it is; (2) it uses an <strong>upsert</strong> keyed on the business key, so the same row twice gives one row; (3) it only lets a <em>newer</em> version overwrite an older one, so a late replay of old data cannot undo fresh data; (4) it records the run in an audit table.</p>
+<pre class="code lang-python"><code>import sqlite3
+
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE orders(order_id TEXT PRIMARY KEY, amount INTEGER, updated_at TEXT);
+CREATE TABLE load_log(run_id TEXT PRIMARY KEY, rows_in INTEGER);
+""")
+
+def load_batch(db, run_id, rows, fail_after=None):
+    with db:                                           # one transaction: commit or roll back
+        for i, (oid, amount, ts) in enumerate(rows):
+            if fail_after is not None and i == fail_after:
+                raise RuntimeError("worker died mid-batch")
+            db.execute("""INSERT INTO orders VALUES (?,?,?)
+                          ON CONFLICT(order_id) DO UPDATE
+                          SET amount = excluded.amount, updated_at = excluded.updated_at
+                          WHERE excluded.updated_at &gt;= orders.updated_at""", (oid, amount, ts))
+        db.execute("INSERT OR REPLACE INTO load_log VALUES (?,?)", (run_id, len(rows)))
+
+def state():
+    return db.execute("SELECT order_id, amount FROM orders ORDER BY order_id").fetchall()
+
+batch = [("O1", 100, "2024-06-01T10:00"), ("O2", 200, "2024-06-01T11:00"), ("O3", 300, "2024-06-01T12:00")]
+load_batch(db, "run-1", batch)
+print("after run 1:     ", state())
+load_batch(db, "run-1", batch)                         # retry of the same run
+print("after retry:     ", state())
+load_batch(db, "run-2", [("O2", 999, "2024-06-01T09:00")])   # a stale, older version of O2
+print("after stale row: ", state())
+load_batch(db, "run-3", [("O2", 250, "2024-06-02T08:00")])   # a genuine update
+print("after update:    ", state())
+try:
+    load_batch(db, "run-4", [("O4", 400, "2024-06-02T09:00"), ("O5", 500, "2024-06-02T09:05")], fail_after=1)
+except RuntimeError as e:
+    print("run 4 failed:", e)
+print("after failed run:", state())
+print("log:", db.execute("SELECT run_id, rows_in FROM load_log ORDER BY run_id").fetchall())</code></pre>
+<pre class="code lang-text"><code>after run 1:      [('O1', 100), ('O2', 200), ('O3', 300)]
+after retry:      [('O1', 100), ('O2', 200), ('O3', 300)]
+after stale row:  [('O1', 100), ('O2', 200), ('O3', 300)]
+after update:     [('O1', 100), ('O2', 250), ('O3', 300)]
+run 4 failed: worker died mid-batch
+after failed run: [('O1', 100), ('O2', 250), ('O3', 300)]
+log: [('run-1', 3), ('run-2', 1), ('run-3', 1)]</code></pre>
+<p><strong>Explain, step by step.</strong></p>
+<ul><li><em>Run 1</em> inserts three rows.</li><li><em>The retry</em> hits the conflict clause for all three rows, rewrites the same values, and the table is unchanged. This is idempotency.</li><li><em>The stale row</em> has <code>updated_at</code> 09:00, older than the stored 11:00, so the <code>WHERE</code> in the upsert rejects it and O2 keeps 200.</li><li><em>The genuine update</em> is newer, so O2 becomes 250.</li><li><em>The failed run</em> inserted O4 and then raised before O5. Because everything sits inside <code>with db:</code>, the transaction rolled back: O4 is not stored, and no log row exists for run-4. Half-written batches are the cause of many duplicate and missing-row incidents.</li></ul>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Idempotent loader = transaction + upsert on the business key + "newer wins" guard + run log. The retry logic of Section 4.2 is only safe because the loader underneath is built this way.</div></div>
+<p class="problem"><span class="pl">Problem 4.6.1</span> Your loader runs twice for the same day because the scheduler retried. Compare two designs on a table that already holds 1,000 rows for that day and a batch of 1,000 rows: (a) plain <code>INSERT</code>; (b) <code>DELETE</code> the day's partition then <code>INSERT</code>, in one transaction. What are the row counts after the second run?</p>
+<table class="steps"><tr><th>Design (a)</th><td>The second run inserts the same 1,000 rows again: 1,000 + 1,000 = 2,000 rows (or a primary-key error and a failed task if a key exists).</td></tr><tr><th>Design (b)</th><td>The delete removes 1,000, the insert adds 1,000: 1,000 rows.</td></tr><tr><th>Answer</th><td>(a) 2,000 rows, double counted revenue; (b) 1,000 rows. Design (b) is idempotent because the result depends only on the batch, not on how many times it ran.</td></tr><tr><th>Check</th><td>Run (b) ten times: still 1,000. Run (a) ten times: 10,000.</td></tr><tr><th>Caution</th><td>(b) is safe only if the delete and insert are in one transaction. If the process dies between them, the day is empty.</td></tr></table>
+<p class="problem"><span class="pl">Problem 4.6.2</span> A file of 3 rows is loaded with the upsert loader above. Batch: (O7, 10, 09:00), (O7, 20, 10:00), (O7, 15, 09:30), processed in that order. What is O7's final amount?</p>
+<table class="steps"><tr><th>Row 1</th><td>No O7 yet: insert amount 10 at 09:00.</td></tr><tr><th>Row 2</th><td>Conflict. 10:00 is greater than or equal to 09:00, so update: amount 20 at 10:00.</td></tr><tr><th>Row 3</th><td>Conflict. 09:30 is less than 10:00, so the guard rejects it.</td></tr><tr><th>Answer</th><td>20. The guard makes the result independent of arrival order within the batch, which is exactly what you want when events arrive out of order.</td></tr><tr><th>Check</th><td>Order the three rows by time: the latest is (O7, 20, 10:00). Same answer.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using <code>updated_at &gt; stored</code> versus <code>&gt;=</code> without thinking. With <code>&gt;</code>, a retry carrying the same timestamp is silently skipped (fine, same data). With <code>&gt;=</code> it is rewritten (also fine, same data). But two <em>different</em> changes with the same timestamp are ambiguous under either rule. If the source can produce ties, add a monotonically increasing version or log sequence number and compare that instead.</div></div>
+<h3>Going deeper: packaging, config and logging (the habits that make a script a pipeline)</h3>
+<ul><li><strong>Package it.</strong> Put logic in an importable module (<code>shopkart/loaders.py</code>), keep the DAG file thin, and install the module in CI. Then pytest can import it, and Airflow only calls <code>main(run_date)</code>.</li><li><strong>Configuration from the environment.</strong> Read connection strings and bucket names from environment variables or a secrets manager, never from the code (Chapter 12). The same code then runs in dev and prod.</li><li><strong>Pure functions.</strong> Pass "today" and file paths in as arguments, so tests are repeatable (see Practice 5 in Chapter 5).</li><li><strong>Structured logging.</strong> Log one line per event with the same keys: run id, step, rows in, rows out, seconds. Then "which run dropped the rows?" is a search, not an archaeology project.</li><li><strong>pytest fixtures.</strong> A fixture is a function that builds a fresh test input, such as an empty in-memory database. Each test asks for it by name. Not run here (pytest is not installed in this sandbox); the test bodies would be plain <code>assert</code> statements, like the <code>unittest</code> tests of Chapter 5.</li></ul>
+<h2 id="s7-4-7-log-based-cdc-in-depth-events-tombstones-snapshots-and-the-outbox">4.7 Log-Based CDC in Depth: Events, Tombstones, Snapshots and the Outbox</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">The database keeps a diary (the transaction log) of every change it makes, in order, so that it can recover after a crash. Log-based CDC tools such as <strong>Debezium</strong> read that diary instead of asking the tables questions. Reading the diary costs the source almost nothing, sees every change including deletes, and keeps the order. The price: you now handle a stream of <em>events</em>, and events can repeat, arrive late and describe deletes.</div></div>
+<h3>What one event looks like</h3>
+<p>A Debezium change event has an <strong>envelope</strong> with these fields: <code>op</code> (<code>c</code> create, <code>u</code> update, <code>d</code> delete, <code>r</code> a row read during the initial snapshot), <code>before</code> (the row before the change, or null), <code>after</code> (the row after, or null), <code>source</code> (where in the log this came from, for example the log position) and <code>ts_ms</code> (when the connector processed it). After a delete event, Debezium by default also sends a <strong>tombstone</strong>: a Kafka message with the same key and a null value. A tombstone is not a business event. It tells Kafka's log compaction (keep only the latest message per key) that the key can be removed completely.</p>
+<h3>Worked example 1: apply events safely</h3>
+<p>The target keeps, for each key, the last value <em>and the log position that produced it</em>. An event is applied only if its position is newer than the stored one. A delete is stored as a marker (the value becomes none) with its position, not by erasing the key. Before you run this: if the stream replays the whole list a second time, or if an old update arrives late after a delete, what should happen?</p>
+<pre class="code lang-python"><code>events = [  # (log position, op, key, after-value)
+    (1, "c", "O1", 100),
+    (2, "c", "O2", 200),
+    (3, "u", "O1", 150),
+    (4, "d", "O2", None),
+    (5, "c", "O3", 300),
+]
+
+def apply(state, ev, keep_marker=True):
+    pos, op, key, val = ev
+    if keep_marker and key in state and pos &lt;= state[key][1]:
+        return                                      # already applied or older: skip
+    if op == "d":
+        if keep_marker: state[key] = (None, pos)   # remember the delete and its position
+        else: state.pop(key, None)                  # naive: forget the key
+    else:
+        state[key] = (val, pos)
+
+def live(state):
+    return {k: v[0] for k, v in sorted(state.items()) if v[0] is not None}
+
+s = {}
+for ev in events: apply(s, ev)
+print("first pass :", live(s))
+for ev in events: apply(s, ev)                      # full replay
+print("after replay:", live(s))
+late = (2, "c", "O2", 200)                          # an old event arrives late
+apply(s, late)
+print("late old event, guarded:", live(s))
+
+naive = {}
+for ev in events: apply(naive, ev, keep_marker=False)
+apply(naive, late, keep_marker=False)
+print("late old event, naive  :", live(naive))</code></pre>
+<pre class="code lang-text"><code>first pass : {'O1': 150, 'O3': 300}
+after replay: {'O1': 150, 'O3': 300}
+late old event, guarded: {'O1': 150, 'O3': 300}
+late old event, naive  : {'O1': 150, 'O2': 200, 'O3': 300}</code></pre>
+<p><strong>Explain.</strong> The replay changes nothing because every position is already at or below the stored one. The late "create O2" at position 2 is older than the delete marker at position 4, so the guarded target correctly keeps O2 deleted. The naive target forgot the key when it processed the delete, so it has no memory that anything newer ever happened, and the late event brings O2 back from the dead. Deleted rows reappearing is the classic CDC bug. In a warehouse the same idea is a <code>deleted_at</code> column (a soft delete) or a merge with <code>WHEN MATCHED AND source.op = 'd'</code> that compares log positions.</p>
+<h3>Worked example 2: snapshot first, then the stream</h3>
+<p>A new connector must copy a table that already has data. The <strong>initial snapshot</strong> reads all current rows (op <code>r</code>) while the database is still changing, then the connector switches to the log. Changes made during the snapshot appear <em>both</em> in the snapshot rows and in the log. The guard from the last example makes the overlap harmless: the snapshot rows carry the log position at which the snapshot was taken, and log events at or below the stored position are skipped.</p>
+<pre class="code lang-python"><code>snapshot_pos = 100
+snapshot = {"O1": 150, "O2": 200, "O3": 300}                 # table contents as of position 100
+log = [(98, "u", "O1", 150),                                   # already inside the snapshot
+       (101, "u", "O2", 250),                                  # after the snapshot
+       (102, "c", "O4", 400),
+       (103, "d", "O3", None)]
+
+state = {k: (v, snapshot_pos) for k, v in snapshot.items()}
+for pos, op, key, val in log:
+    if key in state and pos &lt;= state[key][1]:
+        print(f"skip   pos {pos} {op} {key} (inside snapshot)")
+        continue
+    state[key] = (None, pos) if op == "d" else (val, pos)
+    print(f"apply  pos {pos} {op} {key}")
+print({k: v[0] for k, v in sorted(state.items()) if v[0] is not None})</code></pre>
+<pre class="code lang-text"><code>skip   pos 98 u O1 (inside snapshot)
+apply  pos 101 u O2
+apply  pos 102 c O4
+apply  pos 103 d O3
+{'O1': 150, 'O2': 250, 'O4': 400}</code></pre>
+<p><strong>Explain.</strong> Position 98 happened before the snapshot, so the snapshot already contains it and the event is skipped. Positions 101 to 103 happen after: O2 changes to 250, O4 is created, O3 is deleted. The final live table is O1 150, O2 250, O4 400. <strong>Check:</strong> start from the snapshot (150, 200, 300), apply the three newer events by hand: O2 becomes 250, O4 appears, O3 vanishes.</p>
+<h3>Worked example 3: the outbox pattern</h3>
+<p>A service must save an order <em>and</em> tell Kafka about it. Two separate writes can fail between them: the order is saved and the message is lost, or the message is sent and the order is lost (a dual-write bug). The <strong>outbox pattern</strong> writes the order and an "event to send" row in <em>one database transaction</em>. A separate relay (often Debezium reading the outbox table) publishes the rows later. If the relay crashes after publishing and before marking the row as sent, the event is published twice, so consumers must deduplicate by the event id (Chapter 11).</p>
+<pre class="code lang-python"><code>import sqlite3, json
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE orders(order_id TEXT PRIMARY KEY, amount INTEGER);
+CREATE TABLE outbox(event_id INTEGER PRIMARY KEY AUTOINCREMENT, payload TEXT, sent INTEGER DEFAULT 0);
+""")
+
+def place_order(order_id, amount, crash=False):
+    try:
+        with db:                                   # one transaction for both writes
+            db.execute("INSERT INTO orders VALUES (?,?)", (order_id, amount))
+            db.execute("INSERT INTO outbox(payload) VALUES (?)", (json.dumps({"order_id": order_id, "amount": amount}),))
+            if crash: raise RuntimeError("crash before commit")
+    except RuntimeError: pass
+
+place_order("O1", 100)
+place_order("O2", 200, crash=True)                 # neither row is written
+print("orders:", db.execute("SELECT COUNT(*) FROM orders").fetchone()[0],
+      "outbox:", db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0])
+
+published = []                                     # stands in for Kafka
+def relay(crash_before_mark=False):
+    for eid, payload in db.execute("SELECT event_id, payload FROM outbox WHERE sent = 0").fetchall():
+        published.append((eid, payload))           # publish first
+        if crash_before_mark: return               # crash: the row is not marked as sent
+        db.execute("UPDATE outbox SET sent = 1 WHERE event_id = ?", (eid,)); db.commit()
+
+relay(crash_before_mark=True)
+relay()                                            # restart: publishes the same event again
+print("published:", [e for e, _ in published])
+seen, processed = set(), []
+for eid, payload in published:                     # consumer deduplicates by event id
+    if eid in seen: continue
+    seen.add(eid); processed.append(eid)
+print("processed once:", processed)</code></pre>
+<pre class="code lang-text"><code>orders: 1 outbox: 1
+published: [1, 1]
+processed once: [1]</code></pre>
+<p><strong>Explain.</strong> The crashed transaction left no order and no outbox row, so the two stay consistent. The relay delivers <strong>at least once</strong>: event 1 was published twice, once before the crash and once after the restart. The consumer's seen-set turns "at least once" into "effectively once". This is the same reasoning as the exactly-once recipe in Chapter 11.</p>
+<h3>Schema evolution, ordering and backfills</h3>
+<ul><li><strong>Schema evolution.</strong> Adding a nullable column is safe: the sink adds the column and old rows get nulls. A <em>rename</em> looks like "drop old column, add new column" to the connector, so a naive sink creates an empty new column and keeps the old data under the old name. Treat renames as a planned migration with both columns for a while.</li><li><strong>Ordering.</strong> Kafka orders messages only within a partition. Debezium uses the table's primary key as the message key, so all changes for one row go to one partition and stay in order. Changes to <em>different</em> rows may be consumed in any relative order, which is fine for row-level tables but breaks multi-table consistency (an order line may arrive before its order). Join on read, or wait for both.</li><li><strong>A backfill that keeps merges correct.</strong> (1) Pause or let the stream continue, but record the log position P at which the backfill starts. (2) Load the historical data with position fields at or below P. (3) Merge with the "newer position wins" guard, so the live stream, running at positions above P, is never overwritten. (4) Reconcile counts and sums against the source. (5) Rerun safely: the guard makes the backfill idempotent.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Deleting the key from the target when a delete event arrives, with no marker and no position. Any late or replayed older event then resurrects the row. Keep a soft-delete marker with the log position, and only purge it after the replay window (for example the Kafka retention period) has passed.</div></div>
+<p class="problem"><span class="pl">Problem 4.7.1</span> A table has 20 million rows. The snapshot takes 4 hours and the table changes by 500 rows per second during that time. How many changes pile up in the log meanwhile, and how many of them touch rows already copied?</p>
+<table class="steps"><tr><th>Setup</th><td>4 hours = 4 × 3,600 = 14,400 seconds.</td></tr><tr><th>Changes</th><td>500 × 14,400 = 7,200,000 changes pile up.</td></tr><tr><th>Overlap</th><td>If the changes are spread evenly over the copy order, a change at time t touches a row already copied with probability t / 4 h, so on average half of them: about 3,600,000 touch already-copied rows. The other half touch rows not yet copied, and the snapshot reads those after the change.</td></tr><tr><th>Answer</th><td>About 7.2 million events wait in the log (retention must cover at least 4 hours plus the catch-up time); about half arrive for rows the snapshot has already copied, so they must be applied on top.</td></tr><tr><th>Check</th><td>The guard from Worked example 2 handles both halves: events at or below the snapshot position are skipped, the rest are applied.</td></tr></table>
+<h2 id="s8-chapter-recap">Chapter recap</h2>
 <ul><li>Full load is simple but grows with table size; incremental uses a watermark and a state table.</li><li>Always upsert by key so re-runs, overlaps and backfills never duplicate.</li><li>Advance the watermark only to the largest value actually loaded, in the same transaction as the data.</li><li>Timestamp ties and clock skew lose rows with strict <code>&gt;</code>; read inclusive or with a safety window.</li><li>Prefer cursor pagination to offset; respect rate limits; retry only transient errors with exponential backoff and jitter, with a maximum.</li><li>File drops need completion markers; webhooks need fast acknowledgement and duplicate handling.</li><li>CDC reads the database log, sees deletes and costs the source little; apply events in log order.</li><li>Backfills work when jobs take a logical date and overwrite their own partition.</li></ul>
 <div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Rule</th></tr></thead><tbody><tr><td>Watermark</td><td>max(updated_at) actually loaded; read <code>&gt;=</code> (or with a safety window); upsert</td></tr><tr><td>Pages</td><td>⌈rows / page size⌉</td></tr><tr><td>Backoff</td><td>wait = min(cap, base × 2^(attempt−1)) with jitter</td></tr><tr><td>Idempotent load</td><td>delete-then-insert partition, MERGE, or upsert by key</td></tr><tr><td>CDC final state</td><td>order by LSN; keep the highest per key</td></tr></tbody></table></div>
-<h2 id="s5-practice-set">Practice set</h2>
+<h2 id="s9-practice-set">Practice set</h2>
 <p><strong>1.</strong> (easy) 95 rows, page size 20. How many pages? <strong>Answer:</strong> ⌈95 / 20⌉ = 5.</p>
 <p><strong>2.</strong> (easy) Which is idempotent: <code>INSERT</code> or <code>INSERT ... ON CONFLICT DO UPDATE</code>? <strong>Answer:</strong> the upsert.</p>
 <p><strong>3.</strong> Backoff with base 2 s, no cap, three failures. Waits? <strong>Answer:</strong> 2, 4, 8 seconds (2 × 2^(attempt−1)), total 14.</p>
@@ -202,9 +567,24 @@ after replaying events 3,4 again: [(1, 'Asha', 'Mumbai'), (3, 'Meena', 'Kochi')]
 <p><strong>9.</strong> (interview) "How would you ingest a 2 TB Postgres database into a warehouse and keep it fresh?" <strong>Answer:</strong> One snapshot (parallel by key range) into bronze, then log-based CDC (Debezium to Kafka) for changes, applied with MERGE ordered by LSN; soft-delete flags for deletes; reconcile counts and checksums per table; monitor lag; document backfill by re-snapshot of a table.</p>
 <p><strong>10.</strong> (interview) "What does idempotent mean and how do you build idempotent ingestion?" <strong>Answer:</strong> Running it twice gives the same result as once. Use upserts by business key, partition overwrite by logical date, state updated atomically with data, and no use of "now" in the logic.</p>
 <p><strong>11.</strong> (scenario) A partner API changes <code>amount</code> from a number to a string "1,250.50" on a Tuesday and your load fails. Describe a robust approach. <strong>Answer:</strong> Validate against a schema on ingest, quarantine failing records in a dead-letter table with the reason, alert, keep landing raw JSON in bronze, fix the parsing in silver, and reprocess the quarantined rows. Add a data contract with the partner.</p>
-<h2 id="s6-prompt-pack">Prompt pack</h2>
+<p><strong>12.</strong> (easy) What does <code>yield</code> do that <code>return</code> does not? <strong>Answer:</strong> it hands over one value and pauses the function, resuming at the same place on the next request, so a large sequence is produced one item at a time without being stored.</p>
+<p><strong>13.</strong> (easy) A 4 GB file is read in 256 MB chunks. How many chunks? <strong>Answer:</strong> 4 × 1,024 = 4,096 MB; 4,096 / 256 = 16 chunks.</p>
+<p><strong>14.</strong> (medium) Chunk 1 has average 60 over 100 rows; chunk 2 has average 90 over 300 rows. What is the overall average? <strong>Answer:</strong> (60 × 100 + 90 × 300) / 400 = (6,000 + 27,000) / 400 = 82.5. The average of averages (75) is wrong.</p>
+<p><strong>15.</strong> (medium) A column holds integers from 0 to 200 for 5,000,000 rows. How many bytes does it save by moving from <code>int64</code> to <code>uint8</code> (0 to 255)? <strong>Answer:</strong> 5,000,000 × (8 − 1) = 35,000,000 bytes, about 35 MB. <code>int8</code> would not work because it stops at 127.</p>
+<p><strong>16.</strong> (medium) 2,000 API pages, each call waits 0.5 s, 25 calls in flight, no rate limit. Total time? <strong>Answer:</strong> 2,000 / 25 = 80 rounds × 0.5 s = 40 s (against 1,000 s sequential).</p>
+<p><strong>17.</strong> (medium, find the bug) <code>rows = load(); gen = (r for r in rows); total = sum(gen); n = len(list(gen))</code> returns <code>n = 0</code>. Why? <strong>Answer:</strong> the generator was already consumed by <code>sum</code>. A second pass sees nothing. Count while summing, or create a new generator.</p>
+<p><strong>18.</strong> (medium) A loader uses plain <code>INSERT</code> and is retried after a timeout that happened <em>after</em> the commit. What goes wrong and what is the minimal fix? <strong>Answer:</strong> the retry inserts the batch twice (duplicates or a key error). Make the write an upsert on the business key (or delete-then-insert by partition in one transaction).</p>
+<p><strong>19.</strong> (hard) The upsert guard is <code>WHERE excluded.updated_at &gt;= orders.updated_at</code>. Rows for key K arrive in the order 10:00, 12:00, 11:00. What is stored at the end, and would the order 11:00, 10:00, 12:00 change it? <strong>Answer:</strong> 12:00 in both cases, because only a row at least as new as the stored one may replace it. Order independence is the point.</p>
+<p><strong>20.</strong> (interview) "You must pull 5 million records from a rate-limited REST API every night. Design it." <strong>Answer:</strong> cursor pagination with the cursor saved after each committed page; bounded concurrency (semaphore) below the rate limit; retries with exponential backoff and jitter on 429 and 5xx only; each page written to a raw file with a deterministic name (so a rerun overwrites it); a transactional, idempotent load into the warehouse; volume and freshness checks; alert on a failure with the page cursor in the message so a rerun can resume.</p>
+<p><strong>21.</strong> (easy) What do the Debezium <code>op</code> codes <code>c</code>, <code>u</code>, <code>d</code>, <code>r</code> mean? <strong>Answer:</strong> create, update, delete, and a row read during the initial snapshot.</p>
+<p><strong>22.</strong> (medium) Why does a CDC consumer keep the log position per key instead of just overwriting the row? <strong>Answer:</strong> to ignore replayed and late older events, so the result does not depend on duplicates or arrival order.</p>
+<p><strong>23.</strong> (medium) What is a tombstone, and is it a business event? <strong>Answer:</strong> a message with the row's key and a null value that follows a delete event. It is a signal for log compaction to drop the key, not a business event; sinks should not count it as a second delete.</p>
+<p><strong>24.</strong> (medium) The snapshot is at position 500. Log events arrive at 480 (update O1), 505 (update O1), 505 (update O1 again, replay). Which are applied? <strong>Answer:</strong> 480 is skipped (inside the snapshot). 505 is applied. The replayed 505 is skipped because its position equals the stored one (guard "skip if position is at or below stored").</p>
+<p><strong>25.</strong> (hard) The outbox relay publishes event 7, crashes before marking it sent, restarts and publishes it again. The consumer inserts into a table with a unique constraint on <code>event_id</code>. What happens to the second delivery and what delivery guarantee do you get? <strong>Answer:</strong> the insert is rejected (or ignored with <code>ON CONFLICT DO NOTHING</code>), so the effect happens once. The transport is at-least-once; with the dedup it is effectively once.</p>
+<p><strong>26.</strong> (interview) "Walk me through capturing changes from Postgres into a lakehouse table with deletes." <strong>Answer:</strong> logical replication slot read by Debezium, initial snapshot then log, key by primary key, Kafka topic per table, a sink that merges with a log-position guard and soft deletes, handling of tombstones, a schema registry for evolution, monitoring of connector lag and replication-slot size (an unread slot makes the source keep log files and fill its disk), and periodic reconciliation counts against the source.</p>
+<h2 id="s10-prompt-pack">Prompt pack</h2>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me incremental loading with a watermark and a state table. Use a small Python and SQLite example, explain each line, then show me the tie-at-watermark bug and how to fix it. Ask me 3 questions one at a time about when a watermark loses data.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: ingesting from REST APIs: offset versus cursor pagination, rate limits, retries with exponential backoff and jitter, idempotency keys. Give me 8 graded exercises with real numbers (pages, rates, waits) with no solutions, then check my answers when I paste them: [PASTE HERE]</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am learning data engineering. Explain Change Data Capture (query-based, trigger-based, log-based with Debezium) with an analogy, a diagram in text, and a worked example of applying out-of-order events by log position. Then quiz me, one scenario at a time, on choosing the CDC method and handling deletes.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: backfills, idempotent partition overwrites, and late-arriving data. Describe a realistic pipeline failure and ask me to design the rerun safely. Critique my design, then show a better one using logical dates and MERGE or partition overwrite. Keep simple English.</pre></div>
-<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, applying for data engineer roles. Run a mock interview on ingestion patterns: full versus incremental, watermarks, CDC, API ingestion, idempotency and backfills. Ask 8 questions one at a time, score my answers 1 to 5, give a model answer in simple English, and name one follow-up an interviewer might ask. My answers: [PASTE HERE]</pre></div><div class="readbtn"><button class="btn" data-read="study:de:ch04">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch03.html">← Chapter 3: File Formats, Storage and Lakehouse Tabl</a><a class="btn" href="ch05.html">Chapter 5: Data Quality and Testing →</a></div></div><script src="../../assets/study.js"></script></body></html>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, applying for data engineer roles. Run a mock interview on ingestion patterns: full versus incremental, watermarks, CDC, API ingestion, idempotency and backfills. Ask 8 questions one at a time, score my answers 1 to 5, give a model answer in simple English, and name one follow-up an interviewer might ask. My answers: [PASTE HERE]</pre></div><div class="readbtn"><button class="btn" data-read="study:de:ch04">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch03.html">← Chapter 3: File Formats, Storage and Lakehouse Table Formats</a><a class="btn" href="ch05.html">Chapter 5: Data Quality and Testing →</a></div></div><script src="../../assets/study.js"></script></body></html>

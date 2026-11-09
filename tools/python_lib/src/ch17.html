@@ -1,0 +1,2408 @@
+<p>It is Monday morning and the finance team has sent you three files: a CSV of last month's orders (40,000 rows), an Excel sheet with customer regions, and a JSON export from the payment provider. The question sounds simple: "Which regions grew, which customers stopped buying, and do our books match the payment provider?" With plain Python lists and dicts you could answer it, but you would write hundreds of lines and probably get a join wrong. With <strong>pandas</strong> the whole job is about thirty readable lines. Every analyst, data engineer and data scientist uses it daily, which is why interviews for data roles almost always include a pandas exercise.</p>
+<p>This chapter is a practical handbook. It is organised by <em>task</em>: reading files, looking at data, selecting, cleaning, grouping, joining, reshaping, time series, speed. Each area starts with a reference table of the functions you will actually use, then worked examples that climb from trivial to realistic. Every code block runs on its own, and every printed result is the real output from pandas 3.0 on NumPy 2.x. By the end you will be able to solve a new pandas problem methodically instead of by search-and-paste.</p>
+<p><em>Words you need.</em> <strong>Vectorised</strong> means one call works on a whole column at once, with the loop running in fast compiled code. <strong>Index</strong> is the set of row labels. <strong>dtype</strong> is the data type of a column. <strong>NaN</strong> is "not a number", the usual marker for a missing value. <strong>Copy-on-write</strong> is the rule (always on in pandas 3.0) that a changed object never silently changes another one.</p>
+
+<h2 id="s17-1">17.1 What pandas Is, When to Use It, and the Mental Model</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">pandas is a spreadsheet you drive with code. A <strong>DataFrame</strong> is the sheet, a <strong>Series</strong> is one column, and the <strong>Index</strong> is the row labels. Unlike a spreadsheet it can hold millions of rows, never loses your steps (they are code), and can be re-run tomorrow on new data.</div></div>
+<h3>What it is for, and what it is not for</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Use pandas when</th><th>Think twice when</th></tr></thead><tbody>
+<tr><td>Data fits in memory (rule of thumb: comfortably under a quarter of your RAM)</td><td>Data is larger than memory: consider Polars (lazy engine), DuckDB (SQL on files) or Spark</td></tr>
+<tr><td>Tabular data with mixed types: CSV, Excel, JSON, SQL results, Parquet</td><td>Pure numeric arrays with no labels: NumPy is simpler and faster</td></tr>
+<tr><td>Exploration, cleaning, reshaping, joins, group summaries, time series</td><td>Heavy row-by-row logic with branching: plain Python or a database may be clearer</td></tr>
+<tr><td>Glue between files, SQL, plotting and machine-learning libraries</td><td>Multi-user transactional storage: use a database</td></tr>
+</tbody></table></div>
+<h3>Install, version check, import convention</h3>
+<p>Install with <code>pip install pandas</code> (add <code>openpyxl</code> for <code>.xlsx</code> files and <code>pyarrow</code> for Parquet; the second is <em>not run here</em>, because we only use what is installed). The universal import convention is <code>import pandas as pd</code> together with <code>import numpy as np</code>. Always check the version, because behaviour changed in 3.0.</p>
+<pre class="code lang-python"><code>import pandas as pd
+import numpy as np
+
+print(pd.__version__)
+print(np.__version__)
+print(pd.options.display.max_rows)</code></pre>
+<pre class="code lang-text"><code>3.0.6
+2.5.3
+60</code></pre>
+<ol><li><code>import pandas as pd</code> loads the library under the short name every tutorial uses.</li><li><code>import numpy as np</code> is imported alongside because pandas columns are built on NumPy arrays and you will use <code>np.nan</code>, <code>np.where</code> and friends.</li><li><code>pd.__version__</code> prints the version string. Here it is a 3.0 release, so string columns default to the new <code>str</code> dtype and copy-on-write is always on.</li><li>The NumPy version should be 2.x. <code>pd.options</code> holds display and behaviour settings; <code>max_rows</code> is the number of rows printed before pandas truncates with <code>...</code>.</li></ol>
+<h3>The mental model</h3>
+<figure><img src="images/lib17_model.png" alt="A DataFrame drawn as an index column plus three coloured column boxes, each with its own dtype" loading="lazy"/><figcaption>A DataFrame is a dict of Series that share one Index. Each Series has exactly one dtype.</figcaption></figure>
+<p><strong>How to read it:</strong> the grey box on the left is the Index (row labels 0, 1, 2). Each coloured box is a column, and its dtype is written underneath. Because columns are separate, a DataFrame can mix text, numbers and booleans, but inside one column everything has the same type. Operations <em>align on the Index labels</em>, not on position: that single rule explains most surprising pandas behaviour, including joins, arithmetic between Series and assigning a Series as a new column.</p>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Think in columns, not rows. Instead of "for each row, do X", say "take this column, apply X to all of it". Almost every fast and readable pandas line is a whole-column statement.</div></div>
+
+<h2 id="s17-2">17.2 Series, DataFrame and Index</h2>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>pd.Series(data, index=)</code></td><td>One labelled column</td><td><code>pd.Series([3,5], index=["a","b"])</code></td></tr>
+<tr><td><code>pd.DataFrame(dict)</code></td><td>Table from a dict of columns</td><td><code>pd.DataFrame({"x":[1,2]})</code></td></tr>
+<tr><td><code>pd.DataFrame(list_of_dicts)</code></td><td>Table from records (one dict per row)</td><td><code>pd.DataFrame([{"x":1},{"x":2}])</code></td></tr>
+<tr><td><code>df.shape</code></td><td>(rows, columns)</td><td><code>df.shape</code></td></tr>
+<tr><td><code>df.columns</code></td><td>Column labels (an Index)</td><td><code>list(df.columns)</code></td></tr>
+<tr><td><code>df.index</code></td><td>Row labels</td><td><code>df.index</code></td></tr>
+<tr><td><code>df.dtypes</code></td><td>Type of each column</td><td><code>df.dtypes</code></td></tr>
+<tr><td><code>df.values</code> / <code>df.to_numpy()</code></td><td>Plain NumPy array of the data</td><td><code>df.to_numpy()</code></td></tr>
+<tr><td><code>s.to_frame()</code></td><td>Series to one-column DataFrame</td><td><code>s.to_frame("n")</code></td></tr>
+<tr><td><code>df.set_index("col")</code></td><td>Move a column into the index</td><td><code>df.set_index("id")</code></td></tr>
+<tr><td><code>df.reset_index()</code></td><td>Move the index back to a column</td><td><code>df.reset_index(drop=True)</code></td></tr>
+<tr><td><code>df.rename(columns=)</code></td><td>Rename columns</td><td><code>df.rename(columns={"a":"b"})</code></td></tr>
+<tr><td><code>df.reindex(new_labels)</code></td><td>Conform to a new index, inserting NaN</td><td><code>s.reindex(["a","z"])</code></td></tr>
+<tr><td><code>df.sort_index()</code></td><td>Sort by labels</td><td><code>df.sort_index()</code></td></tr>
+<tr><td><code>df.sort_values(by)</code></td><td>Sort by column values</td><td><code>df.sort_values("x", ascending=False)</code></td></tr>
+<tr><td><code>df.T</code></td><td>Transpose</td><td><code>df.T</code></td></tr>
+<tr><td><code>df.copy()</code></td><td>Explicit independent copy</td><td><code>df2 = df.copy()</code></td></tr>
+<tr><td><code>pd.RangeIndex</code></td><td>Default 0..n-1 index, stored cheaply</td><td><code>pd.RangeIndex(3)</code></td></tr>
+<tr><td><code>pd.DatetimeIndex</code></td><td>Index of timestamps (enables time slicing)</td><td><code>pd.date_range("2025-01-01", periods=3)</code></td></tr>
+<tr><td><code>idx.is_unique</code></td><td>Does every label appear once?</td><td><code>df.index.is_unique</code></td></tr>
+<tr><td><code>pd.concat([..], axis=1)</code></td><td>Glue Series into a DataFrame</td><td><code>pd.concat([a, b], axis=1)</code></td></tr>
+</tbody></table></div>
+<h3>Beginner: build the three objects</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+s = pd.Series([10, 7, 3], index=["Oslo", "Rome", "Lima"], name="sales")
+print(s)
+print(s["Rome"], s.iloc[0])
+print(s.index)
+print(s.dtype)</code></pre>
+<pre class="code lang-text"><code>Oslo    10
+Rome     7
+Lima     3
+Name: sales, dtype: int64
+7 10
+Index(['Oslo', 'Rome', 'Lima'], dtype='str')
+int64</code></pre>
+<ol><li>A Series is built from a list plus an optional list of labels. <code>name="sales"</code> becomes the column name if the Series is later put in a DataFrame.</li><li><code>print(s)</code> shows labels on the left, values on the right, and a footer with the name and dtype.</li><li><code>s["Rome"]</code> looks up by <em>label</em>. <code>s.iloc[0]</code> looks up by <em>position</em>. Labels and positions are different things; keep them apart.</li><li><code>s.index</code> is an <code>Index</code> object. In pandas 3.0 an index of text has dtype <code>str</code>.</li><li><code>s.dtype</code> is <code>int64</code>, the type of the values.</li></ol>
+<h3>Intermediate: a DataFrame from records, and index alignment</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+rows = [
+    {"city": "Oslo", "sales": 10, "paid": True},
+    {"city": "Rome", "sales": 7, "paid": False},
+    {"city": "Oslo", "sales": 3, "paid": True},
+]
+df = pd.DataFrame(rows)
+print(df)
+print(df.dtypes)
+
+a = pd.Series([1, 2, 3], index=["x", "y", "z"])
+b = pd.Series([10, 20, 30], index=["y", "z", "w"])
+print(a + b)</code></pre>
+<pre class="code lang-text"><code>   city  sales   paid
+0  Oslo     10   True
+1  Rome      7  False
+2  Oslo      3   True
+city       str
+sales    int64
+paid      bool
+dtype: object
+w     NaN
+x     NaN
+y    12.0
+z    23.0
+dtype: float64</code></pre>
+<ol><li>A list of dicts is the natural shape of JSON and of API responses. Each dict is a row; keys become columns.</li><li><code>df.dtypes</code> confirms that pandas guessed <code>str</code>, <code>int64</code> and <code>bool</code>. If a key were missing from some dict, that cell would be NaN.</li><li>Series <code>a</code> has labels x, y, z; <code>b</code> has y, z, w.</li><li><code>a + b</code> matches by <em>label</em>, not position. Labels y and z exist in both, so they add (12 and 23). Labels x and w exist in only one, so the result is NaN. The ints became floats because NaN needs a float column.</li></ol>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">Alignment is why pandas is safe for joining two columns from different tables: it will not silently pair row 5 of one with row 5 of the other if their ids differ. It is also why a stray duplicate or mismatched index suddenly fills a column with NaN. When you see unexpected NaN after arithmetic, compare the two indexes first.</div></div>
+<h3>Expert: custom index, set_index, reindex</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"id": [101, 102, 103], "name": ["Ana", "Bo", "Cy"], "score": [88, 92, 75]})
+by_id = df.set_index("id")
+print(by_id)
+print(by_id.loc[102, "name"])
+print(by_id["score"].reindex([101, 999]))
+print(by_id.reset_index().columns.tolist())
+print(by_id.index.is_unique, df.index)</code></pre>
+<pre class="code lang-text"><code>    name  score
+id             
+101  Ana     88
+102   Bo     92
+103   Cy     75
+Bo
+id
+101    88.0
+999     NaN
+Name: score, dtype: float64
+['id', 'name', 'score']
+True RangeIndex(start=0, stop=3, step=1)</code></pre>
+<ol><li>The <code>id</code> column becomes the index, so <code>loc[102, ...]</code> means "the row whose id is 102".</li><li><code>by_id.loc[102, "name"]</code> returns a single value, <code>Bo</code>.</li><li><code>reindex([101, 999])</code> asks for exactly those labels. 999 does not exist, so it gets NaN instead of an error. This is the safe way to "look up and tolerate misses".</li><li><code>reset_index()</code> puts <code>id</code> back as an ordinary column at the front.</li><li><code>is_unique</code> is worth checking before you rely on an index as a key. <code>df.index</code> shows the default <code>RangeIndex</code>, which stores only start, stop and step, so it costs almost no memory.</li></ol>
+<div class="callout blue"><div class="lab">DEFINITION</div><div class="txt"><strong>axis</strong> names a direction. <code>axis=0</code> (or <code>"index"</code>) means "going down the rows", so <code>df.sum(axis=0)</code> gives one number per column. <code>axis=1</code> means "going across the columns", so <code>df.sum(axis=1)</code> gives one number per row. Writing the word (<code>axis="columns"</code>) is clearer than the digit.</div></div>
+
+
+<h2 id="s17-3">17.3 Reading and Writing CSV, Excel and JSON</h2>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>pd.read_csv(path)</code></td><td>Load a CSV (path, URL or file-like)</td><td><code>pd.read_csv("a.csv")</code></td></tr>
+<tr><td><code>sep=</code></td><td>Field separator</td><td><code>read_csv(p, sep=";")</code></td></tr>
+<tr><td><code>usecols=</code></td><td>Load only some columns (saves memory)</td><td><code>read_csv(p, usecols=["id","x"])</code></td></tr>
+<tr><td><code>dtype=</code></td><td>Force column types</td><td><code>read_csv(p, dtype={"zip":"str"})</code></td></tr>
+<tr><td><code>parse_dates=</code></td><td>Parse columns as datetimes</td><td><code>read_csv(p, parse_dates=["when"])</code></td></tr>
+<tr><td><code>na_values=</code></td><td>Extra strings that mean missing</td><td><code>read_csv(p, na_values=["n/a","-"])</code></td></tr>
+<tr><td><code>index_col=</code></td><td>Use a column as the index</td><td><code>read_csv(p, index_col="id")</code></td></tr>
+<tr><td><code>nrows=</code></td><td>Read only the first n rows (peek)</td><td><code>read_csv(p, nrows=5)</code></td></tr>
+<tr><td><code>skiprows=</code></td><td>Skip junk header lines</td><td><code>read_csv(p, skiprows=2)</code></td></tr>
+<tr><td><code>chunksize=</code></td><td>Iterate over the file in pieces</td><td><code>for c in read_csv(p, chunksize=1000): ...</code></td></tr>
+<tr><td><code>encoding=</code></td><td>Text encoding</td><td><code>read_csv(p, encoding="latin-1")</code></td></tr>
+<tr><td><code>df.to_csv(path, index=False)</code></td><td>Write CSV without the index column</td><td><code>df.to_csv("o.csv", index=False)</code></td></tr>
+<tr><td><code>pd.read_excel(path, sheet_name=)</code></td><td>Load a sheet (needs openpyxl)</td><td><code>read_excel("a.xlsx", sheet_name="Q1")</code></td></tr>
+<tr><td><code>df.to_excel(path)</code></td><td>Write a sheet</td><td><code>df.to_excel("o.xlsx", index=False)</code></td></tr>
+<tr><td><code>pd.ExcelWriter</code></td><td>Write several sheets to one file</td><td><code>with pd.ExcelWriter(p) as w: ...</code></td></tr>
+<tr><td><code>pd.read_json(path)</code></td><td>Load JSON (records, columns, lines)</td><td><code>read_json(p, lines=True)</code></td></tr>
+<tr><td><code>pd.json_normalize(list)</code></td><td>Flatten nested JSON into columns</td><td><code>json_normalize(data, sep="_")</code></td></tr>
+<tr><td><code>df.to_json(orient=)</code></td><td>Write JSON in a chosen shape</td><td><code>df.to_json(orient="records")</code></td></tr>
+<tr><td><code>pd.read_parquet / to_parquet</code></td><td>Fast typed columnar format (needs pyarrow; not run here)</td><td><code>df.to_parquet("o.parquet")</code></td></tr>
+<tr><td><code>pd.read_sql(query, conn)</code></td><td>Run SQL, get a DataFrame</td><td><code>read_sql("select * from t", conn)</code></td></tr>
+<tr><td><code>pd.read_clipboard()</code></td><td>Paste from a spreadsheet (handy, not for pipelines)</td><td><code>pd.read_clipboard()</code></td></tr>
+<tr><td><code>io.StringIO(text)</code></td><td>Pretend a string is a file (great for examples)</td><td><code>read_csv(StringIO(txt))</code></td></tr>
+</tbody></table></div>
+<h3>Beginner: read a CSV and look at what pandas guessed</h3>
+<pre class="code lang-python"><code>import io
+import pandas as pd
+
+text = """order_id,customer,amount,placed
+1001,ana,25.5,2025-03-01
+1002,bo,,2025-03-02
+1003,ana,12.0,2025-03-04
+"""
+df = pd.read_csv(io.StringIO(text))
+print(df)
+print(df.dtypes)</code></pre>
+<pre class="code lang-text"><code>   order_id customer  amount      placed
+0      1001      ana    25.5  2025-03-01
+1      1002       bo     NaN  2025-03-02
+2      1003      ana    12.0  2025-03-04
+order_id      int64
+customer        str
+amount      float64
+placed          str
+dtype: object</code></pre>
+<ol>
+<li><code>io.StringIO(text)</code> makes the string behave like an open file, so the example needs no file on disk. With a real file you would write <code>pd.read_csv("orders.csv")</code>.</li>
+<li>The first line becomes the column names. Each later line becomes a row.</li>
+<li>The empty amount for order 1002 becomes <code>NaN</code>, and because NaN is a float, the whole <code>amount</code> column is <code>float64</code>.</li>
+<li>The <code>placed</code> column stays text (<code>str</code>), because we did not ask for dates. That is the most common surprise: pandas does not parse dates unless told.</li>
+</ol>
+<h3>Intermediate: control types, dates and missing markers on the way in</h3>
+<pre class="code lang-python"><code>import io
+import pandas as pd
+
+text = """zip;customer;amount;placed
+01234;ana;1,5;2025-03-01
+02345;bo;n/a;2025-03-02
+"""
+df = pd.read_csv(
+    io.StringIO(text),
+    sep=";",
+    dtype={"zip": "str"},
+    decimal=",",
+    na_values=["n/a"],
+    parse_dates=["placed"],
+)
+print(df)
+print(df.dtypes)</code></pre>
+<pre class="code lang-text"><code>     zip customer  amount     placed
+0  01234      ana     1.5 2025-03-01
+1  02345       bo     NaN 2025-03-02
+zip                    str
+customer               str
+amount             float64
+placed      datetime64[us]
+dtype: object</code></pre>
+<ol>
+<li><code>sep=";"</code>: European exports often use semicolons because commas are decimal marks.</li>
+<li><code>dtype={"zip": "str"}</code> keeps the leading zero. Without it, <code>01234</code> becomes the integer 1234 and the zero is lost for ever.</li>
+<li><code>decimal=","</code> reads <code>1,5</code> as the number 1.5.</li>
+<li><code>na_values=["n/a"]</code> adds a custom missing marker. pandas already treats empty cells, <code>NA</code>, <code>NaN</code> and <code>null</code> as missing.</li>
+<li><code>parse_dates=["placed"]</code> converts the column to datetimes. In pandas 3.0 the unit is chosen automatically (here microseconds, shown as <code>datetime64[us]</code>).</li>
+</ol>
+<h3>Realistic: write and read back, Excel, and nested JSON</h3>
+<pre class="code lang-python"><code>import json
+import tempfile
+from pathlib import Path
+import pandas as pd
+
+df = pd.DataFrame({"id": [1, 2], "region": ["north", "south"], "sales": [10.5, 20.0]})
+folder = Path(tempfile.mkdtemp())
+
+df.to_csv(folder / "a.csv", index=False)
+print((folder / "a.csv").read_text())
+
+df.to_excel(folder / "a.xlsx", sheet_name="Q1", index=False)
+print(pd.read_excel(folder / "a.xlsx", sheet_name="Q1"))
+
+payload = [
+    {"id": 1, "user": {"name": "Ana", "city": "Oslo"}, "items": [{"sku": "A", "qty": 2}, {"sku": "B", "qty": 1}]},
+    {"id": 2, "user": {"name": "Bo", "city": "Rome"}, "items": [{"sku": "A", "qty": 5}]},
+]
+print(pd.json_normalize(payload, sep="_").drop(columns="items"))
+flat = pd.json_normalize(payload, record_path="items", meta=["id", ["user", "name"]])
+print(flat)
+print(df.to_json(orient="records"))</code></pre>
+<pre class="code lang-text"><code>id,region,sales
+1,north,10.5
+2,south,20.0
+
+   id region  sales
+0   1  north   10.5
+1   2  south   20.0
+   id user_name user_city
+0   1       Ana      Oslo
+1   2        Bo      Rome
+  sku  qty id user.name
+0   A    2  1       Ana
+1   B    1  1       Ana
+2   A    5  2        Bo
+[{"id":1,"region":"north","sales":10.5},{"id":2,"region":"south","sales":20.0}]</code></pre>
+<ol>
+<li><code>tempfile.mkdtemp()</code> gives a throwaway folder so the example leaves nothing behind.</li>
+<li><code>to_csv(..., index=False)</code> writes only your columns. Forgetting <code>index=False</code> adds an unnamed first column, which then comes back as <code>Unnamed: 0</code> when you reload.</li>
+<li><code>to_excel</code> and <code>read_excel</code> use the installed <code>openpyxl</code> engine. The sheet name is how you pick one sheet out of many.</li>
+<li><code>json_normalize(payload, sep="_")</code> flattens nested dicts: <code>user</code> becomes <code>user_name</code> and <code>user_city</code>. The list column <code>items</code> stays as a list, so we drop it for display.</li>
+<li><code>record_path="items"</code> explodes the nested list into one row per item, and <code>meta=[...]</code> copies parent fields onto each row. This is the standard way to turn "orders with line items" JSON into a flat table.</li>
+<li><code>to_json(orient="records")</code> writes a list of row dicts, the shape most APIs expect.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Reading codes as numbers.</strong> Zip codes, phone numbers and product ids with leading zeros must be read with <code>dtype=str</code>. Fix it at read time; repairing later with <code>zfill</code> only works if you know the original width.</div></div>
+
+<h2 id="s17-4">17.4 Inspecting a DataFrame</h2>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>df.head(n) / tail(n)</code></td><td>First or last n rows</td><td><code>df.head(3)</code></td></tr>
+<tr><td><code>df.sample(n, random_state=)</code></td><td>Random rows (reproducible with a seed)</td><td><code>df.sample(5, random_state=0)</code></td></tr>
+<tr><td><code>df.shape</code></td><td>Rows and columns</td><td><code>df.shape</code></td></tr>
+<tr><td><code>df.info()</code></td><td>Columns, non-null counts, dtypes, memory</td><td><code>df.info()</code></td></tr>
+<tr><td><code>df.describe()</code></td><td>Summary stats of numeric columns</td><td><code>df.describe()</code></td></tr>
+<tr><td><code>df.describe(include="all")</code></td><td>Also text and dates</td><td><code>df.describe(include="all")</code></td></tr>
+<tr><td><code>s.value_counts()</code></td><td>Frequency table of a column</td><td><code>df["city"].value_counts()</code></td></tr>
+<tr><td><code>value_counts(normalize=True)</code></td><td>Shares instead of counts</td><td><code>s.value_counts(normalize=True)</code></td></tr>
+<tr><td><code>s.nunique()</code></td><td>Number of distinct values</td><td><code>df["id"].nunique()</code></td></tr>
+<tr><td><code>s.unique()</code></td><td>The distinct values themselves</td><td><code>df["city"].unique()</code></td></tr>
+<tr><td><code>df.isna().sum()</code></td><td>Missing count per column</td><td><code>df.isna().sum()</code></td></tr>
+<tr><td><code>df.duplicated().sum()</code></td><td>Number of repeated rows</td><td><code>df.duplicated().sum()</code></td></tr>
+<tr><td><code>df.memory_usage(deep=True)</code></td><td>Bytes per column (deep counts text)</td><td><code>df.memory_usage(deep=True)</code></td></tr>
+<tr><td><code>df.select_dtypes(include=)</code></td><td>Pick columns by dtype</td><td><code>df.select_dtypes("number")</code></td></tr>
+<tr><td><code>df.corr(numeric_only=True)</code></td><td>Correlation matrix</td><td><code>df.corr(numeric_only=True)</code></td></tr>
+<tr><td><code>s.min() / max() / mean() / median()</code></td><td>Basic aggregates</td><td><code>df["x"].median()</code></td></tr>
+<tr><td><code>s.quantile(q)</code></td><td>Percentile</td><td><code>s.quantile([.25,.75])</code></td></tr>
+<tr><td><code>s.idxmax() / idxmin()</code></td><td>Index label of the biggest or smallest</td><td><code>s.idxmax()</code></td></tr>
+<tr><td><code>df.nlargest(n, col)</code></td><td>Top n rows by a column</td><td><code>df.nlargest(3, "sales")</code></td></tr>
+<tr><td><code>df.agg(["min","max"])</code></td><td>Several aggregates at once</td><td><code>df.agg(["min","max"])</code></td></tr>
+<tr><td><code>pd.set_option</code></td><td>Display settings</td><td><code>pd.set_option("display.max_columns", 50)</code></td></tr>
+</tbody></table></div>
+<h3>The 60-second health check</h3>
+<p>Whenever a new table arrives, run the same checks in the same order: size, types, missing, duplicates, ranges, categories. It catches 90 percent of data problems before they become wrong answers.</p>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(42)
+n = 12
+df = pd.DataFrame({
+    "order_id": np.arange(1, n + 1),
+    "city": rng.choice(["Oslo", "Rome", "Lima"], n),
+    "amount": rng.normal(50, 20, n).round(2),
+})
+df.loc[3, "amount"] = np.nan
+df = pd.concat([df, df.iloc[[0]]], ignore_index=True)
+
+print(df.shape)
+df.info()
+print(df.describe().round(2))
+print(df["city"].value_counts())
+print(df.isna().sum().to_dict(), df.duplicated().sum())</code></pre>
+<pre class="code lang-text"><code>(13, 3)
+&lt;class 'pandas.DataFrame'&gt;
+RangeIndex: 13 entries, 0 to 12
+Data columns (total 3 columns):
+ #   Column    Non-Null Count  Dtype  
+---  ------    --------------  -----  
+ 0   order_id  13 non-null     int64  
+ 1   city      13 non-null     str    
+ 2   amount    12 non-null     float64
+dtypes: float64(1), int64(1), str(1)
+memory usage: 444.0 bytes
+       order_id  amount
+count     13.00   12.00
+mean       6.08   52.99
+std        3.77   12.84
+min        1.00   30.82
+25%        3.00   48.16
+50%        6.00   52.56
+75%        9.00   60.90
+max       12.00   72.54
+city
+Oslo    5
+Lima    4
+Rome    4
+Name: count, dtype: int64
+{'order_id': 0, 'city': 0, 'amount': 1} 1</code></pre>
+<ol>
+<li>The seeded generator <code>default_rng(42)</code> makes the "random" data identical every run.</li>
+<li><code>df.loc[3, "amount"] = np.nan</code> plants one missing value, and <code>concat</code> with <code>df.iloc[[0]]</code> appends a copy of the first row, so we have a duplicate to find.</li>
+<li><code>df.shape</code> is a tuple: 13 rows, 3 columns.</li>
+<li><code>df.info()</code> prints directly (it returns <code>None</code>, so do not wrap it in <code>print</code>). Read the "Non-Null Count" column: 12 of 13 for <code>amount</code> reveals the missing cell.</li>
+<li><code>describe()</code> gives count, mean, std, min, quartiles and max. Check that min and max are plausible: negative amounts or a max of 10 million are red flags.</li>
+<li><code>value_counts()</code> shows how many rows per city; a misspelling like "oslo" would appear as its own row here.</li>
+<li><code>isna().sum()</code> counts missing cells per column, and <code>duplicated().sum()</code> counts rows that repeat an earlier row exactly.</li>
+</ol>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Count before you clean. Write down how many rows you have at the start, after each filter, and at the end. A pipeline that silently drops 30 percent of rows is the most common expensive pandas bug.</div></div>
+
+
+<h2 id="s17-5">17.5 Selecting: loc, iloc, Boolean Masks and query</h2>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>df["col"]</code></td><td>One column as a Series</td><td><code>df["city"]</code></td></tr>
+<tr><td><code>df[["a","b"]]</code></td><td>Several columns as a DataFrame</td><td><code>df[["city","sales"]]</code></td></tr>
+<tr><td><code>df.loc[rows, cols]</code></td><td>Select by label (end of a slice is included)</td><td><code>df.loc[0:2, "city"]</code></td></tr>
+<tr><td><code>df.iloc[rows, cols]</code></td><td>Select by position (end excluded)</td><td><code>df.iloc[0:2, 0]</code></td></tr>
+<tr><td><code>df.at[r, c] / df.iat[i, j]</code></td><td>Fast single value by label / position</td><td><code>df.at[0, "city"]</code></td></tr>
+<tr><td><code>df[mask]</code></td><td>Rows where a Boolean Series is True</td><td><code>df[df["sales"] &gt; 5]</code></td></tr>
+<tr><td><code>&amp;  |  ~</code></td><td>and, or, not on masks (brackets required)</td><td><code>(a &gt; 1) &amp; (b &lt; 3)</code></td></tr>
+<tr><td><code>s.isin(values)</code></td><td>Membership test</td><td><code>df["city"].isin(["Oslo","Rome"])</code></td></tr>
+<tr><td><code>s.between(lo, hi)</code></td><td>Range test (inclusive by default)</td><td><code>df["sales"].between(5, 10)</code></td></tr>
+<tr><td><code>s.str.contains(pat)</code></td><td>Text pattern test</td><td><code>df["city"].str.contains("os")</code></td></tr>
+<tr><td><code>s.isna() / notna()</code></td><td>Missing tests</td><td><code>df[df["x"].notna()]</code></td></tr>
+<tr><td><code>df.query("expr")</code></td><td>Filter with a readable string</td><td><code>df.query("sales &gt; 5 and city == 'Oslo'")</code></td></tr>
+<tr><td><code>query("@var")</code></td><td>Use a Python variable inside query</td><td><code>df.query("sales &gt; @cut")</code></td></tr>
+<tr><td><code>df.filter(items/like/regex)</code></td><td>Select columns by name pattern</td><td><code>df.filter(like="amt")</code></td></tr>
+<tr><td><code>df.drop(columns=)</code></td><td>Remove columns</td><td><code>df.drop(columns=["tmp"])</code></td></tr>
+<tr><td><code>df.drop(index=)</code></td><td>Remove rows by label</td><td><code>df.drop(index=[0, 3])</code></td></tr>
+<tr><td><code>df.loc[mask, "col"] = v</code></td><td>Assign into selected cells</td><td><code>df.loc[df.x &lt; 0, "x"] = 0</code></td></tr>
+<tr><td><code>df.where(cond, other)</code></td><td>Keep where True, else replace</td><td><code>df["x"].where(df.x &gt; 0, 0)</code></td></tr>
+<tr><td><code>np.where(cond, a, b)</code></td><td>Vectorised if/else</td><td><code>np.where(df.x &gt; 0, "pos", "neg")</code></td></tr>
+<tr><td><code>df.take / df.xs</code></td><td>Positional take / cross-section of a MultiIndex</td><td><code>df.xs("Oslo", level="city")</code></td></tr>
+<tr><td><code>df.nsmallest / nlargest</code></td><td>Top or bottom n rows</td><td><code>df.nlargest(2, "sales")</code></td></tr>
+<tr><td><code>df.head(n)</code> / <code>df.iloc[:n]</code></td><td>First n rows</td><td><code>df.iloc[:5]</code></td></tr>
+<tr><td><code>df.sort_values().head()</code></td><td>Top n by sorting</td><td><code>df.sort_values("x").head(3)</code></td></tr>
+</tbody></table></div>
+<h3>Beginner: columns, labels, positions</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame(
+    {"city": ["Oslo", "Rome", "Lima", "Oslo"], "sales": [10, 7, 3, 12]},
+    index=[10, 11, 12, 13],
+)
+print(df["city"].tolist())
+print(df.loc[11, "sales"])
+print(df.iloc[1, 1])
+print(df.loc[10:12, "city"].tolist())
+print(df.iloc[0:2].index.tolist())</code></pre>
+<pre class="code lang-text"><code>['Oslo', 'Rome', 'Lima', 'Oslo']
+7
+7
+['Oslo', 'Rome', 'Lima']
+[10, 11]</code></pre>
+<ol>
+<li><code>df["city"]</code> returns a Series; <code>.tolist()</code> turns it into a plain list so the print is short.</li>
+<li><code>df.loc[11, "sales"]</code> means "the row labelled 11, column sales", which is 7.</li>
+<li><code>df.iloc[1, 1]</code> means "second row, second column" by position. It is also 7 here because label 11 sits in position 1.</li>
+<li><code>loc[10:12]</code> is a <em>label</em> slice and includes the end label 12, so three rows come back.</li>
+<li><code>iloc[0:2]</code> is a <em>position</em> slice and excludes the end, so two rows come back, with labels 10 and 11.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Mixing up loc and iloc end points.</strong> <code>loc[0:2]</code> returns three rows, <code>iloc[0:2]</code> returns two. And with a non-default index, <code>s[0]</code> no longer falls back to position in pandas 3.0: it raises a <code>KeyError</code>. Say <code>loc</code> or <code>iloc</code> every time.</div></div>
+<h3>Intermediate: Boolean masks and query</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({
+    "city": ["Oslo", "Rome", "Lima", "Oslo", "Rome"],
+    "sales": [10, 7, 3, 12, 9],
+    "paid": [True, False, True, True, False],
+})
+mask = (df["sales"] &gt; 5) &amp; df["paid"]
+print(mask.tolist())
+print(df[mask])
+print(df[df["city"].isin(["Rome", "Lima"]) | (df["sales"] &gt; 11)])
+print(df[~df["paid"]]["sales"].sum())
+cut = 8
+print(df.query("sales &gt; @cut and city != 'Rome'"))</code></pre>
+<pre class="code lang-text"><code>[True, False, False, True, False]
+   city  sales  paid
+0  Oslo     10  True
+3  Oslo     12  True
+   city  sales   paid
+1  Rome      7  False
+2  Lima      3   True
+3  Oslo     12   True
+4  Rome      9  False
+16
+   city  sales  paid
+0  Oslo     10  True
+3  Oslo     12  True</code></pre>
+<ol>
+<li>Each comparison returns a Series of True/False. <code>&amp;</code> combines them element by element. Every comparison needs its own brackets because <code>&amp;</code> binds tighter than <code>&gt;</code>.</li>
+<li>The column <code>paid</code> is already Boolean, so it works as a mask on its own.</li>
+<li><code>df[mask]</code> keeps the rows where the mask is True and keeps their original labels (0 and 3).</li>
+<li>Line 3 uses <code>|</code> (or) with <code>isin</code>: rows in Rome or Lima, or with sales above 11.</li>
+<li><code>~df["paid"]</code> flips True and False, selecting the unpaid rows (sales 7 and 9, total 16).</li>
+<li><code>query</code> takes the condition as a string, which reads like SQL. <code>@cut</code> pulls in the Python variable. Use <code>and</code>/<code>or</code> inside query, but <code>&amp;</code>/<code>|</code> outside it.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Using and / or on Series.</strong> <code>df[(df.a &gt; 1) and (df.b &lt; 2)]</code> raises "The truth value of a Series is ambiguous". Python's <code>and</code> wants one True or False, but a Series holds many. Use <code>&amp;</code>, <code>|</code>, <code>~</code> with brackets.</div></div>
+<h3>Expert: assigning safely with loc, where and np.where</h3>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+df = pd.DataFrame({"x": [-5, 2, -1, 8], "grp": ["a", "b", "a", "b"]})
+df.loc[df["x"] &lt; 0, "x"] = 0
+print(df["x"].tolist())
+
+df["sign"] = np.where(df["x"] &gt; 0, "pos", "zero")
+df["capped"] = df["x"].where(df["x"] &lt; 5, 5)
+df["label"] = np.select([df["x"] == 0, df["x"] &lt; 5], ["none", "low"], default="high")
+print(df)</code></pre>
+<pre class="code lang-text"><code>[0, 2, 0, 8]
+   x grp  sign  capped label
+0  0   a  zero       0  none
+1  2   b   pos       2   low
+2  0   a  zero       0  none
+3  8   b   pos       5  high</code></pre>
+<ol>
+<li><code>df.loc[mask, "x"] = 0</code> changes only the cells where the mask is True. This one-step form is the safe way to assign into a selection.</li>
+<li><code>np.where(cond, a, b)</code> builds a whole new column: "pos" where x is positive, else "zero".</li>
+<li><code>Series.where(cond, other)</code> keeps values where the condition is True and replaces the rest. Here it caps x at 5.</li>
+<li><code>np.select(conditions, choices, default)</code> handles more than two outcomes. The conditions are checked in order and the first True wins, so <code>x == 0</code> is tested before <code>x &lt; 5</code>.</li>
+</ol>
+
+<h2 id="s17-6">17.6 Assigning Columns and Choosing dtypes</h2>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>df["new"] = ...</code></td><td>Add or overwrite a column in place</td><td><code>df["tax"] = df.price * 0.2</code></td></tr>
+<tr><td><code>df.assign(new=...)</code></td><td>Return a new frame with extra columns (chainable)</td><td><code>df.assign(tax=lambda d: d.price*.2)</code></td></tr>
+<tr><td><code>df.insert(pos, name, vals)</code></td><td>Add a column at a chosen position</td><td><code>df.insert(0, "k", 1)</code></td></tr>
+<tr><td><code>df.rename(columns=)</code></td><td>Rename</td><td><code>df.rename(columns=str.lower)</code></td></tr>
+<tr><td><code>df.astype(dict)</code></td><td>Convert types</td><td><code>df.astype({"id": "int32"})</code></td></tr>
+<tr><td><code>pd.to_numeric(s, errors=)</code></td><td>Parse numbers; <code>"coerce"</code> turns junk into NaN</td><td><code>pd.to_numeric(s, errors="coerce")</code></td></tr>
+<tr><td><code>pd.to_datetime(s, format=)</code></td><td>Parse dates</td><td><code>pd.to_datetime(s, format="%d/%m/%Y")</code></td></tr>
+<tr><td><code>s.astype("category")</code></td><td>Few distinct values, stored as codes</td><td><code>df["city"].astype("category")</code></td></tr>
+<tr><td><code>pd.Categorical(values, categories, ordered)</code></td><td>Ordered categories (S &lt; M &lt; L)</td><td><code>pd.Categorical(["S"], ["S","M"], ordered=True)</code></td></tr>
+<tr><td><code>"Int64", "Float64", "boolean"</code></td><td>Nullable dtypes that hold <code>pd.NA</code> without turning to float</td><td><code>s.astype("Int64")</code></td></tr>
+<tr><td><code>"string[pyarrow]" / "str"</code></td><td>Text dtypes (default <code>str</code> in 3.0)</td><td><code>s.astype("str")</code></td></tr>
+<tr><td><code>df.convert_dtypes()</code></td><td>Switch to best nullable dtypes</td><td><code>df.convert_dtypes()</code></td></tr>
+<tr><td><code>df.infer_objects()</code></td><td>Re-guess dtypes of object columns</td><td><code>df.infer_objects()</code></td></tr>
+<tr><td><code>pd.api.types.is_numeric_dtype</code></td><td>Type check helpers</td><td><code>is_numeric_dtype(df.x)</code></td></tr>
+<tr><td><code>s.replace(old, new)</code></td><td>Swap values</td><td><code>s.replace({"N":"No"})</code></td></tr>
+<tr><td><code>s.map(dict_or_func)</code></td><td>Look up each value</td><td><code>s.map({"a": 1})</code></td></tr>
+<tr><td><code>s.clip(lo, hi)</code></td><td>Limit to a range</td><td><code>s.clip(0, 100)</code></td></tr>
+<tr><td><code>s.round(n)</code></td><td>Round</td><td><code>s.round(2)</code></td></tr>
+<tr><td><code>s.diff() / pct_change()</code></td><td>Change vs previous row</td><td><code>s.pct_change()</code></td></tr>
+<tr><td><code>s.cumsum() / cummax()</code></td><td>Running total / maximum</td><td><code>s.cumsum()</code></td></tr>
+<tr><td><code>s.rank()</code></td><td>Rank values</td><td><code>s.rank(ascending=False)</code></td></tr>
+<tr><td><code>s.shift(k)</code></td><td>Move values down by k</td><td><code>s.shift(1)</code></td></tr>
+</tbody></table></div>
+<h3>Beginner: add columns two ways</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"item": ["pen", "book", "lamp"], "price": [2.0, 12.5, 30.0], "qty": [10, 2, 1]})
+df["total"] = df["price"] * df["qty"]
+print(df)
+
+priced = df.assign(vat=lambda d: (d["total"] * 0.2).round(2), big=lambda d: d["total"] &gt; 20)
+print(priced[["item", "vat", "big"]])
+print(list(df.columns))</code></pre>
+<pre class="code lang-text"><code>   item  price  qty  total
+0   pen    2.0   10   20.0
+1  book   12.5    2   25.0
+2  lamp   30.0    1   30.0
+   item  vat    big
+0   pen  4.0  False
+1  book  5.0   True
+2  lamp  6.0   True
+['item', 'price', 'qty', 'total']</code></pre>
+<ol>
+<li>Multiplying two columns works row by row: 2.0 x 10, 12.5 x 2, 30.0 x 1.</li>
+<li><code>df["total"] = ...</code> adds the column to <code>df</code> itself.</li>
+<li><code>assign</code> returns a <em>new</em> DataFrame and leaves <code>df</code> alone. The <code>lambda d: ...</code> receives the frame as it is at that moment, so a later argument can use a column created by an earlier one.</li>
+<li>The last line shows <code>df</code> has no <code>vat</code> or <code>big</code>: <code>assign</code> did not change it.</li>
+</ol>
+<h3>Intermediate: dtypes that save memory and prevent bugs</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+raw = pd.Series(["12", "7", "oops", "30", None])
+nums = pd.to_numeric(raw, errors="coerce")
+print(nums.tolist())
+
+ints = nums.astype("Int64")
+print(ints.tolist(), ints.dtype)
+
+size = pd.Series(["M", "S", "L", "M", "S"])
+cat = pd.Series(pd.Categorical(size, categories=["S", "M", "L"], ordered=True))
+print(cat.dtype, (cat &gt;= "M").tolist())
+print(cat.sort_values().tolist(), cat.cat.codes.tolist())
+
+dates = pd.to_datetime(pd.Series(["03/04/2025", "15/04/2025"]), format="%d/%m/%Y")
+print(dates.dt.month.tolist(), dates.dtype)</code></pre>
+<pre class="code lang-text"><code>[12.0, 7.0, nan, 30.0, nan]
+[12, 7, &lt;NA&gt;, 30, &lt;NA&gt;] Int64
+category [True, False, True, True, False]
+['S', 'S', 'M', 'M', 'L'] [1, 0, 2, 1, 0]
+[4, 4] datetime64[us]</code></pre>
+<ol>
+<li><code>to_numeric(..., errors="coerce")</code> turns "oops" and the missing value into NaN instead of crashing. The default <code>errors="raise"</code> is better when you want to be told about bad data.</li>
+<li><code>astype("Int64")</code> (capital I) is the <em>nullable</em> integer: it keeps integers as integers and shows the gap as <code>&lt;NA&gt;</code>. The plain <code>int64</code> cannot hold a missing value.</li>
+<li>An ordered <code>Categorical</code> knows S &lt; M &lt; L, so comparisons (<code>&gt;= "M"</code>) and sorting follow that order, not the alphabet (where L would come before M).</li>
+<li><code>cat.cat.codes</code> are the small integers pandas actually stores: S=0, M=1, L=2. That is why categories save memory.</li>
+<li>Always give <code>format=</code> to <code>to_datetime</code> for non-ISO dates. "03/04/2025" is 3 April in Europe but 4 March in the US, and guessing is how silent bugs are born.</li>
+</ol>
+<h3>Expert: what each dtype costs</h3>
+<figure><img src="images/lib17_dtypes.png" alt="Horizontal bar chart of memory for str, category, int64, int8 and float64 columns of 200,000 rows" loading="lazy"/><figcaption>Memory for the same 200,000 values stored with different dtypes. Measured on one machine; exact bytes vary by platform and version.</figcaption></figure>
+<p><strong>How to read it:</strong> each bar is one column of 200,000 values. The text column built from four repeated words is the longest bar. Converting it to <code>category</code> stores each word once plus a small integer code per row, so the bar shrinks a lot. For numbers, shrinking <code>int64</code> to <code>int8</code> divides memory by eight when values fit between -128 and 127. The lesson: low-cardinality text becomes category, and numbers get the smallest safe type.</p>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+n = 200_000
+city = pd.Series(rng.choice(["Oslo", "Rome", "Lima", "Kyiv"], n))
+qty = pd.Series(rng.integers(0, 100, n))
+
+print(round(city.memory_usage(deep=True) / 1e6, 2), "MB as str")
+print(round(city.astype("category").memory_usage(deep=True) / 1e6, 2), "MB as category")
+print(round(qty.memory_usage(deep=True) / 1e6, 2), "MB int64")
+print(round(qty.astype("int8").memory_usage(deep=True) / 1e6, 2), "MB int8")
+print(qty.astype("int8").max(), np.iinfo("int8").max)</code></pre>
+<pre class="code lang-text"><code>10.6 MB as str
+0.2 MB as category
+1.6 MB int64
+0.2 MB int8
+99 127</code></pre>
+<ol>
+<li>200,000 values drawn from 4 words; <code>default_rng(0)</code> makes it repeatable.</li>
+<li><code>memory_usage(deep=True)</code> measures real bytes including the text; without <code>deep=True</code> pandas under-counts text columns.</li>
+<li>The category version stores 4 strings once plus one byte per row, which is why it is far smaller.</li>
+<li>The int8 conversion is only safe because the largest value, 99, is below <code>np.iinfo("int8").max</code> (127). If a value did not fit, the conversion would silently wrap or raise; always check the range first, or use <code>pd.to_numeric(s, downcast="integer")</code> which picks a safe size for you.</li>
+</ol>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">Rule of thumb: if a text column has fewer distinct values than about half of its rows, try <code>category</code>. It cuts memory and speeds up <code>groupby</code>. If the column is nearly all unique (ids, free text), keep it as <code>str</code>.</div></div>
+
+<h2 id="s17-7">17.7 Missing Data and Duplicates</h2>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>df.isna() / notna()</code></td><td>Boolean map of missing cells</td><td><code>df.isna()</code></td></tr>
+<tr><td><code>df.isna().sum()</code></td><td>Missing per column</td><td><code>df.isna().sum()</code></td></tr>
+<tr><td><code>df.isna().mean()</code></td><td>Share missing per column</td><td><code>df.isna().mean().round(2)</code></td></tr>
+<tr><td><code>df.dropna()</code></td><td>Drop rows with any missing value</td><td><code>df.dropna()</code></td></tr>
+<tr><td><code>dropna(subset=)</code></td><td>Only look at some columns</td><td><code>df.dropna(subset=["id"])</code></td></tr>
+<tr><td><code>dropna(how="all")</code></td><td>Drop only fully empty rows</td><td><code>df.dropna(how="all")</code></td></tr>
+<tr><td><code>dropna(thresh=k)</code></td><td>Keep rows with at least k real values</td><td><code>df.dropna(thresh=2)</code></td></tr>
+<tr><td><code>fillna(value)</code></td><td>Fill with a constant</td><td><code>df["x"].fillna(0)</code></td></tr>
+<tr><td><code>fillna(df.mean())</code></td><td>Fill each column with its own value</td><td><code>df.fillna(df.mean(numeric_only=True))</code></td></tr>
+<tr><td><code>ffill() / bfill()</code></td><td>Carry the last / next value</td><td><code>s.ffill()</code></td></tr>
+<tr><td><code>interpolate()</code></td><td>Estimate between neighbours</td><td><code>s.interpolate()</code></td></tr>
+<tr><td><code>groupby().transform("median")</code></td><td>Fill with a group-specific statistic</td><td><code>g.transform("median")</code></td></tr>
+<tr><td><code>replace(value, np.nan)</code></td><td>Turn sentinels such as -999 into NaN</td><td><code>df.replace(-999, np.nan)</code></td></tr>
+<tr><td><code>pd.NA</code></td><td>The missing marker of nullable dtypes</td><td><code>pd.Series([1, None], dtype="Int64")</code></td></tr>
+<tr><td><code>df.duplicated(subset, keep)</code></td><td>Mark repeated rows</td><td><code>df.duplicated(["id"], keep=False)</code></td></tr>
+<tr><td><code>df.drop_duplicates(subset, keep)</code></td><td>Remove repeated rows</td><td><code>df.drop_duplicates("id", keep="last")</code></td></tr>
+<tr><td><code>s.is_unique</code></td><td>Is every value distinct?</td><td><code>df["id"].is_unique</code></td></tr>
+<tr><td><code>s.value_counts(dropna=False)</code></td><td>Count missing as a category too</td><td><code>s.value_counts(dropna=False)</code></td></tr>
+<tr><td><code>df.sort_values().drop_duplicates()</code></td><td>Keep the best row per key</td><td><code>df.sort_values("ts").drop_duplicates("id", keep="last")</code></td></tr>
+</tbody></table></div>
+<h3>Beginner: find, drop, fill</h3>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+df = pd.DataFrame({"id": [1, 2, 3, 4], "age": [25, np.nan, 40, np.nan], "city": ["Oslo", "Rome", None, "Lima"]})
+print(df.isna().sum().to_dict())
+print(df.dropna().shape)
+print(df.dropna(subset=["city"]).shape)
+filled = df.assign(age=df["age"].fillna(df["age"].median()), city=df["city"].fillna("unknown"))
+print(filled)</code></pre>
+<pre class="code lang-text"><code>{'id': 0, 'age': 2, 'city': 1}
+(1, 3)
+(3, 3)
+   id   age     city
+0   1  25.0     Oslo
+1   2  32.5     Rome
+2   3  40.0  unknown
+3   4  32.5     Lima</code></pre>
+<ol>
+<li><code>isna().sum()</code> counts missing cells: 2 in age, 1 in city.</li>
+<li><code>dropna()</code> with no arguments removes every row that has <em>any</em> gap. Rows 1 and 3 lack an age and row 2 lacks a city, so only row 0 survives: the shape is (1, 3).</li>
+<li><code>subset=["city"]</code> only cares about city, so rows with a missing age are kept and only row 2 is dropped: (3, 3).</li>
+<li>Filling age with the median (32.5, the middle of 25 and 40) is a simple, outlier-resistant choice. Filling text with the word "unknown" keeps the row and makes the gap visible.</li>
+</ol>
+<h3>Intermediate: group-aware fill, sentinels, forward fill</h3>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+df = pd.DataFrame({
+    "dept": ["a", "a", "b", "b", "b"],
+    "pay": [100.0, np.nan, 200.0, -999.0, np.nan],
+})
+df["pay"] = df["pay"].replace(-999, np.nan)
+df["pay_filled"] = df["pay"].fillna(df.groupby("dept")["pay"].transform("median"))
+print(df)
+
+ts = pd.Series([1.0, np.nan, np.nan, 4.0, np.nan])
+print(ts.ffill().tolist())
+print(ts.interpolate().tolist())</code></pre>
+<pre class="code lang-text"><code>  dept    pay  pay_filled
+0    a  100.0       100.0
+1    a    NaN       100.0
+2    b  200.0       200.0
+3    b    NaN       200.0
+4    b    NaN       200.0
+[1.0, 1.0, 1.0, 4.0, 4.0]
+[1.0, 2.0, 3.0, 4.0, 4.0]</code></pre>
+<ol>
+<li>Some systems store "unknown" as -999. If you average that you get nonsense, so <code>replace(-999, np.nan)</code> converts the sentinel to a real missing marker first.</li>
+<li><code>groupby("dept")["pay"].transform("median")</code> returns a Series the same length as <code>df</code> in which each row holds the median of its own department (100 for a, 200 for b).</li>
+<li><code>fillna(that_series)</code> fills each gap with the matching department median. This is better than one global median because departments differ.</li>
+<li><code>ffill()</code> carries the last known value forward (1, 1, 1, 4, 4): right for state that persists, such as a price.</li>
+<li><code>interpolate()</code> draws a straight line between known points (1, 2, 3, 4, then 4 at the end because nothing follows): right for smooth measurements such as temperature.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Filling before you understand why it is missing.</strong> If "no discount" is stored as NaN, filling it with the mean invents a discount. Decide per column: is missing zero, unknown, or not applicable? Keep an indicator column (<code>df["age_missing"] = df["age"].isna()</code>) when missingness itself carries information.</div></div>
+<h3>Duplicates: exact, by key, and keep the latest</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({
+    "id": [1, 1, 2, 3, 3],
+    "ts": ["2025-01-01", "2025-01-05", "2025-01-02", "2025-01-03", "2025-01-03"],
+    "val": [10, 12, 7, 5, 5],
+})
+print(df.duplicated().tolist())
+print(df.duplicated("id", keep=False).tolist())
+latest = df.sort_values("ts").drop_duplicates("id", keep="last")
+print(latest.sort_values("id"))
+print(df.drop_duplicates().shape[0])</code></pre>
+<pre class="code lang-text"><code>[False, False, False, False, True]
+[True, True, False, True, True]
+   id          ts  val
+1   1  2025-01-05   12
+2   2  2025-01-02    7
+4   3  2025-01-03    5
+4</code></pre>
+<ol>
+<li><code>duplicated()</code> with no arguments compares whole rows. Only the last row repeats an earlier one exactly, so only it is True.</li>
+<li><code>duplicated("id", keep=False)</code> compares only the key and marks <em>every</em> row that shares an id (<code>keep=False</code>), which is what you want when you need to inspect all conflicting versions.</li>
+<li>To keep the most recent row per id: sort by time first, then <code>drop_duplicates("id", keep="last")</code>. Order matters; without the sort, "last" means last in file order.</li>
+<li>Dropping exact duplicates leaves 4 rows. Note the difference: key duplicates (id 1 appears with different values) are a <em>business</em> question, exact duplicates are usually an extraction error.</li>
+</ol>
+
+
+<h2 id="s17-8">17.8 String and Datetime Accessors, and apply vs Vectorised</h2>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>s.str.lower() / upper() / title()</code></td><td>Change case</td><td><code>s.str.lower()</code></td></tr>
+<tr><td><code>s.str.strip()</code></td><td>Trim spaces at both ends</td><td><code>s.str.strip()</code></td></tr>
+<tr><td><code>s.str.replace(pat, repl, regex=)</code></td><td>Replace text</td><td><code>s.str.replace(r"\D", "", regex=True)</code></td></tr>
+<tr><td><code>s.str.contains(pat)</code></td><td>Boolean pattern match</td><td><code>s.str.contains("^A")</code></td></tr>
+<tr><td><code>s.str.startswith / endswith</code></td><td>Prefix and suffix test</td><td><code>s.str.endswith(".csv")</code></td></tr>
+<tr><td><code>s.str.split(sep, expand=True)</code></td><td>Split into columns</td><td><code>s.str.split(" ", expand=True)</code></td></tr>
+<tr><td><code>s.str.extract(regex)</code></td><td>Pull capture groups into columns</td><td><code>s.str.extract(r"(\d+)")</code></td></tr>
+<tr><td><code>s.str.len()</code></td><td>String length</td><td><code>s.str.len()</code></td></tr>
+<tr><td><code>s.str.cat(sep=)</code></td><td>Join strings</td><td><code>s.str.cat(sep=", ")</code></td></tr>
+<tr><td><code>s.str.get_dummies(sep)</code></td><td>One-hot from delimited tags</td><td><code>s.str.get_dummies("|")</code></td></tr>
+<tr><td><code>s.str.zfill(w)</code></td><td>Left-pad with zeros</td><td><code>s.str.zfill(5)</code></td></tr>
+<tr><td><code>s.dt.year / month / day</code></td><td>Date parts</td><td><code>s.dt.month</code></td></tr>
+<tr><td><code>s.dt.dayofweek / day_name()</code></td><td>Weekday (Monday = 0)</td><td><code>s.dt.day_name()</code></td></tr>
+<tr><td><code>s.dt.to_period("M")</code></td><td>Month bucket (as Period)</td><td><code>s.dt.to_period("M")</code></td></tr>
+<tr><td><code>s.dt.floor("h") / ceil / round</code></td><td>Snap to a unit</td><td><code>s.dt.floor("D")</code></td></tr>
+<tr><td><code>s.dt.normalize()</code></td><td>Drop the time of day</td><td><code>s.dt.normalize()</code></td></tr>
+<tr><td><code>s.dt.strftime(fmt)</code></td><td>Format as text</td><td><code>s.dt.strftime("%Y-%m")</code></td></tr>
+<tr><td><code>s.dt.tz_localize / tz_convert</code></td><td>Attach and change time zone</td><td><code>s.dt.tz_localize("UTC")</code></td></tr>
+<tr><td><code>pd.Timedelta / s.dt.days</code></td><td>Durations</td><td><code>(b - a).dt.days</code></td></tr>
+<tr><td><code>pd.date_range(start, periods, freq)</code></td><td>Regular calendar</td><td><code>pd.date_range("2025-01-01", periods=3, freq="D")</code></td></tr>
+<tr><td><code>pd.offsets.MonthEnd</code></td><td>Calendar arithmetic</td><td><code>s + pd.offsets.MonthEnd(0)</code></td></tr>
+<tr><td><code>s.map(func_or_dict)</code></td><td>Element-wise on a Series</td><td><code>s.map({"a": 1})</code></td></tr>
+<tr><td><code>df.apply(f, axis=)</code></td><td>Run a function per column or per row</td><td><code>df.apply(f, axis=1)</code></td></tr>
+<tr><td><code>df.map(f)</code></td><td>Element-wise on a whole DataFrame (replaces <code>applymap</code>)</td><td><code>df.map(len)</code></td></tr>
+</tbody></table></div>
+<h3>Beginner: clean messy text</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+names = pd.Series(["  Ana Silva ", "BO chen", "cy O'Neil"])
+clean = names.str.strip().str.title()
+print(clean.tolist())
+parts = clean.str.split(" ", n=1, expand=True)
+parts.columns = ["first", "last"]
+print(parts)
+print(clean.str.contains("an", case=False).tolist())
+print(clean.str.len().tolist())</code></pre>
+<pre class="code lang-text"><code>['Ana Silva', 'Bo Chen', "Cy O'Neil"]
+  first    last
+0   Ana   Silva
+1    Bo    Chen
+2    Cy  O'Neil
+[True, False, False]
+[9, 7, 9]</code></pre>
+<ol>
+<li><code>.str</code> is an <em>accessor</em>: it applies a text method to every element of the column. You chain methods: strip first, then title-case.</li>
+<li><code>title()</code> capitalises each word; it handles these three names, but it turns "mcdonald" into "Mcdonald", so check on your real data.</li>
+<li><code>split(" ", n=1, expand=True)</code> splits at the first space only and returns a DataFrame with one column per piece; we then name them.</li>
+<li><code>contains("an", case=False)</code> tests for the substring ignoring case: True for "Ana Silva", False for the others.</li>
+<li><code>len()</code> counts characters (after cleaning, so the spaces are gone).</li>
+</ol>
+<h3>Intermediate: regex extraction and dates</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+log = pd.DataFrame({
+    "line": ["ERR 2025-03-07 14:05 code=502", "OK 2025-03-08 09:30 code=200", "ERR 2025-03-09 23:59 code=404"],
+})
+ex = log["line"].str.extract(r"^(?P&lt;level&gt;\w+) (?P&lt;when&gt;[\d-]+ [\d:]+) code=(?P&lt;code&gt;\d+)$")
+ex["when"] = pd.to_datetime(ex["when"])
+ex["code"] = ex["code"].astype(int)
+print(ex)
+print(ex["when"].dt.day_name().tolist())
+ex["day"] = ex["when"].dt.normalize()
+ex["hour"] = ex["when"].dt.hour
+print(ex[["day", "hour"]])
+gap = ex["when"].diff()
+print(gap.dt.total_seconds().div(3600).round(1).tolist())</code></pre>
+<pre class="code lang-text"><code>  level                when  code
+0   ERR 2025-03-07 14:05:00   502
+1    OK 2025-03-08 09:30:00   200
+2   ERR 2025-03-09 23:59:00   404
+['Friday', 'Saturday', 'Sunday']
+         day  hour
+0 2025-03-07    14
+1 2025-03-08     9
+2 2025-03-09    23
+[nan, 19.4, 38.5]</code></pre>
+<ol>
+<li><code>str.extract</code> takes a regular expression with <em>named groups</em> <code>(?P&lt;name&gt;...)</code> and returns one column per group. Rows that do not match become NaN.</li>
+<li>Extracted pieces are text, so we convert: <code>to_datetime</code> for the timestamp and <code>astype(int)</code> for the code.</li>
+<li><code>.dt</code> is the date accessor, the twin of <code>.str</code>. <code>day_name()</code> gives weekday names (7 March 2025 was a Friday).</li>
+<li><code>normalize()</code> sets the time to midnight, which is the easiest way to get a "date" key for grouping; <code>hour</code> is an integer part.</li>
+<li><code>diff()</code> on a datetime column gives a Timedelta between consecutive rows. <code>total_seconds()</code> converts to seconds, and dividing by 3600 gives hours. The first gap is NaN because no row precedes it.</li>
+</ol>
+<h3>apply vs map vs vectorised: the speed ladder</h3>
+<p>The same task, "total = price times quantity", can be written four ways. They give the same answer at very different cost.</p>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+df = pd.DataFrame({"price": rng.uniform(1, 10, 5), "qty": rng.integers(1, 5, 5)})
+
+a = df["price"] * df["qty"]
+b = df.apply(lambda r: r["price"] * r["qty"], axis=1)
+c = pd.Series([p * q for p, q in zip(df["price"], df["qty"])])
+d = pd.Series([r.price * r.qty for r in df.itertuples()])
+print(np.allclose(a, b), np.allclose(a, c), np.allclose(a, d))
+print(a.round(2).tolist())
+
+tier = pd.Series([1, 2, 3, 1, 4]).map({1: "single", 2: "pair"}).fillna("bulk")
+print(tier.tolist())</code></pre>
+<pre class="code lang-text"><code>True True True
+[20.2, 13.71, 4.11, 3.45, 33.28]
+['single', 'pair', 'bulk', 'single', 'bulk']</code></pre>
+<ol>
+<li><code>a</code> is vectorised: one multiplication of two whole columns, executed in compiled code. This is the default choice.</li>
+<li><code>b</code> uses <code>apply(axis=1)</code>, which builds a Series object for every row and calls your Python function once per row. It is the slowest and the most overused.</li>
+<li><code>c</code> is a list comprehension over <code>zip</code> of two columns. It is a Python loop but avoids row objects, so it is typically much faster than <code>apply(axis=1)</code> and is a good fallback for logic that cannot be vectorised.</li>
+<li><code>d</code> uses <code>itertuples()</code>, the right way to loop over rows if you must (much faster than <code>iterrows</code>).</li>
+<li><code>np.allclose</code> checks that all four agree. The timings are in the figure below.</li>
+<li><code>Series.map(dict)</code> is the vectorised way to recode values. Anything not in the dict becomes NaN, which we fill with "bulk".</li>
+</ol>
+<figure><img src="images/lib17_speed.png" alt="Log-scale bar chart of milliseconds for iterrows, apply axis 1, list comprehension and vectorised addition" loading="lazy"/><figcaption>Adding two columns of 100,000 rows. Times measured on one laptop; they vary by machine, version and data, but the ordering is stable.</figcaption></figure>
+<p><strong>How to read it:</strong> the horizontal axis is logarithmic, so each gridline is ten times larger than the one before. The vectorised bar is orders of magnitude shorter than the two row-wise approaches. The gap grows with the number of rows. Reach for <code>apply(axis=1)</code> only after you have tried column arithmetic, <code>np.where</code>, <code>np.select</code>, <code>map</code> and the <code>.str</code>/<code>.dt</code> accessors.</p>
+
+<h2 id="s17-9">17.9 groupby: agg, transform, filter and Named Aggregation</h2>
+<figure><img src="images/lib17_splitapply.png" alt="Diagram: all rows are split into groups A, B and C, each is summed, and the results are combined into one row per key" loading="lazy"/><figcaption>groupby is split, apply, combine: cut the rows by key, summarise each piece, stack the summaries.</figcaption></figure>
+<p><strong>How to read it:</strong> follow the arrows left to right. The blue box holds all rows. They are split by key into three boxes, a function (here <code>sum</code>) runs inside each box independently, and the three small results are combined into the final table with one row per key. <code>agg</code> shrinks each group to one row. <code>transform</code> returns one value for <em>every</em> original row. <code>filter</code> keeps or drops whole groups.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>df.groupby("k")</code></td><td>Create the groups (nothing computed yet)</td><td><code>g = df.groupby("city")</code></td></tr>
+<tr><td><code>g["x"].sum() / mean() / count()</code></td><td>Built-in per-group stats</td><td><code>g["sales"].sum()</code></td></tr>
+<tr><td><code>g.size()</code></td><td>Rows per group (counts NaN too)</td><td><code>g.size()</code></td></tr>
+<tr><td><code>g.count()</code></td><td>Non-null values per column per group</td><td><code>g.count()</code></td></tr>
+<tr><td><code>g.nunique()</code></td><td>Distinct values per group</td><td><code>g["user"].nunique()</code></td></tr>
+<tr><td><code>g.agg({"x": ["sum","mean"]})</code></td><td>Several stats per column</td><td><code>g.agg({"x": ["sum","mean"]})</code></td></tr>
+<tr><td><code>g.agg(total=("x","sum"))</code></td><td>Named aggregation: clear output names</td><td><code>g.agg(total=("sales","sum"))</code></td></tr>
+<tr><td><code>g.agg(func)</code></td><td>Custom function per group</td><td><code>g["x"].agg(lambda s: s.max()-s.min())</code></td></tr>
+<tr><td><code>g.transform("mean")</code></td><td>Group stat broadcast to every row</td><td><code>g["x"].transform("mean")</code></td></tr>
+<tr><td><code>g.filter(func)</code></td><td>Keep only groups that pass a test</td><td><code>g.filter(lambda d: len(d) &gt; 2)</code></td></tr>
+<tr><td><code>g.apply(func)</code></td><td>Flexible per-group function (slowest)</td><td><code>g.apply(lambda d: d.nlargest(2, "x"))</code></td></tr>
+<tr><td><code>g.head(n) / tail(n)</code></td><td>First n rows of each group</td><td><code>g.head(2)</code></td></tr>
+<tr><td><code>g.nth(k)</code></td><td>k-th row of each group</td><td><code>g.nth(0)</code></td></tr>
+<tr><td><code>g.cumcount()</code></td><td>0,1,2... within each group</td><td><code>g.cumcount()</code></td></tr>
+<tr><td><code>g.rank()</code></td><td>Rank within group</td><td><code>g["x"].rank(ascending=False)</code></td></tr>
+<tr><td><code>g.cumsum() / shift() / diff()</code></td><td>Running/lagged values within group</td><td><code>g["x"].shift(1)</code></td></tr>
+<tr><td><code>g.first() / last()</code></td><td>First/last non-null per group</td><td><code>g.last()</code></td></tr>
+<tr><td><code>g.idxmax()</code></td><td>Row label of the max per group</td><td><code>g["x"].idxmax()</code></td></tr>
+<tr><td><code>groupby(["a","b"])</code></td><td>Group by several keys</td><td><code>df.groupby(["city","year"])</code></td></tr>
+<tr><td><code>groupby(..., as_index=False)</code></td><td>Keys stay as ordinary columns</td><td><code>df.groupby("k", as_index=False).sum()</code></td></tr>
+<tr><td><code>groupby(..., dropna=False)</code></td><td>Keep a NaN group</td><td><code>df.groupby("k", dropna=False)</code></td></tr>
+<tr><td><code>groupby(..., observed=)</code></td><td>For categorical keys: show unused categories? (default True in 3.0)</td><td><code>groupby("cat", observed=False)</code></td></tr>
+<tr><td><code>groupby(pd.Grouper(key, freq))</code></td><td>Group a date column by period</td><td><code>pd.Grouper(key="ts", freq="W")</code></td></tr>
+<tr><td><code>g.ngroups / g.groups</code></td><td>Number of groups / their row labels</td><td><code>g.ngroups</code></td></tr>
+<tr><td><code>g.get_group(key)</code></td><td>Pull one group out</td><td><code>g.get_group("Oslo")</code></td></tr>
+<tr><td><code>g.describe()</code></td><td>Summary statistics per group</td><td><code>g["x"].describe()</code></td></tr>
+</tbody></table></div>
+<h3>Beginner: one key, one statistic</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({
+    "city": ["Oslo", "Rome", "Oslo", "Lima", "Rome", "Oslo"],
+    "sales": [10, 7, 3, 5, 9, 12],
+})
+print(df.groupby("city")["sales"].sum())
+print(df.groupby("city")["sales"].agg(["count", "mean", "max"]))
+print(df.groupby("city", as_index=False)["sales"].sum())</code></pre>
+<pre class="code lang-text"><code>city
+Lima     5
+Oslo    25
+Rome    16
+Name: sales, dtype: int64
+      count      mean  max
+city                      
+Lima      1  5.000000    5
+Oslo      3  8.333333   12
+Rome      2  8.000000    9
+   city  sales
+0  Lima      5
+1  Oslo     25
+2  Rome     16</code></pre>
+<ol>
+<li><code>groupby("city")</code> says "split by city". <code>["sales"]</code> selects the column to summarise and <code>.sum()</code> adds within each group. Oslo: 10+3+12 = 25. Groups are sorted by key by default.</li>
+<li>Passing a list to <code>agg</code> computes several statistics at once; each becomes a column.</li>
+<li><code>as_index=False</code> keeps <code>city</code> as an ordinary column instead of the index, which is easier to merge or plot afterwards.</li>
+</ol>
+<h3>Intermediate: named aggregation, transform and filter</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({
+    "city": ["Oslo", "Rome", "Oslo", "Lima", "Rome", "Oslo"],
+    "channel": ["web", "web", "shop", "web", "shop", "web"],
+    "sales": [10, 7, 3, 5, 9, 12],
+})
+summary = df.groupby("city").agg(
+    orders=("sales", "size"),
+    total=("sales", "sum"),
+    best=("sales", "max"),
+    channels=("channel", "nunique"),
+)
+print(summary)
+
+df["share_of_city"] = (df["sales"] / df.groupby("city")["sales"].transform("sum")).round(2)
+df["vs_city_mean"] = df["sales"] - df.groupby("city")["sales"].transform("mean")
+print(df)
+
+big = df.groupby("city").filter(lambda d: len(d) &gt;= 2)
+print(sorted(big["city"].unique()))</code></pre>
+<pre class="code lang-text"><code>      orders  total  best  channels
+city                               
+Lima       1      5     5         1
+Oslo       3     25    12         2
+Rome       2     16     9         2
+   city channel  sales  share_of_city  vs_city_mean
+0  Oslo     web     10           0.40      1.666667
+1  Rome     web      7           0.44     -1.000000
+2  Oslo    shop      3           0.12     -5.333333
+3  Lima     web      5           1.00      0.000000
+4  Rome    shop      9           0.56      1.000000
+5  Oslo     web     12           0.48      3.666667
+['Oslo', 'Rome']</code></pre>
+<ol>
+<li>Named aggregation has the form <code>output_name=(column, function)</code>. It gives flat, readable column names, so prefer it over the dict-of-lists form which creates a two-level header.</li>
+<li><code>size</code> counts rows, <code>nunique</code> counts distinct channels. Lima has one order and one channel.</li>
+<li><code>transform("sum")</code> returns a Series aligned to the original rows: each Oslo row sees 25. Dividing gives each row's share of its city total.</li>
+<li><code>sales - transform("mean")</code> centres each value on its group mean: a common feature-engineering step.</li>
+<li><code>filter</code> receives each group as a small DataFrame and returns True to keep it. Lima has only one row, so it is dropped; Oslo and Rome stay.</li>
+</ol>
+<p class="problem"><span class="pl">Problem 17.9.1</span> For the table above, find the city whose average sale is highest, using one chain.</p>
+<table class="steps"><tr><th>Idea</th><td>Group by city, take the mean of sales, then pick the label of the largest mean.</td></tr><tr><th>Code</th><td><code>df.groupby("city")["sales"].mean().idxmax()</code></td></tr><tr><th>By hand</th><td>Oslo (10+3+12)/3 = 8.33, Rome (7+9)/2 = 8.0, Lima 5/1 = 5.0.</td></tr><tr><th>Answer</th><td>Oslo. <code>idxmax()</code> returns the <em>label</em> (the city), whereas <code>max()</code> would return the number 8.33.</td></tr></table>
+<h3>Expert: top-N per group, custom aggregations, and what apply costs</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({
+    "dept": ["a", "a", "a", "b", "b", "b"],
+    "emp": ["u1", "u2", "u3", "u4", "u5", "u6"],
+    "pay": [50, 80, 65, 90, 40, 70],
+})
+top2 = df.sort_values("pay", ascending=False).groupby("dept").head(2)
+print(top2.sort_values(["dept", "pay"], ascending=[True, False]))
+
+df["rank"] = df.groupby("dept")["pay"].rank(ascending=False, method="first").astype(int)
+print(df[df["rank"] == 1][["dept", "emp"]])
+
+spread = df.groupby("dept")["pay"].agg(lambda s: s.max() - s.min())
+print(spread.to_dict())
+print(df.groupby("dept")["pay"].agg(["min", "max"]).assign(spread=lambda d: d["max"] - d["min"])["spread"].to_dict())</code></pre>
+<pre class="code lang-text"><code>  dept emp  pay
+1    a  u2   80
+2    a  u3   65
+3    b  u4   90
+5    b  u6   70
+  dept emp
+1    a  u2
+3    b  u4
+{'a': 30, 'b': 50}
+{'a': 30, 'b': 50}</code></pre>
+<ol>
+<li>Sorting by pay descending and then taking <code>groupby("dept").head(2)</code> is the fast idiom for top-N per group. <code>head</code> is implemented without calling Python per group.</li>
+<li>The second <code>sort_values</code> is only for tidy display.</li>
+<li><code>rank(ascending=False, method="first")</code> numbers pay within each department; ties get distinct ranks in order of appearance. Filtering <code>rank == 1</code> gives the top earner per department. Ranks are floats, hence <code>astype(int)</code>.</li>
+<li><code>agg(lambda ...)</code> calls your Python function once per group: simple and flexible, but slower for many groups.</li>
+<li>The last line computes the same spread with built-ins (<code>min</code>, <code>max</code>, then subtract). Prefer built-in aggregations whenever possible; they run in compiled code.</li>
+</ol>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">Whenever you hear "per customer / per day / per region", say "groupby". Whenever you hear "compared with the group average" or "share of the group total", say "transform". Whenever you hear "only groups that ...", say "filter".</div></div>
+
+
+<h2 id="s17-10">17.10 merge, join and concat, with Join Validation</h2>
+<figure><img src="images/lib17_joins.png" alt="Bar chart of row counts for inner, left, right and outer joins of keys 1-4 with keys 3-7" loading="lazy"/><figcaption>The same two small tables joined four ways. Left keys are 1 to 4, right keys are 3 to 7, so only 3 and 4 match.</figcaption></figure>
+<p><strong>How to read it:</strong> each bar is the number of rows after a join. <code>inner</code> keeps only matching keys (2). <code>left</code> keeps all four left keys (4). <code>right</code> keeps all five right keys (5). <code>outer</code> keeps every key from either side (7). The row count is the quickest sanity check: if your left join returns more rows than the left table had, the right table had duplicate keys.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>pd.merge(a, b, on="k")</code></td><td>SQL-style join on a shared column</td><td><code>a.merge(b, on="k")</code></td></tr>
+<tr><td><code>how="inner"</code></td><td>Only keys in both</td><td><code>a.merge(b, on="k", how="inner")</code></td></tr>
+<tr><td><code>how="left"</code></td><td>All left rows, matches from right</td><td><code>a.merge(b, on="k", how="left")</code></td></tr>
+<tr><td><code>how="right"</code></td><td>All right rows</td><td><code>how="right"</code></td></tr>
+<tr><td><code>how="outer"</code></td><td>All keys from both</td><td><code>how="outer"</code></td></tr>
+<tr><td><code>how="cross"</code></td><td>Every pairing (Cartesian product)</td><td><code>a.merge(b, how="cross")</code></td></tr>
+<tr><td><code>left_on= / right_on=</code></td><td>Different key names</td><td><code>a.merge(b, left_on="id", right_on="user_id")</code></td></tr>
+<tr><td><code>on=["a","b"]</code></td><td>Composite key</td><td><code>a.merge(b, on=["y","m"])</code></td></tr>
+<tr><td><code>suffixes=</code></td><td>Names for clashing columns</td><td><code>suffixes=("_a","_b")</code></td></tr>
+<tr><td><code>validate="1:1" / "m:1" / "1:m"</code></td><td>Raise if key uniqueness is not as expected</td><td><code>a.merge(b, on="k", validate="m:1")</code></td></tr>
+<tr><td><code>indicator=True</code></td><td>Add a column saying which side matched</td><td><code>a.merge(b, on="k", how="outer", indicator=True)</code></td></tr>
+<tr><td><code>a.join(b)</code></td><td>Join on the index (shortcut)</td><td><code>a.join(b, how="left")</code></td></tr>
+<tr><td><code>pd.concat([a, b])</code></td><td>Stack frames vertically</td><td><code>pd.concat([a, b], ignore_index=True)</code></td></tr>
+<tr><td><code>pd.concat(axis=1)</code></td><td>Place side by side, aligned on index</td><td><code>pd.concat([a, b], axis=1)</code></td></tr>
+<tr><td><code>concat(keys=)</code></td><td>Label each piece in a MultiIndex</td><td><code>pd.concat([a, b], keys=["x","y"])</code></td></tr>
+<tr><td><code>pd.merge_asof</code></td><td>Join to the nearest earlier key (time)</td><td><code>pd.merge_asof(t, q, on="ts")</code></td></tr>
+<tr><td><code>pd.merge_ordered</code></td><td>Ordered merge with fill</td><td><code>pd.merge_ordered(a, b, on="ts")</code></td></tr>
+<tr><td><code>df.isin(other)</code></td><td>Semi-join test</td><td><code>a[a.k.isin(b.k)]</code></td></tr>
+<tr><td><code>~a.k.isin(b.k)</code></td><td>Anti-join</td><td><code>a[~a.k.isin(b.k)]</code></td></tr>
+<tr><td><code>df.combine_first(other)</code></td><td>Fill gaps from another frame</td><td><code>a.combine_first(b)</code></td></tr>
+<tr><td><code>df.update(other)</code></td><td>Overwrite in place with non-NaN values</td><td><code>a.update(b)</code></td></tr>
+</tbody></table></div>
+<h3>Beginner: the four join types</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+customers = pd.DataFrame({"cid": [1, 2, 3], "name": ["Ana", "Bo", "Cy"]})
+orders = pd.DataFrame({"cid": [2, 3, 3, 4], "amount": [20, 30, 5, 99]})
+
+for how in ["inner", "left", "outer"]:
+    out = customers.merge(orders, on="cid", how=how)
+    print(how, out.shape)
+print(customers.merge(orders, on="cid", how="left"))</code></pre>
+<pre class="code lang-text"><code>inner (3, 3)
+left (4, 3)
+outer (5, 3)
+   cid name  amount
+0    1  Ana     NaN
+1    2   Bo    20.0
+2    3   Cy    30.0
+3    3   Cy     5.0</code></pre>
+<ol>
+<li>Customers 1 to 3 and orders from customers 2, 3, 3, 4. Customer 3 has two orders; order 4 belongs to a customer that does not exist in the table.</li>
+<li><code>inner</code> gives 3 rows: customer 2 once and customer 3 twice. Customer 1 (no orders) and order 4 (no customer) vanish.</li>
+<li><code>left</code> gives 4 rows: the same 3 plus customer 1 with NaN amount.</li>
+<li><code>outer</code> gives 5 rows: left plus the orphan order for customer 4.</li>
+<li>Notice that a one-to-many join <em>multiplies</em> rows: customer 3 appears twice. That is correct here, but it is the root of the classic "my totals doubled" bug.</li>
+</ol>
+<h3>Intermediate: validate, indicator, different key names</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+users = pd.DataFrame({"user_id": [1, 2, 3], "plan": ["free", "pro", "pro"]})
+events = pd.DataFrame({"uid": [1, 1, 2, 9], "event": ["a", "b", "c", "d"]})
+
+m = events.merge(users, left_on="uid", right_on="user_id", how="left", validate="m:1", indicator=True)
+print(m)
+print(m["_merge"].value_counts().to_dict())
+
+dup_users = pd.concat([users, users.iloc[[0]]], ignore_index=True)
+try:
+    events.merge(dup_users, left_on="uid", right_on="user_id", validate="m:1")
+except Exception as e:
+    print(type(e).__name__, "-", str(e)[:60])</code></pre>
+<pre class="code lang-text"><code>   uid event  user_id  plan     _merge
+0    1     a      1.0  free       both
+1    1     b      1.0  free       both
+2    2     c      2.0   pro       both
+3    9     d      NaN   NaN  left_only
+{'both': 3, 'left_only': 1, 'right_only': 0}
+MergeError - Merge keys are not unique in right dataset; not a many-to-on</code></pre>
+<ol>
+<li><code>left_on="uid", right_on="user_id"</code> joins differently named keys. Both key columns stay in the result; drop one afterwards.</li>
+<li><code>validate="m:1"</code> promises "many events, one user each". If any user id repeats in <code>users</code>, pandas raises <code>MergeError</code> instead of silently multiplying rows.</li>
+<li><code>indicator=True</code> adds <code>_merge</code> with values <code>both</code>, <code>left_only</code> or <code>right_only</code>. Here event "d" has uid 9, which is not a user, so it is <code>left_only</code> with NaN plan.</li>
+<li>We then add a duplicate user and merge again. The <code>validate</code> check fires, and the message tells you the right side is not unique. Catching this at the join is far cheaper than discovering inflated revenue in a report.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>A left join that changes the row count.</strong> If the right table has duplicate keys the output has more rows than the left input. Always pass <code>validate="m:1"</code> (or "1:1") when you expect uniqueness, and assert the row count after the join.</div></div>
+<h3>concat, merge_asof and anti-joins</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+jan = pd.DataFrame({"id": [1, 2], "v": [10, 20]})
+feb = pd.DataFrame({"id": [2, 3], "v": [25, 30]})
+stacked = pd.concat([jan, feb], keys=["jan", "feb"])
+print(stacked)
+print(pd.concat([jan, feb], ignore_index=True).shape)
+
+trades = pd.DataFrame({"ts": pd.to_datetime(["2025-01-01 10:00:05", "2025-01-01 10:00:20"]), "qty": [5, 7]})
+quotes = pd.DataFrame({"ts": pd.to_datetime(["2025-01-01 10:00:00", "2025-01-01 10:00:10"]), "px": [100.0, 101.5]})
+print(pd.merge_asof(trades, quotes, on="ts"))
+
+print(jan[~jan["id"].isin(feb["id"])]["id"].tolist())</code></pre>
+<pre class="code lang-text"><code>       id   v
+jan 0   1  10
+    1   2  20
+feb 0   2  25
+    1   3  30
+(4, 2)
+                   ts  qty     px
+0 2025-01-01 10:00:05    5  100.0
+1 2025-01-01 10:00:20    7  101.5
+[1]</code></pre>
+<ol>
+<li><code>concat</code> stacks rows. <code>keys=["jan","feb"]</code> records which piece each row came from as an extra index level, useful when you read many files and need to know the source.</li>
+<li><code>ignore_index=True</code> discards the old labels and renumbers 0..n-1; the shape (4 rows, 2 columns) confirms nothing was lost.</li>
+<li><code>merge_asof</code> matches each trade with the <em>latest quote at or before</em> it: the 10:00:05 trade gets the 10:00:00 price, the 10:00:20 trade gets the 10:00:10 price. Both tables must be sorted by the key.</li>
+<li><code>~isin</code> is the anti-join: ids in January that are not in February (id 1).</li>
+</ol>
+
+<h2 id="s17-11">17.11 Reshaping: pivot, pivot_table, melt, stack and crosstab</h2>
+<figure><img src="images/lib17_reshape.png" alt="Wide table with columns Q1 and Q2 becomes a long table with qtr and val columns via melt, and back via pivot" loading="lazy"/><figcaption>Wide and long are two shapes of the same data. melt goes wide to long; pivot goes long to wide.</figcaption></figure>
+<p><strong>How to read it:</strong> the blue table keeps one row per id with a column per quarter (wide, good for people). The orange table has one row per id and quarter (long, good for groupby, plotting and databases). The top arrow is <code>melt</code>, the bottom arrow is <code>pivot</code>. If a tool complains that it needs "tidy data", it wants the long shape.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>df.pivot(index, columns, values)</code></td><td>Long to wide; fails on duplicate pairs</td><td><code>df.pivot(index="id", columns="q", values="v")</code></td></tr>
+<tr><td><code>df.pivot_table(..., aggfunc)</code></td><td>Long to wide with aggregation of duplicates</td><td><code>pivot_table(index="a", columns="b", values="v", aggfunc="sum")</code></td></tr>
+<tr><td><code>pivot_table(margins=True)</code></td><td>Add totals row and column</td><td><code>margins=True</code></td></tr>
+<tr><td><code>pivot_table(fill_value=0)</code></td><td>Replace empty cells</td><td><code>fill_value=0</code></td></tr>
+<tr><td><code>pd.melt(df, id_vars, value_vars)</code></td><td>Wide to long</td><td><code>df.melt(id_vars="id", var_name="q", value_name="v")</code></td></tr>
+<tr><td><code>df.stack()</code></td><td>Columns into an inner index level</td><td><code>df.stack()</code></td></tr>
+<tr><td><code>df.unstack(level)</code></td><td>Inner index level into columns</td><td><code>s.unstack()</code></td></tr>
+<tr><td><code>pd.crosstab(a, b)</code></td><td>Count table of two columns</td><td><code>pd.crosstab(df.a, df.b)</code></td></tr>
+<tr><td><code>crosstab(normalize="index")</code></td><td>Row percentages</td><td><code>normalize="index"</code></td></tr>
+<tr><td><code>df.explode("col")</code></td><td>One row per list item</td><td><code>df.explode("tags")</code></td></tr>
+<tr><td><code>pd.get_dummies(s)</code></td><td>One-hot encode</td><td><code>pd.get_dummies(df["city"], dtype=int)</code></td></tr>
+<tr><td><code>pd.wide_to_long</code></td><td>Several stubbed column families to long</td><td><code>wide_to_long(df, ["q"], i="id", j="n")</code></td></tr>
+<tr><td><code>df.T</code></td><td>Swap rows and columns</td><td><code>df.T</code></td></tr>
+<tr><td><code>df.reset_index()</code></td><td>Flatten after pivot</td><td><code>pt.reset_index()</code></td></tr>
+<tr><td><code>df.columns.to_flat_index()</code></td><td>Flatten MultiIndex columns</td><td><code>["_".join(c) for c in df.columns]</code></td></tr>
+</tbody></table></div>
+<h3>Beginner: melt and pivot are inverses</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+wide = pd.DataFrame({"id": ["a", "b"], "Q1": [5, 3], "Q2": [7, 4]})
+long = wide.melt(id_vars="id", var_name="qtr", value_name="val")
+print(long)
+back = long.pivot(index="id", columns="qtr", values="val").reset_index()
+back.columns.name = None
+print(back)
+print(back.equals(wide))</code></pre>
+<pre class="code lang-text"><code>  id qtr  val
+0  a  Q1    5
+1  b  Q1    3
+2  a  Q2    7
+3  b  Q2    4
+  id  Q1  Q2
+0  a   5   7
+1  b   3   4
+True</code></pre>
+<ol>
+<li><code>id_vars</code> are the columns that stay as identifiers. Every other column is "melted" into two new columns: <code>var_name</code> holds the old column name, <code>value_name</code> holds the cell value.</li>
+<li>The long table has 2 ids x 2 quarters = 4 rows.</li>
+<li><code>pivot</code> reverses it: the unique values of <code>qtr</code> become columns. <code>reset_index()</code> turns the id index back into a column and <code>columns.name = None</code> removes the leftover label "qtr".</li>
+<li><code>equals</code> confirms we are back to the original table.</li>
+</ol>
+<h3>Intermediate: pivot_table, crosstab, stack and unstack</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({
+    "city": ["Oslo", "Oslo", "Rome", "Rome", "Oslo"],
+    "year": [2024, 2025, 2024, 2025, 2025],
+    "sales": [10, 12, 7, 9, 3],
+    "paid": ["y", "n", "y", "y", "y"],
+})
+pt = df.pivot_table(index="city", columns="year", values="sales", aggfunc="sum", fill_value=0, margins=True)
+print(pt)
+print(pd.crosstab(df["city"], df["paid"]))
+print(pd.crosstab(df["city"], df["paid"], normalize="index").round(2))
+s = df.groupby(["city", "year"])["sales"].sum()
+print(s.unstack())
+print(s.unstack().stack().equals(s))</code></pre>
+<pre class="code lang-text"><code>year  2024  2025  All
+city                 
+Oslo    10    15   25
+Rome     7     9   16
+All     17    24   41
+paid  n  y
+city      
+Oslo  1  2
+Rome  0  2
+paid     n     y
+city            
+Oslo  0.33  0.67
+Rome  0.00  1.00
+year  2024  2025
+city            
+Oslo    10    15
+Rome     7     9
+True</code></pre>
+<ol>
+<li><code>pivot_table</code> is <code>groupby</code> plus a reshape: rows by city, columns by year, cells are the sum of sales. Oslo in 2025 has two rows (12 and 3), so they are added to 15. Plain <code>pivot</code> would have raised an error here because of the duplicate pair.</li>
+<li><code>margins=True</code> adds an "All" row and column of totals; <code>fill_value=0</code> replaces empty combinations.</li>
+<li><code>crosstab</code> counts how many rows fall in each pair of values. <code>normalize="index"</code> divides each row by its total, giving row percentages (Oslo: 2 of 3 paid).</li>
+<li>A groupby on two keys returns a Series with a two-level index. <code>unstack()</code> moves the inner level (year) into columns; <code>stack()</code> moves it back. The final <code>equals</code> shows they round-trip.</li>
+</ol>
+<h3>Realistic: explode tags and one-hot encode</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+posts = pd.DataFrame({"id": [1, 2, 3], "tags": ["py|sql", "py", "sql|dbt|py"]})
+posts["tag"] = posts["tags"].str.split("|")
+exploded = posts.explode("tag")[["id", "tag"]]
+print(exploded.groupby("tag").size().sort_values(ascending=False).to_dict())
+onehot = posts["tags"].str.get_dummies("|")
+print(onehot)
+print(pd.get_dummies(pd.Series(["Oslo", "Rome", "Oslo"]), dtype=int))</code></pre>
+<pre class="code lang-text"><code>{'py': 3, 'sql': 2, 'dbt': 1}
+   dbt  py  sql
+0    0   1    1
+1    0   1    0
+2    1   1    1
+   Oslo  Rome
+0     1     0
+1     0     1
+2     1     0</code></pre>
+<ol>
+<li><code>str.split("|")</code> turns each cell into a Python list.</li>
+<li><code>explode</code> repeats the row once per list element, so post 3 becomes three rows. Counting rows per tag then answers "how popular is each tag" (py: 3, sql: 2, dbt: 1).</li>
+<li><code>str.get_dummies("|")</code> does split plus one-hot in one call: a 0/1 column per tag, ready for a model.</li>
+<li><code>pd.get_dummies</code> one-hot encodes an ordinary categorical column. Use <code>dtype=int</code> to get 0/1 instead of True/False.</li>
+</ol>
+
+
+<h2 id="s17-12">17.12 Window Functions: rolling, expanding and resample</h2>
+<figure><img src="images/lib17_rolling.png" alt="Line chart of a noisy daily series with a 7-day rolling mean, an expanding mean and weekly resample means" loading="lazy"/><figcaption>One noisy daily series, smoothed three ways. Synthetic data with a fixed seed.</figcaption></figure>
+<p><strong>How to read it:</strong> the grey line is the raw daily value. The blue <code>rolling(7).mean()</code> follows it closely but irons out day-to-day noise, because each point is the mean of the last seven days. The orange <code>expanding().mean()</code> averages <em>everything so far</em>, so it reacts slowly as history piles up. The teal steps are <code>resample("W").mean()</code>: one value per week, so the series has fewer points. Rolling keeps the original length; resample changes it.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>s.rolling(n).mean()</code></td><td>Moving average of the last n rows</td><td><code>s.rolling(7).mean()</code></td></tr>
+<tr><td><code>rolling(n, min_periods=k)</code></td><td>Allow shorter windows at the start</td><td><code>s.rolling(7, min_periods=1).mean()</code></td></tr>
+<tr><td><code>rolling("7D")</code></td><td>Time-based window (needs a DatetimeIndex)</td><td><code>s.rolling("7D").sum()</code></td></tr>
+<tr><td><code>rolling(n).sum() / std() / min() / max()</code></td><td>Other window statistics</td><td><code>s.rolling(3).max()</code></td></tr>
+<tr><td><code>rolling(n, center=True)</code></td><td>Window centred on each point</td><td><code>s.rolling(3, center=True).mean()</code></td></tr>
+<tr><td><code>rolling(n).apply(f, raw=True)</code></td><td>Custom window function</td><td><code>s.rolling(5).apply(np.ptp, raw=True)</code></td></tr>
+<tr><td><code>s.expanding().sum()</code></td><td>Running aggregate from the start</td><td><code>s.expanding().max()</code></td></tr>
+<tr><td><code>s.ewm(span=n).mean()</code></td><td>Exponentially weighted average (recent counts more)</td><td><code>s.ewm(span=7).mean()</code></td></tr>
+<tr><td><code>s.cumsum() / cummax()</code></td><td>Cumulative shortcuts</td><td><code>s.cumsum()</code></td></tr>
+<tr><td><code>s.shift(k)</code></td><td>Previous or next value</td><td><code>s.shift(1)</code></td></tr>
+<tr><td><code>s.diff(k)</code></td><td>Change vs k rows ago</td><td><code>s.diff()</code></td></tr>
+<tr><td><code>s.pct_change()</code></td><td>Relative change</td><td><code>s.pct_change()</code></td></tr>
+<tr><td><code>s.resample("D").sum()</code></td><td>Aggregate into time buckets</td><td><code>s.resample("W").mean()</code></td></tr>
+<tr><td><code>resample("ME")</code></td><td>Month end buckets (<code>"M"</code> was removed)</td><td><code>s.resample("ME").sum()</code></td></tr>
+<tr><td><code>resample(...).agg([..])</code></td><td>Several stats per bucket</td><td><code>.agg(["min","max"])</code></td></tr>
+<tr><td><code>resample(...).asfreq() / ffill()</code></td><td>Up-sample (more buckets than data)</td><td><code>s.resample("h").ffill()</code></td></tr>
+<tr><td><code>s.asfreq("D")</code></td><td>Insert missing dates as NaN</td><td><code>s.asfreq("D")</code></td></tr>
+<tr><td><code>groupby(pd.Grouper(freq=))</code></td><td>Resample inside groups</td><td><code>groupby(["k", pd.Grouper(key="ts", freq="W")])</code></td></tr>
+<tr><td><code>s.loc["2025-03"]</code></td><td>Slice by partial date string</td><td><code>s.loc["2025-03-01":"2025-03-07"]</code></td></tr>
+<tr><td><code>pd.date_range(..., freq=)</code></td><td>Build a calendar ("D", "h", "ME", "W", "QE")</td><td><code>pd.date_range("2025", periods=4, freq="QE")</code></td></tr>
+<tr><td><code>s.tz_localize / tz_convert</code></td><td>Time zones</td><td><code>s.tz_localize("UTC").tz_convert("Europe/Oslo")</code></td></tr>
+<tr><td><code>s.between_time("09:00","17:00")</code></td><td>Filter by time of day</td><td><code>df.between_time("09:00","17:00")</code></td></tr>
+</tbody></table></div>
+<h3>Beginner and intermediate: rolling, expanding and shift</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+s = pd.Series([10, 12, 9, 15, 20, 18],
+              index=pd.date_range("2025-03-01", periods=6, freq="D"), name="visits")
+print(s.rolling(3).mean().round(2).tolist())
+print(s.rolling(3, min_periods=1).mean().round(2).tolist())
+print(s.expanding().max().tolist())
+print(s.shift(1).tolist())
+print(s.pct_change().round(3).tolist())
+print((s - s.shift(7)).isna().all())</code></pre>
+<pre class="code lang-text"><code>[nan, nan, 10.33, 12.0, 14.67, 17.67]
+[10.0, 11.0, 10.33, 12.0, 14.67, 17.67]
+[10.0, 12.0, 12.0, 15.0, 20.0, 20.0]
+[nan, 10.0, 12.0, 9.0, 15.0, 20.0]
+[nan, 0.2, -0.25, 0.667, 0.333, -0.1]
+True</code></pre>
+<ol>
+<li><code>rolling(3).mean()</code> averages each day with the two before it. The first two values are NaN because a full window of three does not exist yet. Fourth value: (12+9+15)/3 = 12.</li>
+<li><code>min_periods=1</code> accepts shorter windows at the start, so there are no NaN, but the first values are averages of fewer points, so treat them with care.</li>
+<li><code>expanding().max()</code> is the running maximum: 10, 12, 12, 15, 20, 20.</li>
+<li><code>shift(1)</code> moves values down one row, giving "yesterday's visits" next to today's. This is how you build lag features.</li>
+<li><code>pct_change()</code> is (today - yesterday) / yesterday: the second value is 12/10 - 1 = 0.2.</li>
+<li>The last line shows that comparing with 7 days ago gives only NaN in a 6-row series: there is no history that far back.</li>
+</ol>
+<h3>Realistic: resample irregular events into daily and monthly totals</h3>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(3)
+ts = pd.to_datetime("2025-01-01") + pd.to_timedelta(rng.integers(0, 90 * 24 * 60, 400), unit="min")
+ev = pd.DataFrame({"ts": ts, "amount": rng.integers(5, 100, 400)}).sort_values("ts").set_index("ts")
+
+daily = ev["amount"].resample("D").sum()
+print(len(daily), daily.index.min().date(), daily.index.max().date())
+monthly = ev["amount"].resample("ME").agg(["count", "sum"])
+print(monthly)
+print(ev.loc["2025-02-10":"2025-02-11", "amount"].sum())
+roll = daily.rolling("7D").sum()
+print(roll.iloc[[0, 6, 30]].tolist())
+print(ev.groupby(ev.index.dayofweek)["amount"].sum().idxmax())</code></pre>
+<pre class="code lang-text"><code>90 2025-01-01 2025-03-31
+            count   sum
+ts                     
+2025-01-31    140  7064
+2025-02-28    122  6418
+2025-03-31    138  7147
+370
+[254.0, 1465.0, 1652.0]
+2</code></pre>
+<ol>
+<li>400 random timestamps over 90 days become the index. A <code>DatetimeIndex</code> unlocks time-aware slicing and resampling.</li>
+<li><code>resample("D").sum()</code> puts every event into its calendar day and adds the amounts. Days with no events get 0 (for sum), so the result has no gaps.</li>
+<li><code>resample("ME")</code> buckets by month end; <code>agg(["count", "sum"])</code> gives the number of events and the total per month. The 90 days run from 1 January to 31 March, so there are exactly three monthly rows and the counts add up to 400.</li>
+<li>Partial string slicing <code>loc["2025-02-10":"2025-02-11"]</code> selects whole days; both ends are included.</li>
+<li><code>rolling("7D")</code> is a time-based window: the sum of the last seven calendar days, correct even when rows are unevenly spaced.</li>
+<li><code>dayofweek</code> gives 0 for Monday to 6 for Sunday; grouping on it finds the weekday with the largest total (2 means Wednesday here).</li>
+</ol>
+
+<h2 id="s17-13">17.13 MultiIndex, cut/qcut, Method Chaining and pipe</h2>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>set_index(["a","b"])</code></td><td>Build a MultiIndex from columns</td><td><code>df.set_index(["city","year"])</code></td></tr>
+<tr><td><code>pd.MultiIndex.from_product</code></td><td>All combinations of lists</td><td><code>from_product([a, b], names=[..])</code></td></tr>
+<tr><td><code>df.loc[("Oslo", 2025)]</code></td><td>Select by a tuple of labels</td><td><code>df.loc[("Oslo", 2025), "sales"]</code></td></tr>
+<tr><td><code>df.xs(key, level=)</code></td><td>Cross-section on one level</td><td><code>df.xs(2025, level="year")</code></td></tr>
+<tr><td><code>df.loc[pd.IndexSlice[:, 2025], :]</code></td><td>Slice across levels</td><td><code>idx = pd.IndexSlice</code></td></tr>
+<tr><td><code>df.sort_index()</code></td><td>Required for fast, correct slicing</td><td><code>df.sort_index()</code></td></tr>
+<tr><td><code>df.groupby(level=)</code></td><td>Group by an index level</td><td><code>df.groupby(level="city").sum()</code></td></tr>
+<tr><td><code>df.swaplevel()</code></td><td>Swap level order</td><td><code>df.swaplevel()</code></td></tr>
+<tr><td><code>df.reset_index(level=)</code></td><td>Turn a level back into a column</td><td><code>df.reset_index(level="year")</code></td></tr>
+<tr><td><code>df.index.get_level_values(n)</code></td><td>Extract one level as an Index</td><td><code>df.index.get_level_values("city")</code></td></tr>
+<tr><td><code>pd.cut(s, bins, labels)</code></td><td>Fixed-width or custom bins</td><td><code>pd.cut(age, [0,18,65,120])</code></td></tr>
+<tr><td><code>pd.qcut(s, q)</code></td><td>Equal-count bins (quantiles)</td><td><code>pd.qcut(s, 4, labels=False)</code></td></tr>
+<tr><td><code>cut(..., right=False)</code></td><td>Left-closed intervals</td><td><code>right=False</code></td></tr>
+<tr><td><code>pd.IntervalIndex</code></td><td>Interval lookups</td><td><code>pd.IntervalIndex.from_breaks([0,1,2])</code></td></tr>
+<tr><td><code>df.pipe(f, *args)</code></td><td>Put your own function in a chain</td><td><code>df.pipe(clean, col="x")</code></td></tr>
+<tr><td><code>df.assign(...)</code></td><td>Add columns inside a chain</td><td><code>.assign(z=lambda d: d.x*2)</code></td></tr>
+<tr><td><code>df.query(...)</code></td><td>Filter inside a chain</td><td><code>.query("z &gt; 1")</code></td></tr>
+<tr><td><code>df.rename(columns=)</code></td><td>Rename inside a chain</td><td><code>.rename(columns=str.lower)</code></td></tr>
+<tr><td><code>df.loc[lambda d: d.x &gt; 1]</code></td><td>Filter with a callable</td><td><code>.loc[lambda d: d.x &gt; 1]</code></td></tr>
+<tr><td><code>df.sort_values().reset_index(drop=True)</code></td><td>Tidy order and index</td><td><code>.reset_index(drop=True)</code></td></tr>
+</tbody></table></div>
+<h3>MultiIndex: when a table has two row keys</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({
+    "city": ["Oslo", "Oslo", "Rome", "Rome"],
+    "year": [2024, 2025, 2024, 2025],
+    "sales": [10, 15, 7, 9],
+}).set_index(["city", "year"]).sort_index()
+print(df)
+print(df.loc[("Rome", 2025), "sales"])
+print(df.xs(2025, level="year"))
+print(df.groupby(level="city")["sales"].sum().to_dict())
+print(df.reset_index(level="year").columns.tolist())</code></pre>
+<pre class="code lang-text"><code>           sales
+city year       
+Oslo 2024     10
+     2025     15
+Rome 2024      7
+     2025      9
+9
+      sales
+city       
+Oslo     15
+Rome      9
+{'Oslo': 25, 'Rome': 16}
+['year', 'sales']</code></pre>
+<ol>
+<li><code>set_index(["city","year"])</code> makes a two-level row index; <code>sort_index()</code> sorts it, which pandas needs for correct and fast slicing.</li>
+<li>A tuple selects a single combination: Rome in 2025 has sales 9.</li>
+<li><code>xs(2025, level="year")</code> takes all rows with year 2025 and drops that level, leaving a city-indexed table.</li>
+<li><code>groupby(level="city")</code> aggregates by one index level without resetting the index.</li>
+<li>If a MultiIndex gets in your way, <code>reset_index()</code> flattens it back to columns. A good rule: use MultiIndex for the output of reshaping, but keep your working data flat.</li>
+</ol>
+<h3>Binning with cut and qcut</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+age = pd.Series([4, 17, 18, 35, 64, 65, 90])
+groups = pd.cut(age, bins=[0, 17, 64, 120], labels=["child", "adult", "senior"])
+print(groups.tolist())
+print(pd.cut(age, bins=[0, 18, 65, 120], right=False).astype(str).tolist()[:3])
+
+spend = pd.Series([5, 8, 12, 20, 33, 50, 80, 400])
+q = pd.qcut(spend, 4, labels=["Q1", "Q2", "Q3", "Q4"])
+print(q.tolist())
+print(q.value_counts().sort_index().to_dict())
+print(pd.qcut(spend, 4).cat.categories[0])</code></pre>
+<pre class="code lang-text"><code>['child', 'child', 'adult', 'adult', 'adult', 'senior', 'senior']
+['[0, 18)', '[0, 18)', '[18, 65)']
+['Q1', 'Q1', 'Q2', 'Q2', 'Q3', 'Q3', 'Q4', 'Q4']
+{'Q1': 2, 'Q2': 2, 'Q3': 2, 'Q4': 2}
+(4.999, 11.0]</code></pre>
+<ol>
+<li><code>cut</code> with explicit <code>bins</code> uses your edges. By default intervals are closed on the <em>right</em>: (0, 17] contains 17 but not 0 and not 18. So 17 is a "child" and 18 is an "adult".</li>
+<li><code>right=False</code> flips this to [0, 18), so 18 starts a new bin. The printed interval strings show which convention is in force. Always check a boundary value.</li>
+<li><code>qcut</code> chooses edges so that each bin holds about the same number of rows (quartiles). With 8 values, each quartile gets 2: the large value 400 does not distort the bins the way equal-width bins would.</li>
+<li>Counting per label confirms 2 values per quartile. The last line shows the first computed interval, whose lower edge is slightly below the minimum so the minimum is included.</li>
+</ol>
+<h3>Method chaining and pipe</h3>
+<p>A chain reads like a recipe: each line is one step and the whole expression returns the finished table. There are no half-finished variables to confuse you later.</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+raw = pd.DataFrame({
+    "Order ID": [1, 2, 3, 4, 5],
+    "Customer": [" ana", "BO ", "ana", "Cy", None],
+    "Amount": ["10.5", "7", "oops", "30", "12"],
+    "Date": ["2025-03-01", "2025-03-02", "2025-03-02", "2025-03-05", "2025-03-06"],
+})
+
+def drop_small(d, min_amount):
+    return d[d["amount"] &gt;= min_amount]
+
+clean = (
+    raw
+    .rename(columns=lambda c: c.strip().lower().replace(" ", "_"))
+    .assign(
+        customer=lambda d: d["customer"].str.strip().str.lower(),
+        amount=lambda d: pd.to_numeric(d["amount"], errors="coerce"),
+        date=lambda d: pd.to_datetime(d["date"]),
+    )
+    .dropna(subset=["customer", "amount"])
+    .pipe(drop_small, min_amount=8)
+    .sort_values("date")
+    .reset_index(drop=True)
+)
+print(clean)
+print(clean.dtypes.astype(str).to_dict())</code></pre>
+<pre class="code lang-text"><code>   order_id customer  amount       date
+0         1      ana    10.5 2025-03-01
+1         4       cy    30.0 2025-03-05
+{'order_id': 'int64', 'customer': 'str', 'amount': 'float64', 'date': 'datetime64[us]'}</code></pre>
+<ol>
+<li>The whole pipeline is one parenthesised expression, so each line can start with a dot. Parentheses let Python continue the expression over lines without backslashes.</li>
+<li><code>rename(columns=lambda c: ...)</code> normalises every header: strip spaces, lowercase, spaces to underscores. Consistent snake_case names save endless quoting later.</li>
+<li><code>assign</code> creates three cleaned columns. Each lambda receives the current frame, so <code>d["customer"]</code> sees the renamed column.</li>
+<li><code>dropna(subset=...)</code> removes the row with no customer and the row whose amount failed to parse ("oops").</li>
+<li><code>pipe(drop_small, min_amount=8)</code> inserts your own function into the chain; the frame is passed as the first argument. This is how you keep chains readable while reusing logic.</li>
+<li>Finally sort and renumber. Order 3 ("oops") and order 5 (no customer) were dropped by <code>dropna</code>, and order 2 (amount 7) by the size filter, so orders 1 and 4 remain. Printing dtypes proves the types are what you intended.</li>
+</ol>
+
+<h2 id="s17-14">17.14 Memory, Speed and pandas 3.0 Specifics</h2>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>df.memory_usage(deep=True)</code></td><td>Real bytes per column</td><td><code>df.memory_usage(deep=True).sum()</code></td></tr>
+<tr><td><code>pd.to_numeric(downcast=)</code></td><td>Smallest safe number type</td><td><code>pd.to_numeric(s, downcast="integer")</code></td></tr>
+<tr><td><code>astype("category")</code></td><td>Shrink repeated text</td><td><code>df["c"].astype("category")</code></td></tr>
+<tr><td><code>read_csv(usecols=, dtype=)</code></td><td>Load less, with the right types</td><td><code>usecols=["a","b"]</code></td></tr>
+<tr><td><code>read_csv(chunksize=)</code></td><td>Stream large files</td><td><code>for part in read_csv(p, chunksize=10_000)</code></td></tr>
+<tr><td><code>df.eval("c = a + b")</code></td><td>Evaluate an expression in one pass</td><td><code>df.eval("c = a + b")</code></td></tr>
+<tr><td><code>pd.read_parquet(columns=)</code></td><td>Columnar file, read some columns (not run here)</td><td><code>read_parquet(p, columns=["a"])</code></td></tr>
+<tr><td><code>df.itertuples()</code></td><td>Fast row loop when unavoidable</td><td><code>for r in df.itertuples(): r.a</code></td></tr>
+<tr><td><code>s.to_numpy()</code></td><td>Drop to NumPy for tight math</td><td><code>s.to_numpy()</code></td></tr>
+<tr><td><code>df.copy(deep=False)</code></td><td>Cheap shallow copy (safe with copy-on-write)</td><td><code>df.copy(deep=False)</code></td></tr>
+<tr><td><code>pd.options.mode.string_storage</code></td><td>Choose the backing for text</td><td><code>pd.options.mode.string_storage</code></td></tr>
+<tr><td><code>pd.options.future.infer_string</code></td><td>The 2.x switch for the 3.0 string default</td><td>(always on in 3.0)</td></tr>
+<tr><td><code>pd.api.types.is_string_dtype</code></td><td>Is a column text, in any representation?</td><td><code>is_string_dtype(s)</code></td></tr>
+<tr><td><code>df.sort_values(kind=)</code></td><td>Sorting algorithm</td><td><code>kind="stable"</code></td></tr>
+<tr><td><code>df.groupby(sort=False)</code></td><td>Skip sorting group keys</td><td><code>groupby("k", sort=False)</code></td></tr>
+<tr><td><code>DataFrame.map</code></td><td>Element-wise function (<code>applymap</code> was removed)</td><td><code>df.map(str.upper)</code></td></tr>
+</tbody></table></div>
+<h3>Shrink a table: a worked memory diet</h3>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(7)
+n = 100_000
+df = pd.DataFrame({
+    "user_id": rng.integers(0, 5000, n),
+    "country": rng.choice(["NO", "IT", "PE", "UA", "US"], n),
+    "qty": rng.integers(1, 20, n),
+    "price": rng.uniform(1, 100, n).round(2),
+})
+before = df.memory_usage(deep=True).sum()
+slim = df.assign(
+    user_id=pd.to_numeric(df["user_id"], downcast="unsigned"),
+    country=df["country"].astype("category"),
+    qty=pd.to_numeric(df["qty"], downcast="unsigned"),
+    price=df["price"].astype("float32"),
+)
+after = slim.memory_usage(deep=True).sum()
+print(slim.dtypes.astype(str).to_dict())
+print(f"{before/1e6:.1f} MB -&gt; {after/1e6:.1f} MB")
+print(round(after / before, 2))</code></pre>
+<pre class="code lang-text"><code>{'user_id': 'uint16', 'country': 'category', 'qty': 'uint8', 'price': 'float32'}
+7.5 MB -&gt; 0.8 MB
+0.11</code></pre>
+<ol>
+<li>A 100,000-row table with an id, a country, a small integer and a price.</li>
+<li><code>memory_usage(deep=True).sum()</code> is the total in bytes; we remember it as the "before" size.</li>
+<li><code>downcast="unsigned"</code> asks pandas for the smallest unsigned integer that fits: user ids below 5000 need 16 bits, quantities below 20 need 8.</li>
+<li>Country has five values, so <code>category</code> stores them once and uses one byte per row.</li>
+<li><code>float32</code> halves the price column. It carries about 7 significant digits, which is fine for prices rounded to cents in this range but <em>not</em> for money you must add up exactly (use integer cents or <code>Decimal</code> for that).</li>
+<li>The ratio shows the new table is a fraction of the old one. Always compare results before and after to make sure the diet did not change any answer.</li>
+</ol>
+<h3>pandas 3.0 in practice: copy-on-write and the string dtype</h3>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt"><strong>Copy-on-write (CoW)</strong> is now the only behaviour. Every DataFrame or Series derived from another one behaves as an independent copy: changing the child never changes the parent, and vice versa. pandas achieves this lazily (it copies only when you write), so it is cheap. The consequence: <em>chained assignment</em> such as <code>df["a"][mask] = 0</code> or <code>df[mask]["a"] = 0</code> no longer modifies <code>df</code>. Use <code>df.loc[mask, "a"] = 0</code>.</div></div>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"]})
+view = df["a"]
+view.iloc[0] = 100
+print(df["a"].tolist(), view.tolist())
+
+sub = df[df["a"] &gt; 1]
+sub.loc[sub.index[0], "a"] = -1
+print(df["a"].tolist())
+
+df.loc[df["a"] &gt; 2, "a"] = 0
+print(df["a"].tolist())
+
+s = df["b"]
+print(s.dtype, s.str.upper().dtype)
+print(pd.Series(["a", None]).isna().tolist(), pd.Series(["a", None]).dtype)
+print(pd.Series(["a", 1]).dtype)</code></pre>
+<pre class="code lang-text"><code>[1, 2, 3] [100, 2, 3]
+[1, 2, 3]
+[1, 2, 0]
+str str
+[False, True] str
+object</code></pre>
+<ol>
+<li><code>view = df["a"]</code> looks like a window onto the column, but under copy-on-write it is a lazy copy. Writing to <code>view</code> triggers the real copy, so <code>df</code> is unchanged: the first list still starts with 1.</li>
+<li>The same holds for a filtered frame <code>sub</code>. Editing it does not touch <code>df</code>. This removes the old <code>SettingWithCopyWarning</code> confusion: in 3.0 there is no ambiguity and no warning.</li>
+<li><code>df.loc[mask, "a"] = 0</code> is a single operation on <code>df</code> itself, so it works. It changes 3 to 0.</li>
+<li>Text columns now have dtype <code>str</code> by default (before 3.0 they were <code>object</code>). It stores strings only, supports missing values as NaN, and is faster and smaller, especially when <code>pyarrow</code> is installed.</li>
+<li><code>Series(["a", None])</code> is still <code>str</code> and the missing value is detected by <code>isna()</code>.</li>
+<li>A mixed list such as <code>["a", 1]</code> cannot be <code>str</code>, so it falls back to <code>object</code>. If you see <code>object</code> columns in 3.0, you have mixed types, which is worth investigating.</li>
+</ol>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">Migration checklist from pandas 2.x: (1) replace chained assignment with <code>.loc</code>; (2) do not rely on <code>dtype == object</code> to find text columns, use <code>pd.api.types.is_string_dtype</code> or <code>select_dtypes(include="str")</code>; (3) replace <code>applymap</code> by <code>DataFrame.map</code>; (4) use <code>"ME"</code>, <code>"h"</code>, <code>"QE"</code> frequency aliases; (5) do not assume datetimes are nanoseconds: the unit (<code>ns</code>, <code>us</code>, <code>ms</code>, <code>s</code>) is inferred, so avoid <code>.astype("int64")</code> on a datetime and expecting nanoseconds; (6) grouping by a categorical now defaults to <code>observed=True</code> (unused categories are not shown); pass <code>observed=False</code> if you want them.</div></div>
+
+
+<h2 id="s17-15">17.15 Recipes: "How do I ...?"</h2>
+<p>Each recipe is a complete, runnable answer. Copy the pattern, then change the column names.</p>
+<h3>Recipe 1. How do I clean a messy table end to end?</h3>
+<p>The task: a CSV export with inconsistent headers, padded text, mixed number formats, repeated rows, impossible values and missing cells. Write the cleaning as one function so it can be tested and rerun.</p>
+<pre class="code lang-python"><code>import io
+import numpy as np
+import pandas as pd
+
+text = """Order ID,Customer Name,Country,Amount,Order Date,Status
+1001, Ana Silva ,no,"1,250.50",2025-03-01,paid
+1002,bo chen,NO,80,2025-03-02,PAID
+1002,bo chen,NO,80,2025-03-02,PAID
+1003,Cy ONeil,it,-5,2025-03-03,refunded
+1004,,IT,,2025-03-04,paid
+1005,Di Park,pe,300,not a date,Paid
+"""
+
+def clean_orders(raw: pd.DataFrame) -&gt; pd.DataFrame:
+    return (
+        raw
+        .rename(columns=lambda c: c.strip().lower().replace(" ", "_"))
+        .assign(
+            customer_name=lambda d: d["customer_name"].str.strip().str.title(),
+            country=lambda d: d["country"].str.upper(),
+            status=lambda d: d["status"].str.lower(),
+            amount=lambda d: pd.to_numeric(d["amount"].astype("str").str.replace(",", ""), errors="coerce"),
+            order_date=lambda d: pd.to_datetime(d["order_date"], errors="coerce"),
+        )
+        .drop_duplicates()
+        .assign(amount_ok=lambda d: d["amount"].ge(0))
+    )
+
+raw = pd.read_csv(io.StringIO(text), dtype={"Amount": "str"})
+out = clean_orders(raw)
+print(len(raw), "-&gt;", len(out))
+print(out)
+print(out.isna().sum().to_dict())
+print(out.loc[out["amount_ok"] &amp; out["order_date"].notna(), "amount"].sum())</code></pre>
+<pre class="code lang-text"><code>6 -&gt; 5
+   order_id customer_name country  amount order_date    status  amount_ok
+0      1001     Ana Silva      NO  1250.5 2025-03-01      paid       True
+1      1002       Bo Chen      NO    80.0 2025-03-02      paid       True
+3      1003      Cy Oneil      IT    -5.0 2025-03-03  refunded      False
+4      1004           NaN      IT     NaN 2025-03-04      paid      False
+5      1005       Di Park      PE   300.0        NaT      paid       True
+{'order_id': 0, 'customer_name': 1, 'country': 0, 'amount': 1, 'order_date': 1, 'status': 0, 'amount_ok': 0}
+1330.5</code></pre>
+<ol>
+<li>Reading <code>Amount</code> as text (<code>dtype="str"</code>) is deliberate: "1,250.50" contains a thousands comma, so it must be cleaned before conversion.</li>
+<li>The function takes a raw frame and returns a cleaned one. Because it never modifies its input, you can call it twice safely and unit-test it on a tiny frame.</li>
+<li><code>rename</code> normalises headers. <code>str.strip().str.title()</code> fixes padding and case in names. Country codes are upper-cased, status lower-cased, so "PAID" and "paid" are the same value.</li>
+<li>Amounts: remove the comma, then <code>to_numeric(errors="coerce")</code> turns unparseable or empty cells into NaN. Dates: the bad date "not a date" becomes <code>NaT</code> (not-a-time) instead of crashing.</li>
+<li><code>drop_duplicates()</code> removes the repeated row 1002, so six rows become five. Duplicates are removed <em>after</em> normalising, so that rows that differ only by case or spaces are caught.</li>
+<li>Instead of deleting the impossible negative amount, we flag it with <code>amount_ok</code>. Flagging keeps evidence; you can decide later whether to drop.</li>
+<li>The last two lines count missing values and total the valid, dated amounts: 1250.5 + 80 = 1330.5. Order 1005 is excluded (bad date), as are the negative amount and the missing amount.</li>
+</ol>
+<h3>Recipe 2. How do I compute cohort retention?</h3>
+<p>The task: for each month of first purchase (the cohort), what percentage of customers buy again 1, 2, 3 months later?</p>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(5)
+rows = []
+for cust in range(300):
+    start = rng.integers(0, 4)
+    for m in range(start, 6):
+        if m == start or rng.random() &lt; 0.5 ** (m - start) * 0.8 + 0.1:
+            rows.append((cust, pd.Timestamp("2025-01-01") + pd.DateOffset(months=int(m))))
+orders = pd.DataFrame(rows, columns=["customer", "order_month"])
+
+first = orders.groupby("customer")["order_month"].transform("min")
+orders["cohort"] = first.dt.to_period("M")
+orders["age"] = (orders["order_month"].dt.year - first.dt.year) * 12 + (orders["order_month"].dt.month - first.dt.month)
+
+counts = orders.pivot_table(index="cohort", columns="age", values="customer", aggfunc="nunique")
+retention = counts.div(counts[0], axis=0).round(2)
+print(retention)
+print(counts[0].tolist())</code></pre>
+<pre class="code lang-text"><code>age        0     1     2     3     4     5
+cohort                                    
+2025-01  1.0  0.53  0.22  0.17  0.18  0.09
+2025-02  1.0  0.52  0.36  0.19  0.04   NaN
+2025-03  1.0  0.58  0.36  0.19   NaN   NaN
+2025-04  1.0  0.53  0.27   NaN   NaN   NaN
+[90.0, 75.0, 73.0, 62.0]</code></pre>
+<ol>
+<li>We simulate 300 customers who start in one of four months and then return with a probability that falls with time. Real data would come from an orders table with a customer id and a date.</li>
+<li><code>transform("min")</code> gives each order row the customer's first order month, aligned to the original rows.</li>
+<li><code>to_period("M")</code> turns the date into a month label, the cohort.</li>
+<li><code>age</code> is the number of whole months between the order and the cohort start: years difference times 12 plus months difference.</li>
+<li><code>pivot_table(..., aggfunc="nunique")</code> counts distinct customers per cohort and age. Using <code>nunique</code> matters when a customer can place several orders in one month.</li>
+<li>Dividing every row by its age-0 column (<code>div(counts[0], axis=0)</code>) turns counts into retention rates. Age 0 is 1.00 by definition. Cells that lie in the future are NaN.</li>
+</ol>
+<figure><img src="images/lib17_cohort.png" alt="Heatmap of cohort retention percentages: rows are monthly cohorts, columns are months since first order" loading="lazy"/><figcaption>A cohort retention triangle (illustrative data). Darker means more customers came back.</figcaption></figure>
+<p><strong>How to read it:</strong> each row is a group of customers who started in the same month. Moving right shows what share of that group is still buying 1, 2, 3 months later. The empty bottom-right corner is the future: those months have not happened yet. Compare columns down a column to see whether newer cohorts retain better than older ones.</p>
+<h3>Recipe 3. How do I score customers with RFM?</h3>
+<p>RFM scores each customer by <strong>R</strong>ecency (days since last order), <strong>F</strong>requency (number of orders) and <strong>M</strong>onetary value (total spent).</p>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(11)
+n = 400
+orders = pd.DataFrame({
+    "customer": rng.integers(0, 60, n),
+    "date": pd.Timestamp("2025-01-01") + pd.to_timedelta(rng.integers(0, 180, n), unit="D"),
+    "amount": rng.gamma(2.0, 30.0, n).round(2),
+})
+today = orders["date"].max() + pd.Timedelta(days=1)
+
+rfm = orders.groupby("customer").agg(
+    recency=("date", lambda s: (today - s.max()).days),
+    frequency=("date", "size"),
+    monetary=("amount", "sum"),
+)
+rfm["r"] = pd.qcut(rfm["recency"], 4, labels=[4, 3, 2, 1]).astype(int)
+rfm["f"] = pd.qcut(rfm["frequency"].rank(method="first"), 4, labels=[1, 2, 3, 4]).astype(int)
+rfm["m"] = pd.qcut(rfm["monetary"], 4, labels=[1, 2, 3, 4]).astype(int)
+rfm["score"] = rfm["r"] + rfm["f"] + rfm["m"]
+print(rfm.sort_values("score", ascending=False).head(4).round(1))
+print(rfm["score"].describe().round(2)[["min", "max"]].tolist())
+print(rfm["r"].value_counts().sort_index().tolist())</code></pre>
+<pre class="code lang-text"><code>          recency  frequency  monetary  r  f  m  score
+customer                                              
+17             10         10     776.8  4  4  4     12
+58              1          9     650.8  4  4  4     12
+4               7         11     571.9  4  4  4     12
+54             10          8     663.1  4  4  4     12
+[3.0, 12.0]
+[14, 16, 13, 17]</code></pre>
+<ol>
+<li>We fix "today" as the day after the latest order so results do not change with the calendar.</li>
+<li>Named aggregation computes three measures per customer in one pass. Recency uses a small lambda: days between today and the customer's latest order.</li>
+<li><code>qcut(..., 4)</code> splits customers into four equal-size groups. For recency, <em>smaller is better</em>, so labels are reversed (4 for the most recent quartile).</li>
+<li>Frequency has many ties (customers with the same count), and <code>qcut</code> fails when bin edges repeat. Ranking with <code>method="first"</code> first breaks ties so that the edges are unique.</li>
+<li>The score is the sum, from 3 (worst) to 12 (best). Sorting by it lists the best customers first. A segment such as "score 10 or more" is then a one-line filter.</li>
+</ol>
+<h3>Recipe 4. How do I get the top N rows per group?</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+sales = pd.DataFrame({
+    "region": ["n", "n", "n", "s", "s", "s", "s"],
+    "product": ["a", "b", "c", "a", "b", "c", "d"],
+    "revenue": [100, 250, 80, 40, 40, 300, 90],
+})
+top2 = (sales.sort_values(["region", "revenue"], ascending=[True, False])
+             .groupby("region").head(2))
+print(top2)
+ranked = sales.assign(rk=sales.groupby("region")["revenue"].rank(method="dense", ascending=False))
+print(ranked[ranked["rk"] &lt;= 2][["region", "product", "rk"]])
+best = sales.loc[sales.groupby("region")["revenue"].idxmax()]
+print(best[["region", "product"]].to_dict("records"))</code></pre>
+<pre class="code lang-text"><code>  region product  revenue
+1      n       b      250
+0      n       a      100
+5      s       c      300
+6      s       d       90
+  region product   rk
+0      n       a  2.0
+1      n       b  1.0
+5      s       c  1.0
+6      s       d  2.0
+[{'region': 'n', 'product': 'b'}, {'region': 's', 'product': 'c'}]</code></pre>
+<ol>
+<li>Option 1 sorts so the largest revenue is first within each region, then <code>head(2)</code> keeps two rows per region. Ties are broken by file order.</li>
+<li>Option 2 ranks within the group. <code>method="dense"</code> gives tied values the same rank without skipping numbers. In the south group, products a and b tie at 40 and share rank 3, so they are excluded. But if two products tied for rank 2, both would be kept and you would get <em>more than 2 rows</em>. Choose the tie rule deliberately.</li>
+<li>Option 3, <code>idxmax</code>, finds the row label of the largest value per group, and <code>loc</code> pulls those rows. This is the way to get exactly one row per group.</li>
+</ol>
+<h3>Recipe 5. How do I sessionise click events?</h3>
+<p>A <strong>session</strong> is a run of events by one user with no gap longer than 30 minutes. The trick: a new session starts whenever the gap is large, and a cumulative sum of those starts gives each event a session number.</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+ev = pd.DataFrame({
+    "user": ["u1", "u1", "u1", "u1", "u2", "u2"],
+    "ts": pd.to_datetime(["2025-03-01 09:00", "2025-03-01 09:10", "2025-03-01 10:00",
+                          "2025-03-01 10:05", "2025-03-01 09:00", "2025-03-01 09:29"]),
+}).sort_values(["user", "ts"])
+
+gap = ev.groupby("user")["ts"].diff()
+new_session = gap.isna() | (gap &gt; pd.Timedelta(minutes=30))
+ev["session"] = new_session.groupby(ev["user"]).cumsum()
+print(ev)
+summary = ev.groupby(["user", "session"]).agg(start=("ts", "min"), end=("ts", "max"), events=("ts", "size"))
+summary["minutes"] = (summary["end"] - summary["start"]).dt.total_seconds() / 60
+print(summary)</code></pre>
+<pre class="code lang-text"><code>  user                  ts  session
+0   u1 2025-03-01 09:00:00        1
+1   u1 2025-03-01 09:10:00        1
+2   u1 2025-03-01 10:00:00        2
+3   u1 2025-03-01 10:05:00        2
+4   u2 2025-03-01 09:00:00        1
+5   u2 2025-03-01 09:29:00        1
+                           start                 end  events  minutes
+user session                                                         
+u1   1       2025-03-01 09:00:00 2025-03-01 09:10:00       2     10.0
+     2       2025-03-01 10:00:00 2025-03-01 10:05:00       2      5.0
+u2   1       2025-03-01 09:00:00 2025-03-01 09:29:00       2     29.0</code></pre>
+<ol>
+<li>Sort by user and time first. Everything below assumes that order.</li>
+<li><code>groupby("user")["ts"].diff()</code> is the time since the previous event of the <em>same user</em>; each user's first event has NaT.</li>
+<li>An event starts a new session if there is no previous event (<code>isna()</code>) or the gap exceeds 30 minutes. Result: a True/False Series.</li>
+<li>Within each user, a cumulative sum of those flags numbers the sessions 1, 2, 3. For u1, events at 9:00 and 9:10 are session 1; 10:00 starts session 2 (50-minute gap) and 10:05 stays in it.</li>
+<li>Finally, an ordinary groupby on (user, session) gives start, end, event count and duration. User u2 has a 29-minute gap, so it stays one session.</li>
+</ol>
+<h3>Recipe 6. How do I reconcile two tables?</h3>
+<p>Finance wants to know: which invoices are in the ledger but not in the bank file, which are in the bank file but not the ledger, and which are in both with different amounts?</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+ledger = pd.DataFrame({"invoice": ["A1", "A2", "A3", "A4"], "amount": [100.0, 250.0, 75.0, 60.0]})
+bank = pd.DataFrame({"invoice": ["A2", "A3", "A5"], "amount": [250.0, 70.0, 40.0]})
+
+m = ledger.merge(bank, on="invoice", how="outer", suffixes=("_ledger", "_bank"), indicator=True, validate="1:1")
+only_ledger = m.loc[m["_merge"] == "left_only", "invoice"].tolist()
+only_bank = m.loc[m["_merge"] == "right_only", "invoice"].tolist()
+both = m[m["_merge"] == "both"].assign(diff=lambda d: d["amount_ledger"] - d["amount_bank"])
+mismatch = both[both["diff"].abs() &gt; 0.005]
+print(only_ledger, only_bank)
+print(mismatch[["invoice", "amount_ledger", "amount_bank", "diff"]])
+print(m["_merge"].value_counts().to_dict())</code></pre>
+<pre class="code lang-text"><code>['A1', 'A4'] ['A5']
+  invoice  amount_ledger  amount_bank  diff
+2      A3           75.0         70.0   5.0
+{'left_only': 2, 'both': 2, 'right_only': 1}</code></pre>
+<ol>
+<li>An <code>outer</code> join keeps invoices from either table. <code>suffixes</code> labels the two amount columns. <code>validate="1:1"</code> ensures neither file has repeated invoice numbers, which would otherwise corrupt the comparison.</li>
+<li><code>indicator=True</code> adds <code>_merge</code>, so we can split the result into three groups without any second join.</li>
+<li>A4 is <code>left_only</code> (in ledger, missing from the bank). A5 is <code>right_only</code> (bank money with no invoice).</li>
+<li>For invoices in both, compute the difference and compare its absolute value with a small tolerance. Never test float money with <code>==</code>; rounding noise makes equal amounts differ in the last digit.</li>
+<li>The value counts give the headline numbers for the report: 2 matched, 1 only in each.</li>
+</ol>
+<h3>Recipe 7. How do I translate SQL to pandas?</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>SQL</th><th>pandas</th></tr></thead><tbody>
+<tr><td><code>SELECT a, b FROM t</code></td><td><code>t[["a","b"]]</code></td></tr>
+<tr><td><code>SELECT * FROM t WHERE x &gt; 5 AND y = 'z'</code></td><td><code>t[(t.x &gt; 5) &amp; (t.y == "z")]</code> or <code>t.query("x &gt; 5 and y == 'z'")</code></td></tr>
+<tr><td><code>SELECT DISTINCT a FROM t</code></td><td><code>t["a"].drop_duplicates()</code></td></tr>
+<tr><td><code>SELECT a, SUM(x) AS s FROM t GROUP BY a</code></td><td><code>t.groupby("a", as_index=False).agg(s=("x","sum"))</code></td></tr>
+<tr><td><code>... HAVING SUM(x) &gt; 10</code></td><td><code>...agg(s=("x","sum")).query("s &gt; 10")</code></td></tr>
+<tr><td><code>ORDER BY x DESC LIMIT 5</code></td><td><code>t.nlargest(5, "x")</code> or <code>t.sort_values("x", ascending=False).head(5)</code></td></tr>
+<tr><td><code>a JOIN b ON a.k = b.k</code></td><td><code>a.merge(b, on="k")</code></td></tr>
+<tr><td><code>a LEFT JOIN b ON ...</code></td><td><code>a.merge(b, on="k", how="left")</code></td></tr>
+<tr><td><code>a UNION ALL b</code></td><td><code>pd.concat([a, b], ignore_index=True)</code></td></tr>
+<tr><td><code>UNION</code> (no duplicates)</td><td><code>pd.concat([a, b]).drop_duplicates()</code></td></tr>
+<tr><td><code>WHERE k IN (SELECT k FROM b)</code></td><td><code>a[a.k.isin(b.k)]</code></td></tr>
+<tr><td><code>WHERE k NOT IN (...)</code></td><td><code>a[~a.k.isin(b.k)]</code></td></tr>
+<tr><td><code>CASE WHEN x &gt; 0 THEN 'p' ELSE 'n' END</code></td><td><code>np.where(t.x &gt; 0, "p", "n")</code> or <code>np.select</code></td></tr>
+<tr><td><code>COALESCE(x, 0)</code></td><td><code>t["x"].fillna(0)</code></td></tr>
+<tr><td><code>COUNT(*)</code> / <code>COUNT(x)</code> / <code>COUNT(DISTINCT x)</code></td><td><code>len(t)</code> or <code>size()</code> / <code>count()</code> / <code>nunique()</code></td></tr>
+<tr><td><code>ROW_NUMBER() OVER (PARTITION BY k ORDER BY x)</code></td><td><code>t.sort_values("x").groupby("k").cumcount() + 1</code></td></tr>
+<tr><td><code>RANK() OVER (PARTITION BY k ORDER BY x DESC)</code></td><td><code>t.groupby("k")["x"].rank(method="min", ascending=False)</code></td></tr>
+<tr><td><code>SUM(x) OVER (PARTITION BY k)</code></td><td><code>t.groupby("k")["x"].transform("sum")</code></td></tr>
+<tr><td><code>LAG(x) OVER (PARTITION BY k ORDER BY d)</code></td><td><code>t.sort_values("d").groupby("k")["x"].shift(1)</code></td></tr>
+<tr><td><code>SUM(x) OVER (ORDER BY d ROWS 6 PRECEDING)</code></td><td><code>t.sort_values("d")["x"].rolling(7).sum()</code></td></tr>
+<tr><td><code>DATE_TRUNC('month', d)</code></td><td><code>t["d"].dt.to_period("M")</code> or <code>.dt.to_period("M").dt.to_timestamp()</code></td></tr>
+<tr><td><code>PIVOT</code> (conditional aggregation)</td><td><code>t.pivot_table(index=, columns=, values=, aggfunc=)</code></td></tr>
+</tbody></table></div>
+<p>The next block proves a few of these translations by running the same query in SQLite and in pandas and comparing.</p>
+<pre class="code lang-python"><code>import sqlite3
+import pandas as pd
+
+t = pd.DataFrame({"k": ["a", "a", "b", "b", "b"], "x": [3, 9, 4, 4, 1], "d": [1, 2, 1, 2, 3]})
+con = sqlite3.connect(":memory:")
+t.to_sql("t", con, index=False)
+
+sql = pd.read_sql("""
+    SELECT k, SUM(x) AS s, COUNT(*) AS n
+    FROM t GROUP BY k HAVING SUM(x) &gt; 8 ORDER BY s DESC""", con)
+pdf = (t.groupby("k", as_index=False).agg(s=("x", "sum"), n=("x", "size"))
+        .query("s &gt; 8").sort_values("s", ascending=False).reset_index(drop=True))
+print(sql.equals(pdf))
+print(pdf)
+
+win = pd.read_sql("SELECT k, d, x, ROW_NUMBER() OVER (PARTITION BY k ORDER BY x DESC, d) AS rn FROM t ORDER BY k, rn", con)
+t2 = t.sort_values(["k", "x", "d"], ascending=[True, False, True])
+t2["rn"] = t2.groupby("k").cumcount() + 1
+print(win.equals(t2[["k", "d", "x", "rn"]].reset_index(drop=True)))</code></pre>
+<pre class="code lang-text"><code>True
+   k   s  n
+0  a  12  2
+1  b   9  3
+True</code></pre>
+<ol>
+<li>The pandas table is written to an in-memory SQLite database with <code>to_sql</code>, so the same data lives on both sides.</li>
+<li>The SQL query groups, filters groups with <code>HAVING</code> and sorts. The pandas version chains <code>groupby/agg</code>, <code>query</code> (the HAVING step, applied after aggregation) and <code>sort_values</code>.</li>
+<li><code>equals</code> prints True: same rows, same order, same dtypes.</li>
+<li>For the window function, <code>ROW_NUMBER() OVER (PARTITION BY k ORDER BY x DESC, d)</code> becomes: sort by key, then x descending, then d; then <code>cumcount() + 1</code> inside each group. Including <code>d</code> as a tie-breaker in both versions makes the result deterministic.</li>
+</ol>
+<h3>Recipe 8. How do I find the biggest changes between two periods?</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+sales = pd.DataFrame({
+    "product": ["a", "b", "c", "a", "b", "d"],
+    "month": ["jan", "jan", "jan", "feb", "feb", "feb"],
+    "units": [100, 50, 20, 130, 40, 10],
+})
+wide = sales.pivot(index="product", columns="month", values="units").fillna(0)
+wide["change"] = wide["feb"] - wide["jan"]
+wide["pct"] = ((wide["change"] / wide["jan"]).replace([float("inf"), -float("inf")], float("nan")) * 100).round(1)
+print(wide.sort_values("change", ascending=False))</code></pre>
+<pre class="code lang-text"><code>month      feb    jan  change    pct
+product                             
+a        130.0  100.0    30.0   30.0
+d         10.0    0.0    10.0    NaN
+b         40.0   50.0   -10.0  -20.0
+c          0.0   20.0   -20.0 -100.0</code></pre>
+<ol>
+<li>Pivot to one row per product and one column per month; products missing in a month get NaN, which we fill with 0 because "not sold" means zero units.</li>
+<li>Absolute change is February minus January.</li>
+<li>Percentage change divides by January. Product d did not exist in January, so the division gives infinity; replacing infinities by NaN avoids a meaningless number.</li>
+<li>Sorting by <code>change</code> shows the winners at the top (a: +30) and the biggest loser last (c: -20).</li>
+</ol>
+<h3>Recipe 9. How do I find outliers?</h3>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(1)
+s = pd.Series(np.append(rng.normal(100, 10, 200), [250, -40]), name="x")
+q1, q3 = s.quantile([0.25, 0.75])
+iqr = q3 - q1
+low, high = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+out = s[(s &lt; low) | (s &gt; high)]
+print(round(low, 1), round(high, 1))
+print(out.round(1).to_dict())
+z = (s - s.mean()) / s.std()
+print((z.abs() &gt; 3).sum())
+clipped = s.clip(low, high)
+print(round(clipped.min(), 1), round(clipped.max(), 1))</code></pre>
+<pre class="code lang-text"><code>74.9 123.8
+{24: 72.9, 124: 125.5, 183: 128.7, 193: 72.9, 200: 250.0, 201: -40.0}
+2
+74.9 123.8</code></pre>
+<ol>
+<li>200 normal values around 100 plus two planted outliers (250 and -40).</li>
+<li>The IQR rule: the interquartile range is Q3 minus Q1; anything more than 1.5 IQRs beyond the quartiles is flagged. It is robust because quartiles ignore extreme values.</li>
+<li>The z-score rule flags values more than 3 standard deviations from the mean. It is less robust, since outliers inflate the mean and standard deviation themselves.</li>
+<li>The IQR rule flagged six points, four of them ordinary values near the fences, while the z-score rule flagged just the two planted ones (a normal sample always has a few points beyond 1.5 IQR). Neither rule is "right"; they answer different questions.</li>
+<li><code>clip(low, high)</code> winsorises: it limits values to the fences instead of deleting rows. Whether to remove, clip or keep an outlier is a business decision; investigate before you drop.</li>
+</ol>
+<h3>Recipe 10. How do I fill gaps in a time series and compute week-over-week growth?</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+s = pd.Series([5, 8, 6], index=pd.to_datetime(["2025-03-03", "2025-03-05", "2025-03-10"]), name="orders")
+daily = s.asfreq("D", fill_value=0)
+print(daily.tolist())
+weekly = daily.resample("W-SUN").sum()
+print(weekly.to_dict())
+print(weekly.pct_change().round(3).tolist())</code></pre>
+<pre class="code lang-text"><code>[5, 0, 8, 0, 0, 0, 0, 6]
+{Timestamp('2025-03-09 00:00:00'): 13, Timestamp('2025-03-16 00:00:00'): 6}
+[nan, -0.538]</code></pre>
+<ol>
+<li>The series has only three observed days. <code>asfreq("D", fill_value=0)</code> inserts every calendar day between the first and last, with 0 for days with no orders. Be sure that "no row" truly means zero, not "unknown".</li>
+<li><code>resample("W-SUN")</code> groups days into weeks that end on Sunday: the week of 3 to 9 March sums to 13, and 10 March starts the next week with 6.</li>
+<li><code>pct_change()</code> compares each week with the previous one: 6 / 13 - 1.</li>
+</ol>
+<h3>Recipe 11. How do I read many CSV files into one table?</h3>
+<pre class="code lang-python"><code>import tempfile
+from pathlib import Path
+import pandas as pd
+
+folder = Path(tempfile.mkdtemp())
+for month in ["2025-01", "2025-02", "2025-03"]:
+    pd.DataFrame({"id": [1, 2], "v": [10, 20]}).to_csv(folder / f"sales_{month}.csv", index=False)
+
+parts = [pd.read_csv(p).assign(source=p.stem) for p in sorted(folder.glob("sales_*.csv"))]
+all_data = pd.concat(parts, ignore_index=True)
+print(all_data.shape)
+print(all_data["source"].unique().tolist())</code></pre>
+<pre class="code lang-text"><code>(6, 3)
+['sales_2025-01', 'sales_2025-02', 'sales_2025-03']</code></pre>
+<ol>
+<li><code>Path.glob("sales_*.csv")</code> lists matching files; <code>sorted</code> makes the order deterministic.</li>
+<li>A list comprehension reads each file and adds a <code>source</code> column with the file name (<code>p.stem</code>), so you can trace any row back to its file.</li>
+<li>One <code>concat</code> at the end is much faster than appending inside a loop, because each append copies all earlier rows.</li>
+</ol>
+<h3>Recipe 12. How do I flag rows that changed between two snapshots?</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+old = pd.DataFrame({"id": [1, 2, 3], "price": [10.0, 20.0, 30.0], "stock": [5, 0, 7]}).set_index("id")
+new = pd.DataFrame({"id": [1, 2, 4], "price": [10.0, 22.0, 15.0], "stock": [5, 0, 3]}).set_index("id")
+
+added = new.index.difference(old.index).tolist()
+removed = old.index.difference(new.index).tolist()
+common = old.index.intersection(new.index)
+diff = old.loc[common].compare(new.loc[common])
+print(added, removed)
+print(diff)</code></pre>
+<pre class="code lang-text"><code>[4] [3]
+   price      
+    self other
+id            
+2   20.0  22.0</code></pre>
+<ol>
+<li>With <code>id</code> as the index, set operations on the indexes find rows that were added (4) and removed (3).</li>
+<li>For ids present in both, restrict both frames to the same labels; <code>compare</code> needs identically labelled frames.</li>
+<li><code>DataFrame.compare</code> returns only the cells that differ, with <code>self</code> and <code>other</code> columns: price of id 2 went from 20 to 22. Unchanged columns (stock) do not appear at all.</li>
+</ol>
+
+
+<h2 id="s17-16">17.16 Performance and Pitfalls</h2>
+<p>Most pandas disasters are not crashes; they are quiet wrong answers. Each pitfall below has the same layout: a red box describing the trap, then one block that runs the <em>wrong</em> code, shows the symptom, and runs the <em>fix</em>.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE 1: chained assignment</div><div class="txt">Selecting a column and then assigning into the result, such as <code>df["a"][mask] = 0</code> or <code>df[mask]["a"] = 0</code>. In pandas 3.0 the first selection is a lazy copy, so your change lands on a throwaway object. Symptom: no error, data unchanged.</div></div>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"a": [5, -1, 7]})
+df[df["a"] &lt; 0]["a"] = 0          # wrong: edits a temporary copy
+print("wrong:", df["a"].tolist())
+df.loc[df["a"] &lt; 0, "a"] = 0      # fix: one .loc assignment on df itself
+print("fixed:", df["a"].tolist())</code></pre>
+<pre class="code lang-text"><code>wrong: [5, -1, 7]
+fixed: [5, 0, 7]</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE 2: inplace and None</div><div class="txt">Methods with <code>inplace=True</code> return <code>None</code>. Writing <code>df = df.dropna(inplace=True)</code> replaces your table with <code>None</code>. Symptom: <code>AttributeError: 'NoneType' ...</code> on the next line. Prefer the returned-copy style: <code>df = df.dropna()</code>.</div></div>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"a": [1.0, None, 3.0]})
+res = df.dropna(inplace=True)      # wrong to assign this
+print("wrong:", res)
+df = pd.DataFrame({"a": [1.0, None, 3.0]})
+df = df.dropna()                    # fix
+print("fixed:", len(df))</code></pre>
+<pre class="code lang-text"><code>wrong: None
+fixed: 2</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE 3: a join that multiplies rows</div><div class="txt">The right table has a duplicate key, so each matching left row is repeated. Symptom: the total revenue is too high and nothing warns you. Fix: <code>validate="m:1"</code>, or de-duplicate first.</div></div>
+<pre class="code lang-python"><code>import pandas as pd
+
+orders = pd.DataFrame({"cid": [1, 2], "amount": [100, 50]})
+cust = pd.DataFrame({"cid": [1, 1, 2], "tier": ["gold", "gold", "basic"]})
+bad = orders.merge(cust, on="cid", how="left")
+print("wrong total:", bad["amount"].sum())
+try:
+    orders.merge(cust, on="cid", how="left", validate="m:1")
+except Exception as e:
+    print("caught:", type(e).__name__)
+good = orders.merge(cust.drop_duplicates("cid"), on="cid", how="left", validate="m:1")
+print("fixed total:", good["amount"].sum())</code></pre>
+<pre class="code lang-text"><code>wrong total: 250
+caught: MergeError
+fixed total: 150</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE 4: comparing with NaN</div><div class="txt"><code>df[df["x"] == np.nan]</code> returns nothing, because NaN is not equal to anything, not even itself. Symptom: an empty result when you know there are gaps. Fix: <code>isna()</code>.</div></div>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+df = pd.DataFrame({"x": [1.0, np.nan, 3.0]})
+print("wrong:", len(df[df["x"] == np.nan]))
+print("fixed:", len(df[df["x"].isna()]))</code></pre>
+<pre class="code lang-text"><code>wrong: 0
+fixed: 1</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE 5: silent integer wrap-around</div><div class="txt">Down-casting to a smaller integer type without checking the range. NumPy does not raise: values that do not fit wrap around. Symptom: negative numbers where there were none. Fix: check the range or use <code>to_numeric(downcast=...)</code>.</div></div>
+<pre class="code lang-python"><code>import pandas as pd
+
+s = pd.Series([100, 200, 300])
+print("wrong:", s.astype("int8").tolist())
+print("fixed:", pd.to_numeric(s, downcast="integer").dtype)</code></pre>
+<pre class="code lang-text"><code>wrong: [100, -56, 44]
+fixed: int16</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE 6: groupby silently drops missing keys</div><div class="txt">Rows whose group key is NaN vanish from the result by default. Symptom: group totals add up to less than the grand total. Fix: <code>dropna=False</code>, or fill the key first.</div></div>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"k": ["a", None, "a", "b"], "v": [1, 2, 3, 4]})
+print("wrong:", df.groupby("k")["v"].sum().sum(), "of", df["v"].sum())
+print("fixed:", df.groupby("k", dropna=False)["v"].sum().sum())</code></pre>
+<pre class="code lang-text"><code>wrong: 8 of 10
+fixed: 10</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE 7: iterrows changes types</div><div class="txt"><code>iterrows()</code> turns each row into a Series, and a Series has one dtype, so mixed columns are upcast. Symptom: integers become floats (or everything becomes text). It is also slow. Fix: <code>itertuples()</code> or, better, a vectorised expression.</div></div>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"n": [1, 2], "x": [1.5, 2.5]})
+for _, row in df.iterrows():
+    print("wrong:", type(row["n"]).__name__, end="  ")
+print()
+for row in df.itertuples():
+    print("fixed:", type(row.n).__name__, end="  ")
+print()</code></pre>
+<pre class="code lang-text"><code>wrong: float64  wrong: float64  
+fixed: int  fixed: int  </code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE 8: ambiguous dates</div><div class="txt"><code>to_datetime("01/02/2025")</code> reads month first, so it becomes 2 January, not 1 February. Symptom: European dates silently swap day and month whenever both are 12 or less. Fix: always pass <code>format=</code>.</div></div>
+<pre class="code lang-python"><code>import pandas as pd
+
+s = pd.Series(["01/02/2025"])
+print("wrong:", pd.to_datetime(s)[0].date())
+print("fixed:", pd.to_datetime(s, format="%d/%m/%Y")[0].date())</code></pre>
+<pre class="code lang-text"><code>wrong: 2025-01-02
+fixed: 2025-02-01</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE 9: assigning a Series with a different index</div><div class="txt">Assignment aligns on index labels, not position. If the labels differ, you get NaN. Symptom: a new column that is mostly empty. Fix: assign the underlying values with <code>.to_numpy()</code> when you really mean "by position" (and check the lengths), or fix the index.</div></div>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"a": [1, 2, 3]}, index=[10, 11, 12])
+other = pd.Series([7, 8, 9])                 # index 0, 1, 2
+df["b"] = other
+print("wrong:", df["b"].tolist())
+df["b"] = other.to_numpy()
+print("fixed:", df["b"].tolist())</code></pre>
+<pre class="code lang-text"><code>wrong: [nan, nan, nan]
+fixed: [7, 8, 9]</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE 10: aggregating text as numbers</div><div class="txt">Numbers stored as text (from a CSV with a stray character) make <code>mean()</code> fail (and in older object columns <code>sum()</code> would glue the strings together). Symptom: a <code>TypeError</code> or a nonsense result. Fix: convert with <code>to_numeric</code>, then aggregate.</div></div>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"qty": ["3", "4", "x"]})
+try:
+    df["qty"].mean()
+except TypeError as e:
+    print("wrong:", type(e).__name__)
+qty = pd.to_numeric(df["qty"], errors="coerce")
+print("fixed:", qty.mean(), "with", int(qty.isna().sum()), "bad value")</code></pre>
+<pre class="code lang-text"><code>wrong: TypeError
+fixed: 3.5 with 1 bad value</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE 11: float money</div><div class="txt">Sums and comparisons of decimal amounts in binary floating point carry tiny errors. Symptom: <code>0.1 + 0.2 == 0.3</code> is False, and reconciliations show phantom differences of 0.0000001. Fix: compare with a tolerance (<code>np.isclose</code>) or store integer cents.</div></div>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+s = pd.Series([0.1, 0.2])
+print("wrong:", s.sum() == 0.3, repr(s.sum()))
+print("fixed:", bool(np.isclose(s.sum(), 0.3)), (pd.Series([10, 20]).sum() == 30))</code></pre>
+<pre class="code lang-text"><code>wrong: False np.float64(0.30000000000000004)
+fixed: True True</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE 12: growing a DataFrame in a loop</div><div class="txt">Calling <code>pd.concat</code> or appending one row at a time copies the whole table every time, so work grows with the square of the row count. Symptom: a loop that is fine for 1,000 rows and hopeless for 100,000. Fix: collect rows in a Python list and build the DataFrame once.</div></div>
+<pre class="code lang-python"><code>import pandas as pd
+
+rows = []
+for i in range(1000):
+    rows.append({"i": i, "sq": i * i})
+df = pd.DataFrame(rows)          # fix: one construction at the end
+print(df.shape, df["sq"].iloc[-1])</code></pre>
+<pre class="code lang-text"><code>(1000, 2) 998001</code></pre>
+<h3>Speed and memory rules that actually matter</h3>
+<ol>
+<li><strong>Load less.</strong> <code>usecols</code> and <code>dtype</code> at read time beat any later optimisation.</li>
+<li><strong>Shrink types.</strong> <code>category</code> for repeated text, smaller number types where the range allows.</li>
+<li><strong>Vectorise.</strong> Column arithmetic, <code>np.where</code>, <code>map</code>, the string and datetime accessors; avoid <code>apply(axis=1)</code> and <code>iterrows</code>.</li>
+<li><strong>Use built-in aggregations</strong> (<code>"sum"</code>, <code>"mean"</code>) in groupby instead of lambdas.</li>
+<li><strong>Filter early, join late.</strong> Reduce rows and columns before an expensive merge or groupby.</li>
+<li><strong>Build once.</strong> Collect pieces in a list, then one <code>concat</code>.</li>
+<li><strong>Measure.</strong> Use <code>time.perf_counter</code> or <code>%timeit</code>; do not guess.</li>
+<li><strong>Know your ceiling.</strong> When a table is too large for memory even after the diet, move to chunks, Parquet with column selection, DuckDB or Polars rather than fighting pandas.</li>
+</ol>
+<p>A quick measured example of rules 3 and 4 follows. The numbers vary by machine; only the ordering is the lesson.</p>
+<pre class="code lang-python"><code>import time
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+n = 300_000
+df = pd.DataFrame({"k": rng.integers(0, 1000, n), "x": rng.normal(size=n)})
+
+def timeit(f):
+    t = time.perf_counter(); f(); return time.perf_counter() - t
+
+fast = timeit(lambda: df.groupby("k")["x"].agg("sum"))
+slow = timeit(lambda: df.groupby("k")["x"].agg(lambda s: s.sum()))
+print("lambda slower than built-in:", slow &gt; fast)
+a = df.groupby("k")["x"].agg("sum")
+b = df.groupby("k")["x"].agg(lambda s: s.sum())
+print(np.allclose(a, b))</code></pre>
+<pre class="code lang-text"><code>lambda slower than built-in: True
+True</code></pre>
+<ol>
+<li>300,000 rows in 1,000 groups, so a lambda would be called 1,000 times.</li>
+<li><code>timeit</code> times a call with a monotonic clock. We print only a comparison, not the raw seconds, so that the output is the same on every machine.</li>
+<li>The built-in <code>"sum"</code> runs in compiled code for all groups at once; the lambda runs Python for each group.</li>
+<li><code>allclose</code> confirms both versions give the same answer: the speed-up costs no correctness.</li>
+</ol>
+
+<h2 id="s17-17">17.17 Cross-library Integration</h2>
+<p>pandas rarely works alone. The arrows below are the handoffs you will use most.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Partner</th><th>Direction</th><th>Code</th><th>Watch out for</th></tr></thead><tbody>
+<tr><td>NumPy</td><td>both</td><td><code>df.to_numpy()</code>, <code>pd.DataFrame(arr, columns=...)</code>, <code>np.log1p(df["x"])</code></td><td>Ufuncs keep the index; <code>to_numpy()</code> loses labels</td></tr>
+<tr><td>matplotlib / seaborn</td><td>out</td><td><code>df.plot(...)</code>, <code>sns.barplot(data=df, x=, y=)</code></td><td>Seaborn wants long (tidy) data</td></tr>
+<tr><td>scikit-learn</td><td>both</td><td><code>X = df[features]</code>, <code>ColumnTransformer</code></td><td>Split before fitting; keep column order the same at predict time</td></tr>
+<tr><td>SQL (sqlite3, SQLAlchemy)</td><td>both</td><td><code>read_sql</code>, <code>to_sql</code></td><td>Push filters into SQL; do not read a whole table to filter in pandas</td></tr>
+<tr><td>Parquet / Arrow</td><td>both</td><td><code>to_parquet</code>, <code>read_parquet(columns=)</code> (not run here)</td><td>Needs <code>pyarrow</code>; preserves dtypes unlike CSV</td></tr>
+<tr><td>Excel</td><td>both</td><td><code>read_excel</code>, <code>ExcelWriter</code></td><td>Dates and merged cells need care; slow for large files</td></tr>
+<tr><td>JSON / requests</td><td>in</td><td><code>pd.json_normalize(resp.json())</code></td><td>Nested lists need <code>record_path</code></td></tr>
+<tr><td>Polars / DuckDB</td><td>both</td><td><code>pl.from_pandas(df)</code>, <code>duckdb.sql("select ...")</code> (not run here)</td><td>Different semantics for nulls and ordering</td></tr>
+</tbody></table></div>
+<p>Below, one DataFrame goes through NumPy, SQL, scikit-learn and matplotlib in a few lines. Everything here is installed.</p>
+<pre class="code lang-python"><code>import sqlite3
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(0)
+df = pd.DataFrame({"ad": rng.uniform(0, 10, 200)})
+df["sales"] = 3 * df["ad"] + 5 + rng.normal(0, 1, 200)
+
+con = sqlite3.connect(":memory:")
+df.to_sql("t", con, index=False)
+big = pd.read_sql("SELECT * FROM t WHERE ad &gt; 5", con)
+
+X_tr, X_te, y_tr, y_te = train_test_split(df[["ad"]], df["sales"], test_size=0.25, random_state=0)
+model = LinearRegression().fit(X_tr, y_tr)
+pred = pd.Series(model.predict(X_te), index=X_te.index, name="pred")
+res = pd.concat([X_te, y_te, pred], axis=1)
+print(len(big), res.shape)
+print(round(float(model.coef_[0]), 2), round(float(model.intercept_), 2))
+print(res.head(2).round(2))
+
+import matplotlib.pyplot as plt
+ax = res.plot.scatter("ad", "sales", color="#2b4fd6")
+print(type(ax).__name__)
+print(np.log1p(df["ad"]).head(2).round(3).tolist())</code></pre>
+<pre class="code lang-text"><code>112 (50, 3)
+2.95 5.15
+       ad  sales   pred
+18   3.00  14.56  14.00
+170  3.44  14.68  15.32
+Axes
+[1.997, 1.308]</code></pre>
+<ol>
+<li>Synthetic data: sales are 3 times ad spend plus 5 plus noise.</li>
+<li>The table is written to SQLite and a filtered subset is read back with <code>read_sql</code>: the filter runs in the database.</li>
+<li><code>train_test_split</code> accepts DataFrames and Series and returns pieces that keep their index labels, so you can join predictions back to the right rows.</li>
+<li><code>df[["ad"]]</code> (double brackets) gives a DataFrame, which scikit-learn requires for features; <code>df["sales"]</code> is the 1-D target.</li>
+<li>The learned slope and intercept are close to the true 3 and 5.</li>
+<li>Wrapping predictions in a Series with the test index lets <code>concat(axis=1)</code> align them with the inputs and truth, a clean table for error analysis.</li>
+<li><code>res.plot.scatter</code> returns a matplotlib Axes, so everything in the matplotlib chapter applies. NumPy functions such as <code>np.log1p</code> accept a Series and return a Series with the same index.</li>
+</ol>
+
+<h2 id="s17-18">17.18 How to Solve Any pandas Problem</h2>
+<h3>The decision flow</h3>
+<ol>
+<li><strong>State the output table.</strong> Write down the columns and what one row means: "one row per customer per month". The grain of the output decides everything.</li>
+<li><strong>Identify the input grain.</strong> What does one row of the input mean? If input grain is finer than output grain, you need <code>groupby</code> (or <code>resample</code>). If equal, you need column operations. If the information is in another table, you need a <code>merge</code>.</li>
+<li><strong>Pick the verb.</strong> Filter rows (mask, <code>query</code>), create columns (<code>assign</code>, <code>np.where</code>), summarise (<code>groupby.agg</code>), compare to group (<code>transform</code>), combine tables (<code>merge</code>, <code>concat</code>), change shape (<code>pivot</code>, <code>melt</code>), time logic (<code>resample</code>, <code>rolling</code>, <code>shift</code>).</li>
+<li><strong>Write it as a chain, step by step.</strong> Print the head after each step until the shape is right.</li>
+<li><strong>Verify</strong> with counts, totals and a hand-checked row before you trust it.</li>
+</ol>
+<h3>Six to eight recurring patterns, each solved</h3>
+<p><strong>Pattern A: "one row per X with a total" (aggregate).</strong> Group by X, aggregate. <strong>Pattern B: "compare each row with its group" (transform).</strong> <strong>Pattern C: "latest/first/best row per X" (sort then drop_duplicates, or idxmax).</strong> <strong>Pattern D: "attach information from another table" (merge with validate).</strong> <strong>Pattern E: "what did not match" (indicator or anti-join).</strong> <strong>Pattern F: "wide to long and back" (melt/pivot).</strong> <strong>Pattern G: "what happened before/after this row" (sort, groupby, shift/diff/cumsum).</strong> <strong>Pattern H: "bucket the values" (cut/qcut, dt.to_period, resample).</strong> Here is one solved example for each, on one small dataset.</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+o = pd.DataFrame({
+    "cust": ["a", "a", "a", "b", "b", "c"],
+    "day": pd.to_datetime(["2025-03-01", "2025-03-05", "2025-03-20", "2025-03-02", "2025-03-03", "2025-03-09"]),
+    "amt": [10, 30, 20, 50, 5, 40],
+})
+regions = pd.DataFrame({"cust": ["a", "b", "d"], "region": ["north", "south", "west"]})
+
+A = o.groupby("cust")["amt"].sum()
+B = (o["amt"] / o.groupby("cust")["amt"].transform("sum")).round(2)
+C = o.sort_values("day").drop_duplicates("cust", keep="last")[["cust", "amt"]]
+D = o.merge(regions, on="cust", how="left", validate="m:1")
+E = regions.merge(o, on="cust", how="left", indicator=True).query("_merge == 'left_only'")["cust"].tolist()
+F = o.pivot_table(index="cust", columns=o["day"].dt.to_period("M"), values="amt", aggfunc="sum")
+G = o.sort_values(["cust", "day"]).assign(days_since=lambda d: d.groupby("cust")["day"].diff().dt.days)
+H = pd.cut(o["amt"], [0, 10, 30, 100], labels=["small", "mid", "large"])
+
+print(A.to_dict())
+print(B.tolist())
+print(C.to_dict("records"))
+print(D["region"].tolist())
+print(E)
+print(F.round(0).to_dict())
+print(G["days_since"].tolist())
+print(H.tolist())</code></pre>
+<pre class="code lang-text"><code>{'a': 60, 'b': 55, 'c': 40}
+[0.17, 0.5, 0.33, 0.91, 0.09, 1.0]
+[{'cust': 'b', 'amt': 5}, {'cust': 'c', 'amt': 40}, {'cust': 'a', 'amt': 20}]
+['north', 'north', 'north', 'south', 'south', nan]
+['d']
+{Period('2025-03', 'M'): {'a': 60, 'b': 55, 'c': 40}}
+[nan, 4.0, 15.0, nan, 1.0, nan]
+['small', 'mid', 'mid', 'large', 'small', 'large']</code></pre>
+<ol>
+<li><strong>A</strong> sums by customer: a = 60, b = 55, c = 40.</li>
+<li><strong>B</strong> is each order's share of its customer total (customer c has one order, so 1.0).</li>
+<li><strong>C</strong> sorts by day and keeps the last row per customer: the latest order.</li>
+<li><strong>D</strong> attaches regions with a left join. Customer c has no region, so NaN. <code>validate="m:1"</code> proves the regions table is unique per customer.</li>
+<li><strong>E</strong> finds customers in the regions table that have no orders: customer d. The indicator column distinguishes unmatched rows.</li>
+<li><strong>F</strong> pivots to customers by month; every order is in March, so there is one column.</li>
+<li><strong>G</strong> sorts, then diff within each customer gives days since the previous order; each customer's first order is NaN.</li>
+<li><strong>H</strong> buckets amounts: 10 is small (closed right edge), 30 is mid, 50 is large.</li>
+</ol>
+<h3>How to verify</h3>
+<ul>
+<li><strong>Row counts</strong> before and after each filter or join: <code>len(df)</code>. Joins should not change them unexpectedly.</li>
+<li><strong>Totals:</strong> sum of group totals equals the grand total (watch for NaN keys).</li>
+<li><strong>Uniqueness:</strong> <code>df["id"].is_unique</code> or <code>df.duplicated(["id"]).any()</code>.</li>
+<li><strong>Spot-check one entity</strong> by hand: filter to one customer and compare with the aggregated row.</li>
+<li><strong>Assertions as guard rails:</strong> <code>assert out["share"].between(0, 1).all()</code> at the end of a pipeline fails loudly when data changes.</li>
+<li><strong>Compare with a second method:</strong> compute the same number with SQL or plain Python on a small sample.</li>
+</ul>
+<h3>How to debug</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"city": ["Oslo", "oslo ", "Rome"], "x": ["1", "2", "3"]})
+steps = (
+    df
+    .assign(city=lambda d: d["city"].str.strip().str.lower())
+    .pipe(lambda d: (print("after clean:", d["city"].tolist()), d)[1])
+    .assign(x=lambda d: pd.to_numeric(d["x"]))
+    .groupby("city", as_index=False)["x"].sum()
+)
+print(steps.to_dict("records"))
+print(df["x"].dtype, df.shape, df.index.is_unique)</code></pre>
+<pre class="code lang-text"><code>after clean: ['oslo', 'oslo', 'rome']
+[{'city': 'oslo', 'x': 3}, {'city': 'rome', 'x': 3}]
+str (3, 2) True</code></pre>
+<ol>
+<li>A chain is debugged by inserting a <code>pipe</code> with a tiny function that prints and returns its input (here a lambda that prints and returns the frame). You see the state midway without breaking the chain.</li>
+<li>Before cleaning, "Oslo" and "oslo " would be separate groups; after cleaning they merge into one with x = 3, and Rome has x = 3.</li>
+<li>The last line is the standard triage: dtype, shape and index uniqueness. If a column is not the dtype you expect, fix that first.</li>
+<li>Other quick tools: <code>df.head()</code> after each step, <code>df.sample(5, random_state=0)</code>, <code>df["col"].unique()[:20]</code> to see odd values, <code>df.query("...")</code> to isolate the failing rows, and reducing the data to the smallest frame that still shows the bug.</li>
+</ol>
+
+
+<h2 id="s17-19">17.19 Going Deeper: Internals, Memory, Speed and What Interviewers Probe</h2>
+<h3>How a DataFrame is really stored</h3>
+<p>A DataFrame is not a grid of Python objects. Each column is a typed array (a NumPy array for numbers, booleans and datetimes, an extension array for categories, nullable integers and strings). pandas keeps these arrays together with the Index objects that label the rows and columns. Operations on a column therefore run as loops over a contiguous typed array in compiled code, which is the whole source of pandas' speed. A Python-level function applied row by row throws that advantage away, because every cell must be boxed into a Python object again.</p>
+<div class="callout blue"><div class="lab">KEY IDEA</div><div class="txt">The Index is a typed, <strong>immutable</strong> array with a lookup structure that is built lazily on first use. Looking up a label in a unique index is a hash lookup, not a scan, which is why <code>df.loc[label]</code> on a set index is fast and why a non-unique index makes lookups slower and sometimes returns several rows instead of one.</div></div>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+codes, uniques = pd.factorize(pd.Series(["b", "a", "b", "c"]))
+print(codes.tolist(), list(uniques))
+
+df = pd.DataFrame({"a": [1, 2, 3]})
+shallow = df.copy(deep=False)
+print(np.shares_memory(df["a"].to_numpy(), shallow["a"].to_numpy()))
+shallow.loc[0, "a"] = 99
+print(np.shares_memory(df["a"].to_numpy(), shallow["a"].to_numpy()), df["a"].tolist())
+
+idx = pd.Index(["x", "y"])
+try:
+    idx[0] = "z"
+except TypeError as e:
+    print("Index is immutable:", type(e).__name__)</code></pre>
+<pre class="code lang-text"><code>[0, 1, 0, 2] ['b', 'a', 'c']
+True
+False [1, 2, 3]
+Index is immutable: TypeError</code></pre>
+<ol>
+<li><code>factorize</code> converts labels to small integer codes (b=0, a=1, c=2) plus a table of unique values. This is exactly the first step <code>groupby</code> and <code>category</code> use: integers are cheap to compare, hash and count.</li>
+<li>A shallow copy shares the underlying memory with the original, so <code>shares_memory</code> is True: copying costs almost nothing.</li>
+<li>When we write to the shallow copy, copy-on-write notices that the data is shared, copies just that column first, and then writes. The memory is no longer shared, and the original is untouched. This is the mechanism behind "never a surprise write".</li>
+<li>Index objects refuse item assignment; to change labels you build a new Index (<code>rename</code>, <code>set_index</code>).</li>
+</ol>
+<h3>What the main operations do underneath</h3>
+<ul>
+<li><strong>groupby</strong> factorizes the key column(s) into integer group codes, then reduces each value column by those codes. Built-in reducers (<code>sum</code>, <code>mean</code>, <code>count</code>, <code>min</code>, <code>max</code>) are compiled loops. A lambda forces a Python call per group.</li>
+<li><strong>merge</strong> is a hash join: it builds a hash table of keys from one side and probes it with the other. Cost grows roughly with the sum of the two sizes, plus the size of the output, which is why a many-to-many join can explode memory.</li>
+<li><strong>sort_values</strong> sorts one or more keys; use <code>kind="stable"</code> when ties must keep their input order.</li>
+<li><strong>Boolean masks</strong> allocate a full-length mask and a new frame; <code>query</code> and <code>eval</code> can avoid temporaries for large frames when the optional <code>numexpr</code> package is installed (not run here).</li>
+<li><strong>String dtype:</strong> in pandas 3.0 the default <code>str</code> dtype stores text in a dedicated string array rather than as one Python object per cell. Missing values are NaN-like, and <code>.str</code> methods return typed results. With <code>pyarrow</code> installed it uses Arrow storage, which is smaller and faster; without it, a Python-backed storage is used. Check <code>pd.options.mode.string_storage</code>.</li>
+<li><strong>Datetime resolution:</strong> timestamps are no longer always nanoseconds; the unit is inferred (our examples show microseconds). Arithmetic between different units converts to the finer one. Dates far outside the nanosecond range (year 1500 or 3000) now work without special handling.</li>
+<li><strong>Nullable dtypes</strong> (<code>Int64</code>, <code>Float64</code>, <code>boolean</code>) keep a separate mask of missing values, so integers stay integers, at some cost in speed and memory compared with plain NumPy types.</li>
+</ul>
+<h3>Memory arithmetic you should be able to do in your head</h3>
+<p>An <code>int64</code> or <code>float64</code> column takes 8 bytes per row, so 10 million rows take 80 MB per column. A table with 20 numeric columns and 10 million rows is about 1.6 GB before any temporaries. A <code>groupby</code>, <code>merge</code> or <code>sort</code> can need an extra copy or two, so plan for two to three times the table size. That arithmetic tells you when to downcast, read fewer columns, process in chunks, or switch tools.</p>
+<div class="callout green"><div class="lab">INTERVIEW</div><div class="txt"><strong>What interviewers probe.</strong> (1) Difference between <code>loc</code> and <code>iloc</code> and what slice end points include. (2) Why <code>apply(axis=1)</code> is slow and what to use instead. (3) <code>merge</code> types, how to detect and prevent row multiplication. (4) <code>transform</code> vs <code>agg</code> vs <code>apply</code>. (5) What copy-on-write means and why chained assignment no longer works. (6) How to handle a file bigger than memory. (7) How to deduplicate keeping the latest record. (8) How <code>NaN</code> behaves in comparisons, sums and groupby keys. (9) Time series: <code>resample</code> vs <code>rolling</code>, time zones. (10) Reading code and predicting its output, which is why the practice set has many "what does this print" tasks.</div></div>
+<h3>Processing a file bigger than memory</h3>
+<pre class="code lang-python"><code>import io
+import pandas as pd
+
+lines = ["user,amount"] + [f"u{i % 4},{i}" for i in range(1, 21)]
+text = "\n".join(lines)
+
+totals = {}
+for chunk in pd.read_csv(io.StringIO(text), chunksize=6):
+    part = chunk.groupby("user")["amount"].sum()
+    for user, value in part.items():
+        totals[user] = totals.get(user, 0) + int(value)
+print(totals)
+print(sum(totals.values()), sum(range(1, 21)))</code></pre>
+<pre class="code lang-text"><code>{'u0': 60, 'u1': 45, 'u2': 50, 'u3': 55}
+210 210</code></pre>
+<ol>
+<li>We fake a 20-row file; a real one might have billions of rows on disk.</li>
+<li><code>chunksize=6</code> turns <code>read_csv</code> into an iterator of small DataFrames, so only six rows are in memory at a time.</li>
+<li>For each chunk we compute the partial sum per user, then merge it into a running dictionary. This works for any aggregation that can be combined from partial results (sum, count, min, max). A mean needs a running sum and a running count; a median does not combine this way.</li>
+<li>The grand total matches the arithmetic series 1 + 2 + ... + 20 = 210, a cheap correctness check.</li>
+</ol>
+
+<h2>Chapter recap</h2>
+<ul>
+<li>A DataFrame is a dict of typed Series sharing one Index. Think in columns; operations align on labels.</li>
+<li>Read with explicit <code>dtype</code>, <code>parse_dates</code>, <code>na_values</code> and <code>usecols</code>; write with <code>index=False</code>.</li>
+<li>Inspect first: <code>shape</code>, <code>info</code>, <code>describe</code>, <code>value_counts</code>, <code>isna().sum()</code>, <code>duplicated().sum()</code>.</li>
+<li>Select with <code>loc</code> (labels, end included), <code>iloc</code> (positions, end excluded), Boolean masks with <code>&amp; | ~</code> and brackets, or <code>query</code>.</li>
+<li>Assign with <code>df.loc[mask, col] = v</code>, <code>assign</code>, <code>np.where</code>, <code>np.select</code>; never chain indexing in pandas 3.0.</li>
+<li>Pick dtypes on purpose: <code>category</code> for low-cardinality text, nullable integers for gaps, <code>str</code> for text, datetimes with <code>format=</code>.</li>
+<li>Decide what missing means before filling; flag it; remember <code>groupby</code> drops NaN keys unless <code>dropna=False</code>.</li>
+<li><code>groupby</code> is split-apply-combine: <code>agg</code> shrinks, <code>transform</code> keeps length, <code>filter</code> keeps groups. Use named aggregation.</li>
+<li>Joins: choose <code>how</code>, always <code>validate</code>, use <code>indicator</code> to see mismatches, and check the row count.</li>
+<li>Reshape with <code>melt</code>/<code>pivot</code>/<code>pivot_table</code>; windows with <code>rolling</code>, <code>expanding</code>, <code>resample</code>, <code>shift</code>.</li>
+<li>Vectorise, use built-in aggregations, shrink dtypes, build once, measure; leave pandas when data does not fit memory.</li>
+</ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / pattern</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>df.loc[mask, "c"] = v</code></td><td>Safe conditional assignment</td></tr>
+<tr><td><code>df.groupby("k").agg(n=("x","size"), s=("x","sum"))</code></td><td>One row per key, named results</td></tr>
+<tr><td><code>df["x"] / df.groupby("k")["x"].transform("sum")</code></td><td>Share of group total</td></tr>
+<tr><td><code>df.sort_values("t").drop_duplicates("k", keep="last")</code></td><td>Latest row per key</td></tr>
+<tr><td><code>a.merge(b, on="k", how="left", validate="m:1")</code></td><td>Lookup that cannot multiply rows</td></tr>
+<tr><td><code>a.merge(b, how="outer", indicator=True)</code></td><td>Reconciliation of two tables</td></tr>
+<tr><td><code>df.pivot_table(index=, columns=, values=, aggfunc=)</code></td><td>Cross-tab with aggregation</td></tr>
+<tr><td><code>gap = g["ts"].diff(); (gap &gt; lim).groupby(key).cumsum()</code></td><td>Sessions</td></tr>
+<tr><td><code>s.resample("ME").sum()</code></td><td>Monthly totals</td></tr>
+<tr><td><code>s.rolling(7).mean()</code></td><td>Seven-row moving average</td></tr>
+<tr><td><code>pd.qcut(s, 4)</code> / <code>pd.cut(s, bins)</code></td><td>Equal-count / chosen-edge bins</td></tr>
+<tr><td><code>df.pipe(f).assign(...).query(...)</code></td><td>Readable method chain</td></tr>
+</tbody></table></div>
+
+<h2>Practice set</h2>
+<p>Graded from easy to expert. Try each one before reading the answer. Outputs shown were produced by running the code.</p>
+<p class="problem"><span class="pl">Problem 17.P.1</span> (Easy, what does this print?) What do the two lines print?</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+s = pd.Series([4, 8, 15], index=["a", "b", "c"])
+print(s["b"], s.iloc[2])
+print(s.loc["a":"b"].tolist())</code></pre>
+<p><strong>Answer:</strong> <code>s["b"]</code> is a label lookup (8), <code>s.iloc[2]</code> is positional (15). The label slice <code>"a":"b"</code> includes both ends, giving two values.</p>
+<pre class="code lang-text"><code>8 15
+[4, 8]</code></pre>
+<p class="problem"><span class="pl">Problem 17.P.2</span> (Easy) A DataFrame <code>df</code> has 1000 rows. Which line gives the number of missing values in each column, and which gives the number of fully repeated rows?</p>
+<p><strong>Answer:</strong> <code>df.isna().sum()</code> counts missing cells per column; <code>df.duplicated().sum()</code> counts rows identical to an earlier row. <code>len(df)</code> or <code>df.shape[0]</code> gives 1000.</p>
+<p class="problem"><span class="pl">Problem 17.P.3</span> (Easy, find the bug) This line raises an error. Explain and fix it.</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"a": [1, 5, 9], "b": [2, 2, 8]})
+try:
+    print(df[(df["a"] &gt; 2) and (df["b"] &lt; 5)])
+except ValueError as e:
+    print("ValueError")
+print(df[(df["a"] &gt; 2) &amp; (df["b"] &lt; 5)])</code></pre>
+<p><strong>Answer:</strong> <code>and</code> asks Python for one truth value of a whole Series, which is ambiguous, so pandas raises <code>ValueError</code>. Use <code>&amp;</code> with brackets around each comparison. The fixed line keeps only row 1 (a=5, b=2).</p>
+<pre class="code lang-text"><code>ValueError
+   a  b
+1  5  2</code></pre>
+<p class="problem"><span class="pl">Problem 17.P.4</span> (Easy) A column <code>age</code> has values 20, 30, NaN, 40. What is <code>df["age"].mean()</code>, and what is the mean after <code>fillna(0)</code>?</p>
+<p><strong>Answer:</strong> pandas skips NaN by default: (20+30+40)/3 = 30. After <code>fillna(0)</code> the four values sum to 90, and 90/4 = 22.5. Filling with 0 silently changed the mean, which is why the fill value must be chosen with care.</p>
+<p class="problem"><span class="pl">Problem 17.P.5</span> (Easy, what does this print?) What is printed?</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+a = pd.Series([1, 2, 3], index=["x", "y", "z"])
+b = pd.Series([10, 20], index=["y", "z"])
+print((a + b).tolist())
+print(a.add(b, fill_value=0).tolist())</code></pre>
+<p><strong>Answer:</strong> addition aligns on labels. <code>x</code> is missing from <code>b</code>, so <code>x</code> becomes NaN; y is 2+10 = 12 and z is 3+20 = 23. With <code>add(..., fill_value=0)</code> a missing side is treated as 0, so x stays 1.</p>
+<pre class="code lang-text"><code>[nan, 12.0, 23.0]
+[1.0, 12.0, 23.0]</code></pre>
+<p class="problem"><span class="pl">Problem 17.P.6</span> (Medium) For orders <code>cust = [a, a, b]</code> and <code>amt = [10, 30, 20]</code>, write one expression that gives each row's amount divided by the customer's total, and compute it by hand.</p>
+<p><strong>Answer:</strong> <code>df["amt"] / df.groupby("cust")["amt"].transform("sum")</code>. Customer a total is 40, so the first two rows are 10/40 = 0.25 and 30/40 = 0.75; customer b is 20/20 = 1.0.</p>
+<p class="problem"><span class="pl">Problem 17.P.7</span> (Medium, compute by hand) Left table has keys [1, 2, 2, 3]. Right table has keys [2, 2, 3, 4]. How many rows result from an inner join, a left join and an outer join? Verify with code.</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+L = pd.DataFrame({"k": [1, 2, 2, 3]})
+R = pd.DataFrame({"k": [2, 2, 3, 4]})
+print({how: len(L.merge(R, on="k", how=how)) for how in ["inner", "left", "outer"]})</code></pre>
+<p><strong>Answer:</strong> key 2 appears twice on each side, so it produces 2 x 2 = 4 rows. Key 3 gives 1 x 1 = 1. Inner = 4 + 1 = 5. Left adds the unmatched left key 1: 6. Outer also adds the unmatched right key 4: 7. Many-to-many joins multiply.</p>
+<pre class="code lang-text"><code>{'inner': 5, 'left': 6, 'outer': 7}</code></pre>
+<p class="problem"><span class="pl">Problem 17.P.8</span> (Medium) Why does <code>df.pivot(index="city", columns="year", values="sales")</code> fail when Oslo has two rows for 2025, and what do you use instead?</p>
+<p><strong>Answer:</strong> <code>pivot</code> only rearranges: each (city, year) pair must be unique, otherwise it does not know which value to put in the cell, and raises an error about duplicate entries. <code>pivot_table(..., aggfunc="sum")</code> first aggregates duplicates (or use <code>groupby</code> first, then <code>unstack</code>).</p>
+<p class="problem"><span class="pl">Problem 17.P.9</span> (Medium, find the bug) The programmer wants to cap negative values at zero in <code>df</code>. It does not work in pandas 3.0. Why? Fix it and show it works.</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"v": [3, -2, 5, -7]})
+df["v"][df["v"] &lt; 0] = 0
+print(df["v"].tolist())
+df.loc[df["v"] &lt; 0, "v"] = 0
+print(df["v"].tolist())</code></pre>
+<p><strong>Answer:</strong> <code>df["v"]</code> returns a lazy copy under copy-on-write, so assigning into it never reaches <code>df</code>. A single <code>df.loc[mask, "v"] = 0</code> writes to <code>df</code> directly. (An equivalent is <code>df["v"] = df["v"].clip(lower=0)</code>.)</p>
+<pre class="code lang-text"><code>[3, -2, 5, -7]
+[3, 0, 5, 0]</code></pre>
+<p class="problem"><span class="pl">Problem 17.P.10</span> (Medium, what does this print?) What does this print, and why?</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+s = pd.Series([1, 2, 3, 4, 5])
+print(s.rolling(3).sum().tolist())
+print(s.shift(1).tolist())
+print(s.diff().tolist())
+print(s.expanding().mean().tolist())</code></pre>
+<p><strong>Answer:</strong> rolling(3).sum() needs a full window of 3, so the first two are NaN, then 1+2+3 = 6, 9, 12. shift(1) moves values down: the first is NaN. diff() is today minus yesterday: NaN then 1 each time. expanding().mean() is the running average: 1, 1.5, 2, 2.5, 3.</p>
+<pre class="code lang-text"><code>[nan, nan, 6.0, 9.0, 12.0]
+[nan, 1.0, 2.0, 3.0, 4.0]
+[nan, 1.0, 1.0, 1.0, 1.0]
+[1.0, 1.5, 2.0, 2.5, 3.0]</code></pre>
+<p class="problem"><span class="pl">Problem 17.P.11</span> (Medium) Keep only the most recent row per <code>id</code> from a table with columns <code>id, ts, val</code>. Write the code, then explain what goes wrong if you skip the sort.</p>
+<p><strong>Answer:</strong> <code>df.sort_values("ts").drop_duplicates("id", keep="last")</code>. Without the sort, "last" means last in file order, which may not be the latest timestamp; the answer would depend on how the file happened to be arranged.</p>
+<p class="problem"><span class="pl">Problem 17.P.12</span> (Medium, what does this print?) Where do 18, 64 and 65 fall?</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+age = pd.Series([18, 64, 65])
+print(pd.cut(age, [0, 18, 64, 120]).astype(str).tolist())
+print(pd.cut(age, [0, 18, 64, 120], right=False).astype(str).tolist())</code></pre>
+<p><strong>Answer:</strong> by default intervals include the right edge: 18 is in (0, 18], 64 in (18, 64], 65 in (64, 120]. With <code>right=False</code> intervals include the left edge: 18 moves to [18, 64), 64 to [64, 120), 65 stays in [64, 120). Always test boundary values.</p>
+<pre class="code lang-text"><code>['(0, 18]', '(18, 64]', '(64, 120]']
+['[18, 64)', '[64, 120)', '[64, 120)']</code></pre>
+<p class="problem"><span class="pl">Problem 17.P.13</span> (Hard, find the bug) Revenue per tier is overstated after this join. Find why, show the symptom, and fix with a validation that would have caught it.</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+orders = pd.DataFrame({"cid": [1, 2, 3], "amt": [100, 200, 300]})
+tiers = pd.DataFrame({"cid": [1, 2, 2, 3], "tier": ["g", "s", "s", "b"]})
+bad = orders.merge(tiers, on="cid")
+print(bad.groupby("tier")["amt"].sum().to_dict())
+good = orders.merge(tiers.drop_duplicates("cid"), on="cid", validate="m:1")
+print(good.groupby("tier")["amt"].sum().to_dict())</code></pre>
+<p><strong>Answer:</strong> customer 2 is repeated in <code>tiers</code>, so their 200 appears twice and silver shows 400 instead of 200. <code>validate="m:1"</code> would raise <code>MergeError</code> as soon as <code>tiers</code> had a duplicate key. Fix by de-duplicating (or fix the source) and keeping the validation.</p>
+<pre class="code lang-text"><code>{'b': 300, 'g': 100, 's': 400}
+{'b': 300, 'g': 100, 's': 200}</code></pre>
+<p class="problem"><span class="pl">Problem 17.P.14</span> (Hard) Return the two highest-paid employees in each department, and make the handling of ties explicit.</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"dept": list("aaabbb"), "emp": ["u1", "u2", "u3", "u4", "u5", "u6"], "pay": [50, 80, 80, 90, 40, 70]})
+r = df.sort_values(["dept", "pay", "emp"], ascending=[True, False, True]).groupby("dept").head(2)
+print(r[["dept", "emp", "pay"]].to_dict("records"))</code></pre>
+<p><strong>Answer:</strong> sort by department, pay descending and employee as a tie-breaker, then <code>head(2)</code> per group. Department a has a tie at 80 (u2 and u3), and the tie-breaker makes the result deterministic. If instead you wanted <em>all</em> tied employees, use <code>rank(method="min")</code> and keep rank at most 2.</p>
+<pre class="code lang-text"><code>[{'dept': 'a', 'emp': 'u2', 'pay': 80}, {'dept': 'a', 'emp': 'u3', 'pay': 80}, {'dept': 'b', 'emp': 'u4', 'pay': 90}, {'dept': 'b', 'emp': 'u6', 'pay': 70}]</code></pre>
+<p class="problem"><span class="pl">Problem 17.P.15</span> (Hard) Sessionise with a 15-minute limit. User u1 has events at 09:00, 09:10, 09:30, 09:35. How many sessions, and what are their sizes?</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+ts = pd.to_datetime(["2025-01-01 09:00", "2025-01-01 09:10", "2025-01-01 09:30", "2025-01-01 09:35"])
+ev = pd.DataFrame({"user": "u1", "ts": ts})
+gap = ev.groupby("user")["ts"].diff()
+ev["session"] = (gap.isna() | (gap &gt; pd.Timedelta(minutes=15))).groupby(ev["user"]).cumsum()
+print(ev.groupby("session").size().to_dict())</code></pre>
+<p><strong>Answer:</strong> gaps are NaT, 10, 20 and 5 minutes. Only the first event and the 20-minute gap start sessions, so there are two sessions of sizes 2 and 2. The test is "gap greater than the limit", so a gap of exactly 15 minutes stays in the session; decide the boundary rule explicitly.</p>
+<pre class="code lang-text"><code>{1: 2, 2: 2}</code></pre>
+<p class="problem"><span class="pl">Problem 17.P.16</span> (Hard) A text column <code>country</code> has 5 distinct values over 2 million rows, and <code>qty</code> holds integers from 1 to 40. Estimate memory and give the dtypes you choose.</p>
+<p><strong>Answer:</strong> <code>qty</code> as <code>int64</code> costs 8 bytes x 2,000,000 = 16 MB; as <code>uint8</code> (0 to 255) it is 2 MB. <code>country</code> as category costs about one byte per row (about 2 MB, five labels are negligible), against a much larger cost for 2 million separate text values. Verify with <code>memory_usage(deep=True)</code> and compare results before and after.</p>
+<p class="problem"><span class="pl">Problem 17.P.17</span> (Hard, find the bug) The group totals below do not add to the grand total. What is wrong, and what is the fix?</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"region": ["n", "s", None, "n"], "rev": [10, 20, 30, 40]})
+print(df.groupby("region")["rev"].sum().sum(), df["rev"].sum())
+print(df.groupby("region", dropna=False)["rev"].sum().sum())</code></pre>
+<p><strong>Answer:</strong> the row with a missing region is dropped from the groupby by default, so the totals add to 70, not 100. Use <code>dropna=False</code> (a NaN group appears), or fill the key with a label such as "unknown" first, and then reconcile the totals.</p>
+<pre class="code lang-text"><code>70 100
+100</code></pre>
+<p class="problem"><span class="pl">Problem 17.P.18</span> (Hard) Translate to pandas: <code>SELECT dept, AVG(pay) AS avg_pay FROM emp GROUP BY dept HAVING COUNT(*) &gt;= 2 ORDER BY avg_pay DESC</code>.</p>
+<p><strong>Answer:</strong></p>
+<pre class="code lang-text"><code>(emp.groupby("dept").agg(avg_pay=("pay", "mean"), n=("pay", "size"))
+    .query("n &gt;= 2")
+    .sort_values("avg_pay", ascending=False)[["avg_pay"]])</code></pre>
+<p>HAVING becomes a filter on the aggregated table, so it comes after <code>agg</code>; the extra column <code>n</code> is needed to apply it and is dropped at the end.</p>
+<p class="problem"><span class="pl">Problem 17.P.19</span> (Hard) Two payment files should have equal amounts per invoice. Floats differ in the 10th decimal. How do you list true mismatches?</p>
+<p><strong>Answer:</strong> outer-merge on invoice with <code>indicator=True</code> and <code>validate="1:1"</code>, take rows where both sides exist, and keep those where <code>(a - b).abs() &gt; 0.005</code> (half a cent) or compare after <code>round(2)</code>. Never use <code>==</code> on floats for money. See Recipe 6 for the full code.</p>
+<p class="problem"><span class="pl">Problem 17.P.20</span> (Expert, what does this print?) Predict the three lines, then explain the second.</p>
+<pre class="code lang-python"><code>import pandas as pd
+
+df = pd.DataFrame({"a": [1, 2, 3]})
+v = df["a"]
+w = df.copy(deep=False)
+v.iloc[0] = 10
+w.loc[1, "a"] = 20
+print(df["a"].tolist())
+print(v.tolist(), w["a"].tolist())
+s = pd.Series(["x", None, "y"])
+print(s.dtype, s.isna().sum(), s.str.upper().tolist())</code></pre>
+<p><strong>Answer:</strong> with copy-on-write, neither write reaches <code>df</code>, so it stays [1, 2, 3]. <code>v</code> is [10, 2, 3] and <code>w</code> is [1, 20, 3]: each object copied on its own first write. The Series is the default <code>str</code> dtype with one missing value, and upper-casing keeps the missing value as NaN.</p>
+<pre class="code lang-text"><code>[1, 2, 3]
+[10, 2, 3] [1, 20, 3]
+str 1 ['X', nan, 'Y']</code></pre>
+<p class="problem"><span class="pl">Problem 17.P.21</span> (Expert, interview) Explain why <code>df.apply(f, axis=1)</code> is slow, and give three ways to avoid it with a concrete example for each.</p>
+<p><strong>Answer:</strong> <code>apply(axis=1)</code> builds a Series object for every row and calls a Python function once per row, so the work is dominated by interpreter overhead and object creation, not arithmetic. Alternatives: (1) vectorised column arithmetic, <code>df["a"] * df["b"]</code>; (2) <code>np.where</code>/<code>np.select</code> for if/else logic, <code>np.where(df.x &gt; 0, "pos", "neg")</code>; (3) <code>map</code> with a dict for recoding, or the <code>.str</code>/<code>.dt</code> accessors for text and dates. If real per-row logic remains, a list comprehension over <code>zip</code> of columns, or <code>itertuples()</code>, is much cheaper than <code>apply</code>.</p>
+<p class="problem"><span class="pl">Problem 17.P.22</span> (Expert) A cohort table shows retention above 100 percent for one cell. Name two likely causes in the code of Recipe 2 and the fix for each.</p>
+<p><strong>Answer:</strong> (1) Counting rows (<code>size</code>) instead of distinct customers (<code>nunique</code>): a customer with several orders in the same month counts several times. Fix: <code>nunique</code>. (2) Dividing by the wrong denominator, for example the cohort size taken from a different filter, or computing the cohort from a table that was already filtered to repeat buyers. Fix: derive cohort size from the age-0 column of the same pivot, as the recipe does with <code>counts.div(counts[0], axis=0)</code>. Sanity check: age 0 must be exactly 100 percent and no cell can exceed it.</p>
+<p class="problem"><span class="pl">Problem 17.P.23</span> (Expert, design) You must deduplicate and sum a 40 GB CSV of events on a 16 GB laptop. Sketch the approach and its limits.</p>
+<p><strong>Answer:</strong> stream with <code>read_csv(chunksize=..., usecols=..., dtype=...)</code>, aggregate each chunk, and combine partial results, as in the "bigger than memory" example; this is exact for sums and counts. Exact global deduplication needs all keys at once: if the set of distinct keys fits in memory, keep a set of seen keys across chunks; if not, partition the data by a hash of the key into several files first, then deduplicate each partition separately. Better still, convert to Parquet once (not run here) and use a tool built for it, such as DuckDB or Polars lazy mode. State clearly that pandas holds everything it processes in memory.</p>
+<p class="problem"><span class="pl">Problem 17.P.24</span> (Expert, find the bug) A monthly report uses <code>df.resample("M").sum()</code> and <code>df.applymap(str.strip)</code> and fails after upgrading to pandas 3.0. What changed?</p>
+<p><strong>Answer:</strong> the month alias <code>"M"</code> was replaced by <code>"ME"</code> (month end) and the old <code>applymap</code> was removed in favour of <code>DataFrame.map</code>. Fix: <code>df.resample("ME").sum()</code> and <code>df.map(str.strip)</code> (on text-only columns). General lesson: pin your pandas version in <code>requirements.txt</code>, run the test suite after upgrades, and read the release notes.</p>
+
+<h2>Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>&#10024; AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical pandas tutor. I am a working professional moving into data roles and I already know basic Python. Quiz me on pandas one question at a time, starting easy and getting harder: loc vs iloc, Boolean masks, missing data, groupby agg/transform/filter, merge with validate, pivot/melt, resample/rolling, dtypes and memory, and pandas 3.0 copy-on-write. After each answer tell me whether it is right, explain the idea in plain words, show a tiny runnable example, and then ask a harder follow-up. Keep a running score and finish with the three topics I should revise.</pre></div>
+<div class="prompt"><div class="ph"><span>&#10024; AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are a senior data engineer doing a code review. Below is my pandas code (pandas 3.0, NumPy 2). Review it for: wrong results (chained assignment, row-multiplying joins, NaN group keys, float equality, ambiguous dates), slow patterns (apply axis=1, iterrows, growing a DataFrame in a loop), memory waste (object or int64 where smaller dtypes fit), and readability (method chaining, named aggregation). For each issue give the line, why it is a problem, and a corrected snippet. Then list the checks (row counts, totals, uniqueness) I should add to prove the output is right. My code: [PASTE CODE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>&#10024; AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>Act as an interviewer for a data analyst or data scientist role. Run a 30-minute pandas mock interview. Ask me to predict the output of short snippets, find the bug in snippets, translate SQL (GROUP BY, HAVING, window functions, LEFT JOIN) into pandas, and design a pipeline for a file too large for memory. Ask one question at a time, wait for my answer, then give a score out of 10, the model answer, and the common wrong answer candidates give. At the end summarise my strengths and a 7-day plan to improve.</pre></div>

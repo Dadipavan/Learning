@@ -1,0 +1,732 @@
+<p>Your company sells groceries online. On Monday the analyst sends you a spreadsheet: three customers down the side, three products across the top, and in each cell the quantity bought. The finance team sends a second list: the price of each product. Your manager asks one question: "What did each customer pay?" You multiply, you add, you repeat for every row. That small piece of arithmetic is already a <strong>matrix times a vector</strong>, and once you see it that way you also see why the same idea runs a recommender system, a neural network layer, a PCA, and a linear regression.</p>
+<p>A matrix has two faces. The first face is a <strong>table of data</strong>: rows are things (customers, days, images), columns are measurements (products, features, pixels). That is what a pandas DataFrame is. The second face is a <strong>machine</strong>: you feed it a vector and it returns another vector. It can rotate a picture, stretch a cloud of points, squash three dimensions into two, or turn 784 pixel values into 128 learned features. The first face tells you how to store information. The second tells you what the information can do. Almost every confusing thing about matrices becomes simple once you keep both faces in mind.</p>
+<p>This chapter builds from the smallest example to the expert layer. By the end you will compute matrix products four different ways by hand, explain a determinant as "how much area is stretched", know when an inverse exists and why you almost never compute one, read the shape of every array in a neural network layer, spot the broadcasting bug that silently ruins a loss function, and know what a condition number is. You will need vectors from Chapter 5 (dot products and lengths) and the linear equations of Chapter 1. You will meet solving systems in depth in Chapter 7, eigenvalues in Chapter 8, and the SVD in Chapter 9.</p>
+
+<h2>6.1 A Matrix as a Table and as a Machine</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A matrix is a rectangle of numbers. Read it as a table when you want to store or look things up. Read it as a machine when you want to do something with it: "vector in, vector out". A spreadsheet that can move things.</div></div>
+<h3>Beginner: rows, columns and shapes</h3>
+<p>A <strong>matrix</strong> is a rectangular grid of numbers arranged in <strong>rows</strong> (horizontal) and <strong>columns</strong> (vertical). A matrix with m rows and n columns has <strong>shape</strong> m × n, said "m by n". Rows always come first. A single number is a 1 × 1 matrix, a row vector is 1 × n, and a column vector is m × 1. The entry in row i and column j is written A<sub>ij</sub>. In maths we count from 1, in Python from 0, so A<sub>12</sub> in maths is <code>A[0, 1]</code> in NumPy.</p>
+<div class="eq">A = <table class="mat"><tr><td>2</td><td>1</td><td>0</td></tr><tr><td>0</td><td>3</td><td>1</td></tr><tr><td>4</td><td>0</td><td>2</td></tr></table></div>
+<p>This is the grocery table. Each row is a customer, each column a product (apples, bread, milk). Its shape is 3 × 3. The entry A<sub>23</sub> = 1 means customer 2 bought one unit of milk. The row [4, 0, 2] says customer 3 bought 4 apples, no bread and 2 milk.</p>
+<p class="problem"><span class="pl">Problem 6.1.1</span> A matrix has 5 rows and 3 columns. What is its shape, how many entries does it hold, and what is its transpose's shape?</p>
+<table class="steps"><tr><th>Idea</th><td>Shape is rows × columns. Entry count is rows times columns. Transposing swaps rows and columns.</td></tr><tr><th>Compute</th><td>Shape 5 × 3. Entries 5 × 3 = 15. Transpose shape 3 × 5.</td></tr><tr><th>Check</th><td>A DataFrame of 5 customers and 3 products has 15 cells. Correct.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+orders = pd.DataFrame([[2, 1, 0], [0, 3, 1], [4, 0, 2]],
+                      index=["cust1", "cust2", "cust3"],
+                      columns=["apples", "bread", "milk"])
+A = orders.to_numpy()          # the matrix hiding inside the table
+print(A.shape, A.size, A.ndim)
+print("A[1, 2] =", A[1, 2])    # row 2, column 3 in maths counting
+print("row 3   =", A[2, :])
+print("column 1=", A[:, 0])
+print(orders.loc["cust2", "milk"])</code></pre>
+<pre class="code lang-text"><code>(3, 3) 9 2
+A[1, 2] = 1
+row 3   = [4 0 2]
+column 1= [2 0 4]
+1</code></pre>
+<p>Line by line: <code>to_numpy()</code> strips the labels and leaves the bare numbers. <code>A[2, :]</code> means "row index 2, all columns". <code>A[:, 0]</code> means "all rows, column index 0". The DataFrame keeps names, the matrix keeps only positions. Matrix algebra works on positions, so you must keep track of what each column means yourself.</p>
+<h3>Intermediate: the special matrices you will meet everywhere</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>Definition</th><th>Why you care</th></tr></thead><tbody>
+<tr><td>Zero matrix 0</td><td>All entries 0</td><td>A + 0 = A. Starting point for accumulations.</td></tr>
+<tr><td>Identity I</td><td>1 on the diagonal, 0 elsewhere</td><td>I x = x. It does nothing, like multiplying by 1.</td></tr>
+<tr><td>Diagonal</td><td>Non-zero only on the diagonal</td><td>Stretches each axis separately. Scaling features.</td></tr>
+<tr><td>Triangular</td><td>All zeros above (lower) or below (upper) the diagonal</td><td>Easy to solve. LU and Cholesky use them.</td></tr>
+<tr><td>Symmetric</td><td>Aᵀ = A, so A<sub>ij</sub> = A<sub>ji</sub></td><td>Covariance, correlation, Hessian, Gram matrices.</td></tr>
+<tr><td>Orthogonal</td><td>QᵀQ = I (columns are unit length and perpendicular)</td><td>Rotations and reflections. Keeps lengths. Inverse is the transpose.</td></tr>
+<tr><td>Permutation</td><td>One 1 in each row and column, rest 0</td><td>Reorders rows or columns. Shuffling.</td></tr>
+</tbody></table></div>
+<pre class="code lang-python"><code>import numpy as np
+
+x = np.array([1, 10, 100])
+D = np.diag([2, 3, 5])                 # diagonal: scales each coordinate
+print("D @ x =", D @ x)
+
+U = np.triu(np.array([[1, 2, 3], [4, 5, 6], [7, 8, 9]]))   # upper triangular
+print(U)
+
+M = np.array([[1, 2], [3, 4]])
+S = M + M.T                            # any M + M^T is symmetric
+print(S, np.array_equal(S, S.T))
+
+Q = np.array([[0, -1], [1, 0]])        # rotation by 90 degrees
+print(Q.T @ Q)                         # identity, so Q is orthogonal
+
+P = np.array([[0, 1, 0], [0, 0, 1], [1, 0, 0]])   # permutation
+print("P @ x =", P @ x)</code></pre>
+<pre class="code lang-text"><code>D @ x = [  2  30 500]
+[[1 2 3]
+ [0 5 6]
+ [0 0 9]]
+[[2 5]
+ [5 8]] True
+[[1 0]
+ [0 1]]
+P @ x = [ 10 100   1]</code></pre>
+<p>Read the permutation: row 1 of P has its 1 in column 2, so the first output is x<sub>2</sub> = 10. Row 2 picks x<sub>3</sub> = 100, row 3 picks x<sub>1</sub> = 1. The result is [10, 100, 1].</p>
+<h3>Adding and scaling</h3>
+<p>You add two matrices <strong>of the same shape</strong> entry by entry, and you scale a matrix by multiplying every entry by the number.</p>
+<p class="problem"><span class="pl">Problem 6.1.2</span> Weekly sales: week 1 is A = [[2, 1], [0, 3]], week 2 is B = [[1, 4], [2, 2]] (rows are stores, columns are products). Find the total A + B and the weekly average (A + B) / 2.</p>
+<table class="steps"><tr><th>Step 1</th><td>Add entry by entry: [[2+1, 1+4], [0+2, 3+2]] = [[3, 5], [2, 5]].</td></tr><tr><th>Step 2</th><td>Scale by 1/2: [[1.5, 2.5], [1, 2.5]].</td></tr><tr><th>Check</th><td>Store 1 sold 2 + 1 = 3 units of product 1 over two weeks. Half of 3 is 1.5. Correct.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+A = np.array([[2, 1], [0, 3]])
+B = np.array([[1, 4], [2, 2]])
+print(A + B)
+print((A + B) / 2)</code></pre>
+<pre class="code lang-text"><code>[[3 5]
+ [2 5]]
+[[1.5 2.5]
+ [1.  2.5]]</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using <code>*</code> for matrix multiplication. In NumPy, <code>A * B</code> multiplies entry by entry (the Hadamard product). Wrong: <code>A * B</code> for the example above gives [[2, 4], [0, 6]]. Right: matrix multiplication is <code>A @ B</code>, which you meet next and which gives [[4, 10], [6, 6]]. Similarly <code>A ** 2</code> squares each entry; it is not A times A.</div></div>
+<h3>Going deeper</h3>
+<p>Every matrix is a function. If A is m × n, then x ↦ Ax takes a vector with n entries to a vector with m entries. The key property is <strong>linearity</strong>: A(x + y) = Ax + Ay and A(cx) = c(Ax). Conversely, every linear function from n numbers to m numbers is some m × n matrix. That is why "matrix" and "linear transformation" are two names for one idea, and why this chapter has both words in its title.</p>
+<p>In data work you constantly move between the two faces. <code>df.to_numpy()</code> goes from table to matrix. A feature matrix X has shape (n_samples, n_features): samples are rows. A common source of bugs is mixing this with libraries that put samples in columns, so always print <code>.shape</code> before multiplying. Also note that NumPy has an old <code>np.matrix</code> class; avoid it and use ordinary 2-D arrays, where <code>@</code> means matrix product and <code>*</code> means entrywise product.</p>
+
+<h2>6.2 Matrix Products and the Transpose</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Multiplying a matrix by a vector is a bulk operation: many dot products at once, or equivalently, a recipe that blends the matrix columns. Matrix times matrix is just that done to several vectors side by side.</div></div>
+<h3>Beginner: matrix times vector, two pictures</h3>
+<p>Return to the grocery story. A is the 3 × 3 order table and p = [1.5, 2, 0.8] holds the prices per unit (apple, bread, milk). Each customer's bill is a dot product of their row with the price vector.</p>
+<div class="eq">A p = <table class="mat"><tr><td>2</td><td>1</td><td>0</td></tr><tr><td>0</td><td>3</td><td>1</td></tr><tr><td>4</td><td>0</td><td>2</td></tr></table> <table class="mat"><tr><td>1.5</td></tr><tr><td>2</td></tr><tr><td>0.8</td></tr></table></div>
+<p><strong>Rows view.</strong> Row by row, take the dot product:</p>
+<div class="eq">customer 1: 2·1.5 + 1·2 + 0·0.8 = 3 + 2 + 0 = 5.0</div>
+<div class="eq">customer 2: 0·1.5 + 3·2 + 1·0.8 = 0 + 6 + 0.8 = 6.8</div>
+<div class="eq">customer 3: 4·1.5 + 0·2 + 2·0.8 = 6 + 0 + 1.6 = 7.6</div>
+<p><strong>Columns view.</strong> Treat each column of A as a vector and the entries of p as the mixing amounts:</p>
+<div class="eq">A p = 1.5·<table class="mat"><tr><td>2</td></tr><tr><td>0</td></tr><tr><td>4</td></tr></table> + 2·<table class="mat"><tr><td>1</td></tr><tr><td>3</td></tr><tr><td>0</td></tr></table> + 0.8·<table class="mat"><tr><td>0</td></tr><tr><td>1</td></tr><tr><td>2</td></tr></table> = <table class="mat"><tr><td>3</td></tr><tr><td>0</td></tr><tr><td>6</td></tr></table> + <table class="mat"><tr><td>2</td></tr><tr><td>6</td></tr><tr><td>0</td></tr></table> + <table class="mat"><tr><td>0</td></tr><tr><td>0.8</td></tr><tr><td>1.6</td></tr></table> = <table class="mat"><tr><td>5</td></tr><tr><td>6.8</td></tr><tr><td>7.6</td></tr></table></div>
+<p>The same answer, a different story. The rows view says "each output is a dot product". The columns view says "the output is a <em>linear combination of the columns</em>, with weights from the vector". The second view is the key to understanding rank, column space and linear transformations, so make it a habit.</p>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">For an m × n matrix A and a vector x with n entries: <strong>Ax = x<sub>1</sub>·(column 1) + x<sub>2</sub>·(column 2) + ... + x<sub>n</sub>·(column n)</strong>. The output always lives in the span of the columns of A. If A has only 2 independent columns, no x can ever produce an output outside that 2-dimensional flat sheet.</div></div>
+<pre class="code lang-python"><code>import numpy as np
+A = np.array([[2, 1, 0], [0, 3, 1], [4, 0, 2]])
+p = np.array([1.5, 2.0, 0.8])
+
+print("A @ p       =", A @ p)
+rows_view = np.array([A[i, :] @ p for i in range(3)])
+cols_view = p[0] * A[:, 0] + p[1] * A[:, 1] + p[2] * A[:, 2]
+print("rows view   =", rows_view)
+print("columns view=", cols_view)</code></pre>
+<pre class="code lang-text"><code>A @ p       = [5.  6.8 7.6]
+rows view   = [5.  6.8 7.6]
+columns view= [5.  6.8 7.6]</code></pre>
+<h3>Intermediate: the definition and shape rule</h3>
+<p>If A is m × n and B is n × p, the product C = AB is m × p, with</p>
+<div class="eq">C<sub>ij</sub> = A<sub>i1</sub>B<sub>1j</sub> + A<sub>i2</sub>B<sub>2j</sub> + ... + A<sub>in</sub>B<sub>nj</sub> = ∑<sub>k</sub> A<sub>ik</sub> B<sub>kj</sub></div>
+<p>In words: entry (i, j) of the product is the dot product of row i of A with column j of B. This requires the <strong>inner dimensions to match</strong> (the two n's). The outer dimensions give the result: (m × <strong>n</strong>)(<strong>n</strong> × p) → m × p.</p>
+<p class="problem"><span class="pl">Problem 6.2.1 (the four ways to see one product)</span> Let A = [[1, 2], [3, 4]] and B = [[5, 6], [7, 8]]. Compute AB in four ways.</p>
+<table class="steps">
+<tr><th>Way 1: dot products</th><td>(1,1): 1·5 + 2·7 = 5 + 14 = 19. (1,2): 1·6 + 2·8 = 6 + 16 = 22. (2,1): 3·5 + 4·7 = 15 + 28 = 43. (2,2): 3·6 + 4·8 = 18 + 32 = 50. So AB = [[19, 22], [43, 50]].</td></tr>
+<tr><th>Way 2: column combinations</th><td>Column j of AB is A times column j of B. Column 1: A[5, 7] = 5·[1, 3] + 7·[2, 4] = [5, 15] + [14, 28] = [19, 43]. Column 2: A[6, 8] = 6·[1, 3] + 8·[2, 4] = [6, 18] + [16, 32] = [22, 50].</td></tr>
+<tr><th>Way 3: row combinations</th><td>Row i of AB is row i of A times B, a blend of the rows of B. Row 1: 1·[5, 6] + 2·[7, 8] = [5, 6] + [14, 16] = [19, 22]. Row 2: 3·[5, 6] + 4·[7, 8] = [15, 18] + [28, 32] = [43, 50].</td></tr>
+<tr><th>Way 4: sum of outer products</th><td>(column k of A)(row k of B), summed over k. k=1: [1, 3]ᵀ[5, 6] = [[5, 6], [15, 18]]. k=2: [2, 4]ᵀ[7, 8] = [[14, 16], [28, 32]]. Sum: [[19, 22], [43, 50]].</td></tr>
+<tr><th>Check</th><td>All four give [[19, 22], [43, 50]].</td></tr>
+</table>
+<pre class="code lang-python"><code>import numpy as np
+A = np.array([[1, 2], [3, 4]])
+B = np.array([[5, 6], [7, 8]])
+
+way1 = np.array([[A[i, :] @ B[:, j] for j in range(2)] for i in range(2)])
+way2 = np.column_stack([A @ B[:, j] for j in range(2)])
+way3 = np.vstack([A[i, :] @ B for i in range(2)])
+way4 = sum(np.outer(A[:, k], B[k, :]) for k in range(2))
+print(way1); print(np.array_equal(way1, way2), np.array_equal(way1, way3), np.array_equal(way1, way4))
+print(np.array_equal(way1, A @ B))</code></pre>
+<pre class="code lang-text"><code>[[19 22]
+ [43 50]]
+True True True
+True</code></pre>
+<p>Which view when? Dot products when computing one entry. Column combinations when asking "what can this matrix produce?". Row combinations when doing row operations (Gaussian elimination, Chapter 7). Outer products when thinking of data: the product XᵀX is a sum of one outer product per sample, which is why covariance can be accumulated from a stream of data.</p>
+<h3>Non-commutative, but associative</h3>
+<p>With the same A and B compute BA: entry (1,1) is 5·1 + 6·3 = 23, (1,2) is 5·2 + 6·4 = 34, (2,1) is 7·1 + 8·3 = 31, (2,2) is 7·2 + 8·4 = 46. So BA = [[23, 34], [31, 46]], which is not AB = [[19, 22], [43, 50]]. Order matters. Often one order is not even defined: a (2 × 3) times (3 × 4) works, but (3 × 4) times (2 × 3) does not. Fortunately multiplication is <strong>associative</strong>, (AB)C = A(BC), and <strong>distributive</strong>, A(B + C) = AB + AC. Associativity lets you choose the cheapest bracketing (Section 6.6).</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Assuming AB = BA, or that AB = 0 forces A = 0 or B = 0. Wrong thinking: "like numbers, if xy = 0 then x = 0 or y = 0". Counter-example: A = [[1, 0], [0, 0]] and B = [[0, 0], [0, 1]]. Both are non-zero, yet AB = [[1·0 + 0·0, 1·0 + 0·1], [0, 0]] = [[0, 0], [0, 0]]. Right: matrices have "zero divisors", and AB ≠ BA in general. Also, <code>A ** 2</code> in NumPy is not A·A: for A = [[1, 2], [3, 4]], <code>A ** 2</code> = [[1, 4], [9, 16]] but A @ A = [[7, 10], [15, 22]].</div></div>
+<pre class="code lang-python"><code>import numpy as np
+A = np.array([[1, 2], [3, 4]]); B = np.array([[5, 6], [7, 8]])
+print(A @ B); print(B @ A)
+E1 = np.array([[1, 0], [0, 0]]); E2 = np.array([[0, 0], [0, 1]])
+print(E1 @ E2)
+print(A ** 2); print(A @ A)</code></pre>
+<pre class="code lang-text"><code>[[19 22]
+ [43 50]]
+[[23 34]
+ [31 46]]
+[[0 0]
+ [0 0]]
+[[ 1  4]
+ [ 9 16]]
+[[ 7 10]
+ [15 22]]</code></pre>
+<h3>The transpose and its rules</h3>
+<p>The <strong>transpose</strong> Aᵀ flips a matrix over its diagonal: row i becomes column i, so (Aᵀ)<sub>ij</sub> = A<sub>ji</sub> and an m × n matrix becomes n × m. For A = [[1, 2], [3, 4], [5, 6]] (3 × 2), Aᵀ = [[1, 3, 5], [2, 4, 6]] (2 × 3). The rules:</p>
+<ul><li>(Aᵀ)ᵀ = A</li><li>(A + B)ᵀ = Aᵀ + Bᵀ and (cA)ᵀ = cAᵀ</li><li><strong>(AB)ᵀ = BᵀAᵀ</strong> (order reverses, like taking off shoes and socks)</li><li>(A⁻¹)ᵀ = (Aᵀ)⁻¹ when the inverse exists</li><li>The dot product is a matrix product: x · y = xᵀy</li></ul>
+<p class="problem"><span class="pl">Problem 6.2.2</span> With A and B as above, verify (AB)ᵀ = BᵀAᵀ and show that AᵀBᵀ is different.</p>
+<table class="steps"><tr><th>Step 1</th><td>AB = [[19, 22], [43, 50]], so (AB)ᵀ = [[19, 43], [22, 50]].</td></tr><tr><th>Step 2</th><td>Bᵀ = [[5, 7], [6, 8]], Aᵀ = [[1, 3], [2, 4]]. BᵀAᵀ: (1,1) = 5·1 + 7·2 = 19; (1,2) = 5·3 + 7·4 = 43; (2,1) = 6·1 + 8·2 = 22; (2,2) = 6·3 + 8·4 = 50. So BᵀAᵀ = [[19, 43], [22, 50]]. Equal to (AB)ᵀ.</td></tr><tr><th>Step 3</th><td>AᵀBᵀ: (1,1) = 1·5 + 3·6 = 23; (1,2) = 1·7 + 3·8 = 31; (2,1) = 2·5 + 4·6 = 34; (2,2) = 2·7 + 4·8 = 46. This is [[23, 31], [34, 46]], not equal to (AB)ᵀ.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Writing (AB)ᵀ = AᵀBᵀ. Wrong: gives [[23, 31], [34, 46]] in the example. Right: (AB)ᵀ = BᵀAᵀ = [[19, 43], [22, 50]]. For rectangular matrices the wrong version is often not even defined, which is a hint: A (3 × 2) times B (2 × 4) is fine, Aᵀ (2 × 3) times Bᵀ (4 × 2) is not.</div></div>
+<p class="problem"><span class="pl">Problem 6.2.3 (the Gram matrix)</span> A data matrix X has 3 samples and 2 features: X = [[1, 2], [3, 4], [5, 6]]. Compute XᵀX and say what its shape and symmetry tell you.</p>
+<table class="steps"><tr><th>Shape</th><td>Xᵀ is 2 × 3, X is 3 × 2, so XᵀX is 2 × 2: one row and column per feature, whatever the number of samples.</td></tr><tr><th>Compute</th><td>(1,1) = 1² + 3² + 5² = 35. (1,2) = 1·2 + 3·4 + 5·6 = 2 + 12 + 30 = 44. (2,2) = 2² + 4² + 6² = 4 + 16 + 36 = 56. (2,1) = (1,2) = 44.</td></tr><tr><th>Answer</th><td>XᵀX = [[35, 44], [44, 56]]. It is symmetric because (XᵀX)ᵀ = Xᵀ(Xᵀ)ᵀ = XᵀX. Entry (i, j) is the dot product of feature column i with feature column j.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+X = np.array([[1, 2], [3, 4], [5, 6]])
+G = X.T @ X
+print(G, G.shape, np.array_equal(G, G.T))
+A = X; B = np.array([[1, 0, 2, 1], [0, 1, 1, 3]])
+print((A @ B).shape, ((A @ B).T == B.T @ A.T).all())</code></pre>
+<pre class="code lang-text"><code>[[35 44]
+ [44 56]] (2, 2) True
+(3, 4) True</code></pre>
+<h3>Going deeper</h3>
+<p>Why does (AB)ᵀ reverse the order? Compare entries: ((AB)ᵀ)<sub>ij</sub> = (AB)<sub>ji</sub> = ∑<sub>k</sub> A<sub>jk</sub>B<sub>ki</sub> = ∑<sub>k</sub> (Bᵀ)<sub>ik</sub>(Aᵀ)<sub>kj</sub> = (BᵀAᵀ)<sub>ij</sub>. That is a complete proof, and the same index trick proves most matrix identities. In machine learning, XᵀX (features by features) appears in the normal equations of regression, and XXᵀ (samples by samples) appears in kernel methods. The Gram matrix XᵀX is always <strong>positive semi-definite</strong>: for any vector v, vᵀXᵀXv = (Xv)ᵀ(Xv) = |Xv|² ≥ 0. You will use this fact in Chapters 8, 9 and 12.</p>
+<div class="callout cream"><div class="lab">INTERVIEW</div><div class="txt">"If A is 3 × 4 and B is 4 × 5, what are the shapes of AB, and is BA defined?" AB is 3 × 5. BA would need the inner dimensions 5 and 3 to match, so it is undefined. Follow-up: "Is matrix multiplication commutative, associative?" Not commutative, yes associative.</div></div>
+
+<h2>6.3 The Geometry of 2×2 Transformations</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Imagine the plane printed on a sheet of stretchy graph paper. A 2 × 2 matrix grabs the sheet and moves it, keeping the origin pinned and keeping grid lines straight, parallel and evenly spaced. Rotations, stretches, shears, flips and flattening are all of this kind.</div></div>
+<h3>Beginner: the columns tell you everything</h3>
+<p>Two special vectors span the plane: e<sub>1</sub> = [1, 0] (one step right) and e<sub>2</sub> = [0, 1] (one step up). Any point [x, y] equals x·e<sub>1</sub> + y·e<sub>2</sub>. By the columns view of Section 6.2, A[x, y] = x·(column 1) + y·(column 2). So <strong>column 1 of A is where e<sub>1</sub> lands, and column 2 is where e<sub>2</sub> lands</strong>. Once you know where the two basis arrows land, the whole sheet is determined, because every grid square is built from them.</p>
+<p>To design a transformation, decide where e<sub>1</sub> and e<sub>2</sub> go, and write those two landing points as columns. Example: send e<sub>1</sub> → [0, 1] and e<sub>2</sub> → [−1, 0]. The matrix is [[0, −1], [1, 0]], a 90 degree counter-clockwise rotation. Test on the point [2, 1]: 2·[0, 1] + 1·[−1, 0] = [0, 2] + [−1, 0] = [−1, 2]. Plot it: [2, 1] turned a quarter-turn anticlockwise around the origin is indeed [−1, 2].</p>
+<figure><img src="images/ch06_transforms.png" alt="Top row: the original grid, unit square and unit circle repeated five times. Bottom row: after rotation, scaling, shear, reflection and projection." loading="lazy"/><figcaption>Five basic transformations. The unit square (orange) and unit circle (blue) show what each matrix does. The red arrow is the image of e<sub>1</sub>, the teal arrow the image of e<sub>2</sub>; they are exactly the columns of the matrix.</figcaption></figure>
+<p>How to read it: the top row is the starting picture. In each bottom panel, find the red and teal arrows first and read off the matrix columns. Then see what happened to the square and circle. Rotation keeps shape and size. Scaling turns the circle into an ellipse. Shear slides the top of the square sideways while the bottom stays fixed. Reflection flips the picture over an axis. Projection flattens everything onto a line: the square becomes a segment, which means information was destroyed.</p>
+<h3>Intermediate: the standard transformations</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Transformation</th><th>Matrix</th><th>Effect on [x, y]</th><th>det</th></tr></thead><tbody>
+<tr><td>Rotation by θ (anticlockwise)</td><td>[[cos θ, −sin θ], [sin θ, cos θ]]</td><td>Turns by θ, lengths kept</td><td>1</td></tr>
+<tr><td>Scaling by (a, b)</td><td>[[a, 0], [0, b]]</td><td>[ax, by]</td><td>ab</td></tr>
+<tr><td>Horizontal shear by k</td><td>[[1, k], [0, 1]]</td><td>[x + ky, y]</td><td>1</td></tr>
+<tr><td>Reflection in the x-axis</td><td>[[1, 0], [0, −1]]</td><td>[x, −y]</td><td>−1</td></tr>
+<tr><td>Reflection in the line y = x</td><td>[[0, 1], [1, 0]]</td><td>[y, x]</td><td>−1</td></tr>
+<tr><td>Projection onto the x-axis</td><td>[[1, 0], [0, 0]]</td><td>[x, 0]</td><td>0</td></tr>
+<tr><td>Projection onto the line with unit direction u</td><td>uuᵀ</td><td>The shadow of the point on the line</td><td>0</td></tr>
+</tbody></table></div>
+<p class="problem"><span class="pl">Problem 6.3.1</span> Apply (a) rotation by 30 degrees to [2, 0], (b) shear with k = 1 to [1, 2], (c) projection onto the line through [1, 1] to [3, 1].</p>
+<table class="steps">
+<tr><th>(a)</th><td>cos 30° = √3/2 ≈ 0.8660, sin 30° = 0.5. R[2, 0] = 2·(first column) = 2·[0.8660, 0.5] = [1.7321, 1.0]. Length check: √(1.7321² + 1²) = √(3 + 1) = 2. Length kept.</td></tr>
+<tr><th>(b)</th><td>[[1, 1], [0, 1]] times [1, 2]: first entry 1·1 + 1·2 = 3, second 0·1 + 1·2 = 2. Result [3, 2]. The height y = 2 is untouched and x moved by k·y = 2.</td></tr>
+<tr><th>(c)</th><td>Unit direction u = [1, 1]/√2. uuᵀ = (1/2)[[1, 1], [1, 1]] = [[0.5, 0.5], [0.5, 0.5]]. Times [3, 1]: 0.5·3 + 0.5·1 = 2 and the same for the second entry, so [2, 2]. The leftover [3, 1] − [2, 2] = [1, −1] is perpendicular to u (dot product 1·1 + (−1)·1 = 0), as a shadow should be.</td></tr>
+</table>
+<pre class="code lang-python"><code>import numpy as np
+th = np.deg2rad(30)
+R = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+print(np.round(R @ [2, 0], 4), np.linalg.norm(R @ [2, 0]))
+
+S = np.array([[1, 1], [0, 1]])
+print(S @ [1, 2])
+
+u = np.array([1, 1]) / np.sqrt(2)
+P = np.outer(u, u)                        # projection matrix u u^T
+print(np.round(P, 2).tolist(), np.round(P @ [3, 1], 4))
+print(np.allclose(P @ P, P))              # projecting twice = projecting once</code></pre>
+<pre class="code lang-text"><code>[1.7321 1.    ] 2.0
+[3 2]
+[[0.5, 0.5], [0.5, 0.5]] [2. 2.]
+True</code></pre>
+<p>The last line shows a hallmark of projections: P² = P (<strong>idempotent</strong>). Once flattened onto the line, a second flattening changes nothing.</p>
+<h3>Composition is matrix multiplication</h3>
+<p>Apply S first, then R. The point x becomes Sx, then R(Sx). Because matrix multiplication is associative, R(Sx) = (RS)x. So the single matrix <strong>RS performs "S then R"</strong>. Read products right to left, the way you read nested functions f(g(x)).</p>
+<p class="problem"><span class="pl">Problem 6.3.2 (order matters)</span> Let R = [[0, −1], [1, 0]] (rotate 90 degrees) and S = [[1, 1], [0, 1]] (shear, k = 1). Find RS and SR and apply both to the roof tip [0.5, 1.5] of a little house shape.</p>
+<table class="steps">
+<tr><th>RS (shear, then rotate)</th><td>(1,1) = 0·1 + (−1)·0 = 0. (1,2) = 0·1 + (−1)·1 = −1. (2,1) = 1·1 + 0·0 = 1. (2,2) = 1·1 + 0·1 = 1. So RS = [[0, −1], [1, 1]].</td></tr>
+<tr><th>SR (rotate, then shear)</th><td>(1,1) = 1·0 + 1·1 = 1. (1,2) = 1·(−1) + 1·0 = −1. (2,1) = 0·0 + 1·1 = 1. (2,2) = 0·(−1) + 1·0 = 0. So SR = [[1, −1], [1, 0]].</td></tr>
+<tr><th>Apply to the tip</th><td>RS [0.5, 1.5] = [0·0.5 − 1·1.5, 1·0.5 + 1·1.5] = [−1.5, 2]. SR [0.5, 1.5] = [1·0.5 − 1·1.5, 1·0.5 + 0·1.5] = [−1, 0.5].</td></tr>
+<tr><th>Meaning</th><td>Different end points, so RS ≠ SR. The picture below shows both routes.</td></tr>
+</table>
+<figure><img src="images/ch06_compose.png" alt="A house shape shown after shear then rotation, and after rotation then shear, ending in different places." loading="lazy"/><figcaption>The same two operations in opposite orders give different shapes. Red dot: the roof tip.</figcaption></figure>
+<p>How to read it: the first panel is the original house. Panels 2 and 3 show shear first and then rotation, which is the matrix product RS. Panels 4 and 5 show rotation first and then shear, the product SR. The tip ends at [−1.5, 2] in panel 3 and at [−1, 0.5] in panel 5, matching the hand calculation.</p>
+<pre class="code lang-python"><code>import numpy as np
+R = np.array([[0, -1], [1, 0]])
+S = np.array([[1, 1], [0, 1]])
+tip = np.array([0.5, 1.5])
+print(R @ S); print(S @ R)
+print(R @ (S @ tip), (R @ S) @ tip)        # same: associativity
+print(S @ (R @ tip))</code></pre>
+<pre class="code lang-text"><code>[[ 0 -1]
+ [ 1  1]]
+[[ 1 -1]
+ [ 1  0]]
+[-1.5  2. ] [-1.5  2. ]
+[-1.   0.5]</code></pre>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">A pipeline of linear steps is a product of matrices, written in reverse order of application: "first A, then B, then C" is CBA. In practice, multiply the matrices once and apply the single result to a million points.</div></div>
+<h3>Going deeper</h3>
+<p><strong>Rotations are orthogonal.</strong> For R(θ), RᵀR = I, so the inverse of a rotation is its transpose, which is the rotation by −θ. Orthogonal matrices keep lengths and angles, so they are the "rigid motions". In deep learning, orthogonal weight initialisation exploits this: signals neither explode nor shrink as they pass through layers.</p>
+<p><strong>Translation is not linear</strong> (the origin moves), but you can still use a matrix by adding a dummy coordinate equal to 1 (<strong>homogeneous coordinates</strong>). Moving [2, 3] by [5, −1]: multiply [2, 3, 1] by [[1, 0, 5], [0, 1, −1], [0, 0, 1]] to get [2 + 5, 3 − 1, 1] = [7, 2, 1]. Graphics engines and robotics chain such 3 × 3 (and 4 × 4) matrices to move cameras. This is exactly the "column of ones for the intercept" trick of linear regression: the intercept is a translation.</p>
+<p><strong>Any 2 × 2 matrix</strong> is a combination of these basic moves (a rotation, a stretch along perpendicular axes, and another rotation: the SVD of Chapter 9). Applying a matrix to the unit circle always gives an ellipse (or a line segment, or a point if it is degenerate); its axes will turn out to be the singular vectors.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reading a transformation matrix by rows. The columns are the images of the basis vectors. Wrong: for the shear [[1, 2], [0, 1]], saying "e<sub>1</sub> goes to [1, 2]". Right: e<sub>1</sub> = [1, 0] goes to the first column [1, 0] (unchanged), and e<sub>2</sub> = [0, 1] goes to the second column [2, 1].</div></div>
+
+<h2>6.4 Determinant and Trace</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A transformation stretches some regions and squeezes others, but for a linear one it stretches <em>every</em> region by the same factor. That one number is the determinant. If it is 3, every area triples. If it is negative, the picture is flipped like a mirror image. If it is 0, the picture is flattened and cannot be un-flattened.</div></div>
+<h3>Beginner: area of the squashed square</h3>
+<p>The unit square has area 1. Under a matrix, it becomes the parallelogram spanned by the two columns. Take A = [[2, 1], [0, 1.5]]. Column 1 = [2, 0] is a flat arrow of length 2. Column 2 = [1, 1.5] leans right and goes up 1.5. The parallelogram has base 2 and height 1.5, so area 2 × 1.5 = 3. That area is the <strong>determinant</strong>: det A = 3.</p>
+<figure><img src="images/ch06_det.png" alt="Three panels showing the unit square mapped to a parallelogram of area 3, to itself with swapped axes, and to a line segment." loading="lazy"/><figcaption>Left: det = 3, area triples. Middle: the swap matrix has det = −1, the square lands on itself but with e<sub>1</sub> and e<sub>2</sub> exchanged (the orientation flips). Right: a singular matrix with det = 0 collapses the square to a line.</figcaption></figure>
+<p>How to read it: in each panel the grey square is the starting shape and the orange shape is its image. The red arrow is column 1, the teal arrow is column 2. In the middle panel the arrows have swapped places, which is the flip. In the right panel the two arrows point along the same line, so the area is zero.</p>
+<h3>Intermediate: formulas</h3>
+<p>For a 2 × 2 matrix:</p>
+<div class="eq">det <table class="mat"><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table> = ad − bc</div>
+<p>For a 3 × 3 matrix, expand along the first row, with alternating signs (+, −, +) times the 2 × 2 determinant left when you cross out the row and column of each entry:</p>
+<div class="eq">det <table class="mat"><tr><td>a</td><td>b</td><td>c</td></tr><tr><td>d</td><td>e</td><td>f</td></tr><tr><td>g</td><td>h</td><td>i</td></tr></table> = a(ei − fh) − b(di − fg) + c(dh − eg)</div>
+<p class="problem"><span class="pl">Problem 6.4.1</span> Find det [[3, 1], [2, 4]], det [[2, 1], [4, 2]] and det [[0, 1], [1, 0]]. Interpret each.</p>
+<table class="steps"><tr><th>First</th><td>3·4 − 1·2 = 12 − 2 = 10. Areas grow tenfold.</td></tr><tr><th>Second</th><td>2·2 − 1·4 = 4 − 4 = 0. The second column [1, 2] is half of the first column [2, 4]: they are parallel, the square collapses to a line. The matrix is <strong>singular</strong>.</td></tr><tr><th>Third</th><td>0·0 − 1·1 = −1. Area kept, orientation flipped (this swaps x and y: a reflection in the line y = x).</td></tr></table>
+<p class="problem"><span class="pl">Problem 6.4.2 (a 3 × 3 determinant)</span> Compute det of [[2, 0, 1], [1, 3, 2], [1, 1, 4]] by expansion and check with the Sarrus rule.</p>
+<table class="steps">
+<tr><th>Expansion</th><td>2·(3·4 − 2·1) − 0·(1·4 − 2·1) + 1·(1·1 − 3·1) = 2·10 − 0·2 + 1·(−2) = 20 − 0 − 2 = 18.</td></tr>
+<tr><th>Sarrus check</th><td>Down-right diagonals: 2·3·4 + 0·2·1 + 1·1·1 = 24 + 0 + 1 = 25. Up-right diagonals: 1·3·1 + 2·2·1 + 0·1·4 = 3 + 4 + 0 = 7. 25 − 7 = 18.</td></tr>
+<tr><th>Meaning</th><td>Volumes in 3-D are multiplied by 18, and the orientation is kept (positive).</td></tr>
+</table>
+<pre class="code lang-python"><code>import numpy as np
+print(np.linalg.det(np.array([[3, 1], [2, 4]])))
+print(np.linalg.det(np.array([[2, 1], [4, 2]])))
+print(np.linalg.det(np.array([[0, 1], [1, 0]])))
+M = np.array([[2, 0, 1], [1, 3, 2], [1, 1, 4]])
+print(round(np.linalg.det(M), 6))</code></pre>
+<pre class="code lang-text"><code>10.000000000000002
+0.0
+-1.0
+18.0</code></pre>
+<p>Computers return floats, so expect 10.000000000000002 or 17.999999999999996 style answers; round when you compare.</p>
+<h3>Properties you will use</h3>
+<ul>
+<li><strong>det(AB) = det(A) det(B)</strong>: two stretches multiply. Hence det(A⁻¹) = 1/det(A).</li>
+<li>det(Aᵀ) = det(A).</li>
+<li>det(cA) = cⁿ det(A) for an n × n matrix (every one of the n dimensions is scaled by c).</li>
+<li>Swapping two rows flips the sign. Adding a multiple of one row to another changes nothing. A row of zeros, or two equal rows, gives 0.</li>
+<li>For a triangular (or diagonal) matrix, det = product of the diagonal entries.</li>
+<li>A square matrix has an inverse exactly when det ≠ 0.</li>
+</ul>
+<p class="problem"><span class="pl">Problem 6.4.3</span> Using A = [[1, 2], [3, 4]] and B = [[5, 6], [7, 8]] check det(AB) = det(A)det(B), det(2A) = 4 det(A), and see that det(A + B) ≠ det(A) + det(B).</p>
+<table class="steps"><tr><th>det A, det B</th><td>1·4 − 2·3 = −2. 5·8 − 6·7 = 40 − 42 = −2.</td></tr><tr><th>det(AB)</th><td>AB = [[19, 22], [43, 50]]. det = 19·50 − 22·43 = 950 − 946 = 4. And (−2)(−2) = 4. ✓</td></tr><tr><th>det(2A)</th><td>2A = [[2, 4], [6, 8]]. det = 16 − 24 = −8. And 2² · (−2) = −8. ✓</td></tr><tr><th>det(A + B)</th><td>A + B = [[6, 8], [10, 12]]. det = 72 − 80 = −8. But det A + det B = −4. Not equal.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+A = np.array([[1, 2], [3, 4]]); B = np.array([[5, 6], [7, 8]])
+d = lambda M: round(np.linalg.det(M), 6)
+print(d(A @ B), d(A) * d(B))
+print(d(2 * A), 2 ** 2 * d(A))
+print(d(A + B), d(A) + d(B))</code></pre>
+<pre class="code lang-text"><code>4.0 4.0
+-8.0 -8.0
+-8.0 -4.0</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Believing det(A + B) = det(A) + det(B), or det(2A) = 2 det(A). Wrong: det(A + B) = −4 and det(2A) = −4 for the example. Right: det(A + B) = −8 and det(2A) = 4·(−2) = −8. Only products behave well: det(AB) = det(A)det(B).</div></div>
+<h3>Trace</h3>
+<p>The <strong>trace</strong> of a square matrix is the sum of its diagonal entries: tr(A) = A<sub>11</sub> + A<sub>22</sub> + ... + A<sub>nn</sub>. It is linear, tr(A + B) = tr(A) + tr(B), and it has a surprising cyclic property: <strong>tr(AB) = tr(BA)</strong>, even though AB ≠ BA. For our A and B, tr(AB) = 19 + 50 = 69 and tr(BA) = 23 + 46 = 69. Another key fact: tr(AᵀA) is the sum of the squares of all entries (the squared Frobenius norm). Here AᵀA = [[1+9, 2+12], [2+12, 4+16]] = [[10, 14], [14, 20]], trace 30 = 1 + 4 + 9 + 16. In Chapter 8 you will learn that trace = sum of eigenvalues and det = product of eigenvalues.</p>
+<pre class="code lang-python"><code>import numpy as np
+A = np.array([[1, 2], [3, 4]]); B = np.array([[5, 6], [7, 8]])
+print(np.trace(A @ B), np.trace(B @ A))
+print(np.trace(A.T @ A), (A ** 2).sum(), np.linalg.norm(A, "fro") ** 2)</code></pre>
+<pre class="code lang-text"><code>69 69
+30 30 30.0</code></pre>
+<h3>Going deeper</h3>
+<p><strong>Why signs and orientation?</strong> Going from e<sub>1</sub> to e<sub>2</sub> is a counter-clockwise quarter-turn. If after the transformation going from the image of e<sub>1</sub> to the image of e<sub>2</sub> is clockwise, the plane has been flipped over like a page, and the determinant is negative. The absolute value |det| is the area scale factor; the sign is the orientation.</p>
+<p><strong>Areas of shapes.</strong> A linear map multiplies <em>every</em> area by |det A|. The unit circle (area π) mapped by diag(2, 0.5) becomes an ellipse with semi-axes 2 and 0.5, area π · 2 · 0.5 = π: stretching one way and squeezing the other cancelled (det = 1). In the shear, det = 1 as well, so the area of the ellipse is still π. This is the reason determinants appear in the change of variables formula for integrals (Chapter 12) and in the density of a multivariate normal distribution, whose normalising constant involves det Σ, where Σ is the covariance matrix. Also, det of a covariance matrix is called the generalised variance: the volume of the cloud.</p>
+<p><strong>Numerical trap.</strong> The determinant of a large matrix can underflow or overflow even when the matrix is perfectly fine. Never compare it to zero to test for singularity either. Use <code>np.linalg.slogdet</code>, which returns the sign and the log of the absolute value; log-determinants are what probabilistic models actually use.</p>
+<pre class="code lang-python"><code>import numpy as np
+A = 0.1 * np.eye(400)                  # every diagonal entry 0.1, so det = 0.1**400
+print(np.linalg.det(A))                # underflows to 0.0 although A is invertible
+sign, logdet = np.linalg.slogdet(A)
+print(sign, round(logdet, 3), round(400 * np.log(0.1), 3))</code></pre>
+<pre class="code lang-text"><code>0.0
+1.0 -921.034 -921.034</code></pre>
+<div class="callout cream"><div class="lab">INTERVIEW</div><div class="txt">"What does det(A) = 0 mean?" Say it three ways: the transformation squashes space into a lower dimension, the columns are linearly dependent, and A has no inverse. Follow-up: "Is a tiny determinant a sign of near-singularity?" No: 0.1·I of size 400 has a determinant of 10<sup>−400</sup> yet is perfectly conditioned. Use the condition number (Section 6.7), not the determinant.</div></div>
+
+<h2>6.5 Inverse and Rank</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">The inverse is the "undo" button. If A rotates the sheet by 30 degrees, A⁻¹ rotates it back. If A squashes the sheet onto a line, there is no undo: many points landed on the same spot, and you cannot tell which one you started from. Rank counts how many dimensions survive the transformation.</div></div>
+<h3>Beginner: undoing a transformation</h3>
+<p>The <strong>inverse</strong> of a square matrix A is the matrix A⁻¹ with A⁻¹A = AA⁻¹ = I. If y = Ax, then x = A⁻¹y: the inverse recovers the input from the output. Solving the equation Ax = b is exactly "undo A on b".</p>
+<p>Geometrically: the inverse of a rotation by 30 degrees is a rotation by −30 degrees; the inverse of "stretch x by 2" is "shrink x by 2" (diag(1/2, 1)); the inverse of a shear with k = 1 is a shear with k = −1. A projection has no inverse.</p>
+<h3>Intermediate: the 2 × 2 formula and solving systems</h3>
+<div class="eq"><table class="mat"><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table><sup>−1</sup> = <span class="frac"><span>1</span><span>ad − bc</span></span> <table class="mat"><tr><td>d</td><td>−b</td></tr><tr><td>−c</td><td>a</td></tr></table></div>
+<p>Swap the diagonal entries, negate the off-diagonal entries, divide by the determinant. It exists only if ad − bc ≠ 0.</p>
+<p class="problem"><span class="pl">Problem 6.5.1</span> Find the inverse of A = [[4, 7], [2, 6]] and verify it.</p>
+<table class="steps"><tr><th>Determinant</th><td>4·6 − 7·2 = 24 − 14 = 10.</td></tr><tr><th>Inverse</th><td>(1/10)·[[6, −7], [−2, 4]] = [[0.6, −0.7], [−0.2, 0.4]].</td></tr><tr><th>Check row 1 times columns</th><td>4·0.6 + 7·(−0.2) = 2.4 − 1.4 = 1. And 4·(−0.7) + 7·0.4 = −2.8 + 2.8 = 0.</td></tr><tr><th>Check row 2</th><td>2·0.6 + 6·(−0.2) = 1.2 − 1.2 = 0. And 2·(−0.7) + 6·0.4 = −1.4 + 2.4 = 1. So AA⁻¹ = I. ✓</td></tr></table>
+<p class="problem"><span class="pl">Problem 6.5.2 (solving a pricing puzzle)</span> At a cafe, customer 1 bought 3 coffees and 1 muffin and paid 10. Customer 2 bought 2 coffees and 4 muffins and paid 16. What do a coffee and a muffin cost?</p>
+<table class="steps"><tr><th>Setup</th><td>A = [[3, 1], [2, 4]], x = [coffee, muffin], b = [10, 16]. Solve Ax = b.</td></tr><tr><th>Inverse</th><td>det = 3·4 − 1·2 = 10. A⁻¹ = (1/10)·[[4, −1], [−2, 3]].</td></tr><tr><th>Multiply</th><td>x = (1/10)·[4·10 − 1·16, −2·10 + 3·16] = (1/10)·[24, 28] = [2.4, 2.8].</td></tr><tr><th>Check</th><td>3·2.4 + 2.8 = 7.2 + 2.8 = 10. And 2·2.4 + 4·2.8 = 4.8 + 11.2 = 16. ✓ Coffee 2.40, muffin 2.80.</td></tr></table>
+<p class="problem"><span class="pl">Problem 6.5.3 (finding an inverse by row operations)</span> Invert A = [[2, 1], [5, 3]] by Gauss-Jordan: write [A | I] and do row operations until the left side is I.</p>
+<table class="steps">
+<tr><th>Start</th><td>[2 1 | 1 0] and [5 3 | 0 1].</td></tr>
+<tr><th>Step 1</th><td>Row 1 ÷ 2: [1 0.5 | 0.5 0].</td></tr>
+<tr><th>Step 2</th><td>Row 2 − 5 × Row 1: [5 − 5, 3 − 2.5 | 0 − 2.5, 1 − 0] = [0 0.5 | −2.5 1].</td></tr>
+<tr><th>Step 3</th><td>Row 2 × 2: [0 1 | −5 2].</td></tr>
+<tr><th>Step 4</th><td>Row 1 − 0.5 × Row 2: [1 0 | 0.5 + 2.5, 0 − 1] = [1 0 | 3 −1].</td></tr>
+<tr><th>Answer</th><td>A⁻¹ = [[3, −1], [−5, 2]]. Formula check: det = 6 − 5 = 1, so (1/1)[[3, −1], [−5, 2]]. ✓</td></tr>
+</table>
+<pre class="code lang-python"><code>import numpy as np
+A = np.array([[4, 7], [2, 6]])
+print(np.linalg.inv(A))
+print(np.round(A @ np.linalg.inv(A), 10))
+
+C = np.array([[3, 1], [2, 4]]); b = np.array([10, 16])
+print(np.linalg.solve(C, b))
+print(np.linalg.inv(np.array([[2, 1], [5, 3]])).round(6))</code></pre>
+<pre class="code lang-text"><code>[[ 0.6 -0.7]
+ [-0.2  0.4]]
+[[ 1. -0.]
+ [ 0.  1.]]
+[2.4 2.8]
+[[ 3. -1.]
+ [-5.  2.]]</code></pre>
+<h3>When does an inverse exist?</h3>
+<p>For a <strong>square</strong> matrix A (n × n) these statements are all equivalent: A is invertible; det A ≠ 0; the columns of A are independent; the rank of A is n; Ax = 0 only for x = 0; Ax = b has exactly one solution for every b. If one fails, all fail and the matrix is called <strong>singular</strong>. Non-square matrices have no true inverse (Chapter 9 introduces the pseudo-inverse).</p>
+<p>Rules: (A⁻¹)⁻¹ = A. <strong>(AB)⁻¹ = B⁻¹A⁻¹</strong> (reverse order again: to undo "put on socks then shoes", take off shoes first). (Aᵀ)⁻¹ = (A⁻¹)ᵀ. A diagonal matrix inverts by taking reciprocals of the diagonal. An orthogonal matrix inverts by transposing. Note that (A + B)⁻¹ is not A⁻¹ + B⁻¹.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Solving Ax = b by computing <code>np.linalg.inv(A) @ b</code>. Wrong style: <code>x = np.linalg.inv(A) @ b</code>. Right: <code>x = np.linalg.solve(A, b)</code>. Solving factorises A once (LU decomposition) and never builds the inverse, which costs about three times more arithmetic, and is usually less accurate. The same goes for the regression formula (XᵀX)⁻¹Xᵀy: in code, call <code>np.linalg.lstsq(X, y)</code>. The inverse is a tool for thinking and for writing formulas, not for computing.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Inverting a singular matrix and trusting the output. Wrong: for [[2, 1], [4, 2]], the formula divides by ad − bc = 0 and there is no answer. Right: check for the error or check the rank first. NumPy raises <code>LinAlgError: Singular matrix</code> for exact singularity, but for a <em>nearly</em> singular matrix it quietly returns an answer full of rounding errors (Section 6.7).</div></div>
+<pre class="code lang-python"><code>import numpy as np
+A = np.array([[2.0, 1.0], [4.0, 2.0]])
+try:
+    np.linalg.inv(A)
+except np.linalg.LinAlgError as e:
+    print("error:", e)
+print(np.linalg.matrix_rank(A))</code></pre>
+<pre class="code lang-text"><code>error: Singular matrix
+1</code></pre>
+<h3>Rank</h3>
+<p>The <strong>rank</strong> of a matrix is the number of linearly independent columns (equivalently, independent rows; the two counts always agree). A column is <em>dependent</em> if it can be built from the others. Rank is also the dimension of the sheet of all possible outputs Ax, called the <strong>column space</strong>.</p>
+<p class="problem"><span class="pl">Problem 6.5.4</span> Find the rank of (a) [[1, 2], [2, 4]], (b) [[1, 0, 1], [0, 1, 1], [1, 1, 2]], (c) [[1, 2, 3], [4, 5, 6]].</p>
+<table class="steps">
+<tr><th>(a)</th><td>Column 2 = 2 × column 1. Only one independent column: rank 1. (det = 4 − 4 = 0 agrees.)</td></tr>
+<tr><th>(b)</th><td>Column 3 = column 1 + column 2: [1, 0, 1] + [0, 1, 1] = [1, 1, 2]. Columns 1 and 2 are independent (neither is a multiple of the other). Rank 2, not 3. The 3 × 3 matrix is singular.</td></tr>
+<tr><th>(c)</th><td>2 × 3, so rank ≤ 2. Row 2 is not a multiple of row 1, so rank 2. This is <strong>full rank</strong> (the largest possible: min(m, n) = 2).</td></tr>
+</table>
+<p>Rank is at most min(m, n). A matrix with rank equal to that bound is <strong>full rank</strong>; otherwise it is <strong>rank-deficient</strong>. Also rank(AB) ≤ min(rank A, rank B): a product cannot create new dimensions.</p>
+<p class="problem"><span class="pl">Problem 6.5.5 (the dummy variable trap)</span> A regression design matrix has an intercept column of ones plus one-hot columns for three groups A, A, B, B, C, C (six rows). Show that its rank is 3 and not 4.</p>
+<table class="steps"><tr><th>Columns</th><td>intercept = [1,1,1,1,1,1]; isA = [1,1,0,0,0,0]; isB = [0,0,1,1,0,0]; isC = [0,0,0,0,1,1].</td></tr><tr><th>Dependence</th><td>isA + isB + isC = [1,1,1,1,1,1] = intercept. One column is the sum of the others.</td></tr><tr><th>Consequence</th><td>Rank 3 with 4 columns. XᵀX is singular, so (XᵀX)⁻¹ does not exist and the coefficients are not unique: you could add 5 to the intercept and subtract 5 from every group coefficient without changing a single prediction. Fix: drop one dummy column.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+print(np.linalg.matrix_rank(np.array([[1, 2], [2, 4]])))
+print(np.linalg.matrix_rank(np.array([[1, 0, 1], [0, 1, 1], [1, 1, 2]])))
+print(np.linalg.matrix_rank(np.array([[1, 2, 3], [4, 5, 6]])))
+
+X = np.array([[1, 1, 0, 0], [1, 1, 0, 0], [1, 0, 1, 0],
+              [1, 0, 1, 0], [1, 0, 0, 1], [1, 0, 0, 1]])
+print("rank with all dummies:", np.linalg.matrix_rank(X))
+print("rank after dropping one:", np.linalg.matrix_rank(X[:, :3]))
+print("det of X'X:", round(np.linalg.det(X.T @ X), 6))</code></pre>
+<pre class="code lang-text"><code>1
+2
+2
+rank with all dummies: 3
+rank after dropping one: 3
+det of X'X: 0.0</code></pre>
+<h3>Going deeper</h3>
+<p><strong>Low rank means compression.</strong> A matrix of rank r can be written as a product of an m × r and an r × n matrix, storing r(m + n) numbers instead of mn. A 1000 × 1000 ratings table of rank 2 needs 2·(1000 + 1000) = 4000 numbers instead of a million. Real data is rarely exactly low rank but is often <em>close</em> to it, and that is the whole idea behind recommender systems, latent semantic analysis, image compression and LoRA fine-tuning of large language models. Chapter 9 shows how to find the best low-rank approximation.</p>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(0)
+U = rng.normal(size=(100, 2)); V = rng.normal(size=(2, 80))
+R = U @ V                                  # a 100 x 80 "ratings" matrix built from 2 taste factors
+print(R.shape, np.linalg.matrix_rank(R), "numbers stored:", U.size + V.size, "vs", R.size)</code></pre>
+<pre class="code lang-text"><code>(100, 80) 2 numbers stored: 360 vs 8000</code></pre>
+<p><strong>Numerical rank.</strong> In floating point, "exactly dependent" columns rarely stay exactly dependent after rounding. <code>matrix_rank</code> therefore counts singular values above a small tolerance (Chapter 9). Pass your own tolerance if the data has known noise levels.</p>
+<p><strong>The inverse as a data tool.</strong> The inverse of a covariance matrix is called the <em>precision matrix</em>. It shows up in Gaussian models, Mahalanobis distance and Gaussian processes. When you must apply it, factorise (Cholesky) rather than invert.</p>
+<div class="callout cream"><div class="lab">INTERVIEW</div><div class="txt">"Why do we not invert matrices in practice?" Three points: solve is faster (about n³/3 instead of n³ multiplications), more accurate, and it exploits structure (symmetric, triangular, sparse), whereas an explicit inverse of a sparse matrix is usually dense and enormous. Also: "What happens in linear regression if two features are perfectly correlated?" XᵀX is singular (rank-deficient), the coefficients are not unique.</div></div>
+
+<h2>6.6 Matrices in Machine Learning</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A neural network layer is a matrix: it takes a whole batch of examples, mixes the input features with learned weights, and hands back a new table of features. Data preprocessing is also matrix work: centering and scaling are transformations of the data table.</div></div>
+<h3>A linear layer with a batch</h3>
+<p>Stack a batch of examples as rows of X (shape batch × in_features). A layer has a weight matrix W (in_features × out_features) and a bias vector b (out_features). The layer computes</p>
+<div class="eq">Y = XW + b      shape: (batch × in)(in × out) + (out) → (batch × out)</div>
+<p>Each row of Y is the new representation of one example; column j of W holds the weights of output neuron j. The bias is added to every row (broadcasting, see below). After the linear step a non-linear function such as ReLU(z) = max(0, z) is applied entry by entry.</p>
+<p class="problem"><span class="pl">Problem 6.6.1</span> A batch of two examples with three features: X = [[1, 2, 3], [0, 1, 0]]. The layer has W = [[1, 0], [0, 1], [1, 1]] and b = [0.5, −2]. Compute Y = ReLU(XW + b) and report the shapes.</p>
+<table class="steps"><tr><th>Shapes</th><td>X is 2 × 3, W is 3 × 2, XW is 2 × 2, b has 2 entries, Y is 2 × 2.</td></tr><tr><th>XW row 1</th><td>[1·1 + 2·0 + 3·1, 1·0 + 2·1 + 3·1] = [4, 5].</td></tr><tr><th>XW row 2</th><td>[0·1 + 1·0 + 0·1, 0·0 + 1·1 + 0·1] = [0, 1].</td></tr><tr><th>Add bias</th><td>[4 + 0.5, 5 − 2] = [4.5, 3] and [0 + 0.5, 1 − 2] = [0.5, −1].</td></tr><tr><th>ReLU</th><td>Negative entries become 0: [[4.5, 3], [0.5, 0]].</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+X = np.array([[1, 2, 3], [0, 1, 0]])
+W = np.array([[1, 0], [0, 1], [1, 1]])
+b = np.array([0.5, -2])
+Z = X @ W + b                    # b is broadcast across the rows
+print(Z)
+print(np.maximum(Z, 0), Z.shape)</code></pre>
+<pre class="code lang-text"><code>[[ 4.5  3. ]
+ [ 0.5 -1. ]]
+[[4.5 3. ]
+ [0.5 0. ]] (2, 2)</code></pre>
+<p><strong>Counting parameters.</strong> A layer from 784 inputs (a 28 × 28 image) to 128 neurons has 784 × 128 weights plus 128 biases: 100,352 + 128 = 100,480 parameters. A second layer 128 → 10 has 128 × 10 + 10 = 1,290. The whole network has 101,770 parameters. A framework such as PyTorch stores the weight as (out, in) and computes <code>x @ W.T + b</code>; the math is the same, but check the convention when you read code.</p>
+<p><strong>Why a non-linearity?</strong> Two linear layers in a row, Y = (XW<sub>1</sub>)W<sub>2</sub> = X(W<sub>1</sub>W<sub>2</sub>), are just one linear layer with weight matrix W<sub>1</sub>W<sub>2</sub> (associativity). Without a non-linear function between them, depth buys you nothing.</p>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(1)
+X = rng.normal(size=(5, 3))
+W1 = rng.normal(size=(3, 4)); W2 = rng.normal(size=(4, 2))
+two_layers = (X @ W1) @ W2
+one_layer = X @ (W1 @ W2)
+print(np.allclose(two_layers, one_layer), (W1 @ W2).shape)
+print("params:", 784 * 128 + 128, 128 * 10 + 10, 784 * 128 + 128 + 128 * 10 + 10)</code></pre>
+<pre class="code lang-text"><code>True (3, 2)
+params: 100480 1290 101770</code></pre>
+<h3>Data transformations as matrices</h3>
+<p>Let X be n × d (n samples, d features). <strong>Centering</strong> subtracts the column means: X<sub>c</sub> = X − 1μᵀ, where 1 is a column of n ones and μ the vector of means. As a matrix operation, X<sub>c</sub> = CX with the <strong>centering matrix</strong> C = I − (1/n)11ᵀ. <strong>Scaling</strong> divides each column by its standard deviation, which is multiplication on the right by a diagonal matrix: X<sub>c</sub>D with D = diag(1/σ<sub>1</sub>, ..., 1/σ<sub>d</sub>). After centering, the <strong>covariance matrix</strong> is S = X<sub>c</sub>ᵀX<sub>c</sub>/(n − 1), a d × d symmetric matrix.</p>
+<p class="problem"><span class="pl">Problem 6.6.2 (covariance by matrix product)</span> Four customers, two features (hours online, spend): X = [[2, 4], [4, 8], [6, 10], [8, 14]]. Find the covariance matrix and the correlation.</p>
+<table class="steps">
+<tr><th>Means</th><td>Column 1: (2 + 4 + 6 + 8)/4 = 5. Column 2: (4 + 8 + 10 + 14)/4 = 9.</td></tr>
+<tr><th>Centered</th><td>X<sub>c</sub> = [[−3, −5], [−1, −1], [1, 1], [3, 5]].</td></tr>
+<tr><th>X<sub>c</sub>ᵀX<sub>c</sub></th><td>(1,1) = 9 + 1 + 1 + 9 = 20. (1,2) = 15 + 1 + 1 + 15 = 32. (2,2) = 25 + 1 + 1 + 25 = 52. So [[20, 32], [32, 52]].</td></tr>
+<tr><th>Divide by n − 1 = 3</th><td>S = [[6.667, 10.667], [10.667, 17.333]].</td></tr>
+<tr><th>Correlation</th><td>SD<sub>1</sub> = √6.667 = 2.582, SD<sub>2</sub> = √17.333 = 4.163. r = 10.667 / (2.582 × 4.163) = 10.667 / 10.749 = 0.9923.</td></tr>
+</table>
+<pre class="code lang-python"><code>import numpy as np
+X = np.array([[2, 4], [4, 8], [6, 10], [8, 14]], dtype=float)
+n = len(X)
+C = np.eye(n) - np.ones((n, n)) / n          # centering matrix
+Xc = C @ X
+print(Xc.T)
+S = Xc.T @ Xc / (n - 1)
+print(np.round(S, 3))
+print(np.allclose(S, np.cov(X.T)))
+sd = np.sqrt(np.diag(S))
+print(np.round(S / np.outer(sd, sd), 4))</code></pre>
+<pre class="code lang-text"><code>[[-3. -1.  1.  3.]
+ [-5. -1.  1.  5.]]
+[[ 6.667 10.667]
+ [10.667 17.333]]
+True
+[[1.     0.9923]
+ [0.9923 1.    ]]</code></pre>
+<p><strong>PCA preview.</strong> The covariance matrix S describes an ellipse-shaped cloud. Its eigenvectors (Chapter 8) are the directions of greatest spread and PCA (Chapter 9) rotates the data onto those directions: Z = X<sub>c</sub>W, where the columns of W are the chosen eigenvectors. So PCA is "centre, then multiply by an orthogonal matrix", the same machinery as this chapter.</p>
+<h3>Cost, shapes and bracketing</h3>
+<p>Multiplying (m × n)(n × p) needs m·n·p multiplications and about as many additions. Cost depends on the bracketing. Take A (1000 × 1000), B (1000 × 1000), v (1000 × 1): (AB)v costs 1000·1000·1000 + 1000·1000 = 1,001,000,000 multiplications, but A(Bv) costs 1000·1000 + 1000·1000 = 2,000,000, which is 500 times less, for the same answer. Deep learning libraries rely on exactly this care.</p>
+<pre class="code lang-python"><code>import numpy as np
+m, n, p = 200, 300, 50
+print("mults for (200x300)(300x50):", m * n * p)
+rng = np.random.default_rng(2)
+A = rng.normal(size=(1000, 1000)); B = rng.normal(size=(1000, 1000)); v = rng.normal(size=1000)
+cost_slow = 1000 * 1000 * 1000 + 1000 * 1000
+cost_fast = 1000 * 1000 + 1000 * 1000
+print(cost_slow, cost_fast, cost_slow // cost_fast)
+print(np.allclose((A @ B) @ v, A @ (B @ v)))</code></pre>
+<pre class="code lang-text"><code>mults for (200x300)(300x50): 3000000
+1001000000 2000000 500
+True</code></pre>
+<h3>NumPy tools: @, einsum and broadcasting</h3>
+<p><code>A @ B</code> (or <code>np.matmul</code>) is the matrix product. For stacks of matrices, with shape (batch, m, n) @ (n, p) or (batch, m, n) @ (batch, n, p), it multiplies each matrix in the batch. <code>np.einsum</code> writes any sum of products as a labelled formula: repeated letters are multiplied and summed away, letters after the arrow remain.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Operation</th><th>einsum</th><th>Equivalent</th></tr></thead><tbody>
+<tr><td>Matrix product</td><td><code>"ij,jk-&gt;ik"</code></td><td><code>A @ B</code></td></tr>
+<tr><td>Transpose</td><td><code>"ij-&gt;ji"</code></td><td><code>A.T</code></td></tr>
+<tr><td>Trace</td><td><code>"ii-&gt;"</code></td><td><code>np.trace(A)</code></td></tr>
+<tr><td>Dot product</td><td><code>"i,i-&gt;"</code></td><td><code>x @ y</code></td></tr>
+<tr><td>Outer product</td><td><code>"i,j-&gt;ij"</code></td><td><code>np.outer(x, y)</code></td></tr>
+<tr><td>Batch matrix product</td><td><code>"bij,bjk-&gt;bik"</code></td><td><code>A @ B</code> with 3-D arrays</td></tr>
+<tr><td>Row sums of squares</td><td><code>"ij,ij-&gt;i"</code></td><td><code>(A * A).sum(axis=1)</code></td></tr>
+</tbody></table></div>
+<pre class="code lang-python"><code>import numpy as np
+A = np.array([[1, 2], [3, 4]]); B = np.array([[5, 6], [7, 8]])
+print(np.einsum("ij,jk-&gt;ik", A, B))
+print(np.einsum("ii-&gt;", A), np.einsum("ij-&gt;ji", A).tolist())
+x = np.array([1, 2, 3]); y = np.array([4, 5])
+print(np.einsum("i,j-&gt;ij", x, y))
+batch = np.arange(24).reshape(2, 3, 4); W = np.ones((4, 5))
+print((batch @ W).shape, np.einsum("bij,jk-&gt;bik", batch, W).shape)</code></pre>
+<pre class="code lang-text"><code>[[19 22]
+ [43 50]]
+5 [[1, 3], [2, 4]]
+[[ 4  5]
+ [ 8 10]
+ [12 15]]
+(2, 3, 5) (2, 3, 5)</code></pre>
+<p><strong>Broadcasting</strong> lets NumPy combine arrays of different shapes by stretching size-1 or missing dimensions. Shapes are compared from the right: (3, 2) + (2,) works (the vector is added to every row), (3, 2) + (3, 1) works (each row gets its own constant), but (3,) − (3, 1) makes a 3 × 3 table! That is the most common silent bug in loss functions.</p>
+<p class="problem"><span class="pl">Problem 6.6.3 (the silent (n, n) bug)</span> True values y = [1, 2, 3] with shape (3,). A model returns predictions of shape (3, 1): [[1], [2], [4]]. Compute the mean squared error the wrong way (<code>yhat - y</code>) and the right way.</p>
+<table class="steps"><tr><th>Wrong</th><td>(3, 1) − (3,) broadcasts to (3, 3): entry (i, j) = ŷ<sub>i</sub> − y<sub>j</sub>. Rows: [0, −1, −2], [1, 0, −1], [3, 2, 1]. Squares sum to (0 + 1 + 4) + (1 + 0 + 1) + (9 + 4 + 1) = 5 + 2 + 14 = 21. Mean over 9 entries: 21/9 = 2.3333.</td></tr><tr><th>Right</th><td>Make shapes agree: yhat.ravel() − y = [0, 0, 1]. Squares sum to 1, mean 1/3 = 0.3333.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+y = np.array([1.0, 2.0, 3.0])
+yhat = np.array([[1.0], [2.0], [4.0]])
+print((yhat - y).shape, np.mean((yhat - y) ** 2))
+print(np.mean((yhat.ravel() - y) ** 2))
+v = np.array([1, 2, 3])
+print(v.T.shape, v @ v, v.reshape(-1, 1).shape)</code></pre>
+<pre class="code lang-text"><code>(3, 3) 2.3333333333333335
+0.3333333333333333
+(3,) 14 (3, 1)</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Mixing shapes (n,) and (n, 1). Wrong: <code>mean((yhat - y)**2)</code> with yhat of shape (n, 1) returns 2.3333 above. Right: align shapes first (<code>yhat.ravel()</code> or <code>y.reshape(-1, 1)</code>), giving 0.3333. Also remember a 1-D array has no transpose: <code>v.T</code> is the same as <code>v</code>; use <code>v.reshape(-1, 1)</code> to get a true column vector. Defensive habit: <code>assert yhat.shape == y.shape</code>.</div></div>
+<h3>Going deeper</h3>
+<p>Modern hardware (GPUs, TPUs) is built around matrix multiplication: the (batch × in)(in × out) layer product is a few big matmuls rather than millions of tiny dot products, which is why batching is fast. Transformers are mostly matrix products: attention computes QKᵀ (queries times keys) and multiplies by V. The cost of QKᵀ for a sequence of length L with head dimension d is L·L·d multiplications, quadratic in L, which is why long contexts are expensive.</p>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">An ML engineer debugging a training crash reads "mat1 and mat2 shapes cannot be multiplied (32x784 and 748x128)". The inner dimensions 784 and 748 disagree: a typo or a wrong flatten. Reading shapes as (m × n)(n × p) is the whole skill. Always print shapes after every layer when building a model.</div></div>
+
+<h2>6.7 The Expert Layer: Blocks, Kronecker Products, Change of Basis, Conditioning and Sparsity</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Big matrices are rarely random piles of numbers. They have structure: blocks, repeated patterns, mostly zeros, or a hidden simple description in a better coordinate system. Experts exploit structure for speed and for insight, and they ask how much a small error in the input can hurt the answer.</div></div>
+<h3>Block matrices</h3>
+<p>You can cut a matrix into rectangular <strong>blocks</strong> and multiply blocks as if they were numbers, as long as every block product has matching shapes. For example, with M = [[A, B], [C, D]] and N = [[E, F], [G, H]], the top-left block of MN is AE + BG, and so on. Block diagonal matrices (zero off-diagonal blocks) are especially nice: the blocks act independently, the inverse inverts block by block, and the determinant is the product of the block determinants. They appear when several independent models or groups are stacked together.</p>
+<p class="problem"><span class="pl">Problem 6.7.1</span> Let A = [[1, 2], [3, 4]] and B = [[2, 0], [1, 3]]. Build the 4 × 4 block diagonal matrix M with A and B on the diagonal. Find det M and the top-left block of M⁻¹.</p>
+<table class="steps"><tr><th>Determinants</th><td>det A = 4 − 6 = −2. det B = 6 − 0 = 6. det M = (−2)(6) = −12.</td></tr><tr><th>Inverse of A</th><td>(1/−2)·[[4, −2], [−3, 1]] = [[−2, 1], [1.5, −0.5]]. This is the top-left block of M⁻¹; the bottom-right block is B⁻¹ = (1/6)[[3, 0], [−1, 2]].</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+A = np.array([[1, 2], [3, 4]]); B = np.array([[2, 0], [1, 3]])
+Z = np.zeros((2, 2))
+M = np.block([[A, Z], [Z, B]])
+print(M)
+print(round(np.linalg.det(M), 6))
+print(np.linalg.inv(M)[:2, :2])</code></pre>
+<pre class="code lang-text"><code>[[1. 2. 0. 0.]
+ [3. 4. 0. 0.]
+ [0. 0. 2. 0.]
+ [0. 0. 1. 3.]]
+-12.0
+[[-2.   1. ]
+ [ 1.5 -0.5]]</code></pre>
+<h3>Outer products and Kronecker products</h3>
+<p>The <strong>outer product</strong> of u (m entries) and v (n entries) is the m × n matrix uvᵀ with entries u<sub>i</sub>v<sub>j</sub>. Every row is a multiple of vᵀ, so it has rank 1: it is the simplest possible matrix, and every matrix is a sum of rank-1 pieces (this is Way 4 of the matrix product). Example: u = [1, 2, 3], v = [4, 5] gives [[4, 5], [8, 10], [12, 15]].</p>
+<p>The <strong>Kronecker product</strong> A ⊗ B replaces each entry A<sub>ij</sub> by the whole block A<sub>ij</sub>·B. If A is m × n and B is p × q, then A ⊗ B is mp × nq. With A = [[1, 2], [3, 4]] and B = [[0, 1], [1, 0]], the top-left block is 1·B = [[0, 1], [1, 0]], the top-right block is 2·B, and so on, giving a 4 × 4 matrix. Kronecker products describe operations on grids and images (apply one matrix along rows and another along columns), and structured covariance matrices in spatial and multi-task models. A useful identity: (A ⊗ B)(C ⊗ D) = (AC) ⊗ (BD).</p>
+<pre class="code lang-python"><code>import numpy as np
+u = np.array([1, 2, 3]); v = np.array([4, 5])
+O = np.outer(u, v)
+print(O, np.linalg.matrix_rank(O))
+A = np.array([[1, 2], [3, 4]]); B = np.array([[0, 1], [1, 0]])
+K = np.kron(A, B)
+print(K, K.shape)
+C = np.array([[1, 1], [0, 1]]); D = np.array([[2, 0], [0, 3]])
+print(np.array_equal(K @ np.kron(C, D), np.kron(A @ C, B @ D)))</code></pre>
+<pre class="code lang-text"><code>[[ 4  5]
+ [ 8 10]
+ [12 15]] 1
+[[0 1 0 2]
+ [1 0 2 0]
+ [0 3 0 4]
+ [3 0 4 0]] (4, 4)
+True</code></pre>
+<h3>Change of basis</h3>
+<p>The numbers in a vector depend on the axes you measure them against. Suppose you choose new axes, the columns of an invertible matrix P (expressed in the standard coordinates). A vector with coordinates c in the new basis has standard coordinates x = Pc, so <strong>c = P⁻¹x</strong>. A transformation A (given in standard coordinates) acts in the new coordinates as <strong>P⁻¹AP</strong>: convert new to standard (P), apply A, convert back (P⁻¹). Read it right to left.</p>
+<p class="problem"><span class="pl">Problem 6.7.2 (diagonalising by a clever basis)</span> Take A = [[4, 1], [2, 3]]. Use the basis vectors [1, 1] and [1, −2] (the columns of P). Find P⁻¹AP, and the new coordinates of x = [3, 1].</p>
+<table class="steps">
+<tr><th>P and P⁻¹</th><td>P = [[1, 1], [1, −2]], det P = −2 − 1 = −3. P⁻¹ = (1/−3)·[[−2, −1], [−1, 1]] = [[2/3, 1/3], [1/3, −1/3]].</td></tr>
+<tr><th>AP</th><td>Columns: A[1, 1] = [5, 5]. A[1, −2] = [4 − 2, 2 − 6] = [2, −4]. So AP = [[5, 2], [5, −4]].</td></tr>
+<tr><th>P⁻¹(AP)</th><td>(1,1) = (2/3)·5 + (1/3)·5 = 5. (1,2) = (2/3)·2 + (1/3)·(−4) = 0. (2,1) = (1/3)·5 − (1/3)·5 = 0. (2,2) = (1/3)·2 − (1/3)·(−4) = 2. So P⁻¹AP = [[5, 0], [0, 2]].</td></tr>
+<tr><th>New coordinates</th><td>c = P⁻¹[3, 1] = [2 + 1/3, 1 − 1/3] = [7/3, 2/3]. Check: (7/3)[1, 1] + (2/3)[1, −2] = [3, 7/3 − 4/3] = [3, 1]. ✓</td></tr>
+<tr><th>Meaning</th><td>In the new basis A is just a stretch by 5 along the first axis and by 2 along the second: it is <em>diagonal</em>. Trace stays 7 and det stays 10 (5 + 2 and 5·2): similar matrices share trace and determinant.</td></tr>
+</table>
+<pre class="code lang-python"><code>import numpy as np
+A = np.array([[4.0, 1.0], [2.0, 3.0]])
+P = np.array([[1.0, 1.0], [1.0, -2.0]])
+print(np.round(np.linalg.inv(P) @ A @ P, 10))
+print(np.round(np.linalg.inv(P) @ [3, 1], 4), 7 / 3, 2 / 3)
+Dg = np.diag([5.0, 2.0])
+A10 = P @ np.linalg.matrix_power(Dg, 10) @ np.linalg.inv(P)
+print(np.allclose(A10, np.linalg.matrix_power(A, 10)))
+print(np.trace(A), round(np.linalg.det(A), 6))</code></pre>
+<pre class="code lang-text"><code>[[5. 0.]
+ [0. 2.]]
+[2.3333 0.6667] 2.3333333333333335 0.6666666666666666
+True
+7.0 10.0</code></pre>
+<p>The basis [1, 1], [1, −2] was not luck: those are the <strong>eigenvectors</strong> of A, vectors that A only stretches. Finding them is the subject of Chapter 8. The payoff is huge: A<sup>10</sup> = P D<sup>10</sup> P⁻¹ needs only powers of two numbers instead of ten matrix products, as the last code lines confirm. Markov chains, PageRank and the stability of recurrent networks all use this trick.</p>
+<h3>Conditioning: when the inverse is a trap</h3>
+<p>A matrix that is almost singular is mathematically invertible but practically dangerous. Take A = [[1, 1], [1, 1.02]]. Solve Ax = b with b = [2, 2]: the answer is x = [2, 0]. Now change the second entry of b by just 0.02 (1 percent), b = [2, 2.02]: the answer jumps to x = [1, 1]. A tiny change of the input moved the solution by a large amount. Geometrically, the two equations are almost parallel lines, so their crossing point slides far when a line moves a little.</p>
+<figure><img src="images/ch06_conditioning.png" alt="Two panels of two lines each: perpendicular lines whose intersection barely moves, and almost parallel lines whose intersection moves a long way." loading="lazy"/><figcaption>Left: lines at a right angle, the solution barely moves when b changes. Right: nearly parallel lines, the same small change in b moves the solution from (2, 0) to (1, 1).</figcaption></figure>
+<p>How to read it: the solid lines are the system for b<sub>2</sub> = 2 and the dashed lines for b<sub>2</sub> = 2.02. The big dots are the solutions. On the left the dots overlap; on the right they sit far apart even though the lines look almost identical.</p>
+<p>The <strong>condition number</strong> κ(A) = σ<sub>max</sub>/σ<sub>min</sub> (the ratio of the largest to the smallest stretch factor, defined properly in Chapter 9; <code>np.linalg.cond</code> computes it) measures this danger. Rule of thumb: the relative error of the solution can be up to κ times the relative error of the input, and you lose about log<sub>10</sub>(κ) of your 16 digits of floating-point accuracy. Our matrix has κ ≈ 202. The perpendicular system [[1, 1], [1, −1]] has κ = 1, the best possible. A singular matrix has κ = ∞.</p>
+<pre class="code lang-python"><code>import numpy as np
+A = np.array([[1, 1], [1, 1.02]])
+print(np.linalg.solve(A, [2, 2]), np.linalg.solve(A, [2, 2.02]))
+print(round(np.linalg.cond(A), 2), round(np.linalg.cond(np.array([[1, 1], [1, -1]])), 6))
+
+n = 10                                    # Hilbert matrix, a famous ill-conditioned example
+H = np.array([[1 / (i + j + 1) for j in range(n)] for i in range(n)])
+x_true = np.ones(n); b = H @ x_true
+print("cond(H) = %.1e" % np.linalg.cond(H))
+print("error with solve: %.0e" % np.abs(np.linalg.solve(H, b) - x_true).max())
+print("error with inv  : %.0e" % np.abs(np.linalg.inv(H) @ b - x_true).max())</code></pre>
+<pre class="code lang-text"><code>[2. 0.] [1. 1.]
+202.02 1.0
+cond(H) = 1.6e+13
+error with solve: 7e-04
+error with inv  : 8e-03</code></pre>
+<p>With κ ≈ 1.6 × 10<sup>13</sup> we expect to lose about 13 of 16 digits, and the printed errors (between 10<sup>−3</sup> and 10<sup>−2</sup>, so only two or three correct digits remain) confirm it. The inverse route is no better, and in this run it is worse.</p>
+<p class="problem"><span class="pl">Problem 6.7.3 (why the normal equations are risky)</span> A design matrix has two almost identical columns. Show that forming XᵀX squares the condition number.</p>
+<table class="steps"><tr><th>Idea</th><td>The singular values of XᵀX are the squares of those of X, so κ(XᵀX) = κ(X)².</td></tr><tr><th>Setup</th><td>x<sub>1</sub> = 50 evenly spaced numbers from 0 to 1, x<sub>2</sub> = x<sub>1</sub> + 10<sup>−4</sup>·cos(37 x<sub>1</sub>).</td></tr><tr><th>Result</th><td>κ(X) ≈ 1.6 × 10<sup>4</sup> and κ(XᵀX) ≈ 2.7 × 10<sup>8</sup>, about the square. Lesson: use <code>np.linalg.lstsq</code> or a QR decomposition, which work with X itself.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+x1 = np.linspace(0, 1, 50)
+x2 = x1 + 1e-4 * np.cos(37 * x1)
+X = np.column_stack([x1, x2])
+print("cond(X)    = %.1e" % np.linalg.cond(X))
+print("cond(X'X)  = %.1e" % np.linalg.cond(X.T @ X))
+print("cond(X)**2 = %.1e" % np.linalg.cond(X) ** 2)</code></pre>
+<pre class="code lang-text"><code>cond(X)    = 1.6e+04
+cond(X'X)  = 2.7e+08
+cond(X)**2 = 2.7e+08</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using the determinant to detect near-singularity. Wrong: "det = 0.02 for [[1, 1], [1, 1.02]], so it is fine, no zero." Right: det alone is scale dependent. Compare 0.1·I (400 × 400), det 10<sup>−400</sup>, perfectly healthy (κ = 1), with this 2 × 2 matrix whose det 0.02 hides κ = 202. Check <code>np.linalg.cond(A)</code> before trusting a solve.</div></div>
+<h3>Sparse matrices</h3>
+<p>Many real matrices are mostly zeros: a user-by-movie ratings table (each user rated a handful of 10,000 movies), a bag-of-words or TF-IDF text matrix, a one-hot encoding with thousands of categories, the adjacency matrix of a social graph. Storing every zero wastes memory and time. A <strong>sparse matrix</strong> stores only the non-zero entries and where they sit. SciPy's CSR format keeps three arrays: the values, their column indices, and where each row starts.</p>
+<p class="problem"><span class="pl">Problem 6.7.4</span> A 10,000 × 10,000 matrix with density 0.1 percent. How much memory does dense float64 storage need, and how much does CSR need?</p>
+<table class="steps"><tr><th>Dense</th><td>10,000 × 10,000 = 10<sup>8</sup> entries × 8 bytes = 800,000,000 bytes = 800 MB.</td></tr><tr><th>Non-zeros</th><td>0.001 × 10<sup>8</sup> = 100,000.</td></tr><tr><th>CSR</th><td>values 100,000 × 8 = 800,000 bytes; column indices 100,000 × 4 = 400,000 bytes; row pointers (10,000 + 1) × 4 = 40,004 bytes. Total 1,240,004 bytes, about 1.2 MB, roughly 645 times smaller.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+import scipy.sparse as sp
+S = sp.random(10000, 10000, density=0.001, format="csr", random_state=0)
+print(S.shape, S.nnz)
+print("dense bytes :", 10000 * 10000 * 8)
+print("sparse bytes:", S.data.nbytes + S.indices.nbytes + S.indptr.nbytes)
+v = np.ones(10000)
+y = S @ v                                   # fast: touches only the 100,000 non-zeros
+print(y.shape, round(float(y.sum()), 6) == round(float(S.sum()), 6))</code></pre>
+<pre class="code lang-text"><code>(10000, 10000) 100000
+dense bytes : 800000000
+sparse bytes: 1240004
+(10000,) True</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Calling <code>.toarray()</code> (or <code>.todense()</code>) on a big sparse matrix, or inverting it. Wrong: <code>np.linalg.inv(S.toarray())</code> allocates the full 800 MB and returns a dense matrix with no zeros left at all. Right: keep it sparse, use <code>S @ v</code> for products and <code>scipy.sparse.linalg.spsolve</code> (or an iterative solver) for systems.</div></div>
+<h3>Going deeper</h3>
+<p>Structure is the expert's lever. Triangular systems are solved by simple substitution in n² steps. Symmetric positive definite matrices (covariances) factor as LLᵀ (Cholesky) at half the cost of LU. Banded and sparse matrices store and solve in time proportional to their non-zeros. Orthogonal matrices are perfectly conditioned (κ = 1), which is why QR and SVD are the stable workhorses. In deep learning, low-rank updates W + ABᵀ (LoRA) fine-tune a huge weight matrix by training two skinny matrices, and weight matrices with large condition numbers cause exploding or vanishing gradients (Chapter 13).</p>
+<div class="callout cream"><div class="lab">INTERVIEW</div><div class="txt">"Your linear regression gives huge, unstable coefficients. What do you check?" Collinear features: look at the rank and condition number of X, standardise features, drop duplicated columns or add regularisation (ridge adds λI to XᵀX, which lifts its smallest singular value and lowers κ), and solve with <code>lstsq</code>/QR rather than inverting XᵀX.</div></div>
+
+<h2>Chapter recap</h2>
+<ul>
+<li>A matrix is both a table (rows are samples, columns are features, shape rows × columns) and a machine that maps vectors to vectors linearly.</li>
+<li>Matrix-vector product: dot products of rows, or a combination of columns with the vector entries as weights.</li>
+<li>(m × n)(n × p) → (m × p). The inner dimensions must match. Entry (i, j) is row i of A dotted with column j of B.</li>
+<li>A product can be seen four ways: dot products, column combinations, row combinations, and a sum of outer products.</li>
+<li>Matrix multiplication is associative and distributive but not commutative; AB = 0 does not force A = 0 or B = 0.</li>
+<li>(AB)ᵀ = BᵀAᵀ and (AB)⁻¹ = B⁻¹A⁻¹: the order reverses.</li>
+<li>The columns of a 2 × 2 matrix are where e<sub>1</sub> and e<sub>2</sub> land; composition "first A then B" is the product BA.</li>
+<li>det = signed area (volume) scale factor; det = 0 means the space is squashed and the matrix has no inverse; det(AB) = det A · det B.</li>
+<li>Rank = number of independent columns = dimension of the column space; full rank means no redundancy.</li>
+<li>Use <code>solve</code> or <code>lstsq</code>, not <code>inv</code>; check <code>cond</code>, not det, to detect near-singularity.</li>
+<li>A linear layer is Y = XW + b with shapes (batch, in)(in, out); watch for (n,) versus (n, 1) broadcasting bugs.</li>
+<li>Structure (blocks, sparsity, low rank, change of basis) is how experts make matrix computations fast, stable and interpretable.</li>
+</ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / pattern</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>C<sub>ij</sub> = ∑<sub>k</sub> A<sub>ik</sub>B<sub>kj</sub></td><td>Matrix product entry: row of A dot column of B</td></tr>
+<tr><td>Ax = x<sub>1</sub>a<sub>1</sub> + ... + x<sub>n</sub>a<sub>n</sub></td><td>Output is a combination of the columns of A</td></tr>
+<tr><td>(AB)ᵀ = BᵀAᵀ</td><td>Transpose reverses the order</td></tr>
+<tr><td>det [[a, b], [c, d]] = ad − bc</td><td>Signed area scale of the unit square</td></tr>
+<tr><td>A⁻¹ = (1/(ad − bc))·[[d, −b], [−c, a]]</td><td>2 × 2 inverse; needs det ≠ 0</td></tr>
+<tr><td>(AB)⁻¹ = B⁻¹A⁻��</td><td>Undo in reverse order</td></tr>
+<tr><td>tr(AB) = tr(BA)</td><td>Cyclic property of the trace</td></tr>
+<tr><td>Y = XW + b</td><td>Linear layer on a batch</td></tr>
+<tr><td>P⁻¹AP</td><td>The matrix A seen in the basis given by the columns of P</td></tr>
+<tr><td>κ(A) = σ<sub>max</sub>/σ<sub>min</sub></td><td>Error amplification; lose about log<sub>10</sub> κ digits</td></tr>
+</tbody></table></div>
+
+<h2>Practice set</h2>
+<p class="problem"><span class="pl">Problem 6.1</span> A is 3 × 4 and B is 4 × 2. State the shapes of AB, Aᵀ, AAᵀ, and say whether BA is defined.</p>
+<p><strong>Answer:</strong> AB: (3 × 4)(4 × 2) = 3 × 2. Aᵀ is 4 × 3. AAᵀ: (3 × 4)(4 × 3) = 3 × 3. BA would be (4 × 2)(3 × 4): inner dimensions 2 and 3 differ, so it is not defined.</p>
+<p class="problem"><span class="pl">Problem 6.2</span> Compute Ax for A = [[2, 0], [1, 3]] and x = [4, 1], once by rows and once by columns.</p>
+<p><strong>Answer:</strong> Rows: [2·4 + 0·1, 1·4 + 3·1] = [8, 7]. Columns: 4·[2, 1] + 1·[0, 3] = [8, 4] + [0, 3] = [8, 7]. Both give [8, 7].</p>
+<p class="problem"><span class="pl">Problem 6.3</span> For A = [[1, 0], [2, 1]] and B = [[3, 1], [0, 2]] compute AB and BA. Are they equal?</p>
+<p><strong>Answer:</strong> AB = [[1·3 + 0·0, 1·1 + 0·2], [2·3 + 1·0, 2·1 + 1·2]] = [[3, 1], [6, 4]]. BA = [[3·1 + 1·2, 3·0 + 1·1], [0·1 + 2·2, 0·0 + 2·1]] = [[5, 1], [4, 2]]. They differ.</p>
+<p class="problem"><span class="pl">Problem 6.4</span> Find det and inverse of [[5, 2], [3, 1]], and check.</p>
+<p><strong>Answer:</strong> det = 5·1 − 2·3 = −1. Inverse = (1/−1)·[[1, −2], [−3, 5]] = [[−1, 2], [3, −5]]. Check first row: 5·(−1) + 2·3 = 1 and 5·2 + 2·(−5) = 0. Second row: 3·(−1) + 1·3 = 0 and 3·2 + 1·(−5) = 1. Identity. ✓</p>
+<p class="problem"><span class="pl">Problem 6.5</span> The vectors [3, 1] and [1, 2] are the columns of a matrix. What area does the unit square become, and is the orientation kept? Then what is the area of the triangle with vertices at the origin, [3, 1] and [1, 2]?</p>
+<p><strong>Answer:</strong> det = 3·2 − 1·1 = 5, positive, so area 5 and orientation kept. The triangle is half of the parallelogram: 2.5.</p>
+<p class="problem"><span class="pl">Problem 6.6</span> Rotate by 90 degrees (R = [[0, −1], [1, 0]]) and then reflect in the x-axis (F = [[1, 0], [0, −1]]). Give the single matrix, its determinant, and the image of [2, 1].</p>
+<p><strong>Answer:</strong> "R then F" is FR = [[1·0 + 0·1, 1·(−1) + 0·0], [0·0 + (−1)·1, 0·(−1) + (−1)·0]] = [[0, −1], [−1, 0]]. det = 0·0 − (−1)(−1) = −1 = det F · det R = (−1)(1). Image of [2, 1]: [0·2 − 1·1, −1·2 + 0·1] = [−1, −2]. Direct check: R[2, 1] = [−1, 2], then F gives [−1, −2]. ✓</p>
+<p class="problem"><span class="pl">Problem 6.7</span> Find the rank of [[1, 2, 3], [2, 4, 6], [1, 0, 1]] and explain.</p>
+<p><strong>Answer:</strong> Row 2 = 2 × row 1, so it adds nothing. Rows 1 and 3 are not multiples of each other. Rank = 2. The matrix is 3 × 3 but rank-deficient, so det = 0 and there is no inverse. (Check: det = 1(4·1 − 6·0) − 2(2·1 − 6·1) + 3(2·0 − 4·1) = 4 + 8 − 12 = 0. ✓)</p>
+<p class="problem"><span class="pl">Problem 6.8</span> What does this print? <code>w = np.array([[1, 2], [3, 4]]); v = np.array([10, 1]); print(w @ v, v @ w, w * v)</code></p>
+<p><strong>Answer:</strong> <code>w @ v</code> = [1·10 + 2·1, 3·10 + 4·1] = [12, 34] (rows dotted with v). <code>v @ w</code> = [10·1 + 1·3, 10·2 + 1·4] = [13, 24] (v treated as a row vector, combining rows of w). <code>w * v</code> is entrywise with v broadcast over rows: [[1·10, 2·1], [3·10, 4·1]] = [[10, 2], [30, 4]].</p>
+<p class="problem"><span class="pl">Problem 6.9</span> Prove (AB)ᵀ = BᵀAᵀ using entries.</p>
+<p><strong>Answer:</strong> ((AB)ᵀ)<sub>ij</sub> = (AB)<sub>ji</sub> = ∑<sub>k</sub> A<sub>jk</sub>B<sub>ki</sub>. Rewrite each factor as an entry of a transpose: A<sub>jk</sub> = (Aᵀ)<sub>kj</sub> and B<sub>ki</sub> = (Bᵀ)<sub>ik</sub>. Then the sum is ∑<sub>k</sub> (Bᵀ)<sub>ik</sub>(Aᵀ)<sub>kj</sub> = (BᵀAᵀ)<sub>ij</sub>. Same entry for every i, j, so the matrices are equal.</p>
+<p class="problem"><span class="pl">Problem 6.10</span> A is 3 × 3 with det A = 2. Find det(3A), det(A⁻¹), det(AᵀA) and det(A²).</p>
+<p><strong>Answer:</strong> det(3A) = 3³ · 2 = 54. det(A⁻¹) = 1/2. det(AᵀA) = det(Aᵀ)det(A) = 2 · 2 = 4. det(A²) = 2² = 4.</p>
+<p class="problem"><span class="pl">Problem 6.11</span> Let A = [[2, 0], [0, 4]] and B = [[1, 1], [0, 1]]. Compute (AB)⁻¹ two ways.</p>
+<p><strong>Answer:</strong> AB = [[2·1 + 0, 2·1 + 0·1], [0, 4]] = [[2, 2], [0, 4]]. Formula: det = 8, inverse = (1/8)·[[4, −2], [0, 2]] = [[0.5, −0.25], [0, 0.25]]. Rule: B⁻¹A⁻¹ = [[1, −1], [0, 1]]·[[0.5, 0], [0, 0.25]] = [[0.5, −0.25], [0, 0.25]]. Same. The wrong order A⁻¹B⁻¹ = [[0.5, 0], [0, 0.25]]·[[1, −1], [0, 1]] = [[0.5, −0.5], [0, 0.25]] is a different matrix.</p>
+<p class="problem"><span class="pl">Problem 6.12</span> A network takes a batch of 32 inputs with 100 features, goes through a hidden layer of 64 neurons and an output layer of 10. Give the weight shapes, the output shape and the total number of parameters.</p>
+<p><strong>Answer:</strong> W<sub>1</sub> is 100 × 64, b<sub>1</sub> has 64, W<sub>2</sub> is 64 × 10, b<sub>2</sub> has 10. Hidden output (32 × 100)(100 × 64) = 32 × 64; final (32 × 64)(64 × 10) = 32 × 10. Parameters: 100·64 + 64 + 64·10 + 10 = 6400 + 64 + 640 + 10 = 7114.</p>
+<p class="problem"><span class="pl">Problem 6.13</span> Find the cheapest bracketing for ABC with A 200 × 300, B 300 × 50, C 50 × 400, counting multiplications.</p>
+<p><strong>Answer:</strong> (AB)C: AB costs 200·300·50 = 3,000,000 and is 200 × 50; then (200 × 50)(50 × 400) costs 200·50·400 = 4,000,000. Total 7,000,000. A(BC): BC costs 300·50·400 = 6,000,000 and is 300 × 400; then A(BC) costs 200·300·400 = 24,000,000. Total 30,000,000. So (AB)C is about 4.3 times cheaper.</p>
+<p class="problem"><span class="pl">Problem 6.14</span> Find the bug. A student computes the MSE of a regression as <code>np.mean((model.predict(X) - y) ** 2)</code> where predict returns shape (n, 1) and y has shape (n,). The value looks plausible but is too large and training never improves. Why, and what is the fix?</p>
+<p><strong>Answer:</strong> (n, 1) − (n,) broadcasts into an n × n table of all pairwise differences ŷ<sub>i</sub> − y<sub>j</sub>, so the loss measures the spread of y around every prediction, not the pairwise errors. With y = [1, 2, 3] and predictions [1, 2, 4] it gives 2.3333 instead of 0.3333. Fix: <code>pred = model.predict(X).ravel()</code> (or <code>y.reshape(-1, 1)</code>) and assert that the shapes match.</p>
+<p class="problem"><span class="pl">Problem 6.15</span> Change of basis: A = [[1, 0], [0, 2]], P = [[1, 1], [0, 1]]. Compute P⁻¹AP and confirm that the trace and determinant are unchanged.</p>
+<p><strong>Answer:</strong> det P = 1, P⁻¹ = [[1, −1], [0, 1]]. AP = [[1·1, 1·1], [0·1 + 2·0, 0·1 + 2·1]] = [[1, 1], [0, 2]]. P⁻¹(AP) = [[1·1 + (−1)·0, 1·1 + (−1)·2], [0, 2]] = [[1, −1], [0, 2]]. Trace 1 + 2 = 3 as before, det 1·2 − 0 = 2 as before.</p>
+<p class="problem"><span class="pl">Problem 6.16 (interview)</span> A feature matrix X has 1000 rows and 6 columns, and the sixth column is exactly twice the first column. What happens to XᵀX, and what do you do?</p>
+<p><strong>Answer:</strong> The columns are dependent, so rank(X) is one less than the number of columns, and XᵀX (which has the same rank as X) is singular: det = 0, no inverse. <code>np.linalg.inv</code> raises an error or, with rounding noise, returns huge meaningless numbers and the coefficients are not unique. Remove or combine the redundant column (or use ridge regularisation) and solve with <code>lstsq</code>. Diagnose with <code>np.linalg.matrix_rank(X)</code> and <code>np.linalg.cond(X)</code>.</p>
+<p class="problem"><span class="pl">Problem 6.17 (code)</span> Write a function that tests whether a matrix is orthogonal and test it on a rotation by 40 degrees and on the matrix [[1, 1], [0, 1]].</p>
+<p><strong>Answer:</strong> A matrix is orthogonal if QᵀQ = I. Compare with a tolerance, never with exact equality.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+def is_orthogonal(Q, tol=1e-10):
+    Q = np.asarray(Q, dtype=float)
+    return Q.shape[0] == Q.shape[1] and np.allclose(Q.T @ Q, np.eye(Q.shape[0]), atol=tol)
+
+th = np.deg2rad(40)
+R = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+print(is_orthogonal(R), is_orthogonal([[1, 1], [0, 1]]))
+print(round(np.linalg.det(R), 6))</code></pre>
+<pre class="code lang-text"><code>True False
+1.0</code></pre>
+<p>The shear is not orthogonal: its columns [1, 0] and [1, 1] are not perpendicular, and it changes lengths. The rotation has determinant 1.</p>
+
+<h2>Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me matrices and linear transformations step by step: matrix shapes, the matrix-vector product (rows view and columns view), matrix-matrix products (dot products, column combinations, row combinations, outer products), transpose, determinant, inverse, rank and the geometry of 2x2 transformations. Start with a one-paragraph plain-English intuition, then give me 5 quiz questions one at a time, from easy hand calculations to harder conceptual ones. Wait for my answer before revealing the next question. After each answer, correct me kindly, show the full working with real numbers, and tell me which concept to review. Finish with a summary of my weak spots.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>Act as a careful reviewer of my matrix work. I will paste a calculation or NumPy code involving matrix products, inverses, determinants, ranks or shapes. Check every shape (write each as (rows x columns)), recompute the numbers by hand step by step, and compare with my answer. Point out any mistake such as using * instead of @, assuming AB = BA, transposing a product without reversing the order, inverting with inv instead of solve, or a broadcasting bug between shapes (n,) and (n,1). Explain why each error happens, give the corrected code, and suggest one assert statement that would have caught it.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>Run a mock data science interview on linear algebra fundamentals. Ask me one question at a time, mixing: matrix multiplication shapes and cost, what the determinant and rank mean geometrically, why we avoid computing inverses, what the condition number tells us, how a linear layer in a neural network uses a weight matrix, and how collinear features affect linear regression. After each of my answers, grade it from 1 to 5, give a model answer with a small numeric example, and ask a follow-up if my answer was shallow. After 8 questions, give me an overall score and a study plan for the next week.</pre></div>
+

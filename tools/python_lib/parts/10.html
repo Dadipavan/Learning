@@ -1,0 +1,77 @@
+<h2>22.10 Performance and pitfalls</h2>
+<p>These are the mistakes that cost the most hours. Each box gives the wrong code, the symptom you will see, and the fix.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE 1: loading everything first</div><div class="txt"><strong>Wrong:</strong> <code>df = pd.read_csv("events.csv")</code> for a file larger than a third of RAM. <strong>Symptom:</strong> frozen notebook, swapping, or a killed kernel with no traceback. <strong>Fix:</strong> measure first (Section 22.8), then <code>usecols</code> and <code>dtype</code>, or <code>chunksize</code>, or <code>pl.scan_csv</code> / DuckDB on the file.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 2: row-by-row Python</div><div class="txt"><strong>Wrong:</strong> <code>df.apply(f, axis=1)</code>, <code>df.iterrows()</code>, or a Spark <code>F.udf</code> for arithmetic. <strong>Symptom:</strong> a step that takes minutes on 200,000 rows (we measured about 100 times slower than the vectorized form). <strong>Fix:</strong> column expressions, <code>map</code> with a dictionary, <code>np.where</code>, Polars expressions, Spark built-ins, then <code>pandas_udf</code>.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 3: pulling big results to the driver</div><div class="txt"><strong>Wrong:</strong> <code>sdf.toPandas()</code>, <code>sdf.collect()</code> or <code>ddf.compute()</code> on a result as big as the input. <strong>Symptom:</strong> driver out-of-memory error after the cluster finished all the work. <strong>Fix:</strong> aggregate or <code>limit</code> first, or write to Parquet and read the part you need.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 4: averaging averages</div><div class="txt"><strong>Wrong:</strong> combining per-partition means with an unweighted mean. <strong>Symptom:</strong> totals do not match the single-machine answer (we showed it in Section 22.6). <strong>Fix:</strong> keep sum and count per partition and divide at the end; for medians use an approximate quantile and say so.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 5: a million tiny files</div><div class="txt"><strong>Wrong:</strong> <code>df.write.partitionBy("customer_id").parquet(...)</code>, or writing a file per chunk or per minute. <strong>Symptom:</strong> a listing that takes minutes, thousands of 5 ms tasks, slow reads. <strong>Fix:</strong> partition by low-cardinality columns (date, country), then compact to files of about 100 MB to 1 GB.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 6: default shuffle partitions</div><div class="txt"><strong>Wrong:</strong> leaving <code>spark.sql.shuffle.partitions</code> at 200 for a 50 MB job or for a 5 TB job. <strong>Symptom:</strong> 200 near-empty tasks, or 200 giant tasks that spill to disk. <strong>Fix:</strong> aim for partitions of 100 to 200 MB after the shuffle; check the Stages page; let AQE coalesce small ones.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 7: ignoring skew</div><div class="txt"><strong>Wrong:</strong> joining on a key where 20 percent of rows are <code>NULL</code> or one bot id. <strong>Symptom:</strong> 199 tasks finish in seconds, one runs for an hour, executors idle. <strong>Fix:</strong> filter or isolate the hot keys, enable AQE skew join, or salt (Section 22.7).</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 8: caching blindly, or never</div><div class="txt"><strong>Wrong:</strong> <code>df.cache()</code> on everything, or calling three actions on an expensive plan with no cache. <strong>Symptom:</strong> executors fill with cached data and evict useful blocks; or the same scan appears three times in the Jobs tab. <strong>Fix:</strong> cache only DataFrames reused by several actions, trigger them with one action, <code>unpersist()</code> after; or write a checkpoint Parquet file.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 9: unstable hashing</div><div class="txt"><strong>Wrong:</strong> routing rows to buckets with Python's built-in <code>hash(key)</code> for strings. <strong>Symptom:</strong> the same key lands in different buckets in different processes or runs; duplicates survive dedupe, joins miss matches. <strong>Fix:</strong> a stable hash such as <code>pd.util.hash_pandas_object</code>, <code>hashlib</code> or the engine's own partitioner.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 10: schema drift and guessed types</div><div class="txt"><strong>Wrong:</strong> <code>inferSchema=True</code> on a huge CSV, or appending a file where <code>id</code> is a string to a folder where it is an integer. <strong>Symptom:</strong> an extra full pass, ids turning into floats like <code>1.0e7</code>, or "cannot merge incompatible data types" at read time. <strong>Fix:</strong> an explicit schema, ids as strings, types written into Parquet, and a schema check at ingestion.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 11: null keys and silent row loss</div><div class="txt"><strong>Wrong:</strong> an inner join where one side has missing keys, or <code>NaN</code> treated like <code>null</code>. <strong>Symptom:</strong> row counts drop without an error, or <code>NULL = NULL</code> never matches. <strong>Fix:</strong> count rows before and after every join, use <code>left</code> joins when you must keep all rows, report unmatched keys, and learn your library's null rules (in Polars <code>NaN</code> and <code>null</code> are different).</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 12: a global sort you did not need</div><div class="txt"><strong>Wrong:</strong> <code>df.orderBy("ts")</code> or <code>ddf.set_index("ts")</code> in the middle of a pipeline. <strong>Symptom:</strong> an extra full shuffle and a stage that dominates the run. <strong>Fix:</strong> sort only for final output or for window functions that need it; use <code>sortWithinPartitions</code>, or sort when writing.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 13: trusting float sums across engines</div><div class="txt"><strong>Wrong:</strong> asserting <code>spark_total == pandas_total</code> on floats. <strong>Symptom:</strong> the check fails by 1e-9, or flips between runs, because partitions add in a different order. <strong>Fix:</strong> compare with a tolerance (<code>np.isclose</code>) or sum integer cents.</div></div>
+<h3>Quick performance checklist</h3>
+<ol>
+<li>Read only needed columns; filter as early as possible; prefer Parquet over CSV.</li>
+<li>Use the smallest dtypes that are safe; categories for repeated strings.</li>
+<li>Prefer built-in column operations to Python functions.</li>
+<li>Reduce data before a join (filter, select, pre-aggregate); broadcast small tables.</li>
+<li>Count shuffles in the plan; remove the ones you can.</li>
+<li>Check for skew and for tiny or giant partitions before touching configuration.</li>
+<li>Time one stage at a time on a sample, then scale up and measure again; trust measurements over folklore.</li>
+</ol>
+
+<h2>22.11 Cross-library integration</h2>
+<p>You will often mix tools: aggregate in DuckDB or Spark, then finish in pandas, then plot or model. The rule is to move <em>small</em> things between libraries and leave big things on disk as Parquet.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>From to</th><th>How (not run here)</th><th>Cost</th></tr></thead><tbody>
+<tr><td>pandas to Polars</td><td><code>pl.from_pandas(df)</code></td><td>Needs pyarrow; copies unless dtypes map directly</td></tr>
+<tr><td>Polars to pandas</td><td><code>lf.collect().to_pandas()</code></td><td>Needs pyarrow; the whole result must fit in RAM</td></tr>
+<tr><td>pandas to DuckDB</td><td><code>duckdb.sql("SELECT ... FROM df")</code></td><td>Reads the DataFrame in place, no copy of the data into a database</td></tr>
+<tr><td>DuckDB to pandas / Polars / Arrow</td><td><code>.df()</code>, <code>.pl()</code>, <code>.arrow()</code> (accessor name varies by version)</td><td>Cost proportional to the result size</td></tr>
+<tr><td>Dask to pandas</td><td><code>ddf.compute()</code></td><td>The result becomes one pandas object</td></tr>
+<tr><td>pandas to Dask</td><td><code>dd.from_pandas(df, npartitions=8)</code></td><td>Splits in memory</td></tr>
+<tr><td>Spark to pandas</td><td><code>sdf.toPandas()</code> after <code>spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")</code></td><td>Collects to the driver; faster with Arrow</td></tr>
+<tr><td>pandas to Spark</td><td><code>spark.createDataFrame(df)</code></td><td>Serializes through the driver: for small data</td></tr>
+<tr><td>Anything to anything, big data</td><td>Write Parquet, read Parquet</td><td>Zero shared memory, no size limit, fully reproducible</td></tr>
+<tr><td>Spark with the pandas API</td><td><code>sdf.pandas_api()</code> (module <code>pyspark.pandas</code>)</td><td>Familiar syntax; some operations are shuffles in disguise</td></tr>
+</tbody></table></div>
+<p>The scikit-learn side matters too. Most models need all training rows in memory, so you either aggregate or sample before training, or use an estimator with <code>partial_fit</code> that learns from one chunk at a time. The block trains a linear model on 200,000 rows in 20,000-row chunks and compares it with a full fit.</p>
+<py>
+import numpy as np
+from sklearn.linear_model import LinearRegression, SGDRegressor
+from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(0)
+n = 200_000
+X = rng.normal(size=(n, 3))
+y = X @ np.array([3.0, -2.0, 0.5]) + 10 + rng.normal(0, 1, n)
+
+full = LinearRegression().fit(X, y)
+
+scaler = StandardScaler().fit(X[:20_000])                 # in practice: fit the scaler on one chunk or a sample
+model = SGDRegressor(learning_rate="constant", eta0=0.001, random_state=0)
+for epoch in range(3):
+    for start in range(0, n, 20_000):
+        sl = slice(start, start + 20_000)
+        model.partial_fit(scaler.transform(X[sl]), y[sl])
+
+pred_full = full.predict(X[:2000])
+pred_sgd = model.predict(scaler.transform(X[:2000]))
+print("full coefficients:", np.round(full.coef_, 2))
+print("streamed predictions close to full fit:", bool(np.abs(pred_full - pred_sgd).max() < 0.3))
+</py>
+<ol>
+<li>The synthetic data has known coefficients 3, -2 and 0.5 and intercept 10, plus noise.</li>
+<li><code>LinearRegression().fit(X, y)</code> needs the whole matrix at once; this is the reference answer. It recovers the true coefficients to two decimals.</li>
+<li>The scaler is fitted on the first chunk only, which is what you do when the whole data cannot be scanned twice. Scaling matters because SGD is sensitive to feature scale.</li>
+<li><code>partial_fit</code> updates the model with one chunk and remembers its state. Three passes (epochs) over the chunks let it converge.</li>
+<li>The streamed model's predictions agree with the exact fit to within 0.3 on the first 2,000 rows, close but not identical: SGD is approximate. Other estimators with <code>partial_fit</code> include <code>MiniBatchKMeans</code>, <code>SGDClassifier</code>, <code>MultinomialNB</code> and <code>IncrementalPCA</code>.</li>
+</ol>
+<ul>
+<li><strong>Plotting:</strong> never send 100 million points to matplotlib. Aggregate to bins or a few thousand points (a group-by or a histogram in the engine), then plot.</li>
+<li><strong>SQL and pandas:</strong> <code>pd.read_sql(q, con, chunksize=50_000)</code> streams a database result; for real warehouses push the aggregation into SQL.</li>
+<li><strong>joblib and multiprocessing:</strong> for embarrassingly parallel work on a few big files (one file per worker), a <code>joblib.Parallel</code> over files is often enough before you need Dask.</li>
+</ul>

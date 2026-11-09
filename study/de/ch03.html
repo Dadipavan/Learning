@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 3: File Formats, Storage and Lakehouse Table Formats</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#357a70"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Engineering &amp; Big Data</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 3</div><h1>File Formats, Storage and Lakehouse Table Formats</h1><p>How data is written to disk decides how fast, how cheap and how safe everything after it is.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-3-1-text-formats-csv-and-json-and-their-traps">3.1 Text Formats: CSV and JSON, and Their Traps</a></li><li><a href="#s2-3-2-columnar-formats-parquet-orc-avro-arrow">3.2 Columnar Formats: Parquet, ORC, Avro, Arrow</a></li><li><a href="#s3-3-3-compression-partitioning-and-the-small-file-problem">3.3 Compression, Partitioning and the Small-File Problem</a></li><li><a href="#s4-3-4-table-formats-delta-lake-iceberg-hudi">3.4 Table Formats: Delta Lake, Iceberg, Hudi</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>You will meet a surprising number of data problems that are not about SQL or Spark at all. They are about the file. A CSV with a comma inside a name breaks a load at 2 a.m. A folder with 50,000 tiny files makes a job ten times slower than it should be. A query scans 2 TB when it needed 20 GB because the files were not partitioned. In this chapter you will learn what CSV and JSON get wrong, why Parquet is the default for analytics, how compression and partitioning save money, why the small-file problem hurts, and how table formats such as Delta Lake and Iceberg add safe updates on top of plain files. We will measure effects with real code you can run, and one toy table format you can read in 20 lines.</p>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 3: File Formats, Storage and Lakehouse Table Formats</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#357a70"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Engineering &amp; Big Data</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 3</div><h1>File Formats, Storage and Lakehouse Table Formats</h1><p>How data is written to disk decides how fast, how cheap and how safe everything after it is.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-3-1-text-formats-csv-and-json-and-their-traps">3.1 Text Formats: CSV and JSON, and Their Traps</a></li><li><a href="#s2-3-2-columnar-formats-parquet-orc-avro-arrow">3.2 Columnar Formats: Parquet, ORC, Avro, Arrow</a></li><li><a href="#s3-3-3-compression-partitioning-and-the-small-file-problem">3.3 Compression, Partitioning and the Small-File Problem</a></li><li><a href="#s4-3-4-table-formats-delta-lake-iceberg-hudi">3.4 Table Formats: Delta Lake, Iceberg, Hudi</a></li><li><a href="#s5-3-5-table-format-internals-snapshots-conflicts-z-order-and-deletes">3.5 Table Format Internals: Snapshots, Conflicts, Z-order and Deletes</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p>You will meet a surprising number of data problems that are not about SQL or Spark at all. They are about the file. A CSV with a comma inside a name breaks a load at 2 a.m. A folder with 50,000 tiny files makes a job ten times slower than it should be. A query scans 2 TB when it needed 20 GB because the files were not partitioned. In this chapter you will learn what CSV and JSON get wrong, why Parquet is the default for analytics, how compression and partitioning save money, why the small-file problem hurts, and how table formats such as Delta Lake and Iceberg add safe updates on top of plain files. We will measure effects with real code you can run, and one toy table format you can read in 20 lines.</p>
 <h2 id="s1-3-1-text-formats-csv-and-json-and-their-traps">3.1 Text Formats: CSV and JSON, and Their Traps</h2>
 <div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A CSV file is a letter written by hand: anyone can read it, but there is no agreed handwriting. Is a blank an empty text or a missing value? Is <code>07</code> a number or a pin code? Text formats are friendly for humans and risky for machines.</div></div>
 <h3>Words you need</h3>
@@ -217,10 +217,122 @@ OPTIMIZE silver.customers;                             -- compaction</code></pre
 <div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting maintenance. Without compaction and cleanup, a table format accumulates small files and old versions, and queries slow down while storage cost grows. Schedule <code>OPTIMIZE</code>/<code>VACUUM</code> (Delta) or rewrite/expire (Iceberg).</div></div>
 <p><strong>Check yourself</strong></p>
 <ol><li>What two things make a table format? Answer: immutable data files plus a commit log.</li><li>Why can readers still see old data after an update? Answer: old files stay until cleanup; the log lets you read an earlier version.</li><li>What is a catalog? Answer: the directory mapping table names to their current metadata.</li></ol>
-<h2 id="s5-chapter-recap">Chapter recap</h2>
+<h2 id="s5-3-5-table-format-internals-snapshots-conflicts-z-order-and-deletes">3.5 Table Format Internals: Snapshots, Conflicts, Z-order and Deletes</h2>
+<p>Section 3.4 told you what Delta Lake, Iceberg and Hudi give you: transactions, time travel and schema evolution on top of plain Parquet files. This section shows <em>how</em>, with toy models you can run. Once you see the mechanism, the features stop being magic and the interview questions (why can two writers conflict, why does a delete not free disk space, what does Z-order do) become easy.</p>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A table format is a library catalogue for a warehouse of immutable boxes (Parquet files). You never change a box. To change the table you write new boxes and publish a new catalogue edition. Readers who already picked up the old edition keep reading it. The whole trick is that publishing is one atomic step: moving a single "current edition" pointer.</div></div>
+<h3>The metadata tree</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Layer</th><th>Iceberg</th><th>Delta Lake</th><th>What it holds</th></tr></thead><tbody><tr><td>Pointer</td><td>catalog entry points to the current <code>metadata.json</code></td><td>highest numbered file in <code>_delta_log/</code></td><td>which version is current</td></tr><tr><td>Version</td><td>metadata file with snapshots, schema, partition spec</td><td>JSON commit file such as <code>00000000000000000012.json</code> with <code>add</code> and <code>remove</code> actions</td><td>one commit</td></tr><tr><td>File lists</td><td>manifest list, then manifest files with per-file min/max stats</td><td>checkpoint Parquet file (by default about every 10 commits) summarising the log so far</td><td>which data files belong to the version</td></tr><tr><td>Data</td><td>Parquet, ORC or Avro files</td><td>Parquet files</td><td>the rows</td></tr></tbody></table></div>
+<p>Reading a table means: find the current pointer, read the list of files for that version, use the min/max stats to skip files, read what is left. Nothing is listed from the object store directory, which is slow and not atomic. Hudi has the same idea with a timeline of instants, and adds a choice of how to store updates: <strong>copy-on-write</strong> rewrites the whole file on update (fast reads, heavy writes), <strong>merge-on-read</strong> writes small log files and merges them when reading (fast writes, heavier reads) until a compaction folds them in.</p>
+<h3>Example 1: optimistic concurrency with two writers</h3>
+<p>No locks are used. Each writer reads the current version, prepares its new files, then asks to commit "on top of version N". If someone else committed in the meantime the commit is refused and the writer must retry on top of the new version. Predict: writer A appends a file and writer B compacts two files, both starting from snapshot 1. What happens to B?</p>
+<pre class="code lang-python"><code># A tiny table format: snapshots point to manifests, manifests list data files.
+# Commits are atomic because the only mutable thing is one pointer: "current snapshot id".
+class Table:
+    def __init__(self):
+        self.snapshots = {0: []}        # snapshot id -&gt; list of data files (via the manifest)
+        self.current = 0
+    def files(self, snap=None):
+        return self.snapshots[self.current if snap is None else snap]
+    def commit(self, base, add=(), remove=()):
+        """Optimistic concurrency: succeed only if nobody committed since 'base'."""
+        if base != self.current:
+            return False
+        new = [f for f in self.snapshots[base] if f not in remove] + list(add)
+        sid = max(self.snapshots) + 1
+        self.snapshots[sid] = new
+        self.current = sid               # the single atomic step
+        return True
+
+t = Table()
+print("commit load1:", t.commit(0, add=["f1.parquet", "f2.parquet"]), "-&gt; snapshot", t.current)
+# Two writers both start from snapshot 1.
+base_a = base_b = t.current
+print("writer A appends f3 :", t.commit(base_a, add=["f3.parquet"]), "-&gt; snapshot", t.current)
+print("writer B compacts f1+f2 into f12:", t.commit(base_b, add=["f12.parquet"], remove=["f1.parquet", "f2.parquet"]))
+# B must retry: re-read the current state, redo the compaction on top of it.
+base_b = t.current
+print("writer B retry      :", t.commit(base_b, add=["f12.parquet"], remove=["f1.parquet", "f2.parquet"]), "-&gt; snapshot", t.current)
+print("current files      :", t.files())
+print("time travel, snap 1:", t.files(1))
+print("reader that started on snapshot 2 still sees:", t.files(2))</code></pre>
+<pre class="code lang-text"><code>commit load1: True -&gt; snapshot 1
+writer A appends f3 : True -&gt; snapshot 2
+writer B compacts f1+f2 into f12: False
+writer B retry      : True -&gt; snapshot 3
+current files      : ['f3.parquet', 'f12.parquet']
+time travel, snap 1: ['f1.parquet', 'f2.parquet']
+reader that started on snapshot 2 still sees: ['f1.parquet', 'f2.parquet', 'f3.parquet']</code></pre>
+<table class="steps"><tr><th>Step 1</th><td>Both writers start from snapshot 1 (files f1, f2).</td></tr><tr><th>Step 2</th><td>A commits first: snapshot 2 now holds f1, f2, f3. The pointer moved from 1 to 2.</td></tr><tr><th>Step 3</th><td>B asks to commit on top of 1, but the table is at 2. Refused (False). B lost nothing but its time.</td></tr><tr><th>Step 4</th><td>B re-reads snapshot 2, checks that f1 and f2 are still there (A only added f3, so no conflict), and commits on top of 2. Snapshot 3: f3, f12.</td></tr><tr><th>Isolation</th><td>A reader that began on snapshot 2 keeps seeing f1, f2, f3 for its whole query. Time travel to snapshot 1 still works until old versions are expired.</td></tr></table>
+<p>Real formats are smarter than "any new commit refuses mine". They check whether the files you read or deleted were touched by the intervening commits. An append that only adds files does not conflict with a compaction that removes other files, so many real retries succeed without redoing work. Two writers that update the <em>same</em> file do conflict, and one of them fails with a conflict exception. Design for this: let one job own each table (or partition) and make writes retry-safe.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Believing the lakehouse gives you database-style row locks. <strong>Wrong:</strong> "two jobs can update the same rows in parallel and the format will queue them." <strong>Right:</strong> the format gives atomic commits and snapshot isolation by optimistic retry. Two jobs touching the same files means one fails and must be re-run. Partition your writers so they touch different files, and retry on conflict.</div></div>
+<h3>Example 2: Z-order clustering</h3>
+<p>Sorting by one column makes that column prune perfectly and the others not at all (Section 8.4 showed this). <strong>Z-order</strong> interleaves the bits of several columns into one sort key, so rows that are close in <em>both</em> columns end up in the same files. We simulate 4,096 rows with two columns, x and y, in 64 files of 64 rows. Predict: sorted by x, a filter on y only reads how many files? And with Z-order?</p>
+<pre class="code lang-python"><code># Z-order: interleave the bits of two columns so rows close in BOTH columns sit close in the file.
+import random
+random.seed(3)
+N, FILE = 4096, 64                           # 64 files of 64 rows
+rows = [(random.randrange(64), random.randrange(64)) for _ in range(N)]   # (x, y), both 0..63
+def zkey(x, y):
+    z = 0
+    for b in range(6):
+        z |= ((x &gt;&gt; b) &amp; 1) &lt;&lt; (2*b) | ((y &gt;&gt; b) &amp; 1) &lt;&lt; (2*b + 1)
+    return z
+def files_read(order, qx, qy):
+    n = 0
+    for i in range(0, N, FILE):
+        blk = order[i:i+FILE]
+        xs = [r[0] for r in blk]; ys = [r[1] for r in blk]
+        okx = qx is None or (min(xs) &lt;= qx[1] and max(xs) &gt;= qx[0])
+        oky = qy is None or (min(ys) &lt;= qy[1] and max(ys) &gt;= qy[0])
+        if okx and oky: n += 1
+    return n
+by_x = sorted(rows)                                    # sorted by x, then y
+by_z = sorted(rows, key=lambda r: zkey(*r))
+print("filter x in 8..15 only    : sort by x -&gt;", files_read(by_x, (8, 15), None), "files; z-order -&gt;", files_read(by_z, (8, 15), None))
+print("filter y in 8..15 only    : sort by x -&gt;", files_read(by_x, None, (8, 15)), "files; z-order -&gt;", files_read(by_z, None, (8, 15)))
+print("filter both 8..15         : sort by x -&gt;", files_read(by_x, (8, 15), (8, 15)), "files; z-order -&gt;", files_read(by_z, (8, 15), (8, 15)))
+print("total files:", N // FILE)</code></pre>
+<pre class="code lang-text"><code>filter x in 8..15 only    : sort by x -&gt; 9 files; z-order -&gt; 18
+filter y in 8..15 only    : sort by x -&gt; 64 files; z-order -&gt; 12
+filter both 8..15         : sort by x -&gt; 9 files; z-order -&gt; 3
+total files: 64</code></pre>
+<ul><li>Sorted by x: a filter on x reads 9 of 64 files (8 values out of 64 is 1/8 of the files, plus one boundary file). A filter on y reads all 64, because every file has all y values.</li><li>Z-order: a filter on x reads 18 and on y reads 12 files. Both are worse than the perfect single-column sort (9), and both are far better than 64.</li><li>A filter on both reads just 3 files, against 9 for the single sort.</li></ul>
+<p>The trade is the same as with any index: Z-order buys decent pruning on several columns at the price of mediocre pruning on each. It is the right choice when queries filter on different columns at different times. In Delta Lake the command is <code>OPTIMIZE table ZORDER BY (x, y)</code>. Newer approaches (Delta <strong>liquid clustering</strong>, Iceberg sort orders and clustering) let you change the clustering columns later without rewriting the whole table, and they handle new data incrementally. Check the current documentation of your platform, because this area changes quickly.</p>
+<h3>Example 3: deletes, copy-on-write and deletion vectors</h3>
+<p>Files are immutable, so deleting one row has two possible designs. <strong>Copy-on-write:</strong> rewrite the whole file without that row. <strong>Merge-on-read with deletion vectors:</strong> leave the file alone and store a small bitmap saying "row 1 of file 5 is gone"; readers skip marked rows and a later compaction rewrites the file. Predict: how many rows are rewritten in each design when one row of a 100-row file is erased?</p>
+<pre class="code lang-python"><code># Deletes in an immutable-file world: rewrite the file (copy on write) or mark rows (deletion vector).
+rows = [{"id": i, "email": f"user{i}@x.com"} for i in range(1, 1_000_001, 1000)]  # 1,000 sample rows
+FILE_ROWS = 100
+files = [rows[i:i+FILE_ROWS] for i in range(0, len(rows), FILE_ROWS)]
+victim = 501001                      # the id to erase (right to erasure request)
+holder = [i for i, f in enumerate(files) if any(r["id"] == victim for r in f)]
+print("files in table:", len(files), "| file holding the row:", holder)
+cow_rows_written = sum(len(files[i]) - 1 for i in holder)
+print("copy-on-write: rewrite that file, rows written =", cow_rows_written)
+dv = {holder[0]: {next(j for j, r in enumerate(files[holder[0]]) if r["id"] == victim)}}
+print("deletion vector: rows written = 0, bitmap stored:", dv)
+live = [r for i, f in enumerate(files) for j, r in enumerate(f) if j not in dv.get(i, set())]
+print("rows visible to readers:", len(live), "(was", len(rows), ")")
+print("but the old bytes still exist on disk until compaction and vacuum remove the old file version")</code></pre>
+<pre class="code lang-text"><code>files in table: 10 | file holding the row: [5]
+copy-on-write: rewrite that file, rows written = 99
+deletion vector: rows written = 0, bitmap stored: {5: {1}}
+rows visible to readers: 999 (was 1000 )
+but the old bytes still exist on disk until compaction and vacuum remove the old file version</code></pre>
+<table class="steps"><tr><th>Copy-on-write</th><td>Rewrites the 99 surviving rows into a new file. Cost grows with file size: a 1 GB file with one deleted row means about 1 GB of writes.</td></tr><tr><th>Deletion vector</th><td>Writes zero data rows and a tiny bitmap. Readers hide the row at once.</td></tr><tr><th>Catch</th><td>In both designs the old bytes stay in the object store. The row is hidden from queries but not erased from disk until the old file version is removed by a compaction and then a vacuum (Delta <code>VACUUM</code>, Iceberg snapshot expiry plus orphan file removal) after the retention period.</td></tr><tr><td colspan="2"><strong>Why it matters:</strong> a privacy right-to-erasure request is only met when the physical bytes are gone. See Section 12.5 for the full checklist.</td></tr></table>
+<h3>Going deeper</h3>
+<ul><li><strong>Hidden partitioning (Iceberg).</strong> You declare a transform such as <code>days(order_ts)</code>. Users write <code>WHERE order_ts &gt;= '2025-01-01'</code> and the format maps that to partitions. No <code>order_date</code> helper column, and no full table scan if someone forgets it. You can later change the partition spec (for example from months to days) and old files keep their old layout.</li><li><strong>Schema evolution by column id.</strong> Iceberg tracks columns by an id, not by name or position, so renaming a column or reordering is a metadata-only change and cannot silently mix up two columns.</li><li><strong>Small files and the log.</strong> Every commit adds metadata. Streaming writers that commit every few seconds produce thousands of tiny files and a long log. Compact files, and expire old snapshots.</li><li><strong>Vacuum versus time travel.</strong> Time travel works only while old files exist. Running VACUUM with a retention of 0 hours removes them, and breaks long-running readers and concurrent writers, which is why the default retention is 7 days in Delta.</li></ul>
+<p class="problem"><span class="pl">Problem 3.5.1</span> A Delta table receives one commit per minute. A checkpoint is written every 10 commits. How many JSON commit files plus checkpoint files must a reader process after 1 hour, if it can start from the latest checkpoint?</p>
+<table class="steps"><tr><th>Step 1</th><td>60 commits in one hour, so checkpoints at commits 10, 20, 30, 40, 50, 60.</td></tr><tr><th>Step 2</th><td>The latest checkpoint is at 60 if the reader looks right after commit 60. It then reads 1 checkpoint and 0 JSON files.</td></tr><tr><th>Step 3</th><td>If it looks after commit 57: latest checkpoint is 50, plus JSON files 51 to 57, which is 7 files.</td></tr><tr><th>Answer</th><td>At most 9 JSON files plus 1 checkpoint, never 60. Without checkpoints a reader would replay all commits.</td></tr></table>
+<p class="problem"><span class="pl">Problem 3.5.2</span> A 100,000 row file is 400 MB. One row is deleted with copy-on-write, then 10 more rows in the same file are deleted in 10 separate commits. How much is written?</p>
+<table class="steps"><tr><th>Step 1</th><td>Each commit rewrites the file: about 400 MB each.</td></tr><tr><th>Step 2</th><td>11 commits x 400 MB = 4.4 GB written to remove 11 rows.</td></tr><tr><th>Answer</th><td>About 4.4 GB. Batch deletes into one commit (400 MB), or use deletion vectors (kilobytes each plus one compaction).</td></tr></table>
+<p><strong>Practice (with answers)</strong></p>
+<ol><li>What is the only mutable thing in the Iceberg design? <strong>Answer:</strong> the catalog pointer to the current metadata file. Everything else is immutable.</li><li>Writer A and writer B both update rows in file f7. Both start at the same version. What happens? <strong>Answer:</strong> the first to commit wins; the second finds f7 changed and fails with a conflict, then must retry on the new version.</li><li>You delete a user and a month later a restore from snapshot is requested. Is the user's data gone? <strong>Answer:</strong> not until old snapshots and files are expired and vacuumed. Retention settings decide.</li><li>Which filter pattern benefits most from Z-order on (country, device)? <strong>Answer:</strong> filters that use either or both, for example <code>WHERE device = 'ios'</code>.</li><li>Why does merge-on-read speed up writes? <strong>Answer:</strong> an update writes only a small log or delete marker, not a full file.</li></ol>
+<p><em>Not run here:</em> real Delta, Iceberg or Hudi commands and commit file contents. The toy models use plain Python and show the mechanism, not the byte format. Check version-specific features (deletion vectors, liquid clustering) in the documentation of your engine.</p>
+<h2 id="s6-chapter-recap">Chapter recap</h2>
 <ul><li>CSV and JSON have no types and many traps: quoting, encoding, leading zeros, nulls. Always give an explicit schema and parse with a real parser.</li><li>Parquet is columnar with row groups, column chunks and a footer of min/max stats, enabling column pruning and predicate pushdown.</li><li>Avro is row-based with a schema, ideal for Kafka plus a Schema Registry.</li><li>Column layouts compress better because neighbours are alike (dictionary and run-length encoding).</li><li>Partition by low-cardinality filter columns (like date). Prune partitions to cut bytes scanned.</li><li>Small files are slow: cost is files × per-file overhead. Compact to roughly 128 MB to 1 GB.</li><li>Object storage is cheap and durable but not a file system. Use layout conventions, lifecycle rules and least-privilege permissions.</li><li>Delta, Iceberg and Hudi add ACID, time travel and MERGE to lake files via a commit log; run compaction and cleanup.</li></ul>
 <div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Rule</th></tr></thead><tbody><tr><td>Bytes read</td><td>matching groups × group size × (columns read / total columns)</td></tr><tr><td>Files cost</td><td>files × per-file overhead + bytes / throughput</td></tr><tr><td>Target file size</td><td>128 MB to 1 GB</td></tr><tr><td>Dictionary bits</td><td>⌈log₂ distinct values⌉ per row</td></tr><tr><td>Partition column</td><td>low cardinality, used in filters (date)</td></tr><tr><td>Maintenance</td><td>OPTIMIZE / VACUUM (Delta), rewrite / expire (Iceberg)</td></tr></tbody></table></div>
-<h2 id="s6-practice-set">Practice set</h2>
+<h2 id="s7-practice-set">Practice set</h2>
 <p><strong>1.</strong> (easy) Which format is human readable and has no types: Parquet, CSV, Avro? <strong>Answer:</strong> CSV.</p>
 <p><strong>2.</strong> (easy) A column has 4 distinct values. How many bits per row for dictionary encoding? <strong>Answer:</strong> ⌈log₂ 4⌉ = 2 bits.</p>
 <p><strong>3.</strong> What is printed? <code>int("0042")</code> <strong>Answer:</strong> 42. The leading zeros disappear.</p>
@@ -232,7 +344,7 @@ OPTIMIZE silver.customers;                             -- compaction</code></pre
 <p><strong>9.</strong> (interview) "What is the difference between a data lake and a lakehouse?" <strong>Answer:</strong> A lake is files in object storage with no transactions or table semantics. A lakehouse adds a table format (Delta, Iceberg, Hudi) giving ACID, schema enforcement, time travel and MERGE, so one copy of data serves both BI and ML.</p>
 <p><strong>10.</strong> (interview) "Explain Parquet internals." <strong>Answer:</strong> Columnar file made of row groups; each has one chunk per column, split into compressed pages with dictionary or run-length encoding; the footer has schema and min/max/null stats. Readers prune columns, push predicates down to skip groups, and read in parallel by row group.</p>
 <p><strong>11.</strong> (scenario) A nightly Spark job on 3 TB of <code>.csv.gz</code> takes 5 hours on 100 cores although most cores are idle. Why and what do you do? <strong>Answer:</strong> gzip text is not splittable, so each file is read by one task and a few huge files cause a long tail. Convert once to Parquet (zstd/snappy), partition by date, target 128 MB to 1 GB files, and read the Parquet in later jobs.</p>
-<h2 id="s7-prompt-pack">Prompt pack</h2>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Explain the traps of CSV and JSON files (quoting, encoding, leading zeros, null versus empty, type guessing) with small Python examples. Show the wrong version and its result, then the fix. Then give me 6 practice problems with a corrupted CSV, no solutions, and review my answers one by one.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Explain how a Parquet file is laid out (row groups, column chunks, pages, footer statistics, dictionary and run-length encoding) with an analogy first. Then give me a calculation exercise about column pruning and predicate pushdown with real numbers, and wait for my answer before showing the steps.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: partitioning strategy, file sizes and the small-file problem in a data lake on S3 or ADLS. Describe a realistic scenario with daily volume and cardinalities, ask me to choose partition columns and compute file sizes, then critique my choice and explain compaction, lifecycle policies and cost.</pre></div>

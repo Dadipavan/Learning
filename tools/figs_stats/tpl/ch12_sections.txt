@@ -1,0 +1,140 @@
+<h2>12.6 The Applied A/B Testing Toolkit</h2>
+<p>Section 12.3 gave you the basics: pick a metric, size the test, check the split. Real product teams hit five more problems within a month of running experiments. The metric is too noisy to detect anything, someone peeks at the dashboard on day three, the split is slightly off, the metric is a ratio such as revenue per session, or the effect fades after a week. This section gives you a tool for each.</p>
+<h3>Variance reduction with CUPED</h3>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Some of the noise in "spend during the experiment" is not noise at all: it is just that some users always spend more. If you know each user's spend <em>before</em> the experiment, you can subtract the part of today's spend that the past already predicts. What is left has the same average treatment effect but much less spread. This is <strong>CUPED</strong> (Controlled-experiment Using Pre-Experiment Data).</div></div>
+<p>Let <code>Y</code> be the outcome during the test and <code>X</code> the same metric measured before the test (so it cannot be affected by the treatment). Define the adjusted outcome:</p>
+<div class="eq">Y<sub>adj</sub> = Y − θ (X − mean(X)),&nbsp;&nbsp; θ = cov(X, Y) / var(X)</div>
+<p>The mean of <code>X</code> is the same in both arms in expectation, so subtracting <code>θ(X − mean X)</code> does not bias the difference in means. It does remove variance: var(Y<sub>adj</sub>) = var(Y) × (1 − ρ²), where ρ is the correlation between X and Y. With ρ = 0.7 you cut the variance by 49%, which means the same power with about half the users.</p>
+<p class="problem"><span class="pl">Problem 12.6.1</span> Simulate 5,000 users per arm with a true lift of +1.0 spend per user. Pre-period spend X has mean 20; in-test spend is Y = 0.6 X + noise. Estimate the lift with and without CUPED.</p>
+@CODE ch12_cuped
+@S
+Step 1 | Correlation between pre and in-test spend is 0.555, so the predicted variance ratio is 1 − 0.555² = 0.692.
+Step 2 | θ = cov(X, Y) / var(X) = 0.606, close to the true slope 0.6 we built in.
+Step 3 | Naive lift 0.940 with SE 0.214. Both are consistent with the true +1.0, but the interval is wide: 0.94 ± 1.96 × 0.214 = (0.52, 1.36).
+Step 4 | CUPED lift 0.977 with SE 0.178. Interval (0.63, 1.33). The variance ratio (0.178/0.214)² = 0.691 matches 1 − ρ² = 0.692.
+Answer | CUPED shrinks the standard error by about 17% and the variance by 31%, for free, using data you already log.
+@FIG ch12_cuped.png | Left: scatter of in-test spend against pre-test spend. Right: two histograms of estimated lift over 1,500 repeated experiments, the CUPED one narrower. | CUPED removes the predictable part of each user's outcome. The lift estimate stays centred on the truth but spreads less. | In the left panel the cloud slopes upward: the orange line is what pre-period spend predicts, and CUPED subtracts it. In the right panel both histograms centre on the dashed line (no bias), but the green one is narrower, so each single experiment lands closer to the truth.
+@C red | COMMON MISTAKE | Using a covariate measured <em>after</em> randomization, such as "sessions during the test", as X. If the treatment changes X, subtracting it removes part of the real effect. X must be fixed before assignment. Also, users with no history get X = 0 or the mean; check that this is applied the same way in both arms.
+<h3>Sample ratio mismatch: a diagnosis flow</h3>
+<p>Section 12.3 showed the chi-square check on the overall split. When it fails, the question is <em>where</em>. The flow is: (1) test the whole experiment, (2) test each segment (platform, country, browser, day), (3) look for the segment whose ratio is far off, (4) ask what in the pipeline treats that segment differently (a redirect, a crash, a bot filter, a cache).</p>
+<p class="problem"><span class="pl">Problem 12.6.2</span> A test planned as 50/50 shows 55,000 users in control and 53,510 in treatment. Is that a problem, and where is it?</p>
+@CODE ch12_srm
+@S
+Step 1 | Overall: p = 0.000006. The overall split is badly off even though the ratio is only 0.973.
+Step 2 | Desktop (ratio 0.999, p = 0.94) and iOS (ratio 1.006, p = 0.60) are fine.
+Step 3 | Android: 9,810 in control, 8,250 in treatment, ratio 0.841, chi-square 134.75. The whole problem lives here.
+Answer | Do not read any result from this experiment yet. Treatment on Android loses 16% of users. A typical cause is a build of the new feature that crashes before the assignment event is logged, so the users who crash vanish from the treatment arm. Fix the logging and rerun.
+@C red | COMMON MISTAKE | "The split is only 2.7% off, so it is close enough." A mismatch that small is impossible by chance at this sample size (p = 0.000006). The users you lost are usually not random, so the surviving treatment group is a different population from control.
+<h3>Peeking and sequential testing</h3>
+<p>Chapter 5 showed that checking a fixed-sample test repeatedly inflates false positives. Here is the size of the damage and the standard fixes. We simulate A/A tests (no real difference) with 5 equally spaced looks and see how often <code>|z| &gt; 1.96</code> happens at least once.</p>
+<p class="problem"><span class="pl">Problem 12.6.3</span> Simulate 200,000 A/A experiments with 5 looks. (a) How often does naive peeking declare a winner? (b) Find a constant boundary (Pocock) and an O'Brien-Fleming boundary that keep the overall false-positive rate at 5%.</p>
+@CODE ch12_peek
+@S
+Idea | Under H₀ the z statistic at look k is S<sub>k</sub> / √k, where S<sub>k</sub> is a running sum of independent N(0,1) blocks. We simulate it directly.
+Step 1 | Peeking at 1.96 on each of 5 looks gives a false positive rate of 14.2%, almost three times the promised 5%.
+Step 2 | The <strong>Pocock</strong> rule uses one constant boundary at every look. Solving for 5% overall gives 2.413.
+Step 3 | The <strong>O'Brien-Fleming</strong> rule uses boundaries c √(K/k): very strict early, relaxed late. The solved c is 2.033, giving 4.55, 3.21, 2.62, 2.27, 2.03 at the five looks. Published tables list about 2.04 for the last look; the small gap is Monte Carlo noise.
+Answer | Both keep the overall rate at 5.0%. O'Brien-Fleming costs almost nothing at the final look (2.03 versus 1.96), which is why it is the usual default. Pocock lets you stop early more easily but pays at the end (2.41).
+@FIG ch12_peeking.png | Eight simulated A/A tests as grey and orange lines across five looks, with horizontal boundaries at 1.96 (naive), 2.41 (Pocock) and a curved O'Brien-Fleming boundary. | Under no real effect, several paths would still cross the naive 1.96 line at some look. None crosses the O'Brien-Fleming curve. | Follow one orange line: it touches the red 1.96 line, so a peeker would stop and declare victory. The green curve starts very high (4.55) so a lucky early reading cannot stop the test, and falls toward 2.03 at the end.
+<p>These are <strong>group sequential</strong> designs: the number and timing of looks is fixed in advance. If you want to look at <em>any</em> moment, use an <strong>always-valid</strong> test. The <strong>mSPRT</strong> (mixture sequential probability ratio test) computes, after n observations with sample mean x̄ and known variance σ², the likelihood ratio averaged over a N(0, τ²) prior on the effect:</p>
+<div class="eq">Λ<sub>n</sub> = √(σ² / (σ² + nτ²)) × exp( n² τ² x̄² / (2 σ² (σ² + nτ²)) )</div>
+<p>Reject H₀ the first time Λ<sub>n</sub> ≥ 1/α. A theorem (Ville's inequality) guarantees that under H₀ this ever happens with probability at most α, no matter how often you look.</p>
+<p class="problem"><span class="pl">Problem 12.6.4</span> Monitor a stream of standardized paired differences (σ = 1) after every observation up to n = 3,000, with τ² = 0.25 and α = 0.05. Check the false positive rate under no effect and the power for an effect of 0.1 standard deviations.</p>
+@CODE ch12_msprt
+@S
+Step 1 | Under no effect, the test was checked 3,000 times per experiment, yet only 3.5% of 2,000 experiments ever crossed 1/α = 20. It is conservative, as theory says (at most 5%).
+Step 2 | With a real effect of 0.1, 98.8% of experiments stop with a win before n = 3,000, and the median stopping point is n = 874.
+Answer | You can look every day and still control the error rate. The price is a somewhat larger sample than a fixed test for the same power when you do wait until the end; the benefit is that big effects stop early.
+@C green | KEY IDEA | The rule is not "never peek". The rule is "peek only with a method built for peeking". Fixed-sample p-values assume one look. Group sequential boundaries allow a planned number of looks. mSPRT-style tests allow any number.
+<h3>Ratio metrics and the delta method</h3>
+<p>Many key metrics are ratios: revenue per session, clicks per impression, orders per visitor. If you randomize by <em>user</em> but divide by <em>sessions</em>, each row is not independent, because one user's sessions are alike. The standard error from a plain formula on sessions is too small. Two correct fixes: resample whole users (bootstrap), or use the <strong>delta method</strong>. For R = Σy / Σx over n users, with y<sub>i</sub> the user's revenue and x<sub>i</sub> the user's sessions:</p>
+<div class="eq">Var(R) ≈ ( var(y) + R² var(x) − 2R cov(x, y) ) / ( n × mean(x)² )</div>
+<p class="problem"><span class="pl">Problem 12.6.5</span> 4,000 users each have a number of sessions and a total revenue. Compute revenue per session and its standard error three ways.</p>
+@CODE ch12_ratio
+@S
+Step 1 | Revenue per session is 2.1181.
+Step 2 | The delta method gives SE 0.0163. Resampling users 2,000 times gives the same 0.0163.
+Step 3 | Treating the 16,000-odd sessions as independent rows gives 0.0121, which is 26% too small. A 95% interval built from it would be 25% too narrow, so you would call noise a win far too often.
+Answer | Always compute the SE at the level where you randomized (the user), not at the level of the rows.
+@C red | COMMON MISTAKE | Randomizing by user, analysing by session or pageview. The unit of analysis must match the unit of randomization, or the standard error is wrong.
+<h3>Novelty effects and interference</h3>
+<p>Two threats cannot be fixed by statistics alone. A <strong>novelty effect</strong> is a lift that appears because the feature is new and fades; the opposite, a <strong>primacy effect</strong>, is a dip while users learn. Check it by splitting the lift by days since each user's first exposure. If the first day shows +5% and the second week +1%, report the later number. <strong>Interference</strong> means one user's treatment changes another user's outcome (a marketplace where discounted buyers use up supply, a social feature where friends see each other's changes). Then control is contaminated and the measured lift is wrong. Options: randomize by cluster (city, friend group), or run a <strong>switchback</strong> test where the whole market flips between treatment and control by time block.</p>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">A pre-launch checklist that experienced teams use: metric and guardrails defined, sample size computed (with CUPED if history exists), SRM check automated, planned looks stated (or a sequential method chosen), runtime in whole weeks, and a plan to read the lift by exposure day.</div></div>
+<h3>Going deeper</h3>
+<ul><li><strong>Alpha spending.</strong> Lan-DeMets functions such as α*(t) = 2 − 2Φ(z<sub>α/2</sub> / √t) mimic O'Brien-Fleming boundaries for any number or timing of looks, where t is the fraction of information gathered. You "spend" a little alpha at each look.</li><li><strong>CUPED with several covariates</strong> is just regression adjustment: regress Y on treatment plus the pre-period covariates and read the treatment coefficient. Interaction with treatment can add a little more power.</li><li><strong>Stopping early biases the estimate upward</strong> (winner's curse, Chapter 5). A test that stops at an early boundary overstates the lift on average; sequential designs usually report a bias-adjusted estimate.</li></ul>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why can CUPED not use a covariate measured during the test? Answer: the treatment may change it, so adjusting for it would remove part of the real effect.</li><li>An experiment passes overall SRM but fails on Android. Do you trust the iOS result? Answer: only with care; the cause on Android may be a shared bug, so investigate before trusting any segment.</li><li>Which looks are cheapest under O'Brien-Fleming? Answer: late ones. Early looks need very large z.</li></ol>
+<h2>12.7 Causal Inference from Observational Data: End to End</h2>
+<p>Sometimes you cannot randomize: the feature already shipped, the policy is national, ethics forbid it. Then you need methods that rely on assumptions. In this section every example is a simulation, so we know the true effect and can see which method recovers it. Keep one idea in mind: <strong>each method buys credibility by stating one assumption you can argue about</strong>.</p>
+<h3>Causal diagrams: what to adjust for</h3>
+<p>A <strong>DAG</strong> (directed acyclic graph) draws arrows from causes to effects. Three shapes cover almost every decision about what to control for.</p>
+@T
+Shape | Example | Association between A and B | Adjust for the middle variable M?
+Chain: A → M → B | feature → engagement → purchases | A causes B through M | No, if you want the total effect (it blocks the path you care about)
+Fork: A ← M → B | power user → adopts, power user → buys | A and B are linked by a common cause | Yes, this is a confounder
+Collider: A → M ← B | talent → fame ← looks | None unless you condition on M | No, conditioning creates a fake link
+<p>The <strong>backdoor criterion</strong>: to estimate the effect of T on Y, adjust for a set of variables that blocks every path from T to Y that starts with an arrow <em>into</em> T, without including any descendant of T and without opening a collider.</p>
+<p class="problem"><span class="pl">Problem 12.7.1</span> Simulate talent and looks as independent traits. A person is famous if talent + looks + noise is high. What happens to the correlation if you look only at famous people?</p>
+@CODE ch12_collider
+@S
+Step 1 | Among everyone the correlation is −0.011, essentially zero, as built.
+Step 2 | Among the 15.8% who are famous it is −0.566. Within the famous, someone with low talent must have high looks to get there.
+Answer | Selecting or controlling on a collider (here, fame) manufactures a strong negative association from nothing. In data work, "only customers who bought", "only users who logged in", "only admitted students" are all colliders.
+@C red | COMMON MISTAKE | "Control for everything, to be safe." Controlling for a collider or for a mediator biases the answer. Choose controls from the diagram.
+<h3>Propensity scores: matching and weighting</h3>
+<p>The <strong>propensity score</strong> is e(x) = P(treated | covariates x). Two users with the same score are, on the measured covariates, as good as randomly assigned. This lets you compress many covariates into one number. We simulate 20,000 users; the premium feature is taken more by active users, and the true effect on spend is +2.0.</p>
+<p class="problem"><span class="pl">Problem 12.7.2</span> Estimate the effect with (a) the naive gap, (b) regression adjustment, (c) inverse probability weighting, (d) nearest-neighbour matching on the propensity score. Show a balance table.</p>
+@CODE ch12_ps
+@S
+Step 1 | Naive gap 6.786, more than three times the truth: active users both adopt and spend more.
+Step 2 | Regression adjustment gives 2.034. This works because the outcome model here is truly linear.
+Step 3 | Fit a logistic regression of treatment on the covariates to get e(x). Weight treated users by P(T)/e(x) and controls by (1 − P(T))/(1 − e(x)) ("stabilised" weights). The weighted gap is 2.071.
+Step 4 | Matching each treated user to the control with the nearest propensity score (with replacement) gives 2.089. This estimates the effect on the treated (ATT); because the true effect is the same for everyone, it targets the same +2.0.
+Step 5 | Balance: standardized mean differences (SMD = difference in means divided by the pooled SD) fall from 0.127, 0.446, 0.801 to −0.016, −0.005, 0.002 after weighting. All are far below the common 0.1 threshold.
+Answer | Three adjusted methods agree near 2.0 to 2.1. Always show the balance table: if weighting does not balance the covariates, the propensity model is wrong.
+@FIG ch12_propensity.png | Left: histograms of the propensity score for treated and untreated users. Right: a love plot of absolute standardized mean differences before and after weighting. | Both groups cover most of the propensity range, and weighting shrinks all imbalances below the 0.1 line. | Left: where the two histograms overlap, comparisons are credible; where only one group lives (scores near 0 or 1), no comparison exists and weights explode. Right: each dot is a covariate; the red dots (before) sit far right, the green squares (after) sit at zero.
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Trusting propensity scores to fix <em>unmeasured</em> confounding. They only balance what you put in the model. Also check <strong>overlap</strong>: users with scores near 0 or 1 get huge weights (here the scores range from 0.008 to 0.992) and a few of them can dominate the estimate. Trimming or capping extreme scores is common, and should be reported.</div></div>
+<h3>Regression discontinuity</h3>
+<p>Suppose students scoring 50 or more get a coaching programme. Students at 49.9 and 50.1 are nearly identical, but one group gets coached. Near the cutoff the assignment is "as if random". Fit a line on each side within a bandwidth h around the cutoff and read the jump at the cutoff.</p>
+<p class="problem"><span class="pl">Problem 12.7.3</span> Scores are uniform on 0 to 100; outcome rises 0.4 per score point and the programme adds a true +5. Estimate the jump with several bandwidths.</p>
+@CODE ch12_rd
+@S
+Step 1 | The naive gap (all treated minus all untreated) is 24.23, because treated students have higher scores to begin with.
+Step 2 | Local linear fit with |score − 50| ≤ 5: jump 5.07, SE 0.92 (667 students).
+Step 3 | h = 10: 4.49, SE 0.67. h = 20: 4.40, SE 0.46. h = 50 (everyone): 4.64, SE 0.30.
+Answer | All four intervals contain 5. The trade-off: a narrow bandwidth is more credible but noisier; a wide bandwidth is precise but leans on the straight-line assumption far from the cutoff. Report several.
+<h3>Instrumental variables</h3>
+<p>If an unobserved variable (motivation) drives both who uses a tool and how they perform, regression is biased. An <strong>instrument</strong> Z is something that shifts who uses the tool (relevance), affects the outcome <em>only</em> through the tool (exclusion), and is independent of the confounder (as good as random). A randomly sent email nudge is the classic one. The effect for people moved by the instrument is the <strong>Wald estimator</strong>:</p>
+<div class="eq">effect = (mean Y in nudged − mean Y in not nudged) / (take-up in nudged − take-up in not nudged)</div>
+<p class="problem"><span class="pl">Problem 12.7.4</span> A random nudge raises tool use. Motivation (unobserved) raises both use and outcome. The true effect of the tool is +3. Compare OLS, the Wald estimate and two-stage least squares.</p>
+@CODE ch12_iv
+@S
+Step 1 | OLS says 5.076: motivated users both use the tool and do well, so OLS overstates the effect by 2.
+Step 2 | The nudge raises the outcome by 0.641 and raises take-up by 0.22 (22 percentage points).
+Step 3 | Wald: 0.641 / 0.22 = 2.915. This is close to the true 3.
+Step 4 | 2SLS (regress take-up on the nudge, then the outcome on the predicted take-up) gives the same 2.915. The correct SE, computed with the real take-up in the residuals, is 0.128, so the interval is (2.66, 3.17), which contains 3.
+Answer | IV removes the bias from the unobserved confounder because the nudge is random. The cost is precision (SE 0.128 here) and a strong, untestable exclusion assumption.
+@C red | COMMON MISTAKE | A weak instrument. If the nudge barely changes take-up, the denominator is near zero, the estimate is wildly noisy and any small violation of exclusion is amplified. Report the first-stage effect (here 0.22) and its F statistic; a common rule of thumb asks for F above 10.
+<h3>Synthetic control</h3>
+<p>When one region is treated and a few others are not (a pricing change in one country), DiD with a single control can fail parallel trends. <strong>Synthetic control</strong> builds a weighted average of untreated "donor" regions, with non-negative weights summing to 1, that tracks the treated region closely <em>before</em> launch. The gap after launch is the effect.</p>
+<p class="problem"><span class="pl">Problem 12.7.5</span> One region launches at month 24 of 36, with a true effect of −4. Eight donor regions are untreated. Build the synthetic control and run a placebo test.</p>
+@CODE ch12_synth
+@S
+Step 1 | Choose weights w ≥ 0 with Σw = 1 to minimise the squared pre-launch gap. The optimiser puts weight on five donors; the pre-launch RMSE is 0.28.
+Step 2 | After launch the treated region sits on average 4.13 below its synthetic twin. The truth is −4.
+Step 3 | Placebo test: pretend each donor was the treated one and compute the ratio of post-launch to pre-launch RMSE. Region 0 has the largest ratio, 14.8, versus 10.7 at most for the others.
+Answer | The effect is about −4.1. An exact permutation p-value is 1/9 = 0.11 (the treated unit ranks first of nine), the smallest possible with eight donors. With few donors you cannot get p below 1/(donors + 1).
+@FIG ch12_did_rd.png | Left: delivery time for a treated and a control region before and after a launch, with a dashed counterfactual. Right: scatter of an outcome against a score with separate fitted lines on each side of the cutoff. | Parallel lines before launch support DiD; a jump at the cutoff is the regression discontinuity effect. | Left: before month 0 the two lines move together (the 20-minute gap is stable), which is the evidence for parallel trends; the dashed line is where treated would have gone. After launch the real line drops away from it, and that vertical distance is the DiD effect. Right: the two coloured lines are fitted on each side separately; the vertical gap at the dashed line is the estimated jump.
+<h3>Which method when</h3>
+@T
+Situation | Method | The assumption you must defend
+All confounders measured | Regression adjustment, propensity weighting or matching | No unmeasured confounding
+Rollout in some places or times, with history | Difference-in-differences | Parallel trends
+Treatment decided by a score cutoff | Regression discontinuity | No manipulation of the score; continuity at the cutoff
+A random or quasi-random nudge exists | Instrumental variables | Relevance, exclusion, independence
+One treated unit, several untreated | Synthetic control | Donors can reproduce the treated unit's path
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">All of these answer "what would have happened without the treatment?" using a different stand-in for the missing world. Choose the method whose stand-in you can defend, check what you can (balance, pre-trends, bandwidth, placebo tests), and say plainly what you assumed.</div></div>
+<h3>Going deeper</h3>
+<ul><li><strong>Doubly robust estimators</strong> (AIPW) combine an outcome model and a propensity model, and are consistent if either one is correct.</li><li><strong>IV estimates a local effect</strong> (LATE): the effect for people whose behaviour the instrument changes, not necessarily for everyone.</li><li><strong>DiD with staggered rollout</strong> can be biased by the standard two-way fixed-effects regression when effects differ over time; use estimators designed for staggered adoption.</li><li><strong>Sensitivity analysis</strong>: ask how strong an unmeasured confounder would need to be to erase the result (for example the E-value). It does not remove the assumption but quantifies it.</li></ul>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why does a matched or weighted analysis not protect against unmeasured confounders? Answer: the propensity score only balances the covariates in the model.</li><li>In regression discontinuity, why do students just above and below the cutoff make a good comparison? Answer: tiny score differences are mostly luck, so the two sides are alike except for the programme.</li><li>An instrument has first-stage effect 0.01. What is the problem? Answer: it is weak; the Wald ratio divides by a tiny number and becomes unstable.</li></ol>

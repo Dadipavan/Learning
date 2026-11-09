@@ -1,0 +1,117 @@
+<h2>22.12 How to solve any big-data and fast-dataframe problem: the playbook</h2>
+<h3>Step 0: the questions to ask in order</h3>
+<ol>
+<li><strong>How big, really?</strong> Rows, columns, bytes on disk, estimated bytes in memory (Section 22.8).</li>
+<li><strong>What is the answer's size?</strong> A report with 50 rows from 5 billion rows is an aggregation problem; a full-size output is a transformation problem and needs a writable sink.</li>
+<li><strong>Which operation is expensive?</strong> Narrow steps are cheap. Joins, group-bys, distincts and sorts are the costs.</li>
+<li><strong>Who else uses it, and how often?</strong> A one-off analysis tolerates minutes; a nightly job needs idempotence and monitoring.</li>
+<li><strong>How will I know it is right?</strong> Decide the check before you scale up.</li>
+</ol>
+<h3>Eight recurring problem patterns</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>#</th><th>Pattern and symptom</th><th>Fix</th><th>Solved example</th></tr></thead><tbody>
+<tr><td>1</td><td>Does not fit in RAM; kernel dies on load</td><td>Read less, smaller dtypes, chunks, or a lazy engine</td><td>Problem 22.2.1 and 22.2.2: 84 MB to 12 MB; peak memory set by the chunk size</td></tr>
+<tr><td>2</td><td>Big group-by or counts</td><td>Partial aggregates (sum, count), then combine</td><td>Section 22.6, sum/count versus mean of means; recipe "incremental aggregation"</td></tr>
+<tr><td>3</td><td>Big table joined to a small one</td><td>Broadcast: look up in memory, no shuffle</td><td>Recipe "join a big table with a small one": <code>map</code> + SQL check</td></tr>
+<tr><td>4</td><td>Big table joined to a big table, or dedupe at scale</td><td>Hash-partition both sides on the key, join or dedupe each bucket</td><td>Section 22.6 shuffle join; recipe "dedupe at scale"</td></tr>
+<tr><td>5</td><td>One task or one partition far slower than the rest</td><td>Isolate or filter hot keys; AQE; salting</td><td>Section 22.7: max/mean 1.98 to 1.29, same sums</td></tr>
+<tr><td>6</td><td>The same expensive result is recomputed</td><td><code>cache</code>/<code>persist</code>, or write an intermediate Parquet checkpoint</td><td>Section 22.7 broadcast + cache example</td></tr>
+<tr><td>7</td><td>A step is slow although the cluster is idle</td><td>Replace Python UDFs and row loops with column expressions</td><td>Section 22.7: about 100 times in the pandas analogue</td></tr>
+<tr><td>8</td><td>Slow listing, thousands of tiny tasks, slow reads</td><td>Partition by low-cardinality columns; compact files; Parquet instead of CSV</td><td>Problems 22.3.1 and 22.3.2; recipe "partitioned dataset from chunks"</td></tr>
+</tbody></table></div>
+<h3>How to verify a result</h3>
+<p>Never ship a scaled-up pipeline without comparing it with a trusted slow version on a sample. Check row counts, key uniqueness, null counts, and totals (with a tolerance for floats). The helper below does that, and the demo shows it catching a planted bug (an inner join that silently drops rows).</p>
+<py>
+import numpy as np
+import pandas as pd
+
+def compare(trusted, candidate, keys, value_cols):
+    """Return a list of human-readable differences (empty list means they agree)."""
+    problems = []
+    if len(trusted) != len(candidate):
+        problems.append(f"row count {len(trusted)} vs {len(candidate)}")
+    if candidate.duplicated(keys).any():
+        problems.append("duplicate keys in candidate")
+    merged = trusted.merge(candidate, on=keys, how="outer", suffixes=("_t", "_c"), indicator=True)
+    only = merged["_merge"].value_counts()
+    if only.get("left_only", 0) or only.get("right_only", 0):
+        problems.append(f"keys only in trusted: {only.get('left_only', 0)}, only in candidate: {only.get('right_only', 0)}")
+    both = merged[merged["_merge"] == "both"]
+    for c in value_cols:
+        if not np.allclose(both[c + "_t"], both[c + "_c"]):
+            problems.append(f"values differ in {c}")
+    return problems
+
+orders = pd.DataFrame({"cid": [1, 2, 3, 4], "amount": [10.0, 20.0, 30.0, 40.0]})
+tiers = pd.DataFrame({"cid": [1, 2, 3], "tier": ["g", "s", "g"]})           # customer 4 unknown
+trusted = orders.merge(tiers, on="cid", how="left").groupby("cid", as_index=False)["amount"].sum()
+buggy = orders.merge(tiers, on="cid", how="inner").groupby("cid", as_index=False)["amount"].sum()
+print("good:", compare(trusted, trusted.copy(), ["cid"], ["amount"]))
+print("bug :", compare(trusted, buggy, ["cid"], ["amount"]))
+</py>
+<ol>
+<li><code>compare</code> checks four things in turn: row counts, duplicate keys, keys present on only one side, and values on the shared keys using <code>np.allclose</code>.</li>
+<li>The outer merge with <code>indicator=True</code> adds a <code>_merge</code> column saying whether each key is left-only, right-only or in both. It is the quickest way to see which keys went missing.</li>
+<li>The trusted version uses a left join and keeps customer 4. The buggy version uses an inner join and drops the unknown customer, so the totals lose 40 and a row.</li>
+<li>The good comparison prints an empty list. The buggy one reports the row-count mismatch and the key that exists only in the trusted result, which tells you where to look.</li>
+</ol>
+<h3>How to debug when it is slow or crashing</h3>
+<ol>
+<li><strong>Shrink the input</strong> (a sample, one partition, the first million rows) until the problem reproduces in seconds.</li>
+<li><strong>Look at the plan</strong> before the clock: Polars <code>explain()</code>, DuckDB <code>EXPLAIN ANALYZE</code>, Spark <code>explain("formatted")</code>, Dask <code>visualize()</code>.</li>
+<li><strong>Bisect the pipeline</strong>: run it step by step, forcing each with <code>collect()</code> or <code>count()</code>, and time each. The slowest step is usually obvious.</li>
+<li><strong>Check data shape</strong>: key distribution (<code>value_counts().head()</code>), null share, partition sizes.</li>
+<li><strong>Read the right monitor</strong>: Spark UI stage task summary, Dask dashboard memory bars, <code>htop</code> or Activity Monitor for a local engine (one busy core means no parallelism, all cores with high memory means spill risk).</li>
+<li><strong>Change one thing at a time</strong> and keep the measurement next to the change.</li>
+</ol>
+
+<h2>22.13 Going deeper: what is under the hood, and what interviewers probe</h2>
+<h3>Memory formats</h3>
+<ul>
+<li><strong>Apache Arrow</strong> lays a column out as contiguous buffers: a values buffer, an optional validity bitmap (one bit per row saying null or not), and for strings an offsets buffer plus a bytes buffer. Contiguous, typed memory is what makes vectorized CPU code and zero-copy sharing between libraries possible.</li>
+<li><strong>Parquet encodings</strong>: dictionary encoding (store distinct values once, codes per row), run-length and bit-packing for the codes, delta encoding for sorted numbers; then a general compressor per page. Low-cardinality and sorted columns compress extremely well, which is why sorting before writing helps.</li>
+<li><strong>pandas 3.0</strong>: copy-on-write is the default, so derived objects share memory until one is modified, which removes many hidden copies and makes chained assignment safe by construction; text columns default to the <code>str</code> dtype (backed by PyArrow when it is installed). Even so, a typical pandas operation needs more than one copy of the data in the worst case, which is why you size RAM generously relative to the file.</li>
+</ul>
+<h3>Execution models</h3>
+<ul>
+<li><strong>DuckDB</strong> processes vectors of values per operator and parallelizes with small work units shared by threads; large hash tables and sorts can spill to disk.</li>
+<li><strong>Polars</strong> turns lazy plans into optimized physical plans (projection and predicate pushdown, common subexpression elimination) and has a streaming engine for larger-than-memory work, though not every operation is streamable; unsupported ones fall back to in-memory execution.</li>
+<li><strong>Dask</strong> builds a graph of small tasks and a scheduler runs them; overhead is per task, so partition size is the main tuning knob.</li>
+<li><strong>Spark</strong> converts your DataFrame code into a logical plan, optimizes it (the Catalyst optimizer), chooses physical operators (broadcast or sort-merge join), and generates JVM code for pipelines of narrow operations (whole-stage code generation). Adaptive query execution revises the plan at stage boundaries using real statistics.</li>
+</ul>
+<h3>Questions interviewers like</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Question</th><th>Strong answer, in one breath</th></tr></thead><tbody>
+<tr><td>Why is Parquet faster than CSV?</td><td>Columnar (read only needed columns), typed with a schema (no parsing guesses), compressed with encodings, with min/max statistics that let readers skip row groups.</td></tr>
+<tr><td>What is a shuffle and why is it expensive?</td><td>Redistributing rows by key across partitions; it writes to disk, crosses the network and creates a stage barrier. Avoid with broadcast joins, pre-aggregation and fewer wide operations.</td></tr>
+<tr><td>Narrow versus wide transformation?</td><td>Narrow: each output partition depends on one input partition. Wide: depends on many, so a shuffle.</td></tr>
+<tr><td>How do you handle skew?</td><td>Detect it (max task time versus median), isolate or filter hot keys, AQE, salting with a two-stage aggregation or a replicated small side.</td></tr>
+<tr><td>Lazy versus eager evaluation?</td><td>Lazy builds a plan the optimizer can rewrite (pushdown, reordering) and runs on demand; eager runs each step immediately and is easier to debug.</td></tr>
+<tr><td>UDF versus built-in?</td><td>Built-ins are optimized and run in the engine; plain UDFs cross a process boundary per row. Use built-ins, then pandas UDFs, then plain UDFs.</td></tr>
+<tr><td>When not to use Spark?</td><td>When the data fits one machine: DuckDB or Polars is simpler and often faster; Spark startup and shuffles are overhead.</td></tr>
+<tr><td>How would you dedupe 5 billion rows?</td><td>Hash-partition by key, dedupe within partitions with a window or <code>dropDuplicates</code>; if exactness is not needed, a Bloom filter or approximate counts.</td></tr>
+</tbody></table></div>
+
+<h2>Chapter recap</h2>
+<ul>
+<li>Pandas is limited by memory (the whole table in RAM, often several times the file size) and by mostly one core. Measure before you change tools.</li>
+<li>Cheap fixes first: read fewer columns, downcast integers, use <code>category</code> for repeated strings, and read in chunks. Our 1-million-row table went from 84 MB to 12 MB.</li>
+<li>Chunking sets memory by chunk size, not file size, but only works for decomposable statistics: sums, counts, min, max, and means as sum over count.</li>
+<li>Parquet is columnar, typed and compressed, with statistics. Partitioned folders (<code>year=2025/region=EU</code>) allow partition pruning.</li>
+<li>Polars: expressions, <code>group_by().agg()</code>, <code>over()</code> windows, and lazy <code>scan_*</code> + <code>collect()</code> with pushdown. Use <code>explain()</code>.</li>
+<li>DuckDB: SQL on files and DataFrames, window functions, <code>QUALIFY</code>, <code>COPY ... TO</code> Parquet, memory limits with disk spill.</li>
+<li>Dask: partitions plus a task graph; <code>compute()</code> is the action; combine partial results correctly; rank-in-group needs a shuffle.</li>
+<li>Spark: transformations are lazy, actions run jobs, wide operations shuffle. Broadcast small tables, fix skew, cache only reused data, prefer built-ins to UDFs, read the Stages page.</li>
+<li>Choose the smallest tool that finishes in time: pandas, then DuckDB or Polars, then Dask or Spark.</li>
+<li>Verify every migration against a trusted slow version on a sample, with tolerance for floats and counts for rows.</li>
+</ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / pattern</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>mean = (sum of partial sums) / (sum of partial counts)</td><td>The only correct way to combine partition means</td></tr>
+<tr><td>partition = stable_hash(key) % B</td><td>Co-locates equal keys; basis of shuffle joins, dedupe and group-by</td></tr>
+<tr><td>peak memory is about the chunk size, not the file size</td><td>Why chunking works</td></tr>
+<tr><td>number of partitions is about data size / 128 MB (reads), then 100 to 200 MB after shuffles</td><td>Sizing rule of thumb</td></tr>
+<tr><td>skew ratio = max partition size / mean partition size</td><td>Near 1 is healthy; large values mean stragglers</td></tr>
+<tr><td>salt s in 0..S-1, key becomes (key, s), then re-aggregate</td><td>Spreads a hot key over S partitions</td></tr>
+<tr><td>scan(columns, filters) before join before group-by</td><td>Reduce data before the expensive steps</td></tr>
+<tr><td>lazy plan, then one <code>collect()</code>, <code>compute()</code> or action</td><td>Let the optimizer see the whole query</td></tr>
+<tr><td>built-in, then vectorized UDF, then plain UDF</td><td>Order of preference for custom logic</td></tr>
+<tr><td>compare(trusted, candidate): counts, keys, values with tolerance</td><td>Safe migration test</td></tr>
+</tbody></table></div>

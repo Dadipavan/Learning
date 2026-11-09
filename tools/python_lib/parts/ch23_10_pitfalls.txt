@@ -1,0 +1,274 @@
+
+<h2>23.9 Performance and Pitfalls</h2>
+<h3>Performance in one list</h3>
+<ul><li><strong>Measure first.</strong> Use <code>time.perf_counter</code> or <code>cProfile</code>; never guess. Timings in this chapter vary by machine.</li>
+<li><strong>Load once.</strong> Load models and read config at start-up (FastAPI <code>lifespan</code>), not in every request.</li>
+<li><strong>Cache pure, slow functions</strong> with <code>joblib.Memory</code>; do not cache anything that depends on hidden state.</li>
+<li><strong>Parallelise heavy tasks only.</strong> Process start-up and data transfer cost milliseconds; a task must take clearly longer. Many scikit-learn estimators already accept <code>n_jobs</code>.</li>
+<li><strong>Order Dockerfile lines</strong> from stable to volatile, so rebuilds reuse layers.</li>
+<li><strong>Log lazily.</strong> <code>log.debug("x=%s", x)</code> does no formatting when DEBUG is off. Do not log inside a loop of a million rows.</li>
+<li><strong>Keep tests fast</strong> (seconds). Tag slow ones with a marker; small synthetic data in unit tests, real data only in a separate suite.</li></ul>
+<h3>Fourteen mistakes that cost real time</h3>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>1. Mutable default values.</strong> A list or dict default is created once and shared by all calls (functions) or rejected (dataclasses).</div></div>
+@@py
+def add_tag_wrong(tag, tags=[]):
+    tags.append(tag)
+    return tags
+
+def add_tag(tag, tags=None):
+    tags = [] if tags is None else tags
+    return [*tags, tag]
+
+print(add_tag_wrong("a"), add_tag_wrong("b"))      # symptom: "b" call remembers "a"
+print(add_tag("a"), add_tag("b"))
+@@end
+<ol><li>The wrong version prints <code>['a', 'b'] ['a', 'b']</code>: both results are the same list object, because the default list was created once when the function was defined.</li>
+<li>The fix uses <code>None</code> as the default and creates a new list inside. In dataclasses use <code>field(default_factory=list)</code>.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>2. Patching the wrong name.</strong> You must patch the name where it is <em>used</em>, not where it was defined. After <code>from math import sqrt</code> in module <code>m</code>, the name <code>m.sqrt</code> is a separate reference.</div></div>
+@@py
+import math
+import types
+from unittest import mock
+
+m = types.ModuleType("m")                  # a stand-in module that did "from math import sqrt"
+m.sqrt = math.sqrt
+m.root = lambda x: m.sqrt(x)
+
+with mock.patch("math.sqrt", return_value=-1):        # wrong: patches the original only
+    print(m.root(9))
+with mock.patch.object(m, "sqrt", return_value=-1):   # right: patch the name the code looks up
+    print(m.root(9))
+@@end
+<ol><li>The first patch replaces <code>math.sqrt</code>, but <code>m.sqrt</code> still points to the real function, so the symptom is that the mock "does nothing" and the output is <code>3.0</code>.</li>
+<li>Patching <code>m.sqrt</code> (the attribute the code reads) works: output <code>-1</code>. With strings, write <code>patch("mymodule.sqrt")</code>, where <code>mymodule</code> is the module that <em>imports</em> the name.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>3. Duplicate log lines.</strong> Adding a handler every time a function runs, or leaving <code>propagate</code> on while the root logger also has a handler, prints each message several times.</div></div>
+@@py
+import io
+import logging
+
+buf = io.StringIO()
+logging.basicConfig(stream=buf, level=logging.INFO, format="%(message)s")   # root handler
+
+def get_logger_wrong():
+    lg = logging.getLogger("job")
+    lg.setLevel(logging.INFO)
+    lg.addHandler(logging.StreamHandler(buf))      # a new handler on every call
+    return lg
+
+get_logger_wrong().info("start")
+get_logger_wrong().info("start")
+print(buf.getvalue().count("start"))
+
+buf.truncate(0); buf.seek(0)
+lg = logging.getLogger("job2")                     # fix: no handler here, rely on the root handler
+lg.setLevel(logging.INFO)
+lg.info("start")
+lg.info("start")
+print(buf.getvalue().count("start"))
+@@end
+<ol><li>The wrong version: each call adds one more handler to <code>job</code>, and the record also propagates to the root handler. First call: 2 copies; second: 3 copies; total 5 lines printed for two messages.</li>
+<li>The fix: configure handlers once at program start (<code>basicConfig</code> or <code>dictConfig</code>), and in modules only call <code>getLogger(__name__)</code>. Then each message appears once per call (2 for two messages).</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>4. Paths relative to the working directory.</strong> <code>open("data/train.csv")</code> works when you run from the project root and fails from cron, a notebook folder or a container.</div></div>
+@@py
+import os
+import tempfile
+from pathlib import Path
+
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp).resolve()
+    (root / "data").mkdir()
+    (root / "data" / "train.csv").write_text("x\n1\n")
+    script = root / "job.py"
+    script.write_text("")                    # imagine this is the file containing the code below
+
+    HERE = script.resolve().parent           # fix: anchor to the file, not to the cwd
+    os.chdir(tempfile.gettempdir())          # simulate running from somewhere else
+    print(Path("data/train.csv").exists())
+    print((HERE / "data" / "train.csv").exists())
+@@end
+<ol><li>The relative path is looked up from the current directory, which we changed: <code>False</code>. In real code the symptom is <code>FileNotFoundError</code> only on the server.</li>
+<li>The fix anchors paths to the code location with <code>Path(__file__).resolve().parent</code> (here simulated with the script path), or takes the data folder as a command-line option: <code>True</code>.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>5. Saving the model but not the preprocessing.</strong> Scaling inside a notebook cell and saving only the classifier means the service feeds unscaled numbers into a model trained on scaled ones. The symptom is plausible-looking but wrong predictions, with no error.</div></div>
+@@py
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(0)
+X = np.column_stack([rng.normal(50, 10, 400), rng.normal(0, 1, 400)])
+y = (X[:, 0] > 50).astype(int)
+
+scaler = StandardScaler().fit(X)
+lonely = LogisticRegression().fit(scaler.transform(X), y)       # wrong to ship this alone
+pipe = make_pipeline(StandardScaler(), LogisticRegression()).fit(X, y)
+
+row = np.array([[45.0, 0.0]])                                   # clearly class 0 (45 is below 50)
+print(lonely.predict(row), pipe.predict(row))
+print(round(lonely.predict_proba(row)[0, 1], 3), round(pipe.predict_proba(row)[0, 1], 3))
+@@end
+<ol><li>The lone classifier expects standardised input (roughly -3 to 3). We give it the raw value 45, which it reads as "45 standard deviations above the mean", so it predicts class 1 with probability 1.0. The pipeline scales first, sees a value half a standard deviation below the mean, and correctly predicts class 0 with a low probability. Output: <code>[1] [0]</code>, then the two probabilities.</li>
+<li>The fix is to put preprocessing and model in one <code>Pipeline</code> and save the pipeline. One object, one <code>predict</code>, no way to forget a step.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>6. Feature order and names drift.</strong> A model fitted on a NumPy array depends only on column <em>position</em>. If the service builds features in a different order, nothing fails; the answers are just wrong.</div></div>
+@@py
+import numpy as np
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(1)
+train = pd.DataFrame({"age": rng.normal(0, 1, 300), "spend": rng.normal(0, 1, 300)})
+y = (train["spend"] > 0).astype(int)                         # only "spend" matters
+model = LogisticRegression().fit(train.to_numpy(), y)         # names are lost here
+
+request = {"spend": 2.0, "age": -1.0}                         # dictionary in a different order
+wrong = model.predict(pd.DataFrame([request]).to_numpy())     # columns: spend, age (swapped)
+right = model.predict(pd.DataFrame([request])[["age", "spend"]].to_numpy())
+print(wrong, right)
+
+named = LogisticRegression().fit(train, y)                    # fitted on a DataFrame: remembers names
+print(list(named.feature_names_in_))
+@@end
+<ol><li>The wrong call hands <code>spend=2.0</code> to the position where <code>age</code> was trained. The prediction flips to class 0 (<code>[0] [1]</code>) with no warning, while the correctly ordered row gives class 1.</li>
+<li>Fixes: select columns by a stored list (Recipe B), or fit on a DataFrame so scikit-learn records <code>feature_names_in_</code> and warns when names do not match at predict time.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>7. <code>type=bool</code> in argparse.</strong> <code>bool("False")</code> is <code>True</code>, because any non-empty string is true.</div></div>
+@@py
+import argparse
+
+p = argparse.ArgumentParser()
+p.add_argument("--shuffle", type=bool, default=True)        # wrong
+print(p.parse_args(["--shuffle", "False"]).shuffle)
+
+q = argparse.ArgumentParser()
+q.add_argument("--shuffle", action=argparse.BooleanOptionalAction, default=True)
+print(q.parse_args(["--no-shuffle"]).shuffle, q.parse_args([]).shuffle)
+@@end
+<ol><li>The wrong version prints <code>True</code> although the user asked for False. The symptom is "my flag is ignored".</li>
+<li><code>BooleanOptionalAction</code> creates <code>--shuffle</code> and <code>--no-shuffle</code>; the output is <code>False True</code>.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>8. Comparing floats with equality in tests.</strong> The test passes on one machine and fails on another, or fails for the sum <code>0.1 + 0.2</code>.</div></div>
+@@py
+import math
+import numpy as np
+
+print(0.1 + 0.2 == 0.3, 0.1 + 0.2)
+print(math.isclose(0.1 + 0.2, 0.3, rel_tol=1e-9))
+print(np.allclose([0.1 + 0.2], [0.3]))
+@@end
+<ol><li>Binary floating point cannot store 0.1 exactly, so the sum is <code>0.30000000000000004</code> and the equality is <code>False</code>.</li>
+<li>In tests use a tolerance: <code>pytest.approx</code>, <code>math.isclose</code> or <code>np.allclose</code> (<code>True</code> both). Choose a tolerance that matches the precision you really need.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>9. Tests that read the clock or random state.</strong> A test calling <code>datetime.now()</code> works today and fails after midnight; unseeded randomness fails once in a hundred runs.</div></div>
+@@py
+from datetime import datetime, timedelta
+
+def is_stale(updated, now=None):
+    now = now or datetime.now()              # real code uses the clock; tests inject a fixed one
+    return now - updated > timedelta(days=7)
+
+fixed_now = datetime(2026, 11, 9, 12, 0)
+print(is_stale(datetime(2026, 11, 1), now=fixed_now))
+print(is_stale(datetime(2026, 11, 5), now=fixed_now))
+@@end
+<ol><li>The function takes <code>now</code> as an optional argument. Production passes nothing and gets the real time; tests pass a fixed value.</li>
+<li>Nov 1 to Nov 9 12:00 is 8.5 days, so <code>True</code>; Nov 5 is 4.5 days, so <code>False</code>. The result no longer depends on the day you run the test. The same idea (inject the dependency) applies to random generators: pass in a seeded <code>numpy.random.Generator</code>.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>10. Stale cache from hidden inputs.</strong> <code>joblib.Memory</code> hashes the arguments and the function source. A global variable or a file the function reads is invisible to it.</div></div>
+@@py
+import tempfile
+from joblib import Memory
+
+SETTINGS = {"rate": 2}
+
+def scaled(x):                                   # wrong: depends on a global
+    return x * SETTINGS["rate"]
+
+def scaled_ok(x, rate):                          # right: every input is an argument
+    return x * rate
+
+with tempfile.TemporaryDirectory() as tmp:
+    mem = Memory(tmp, verbose=0)
+    a, b = mem.cache(scaled), mem.cache(scaled_ok)
+    print(a(10))
+    SETTINGS["rate"] = 3
+    print(a(10))                                 # symptom: still 20
+    print(b(10, 2), b(10, 3))
+@@end
+<ol><li>After the global changes to 3, <code>a(10)</code> should be 30, but the cache sees identical arguments and source, and returns the stored <code>20</code>.</li>
+<li>Passing <code>rate</code> as an argument makes it part of the key, so the cached function correctly gives <code>20 30</code>.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>11. No seed on the split.</strong> <code>train_test_split</code> without <code>random_state</code> gives a different split on every run, so your metric moves and you cannot tell a real improvement from noise.</div></div>
+@@py
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+X = np.arange(20).reshape(10, 2)
+y = np.arange(10)
+a = train_test_split(y, test_size=0.3)[1]
+b = train_test_split(y, test_size=0.3)[1]
+c = train_test_split(y, test_size=0.3, random_state=42)[1]
+d = train_test_split(y, test_size=0.3, random_state=42)[1]
+print(np.array_equal(c, d))
+print(len(a), len(b))
+@@end
+<ol><li>With <code>random_state=42</code> both calls return the same test rows: <code>True</code>.</li>
+<li>Without a seed, <code>a</code> and <code>b</code> have the same size (3) but usually different members; we print only the size to keep this output stable. Seed every source of randomness you control (splitters, models, <code>numpy.random.default_rng(seed)</code>).</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>12. Blocking the event loop in <code>async def</code>.</strong> Not run here (FastAPI is not installed). Inside <code>async def</code>, a slow synchronous call such as <code>model.predict</code> or <code>requests.get</code> freezes every other request while it runs. The symptom: latency grows with concurrency even though CPU is idle on other cores.</div></div>
+@@np
+# NOT RUN HERE
+@app.post("/predict")
+async def predict(c: Customer):           # wrong: async, but the body is blocking CPU work
+    return model.predict_proba(to_row(c))
+
+@app.post("/predict")
+def predict(c: Customer):                  # right: plain def runs in a worker thread
+    return model.predict_proba(to_row(c))
+@@end
+<ol><li>The first handler runs on the single event-loop thread and holds it for the whole prediction.</li>
+<li>Use plain <code>def</code> for blocking work. Use <code>async def</code> only when every slow call inside is awaited (an async database or HTTP client).</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>13. A Dockerfile that copies everything first.</strong> Not run here. <code>COPY . .</code> before <code>pip install</code> means every code edit invalidates the install layer. The symptom is a three-minute rebuild after changing one line, and an image that contains <code>.git</code>, <code>.env</code> and data.</div></div>
+@@file dockerfile
+# wrong
+FROM python:3.12-slim
+COPY . /app
+RUN pip install -r /app/requirements.txt
+
+# right
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY src/ ./src/              # plus a .dockerignore listing .git, .env, data/
+@@end
+<ol><li>In the wrong version the single <code>COPY . /app</code> layer changes whenever any file changes, so the install runs every time.</li>
+<li>In the right version the dependency layer depends only on <code>requirements.txt</code>, and the secrets and data never enter because of <code>.dockerignore</code> and the narrow <code>COPY</code>. Also pin the base image tag and package versions so a rebuild next month gives the same environment.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>14. Tests that depend on each other.</strong> A module-level list that one test appends to makes a second test pass or fail depending on order.</div></div>
+@@py
+import io
+import unittest
+
+SHARED = []
+
+class Bad(unittest.TestCase):
+    def test_a_adds(self):
+        SHARED.append(1)
+        self.assertEqual(len(SHARED), 1)
+
+    def test_b_adds(self):
+        SHARED.append(2)
+        self.assertEqual(len(SHARED), 1)       # passes only if it runs first
+
+class Good(unittest.TestCase):
+    def setUp(self):
+        self.items = []                         # fresh state for every test
+
+    def test_a_adds(self):
+        self.items.append(1)
+        self.assertEqual(len(self.items), 1)
+
+    def test_b_adds(self):
+        self.items.append(2)
+        self.assertEqual(len(self.items), 1)
+
+for case in (Bad, Good):
+    suite = unittest.defaultTestLoader.loadTestsFromTestCase(case)
+    res = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+    print(case.__name__, "failures:", len(res.failures))
+@@end
+<ol><li>Tests run alphabetically: <code>test_a_adds</code> makes the list length 1 and passes; then <code>test_b_adds</code> appends again, the length is 2, and it fails (<code>Bad failures: 1</code>). Run <code>test_b_adds</code> alone and it would pass, the classic "passes alone, fails in the suite".</li>
+<li>Creating state in <code>setUp</code> (or a function-scoped fixture) gives every test a fresh start: <code>Good failures: 0</code>.</li></ol>

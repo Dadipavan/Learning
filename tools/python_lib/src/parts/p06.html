@@ -1,0 +1,207 @@
+<h2>16.14 Recipes: How Do I ...?</h2>
+<p>Each recipe is a complete, runnable answer to a task you will meet again. Copy the pattern, change the names.</p>
+
+<h3>Recipe 1. How do I normalise and standardise columns?</h3>
+<p><strong>Min-max scaling</strong> maps each column to 0..1: (x - min) / (max - min). <strong>Standardisation</strong> (z-score) gives each column mean 0 and standard deviation 1: (x - mean) / std. Both are one broadcast expression per column.</p>
+<py>
+import numpy as np
+X = np.array([[170.0, 65.0, 30.0],
+              [180.0, 80.0, 45.0],
+              [160.0, 55.0, 22.0],
+              [175.0, 90.0, 38.0]])
+lo, hi = X.min(axis=0), X.max(axis=0)
+minmax = (X - lo) / (hi - lo)
+mu, sd = X.mean(axis=0), X.std(axis=0)
+z = (X - mu) / sd
+print(minmax.round(2))
+print(z.mean(axis=0).round(6), z.std(axis=0).round(6))
+const = np.array([[5.0, 1.0], [5.0, 2.0]])
+rng_ = np.ptp(const, axis=0)
+safe = np.where(rng_ == 0, 1.0, rng_)
+print((const - const.min(axis=0)) / safe)
+</py>
+<ol><li>In <code>minmax</code> every column spans exactly 0 to 1 (the smallest height 160 becomes 0.0, the tallest 180 becomes 1.0).</li><li>After standardising, each column's mean is 0 and its standard deviation is 1; the rounding hides float dust.</li><li>A constant column has range 0 and would divide by zero. Replacing a zero range by 1 gives zeros instead of NaN. Always guard this in real pipelines.</li><li>Fit the statistics (lo, hi, mu, sd) on training data only and reuse them for test data; otherwise information leaks.</li></ol>
+
+<h3>Recipe 2. How do I one-hot encode labels?</h3>
+<p>One-hot encoding turns a category code into a row with a single 1. The trick: index an identity matrix with the codes.</p>
+<py>
+import numpy as np
+labels = np.array(["cat", "dog", "bird", "dog", "cat"])
+classes, codes = np.unique(labels, return_inverse=True)
+onehot = np.eye(len(classes), dtype=int)[codes]
+print(classes)
+print(onehot)
+back = classes[onehot.argmax(axis=1)]
+print(back)
+alt = np.zeros((len(codes), len(classes)), dtype=int)
+alt[np.arange(len(codes)), codes] = 1
+print(np.array_equal(alt, onehot))
+</py>
+<ol><li><code>np.eye(3)[codes]</code> is fancy indexing: row <code>k</code> of the identity matrix is a one-hot vector for class <code>k</code>, so the result is (5, 3).</li><li><code>argmax(axis=1)</code> finds the position of the 1 in each row, and indexing <code>classes</code> with it decodes back to the original labels.</li><li>The second construction sets cell (row i, column codes[i]) to 1. It is the version to use when the number of classes is large and you want to avoid building an identity matrix.</li></ol>
+
+<h3>Recipe 3. How do I compute a pairwise distance matrix without loops?</h3>
+<p>For n points in d dimensions you want an n by n table of distances. Insert axes so that broadcasting forms every pair: shape (n, 1, d) minus (1, n, d) gives (n, n, d); square, sum over the last axis, take the square root.</p>
+<py>
+import numpy as np
+pts = np.array([[0.0, 0.0], [3.0, 4.0], [6.0, 8.0], [0.0, 1.0]])
+diff = pts[:, None, :] - pts[None, :, :]
+D = np.sqrt((diff ** 2).sum(axis=-1))
+print(D.round(2))
+print(diff.shape)
+sq = (pts ** 2).sum(axis=1)
+D2 = np.sqrt(np.maximum(sq[:, None] + sq[None, :] - 2 * pts @ pts.T, 0))
+print(np.allclose(D, D2))
+from scipy.spatial.distance import cdist
+print(np.allclose(D, cdist(pts, pts)))
+nearest = np.where(np.eye(len(pts), dtype=bool), np.inf, D).argmin(axis=1)
+print(nearest)
+</py>
+<ol><li><code>pts[:, None, :]</code> has shape (4, 1, 2) and <code>pts[None, :, :]</code> has shape (1, 4, 2). Subtracting broadcasts to (4, 4, 2): the difference vector for every pair.</li><li>Squaring, summing over the last axis and taking the root gives the Euclidean distance. Point 1 is (3, 4), 5 units from the origin, and point 2 is 10 units away.</li><li>The second form uses the identity |a - b|<sup>2</sup> = |a|<sup>2</sup> + |b|<sup>2</sup> - 2 a.b.</li><li>To find each point's nearest neighbour, set the diagonal (distance to itself) to infinity before <code>argmin</code>. Point 0's nearest is point 3.</li></ol>
+
+<h3>Recipe 4. How do I compute a moving average?</h3>
+<p>A window of width w averages w neighbours. The fast trick: take the cumulative sum, and subtract it from a copy shifted by w. Each window sum is then two lookups.</p>
+<py>
+import numpy as np
+x = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+w = 3
+c = np.cumsum(np.insert(x, 0, 0.0))
+ma = (c[w:] - c[:-w]) / w
+print(ma)
+conv = np.convolve(x, np.ones(w) / w, mode="valid")
+print(np.allclose(ma, conv))
+from numpy.lib.stride_tricks import sliding_window_view
+win = sliding_window_view(x, w)
+print(win.shape, win.mean(axis=1))
+</py>
+<ol><li><code>c[w:] - c[:-w]</code> is the sum of each window of 3 (for example 1+2+3 = 6). Dividing by 3 gives <code>[2. 3. 4. 5. 6. 7.]</code>.</li><li><code>sliding_window_view</code> returns a (6, 3) read-only view with no copying; averaging along axis 1 gives the same answer and extends to medians, maxima, and so on.</li><li>The output has n - w + 1 values: a window needs w points, so the first w - 1 positions have no average.</li></ol>
+<figure><img src="images/lib16_smooth.png" alt="A noisy line with a 7-day and a 20-day moving average drawn over it; the longer window is smoother and starts later" loading="lazy"/><figcaption>The cumulative-sum moving average applied to 120 noisy daily values with windows of 7 and 20.</figcaption></figure>
+<p><strong>How to read it:</strong> the grey line is the raw noisy data. The blue 7-day line follows the ups and downs more closely; the orange 20-day line is much smoother but starts later (it needs 20 points) and lags behind turning points. Choosing the window is a trade between noise and delay.</p>
+
+<h3>Recipe 5. How do I get the top k items (overall and per row)?</h3>
+<py>
+import numpy as np
+scores = np.array([0.2, 0.9, 0.4, 0.95, 0.1, 0.7])
+k = 3
+idx = np.argpartition(scores, -k)[-k:]
+top = idx[np.argsort(scores[idx])[::-1]]
+print(top, scores[top])
+M = np.array([[5, 1, 9, 3], [2, 8, 4, 6], [7, 7, 1, 0]])
+order = np.argsort(-M, axis=1, kind="stable")[:, :2]
+print(order)
+print(np.take_along_axis(M, order, axis=1))
+print(np.sort(M, axis=1)[:, ::-1][:, :2])
+</py>
+<ol><li>Those k positions are then sorted by score (descending) so the answer is ordered: positions 3, 1, 5 with scores 0.95, 0.9, 0.7.</li><li>For a matrix, <code>argsort(-M, axis=1)</code> orders every row at once; the first two columns of the result are each row's top-2 positions.</li><li><code>take_along_axis</code> turns those positions into the values. If you only need values, sorting and slicing does it as in the last line.</li></ol>
+
+<h3>Recipe 6. How do I work with image arrays?</h3>
+<p>A colour image is an array of shape (height, width, 3) of <code>uint8</code> (0 to 255). Real files are loaded with Pillow or matplotlib (<code>plt.imread</code>); here we build a tiny synthetic image so the example is standalone.</p>
+<py>
+import numpy as np
+rng = np.random.default_rng(0)
+img = rng.integers(0, 256, size=(4, 6, 3), dtype=np.uint8)
+print(img.shape, img.dtype, img.min(), img.max())
+gray = img @ np.array([0.299, 0.587, 0.114])
+print(gray.shape, gray.dtype)
+gray8 = gray.round().astype(np.uint8)
+flipped = img[:, ::-1]
+crop = img[1:3, 2:5]
+print(flipped.shape, crop.shape, np.shares_memory(img, crop))
+bright = np.clip(img.astype(np.int16) + 100, 0, 255).astype(np.uint8)
+wrong = img + np.uint8(100)
+print((bright[0, 0] >= img[0, 0]).all(), (wrong[0, 0] >= img[0, 0]).all())
+chw = np.moveaxis(img, -1, 0)
+print(chw.shape, (img / 255.0).dtype)
+mask = gray8 > 128
+print(mask.sum(), img[mask].shape)
+</py>
+<ol><li>Matrix-multiplying the last axis by the luma weights (0.299, 0.587, 0.114) collapses the channels to one grey value per pixel: shape (4, 6), float64.</li><li><code>img[:, ::-1]</code> mirrors left to right as a view; <code>img[1:3, 2:5]</code> crops a 2 by 3 window, also a view that shares memory.</li><li>Brightening: <code>uint8 + 100</code> wraps around past 255 (the pixel gets darker, as the second check shows). Converting to <code>int16</code>, clipping to 0..255, then converting back is the correct recipe.</li><li><code>np.moveaxis(img, -1, 0)</code> gives channels-first (3, 4, 6), the layout used by PyTorch. Dividing by 255.0 gives floats in 0..1.</li></ol>
+
+<h3>Recipe 7. How do I run a Monte Carlo simulation?</h3>
+<p>Monte Carlo estimates a quantity by random sampling. To estimate pi: throw random points in the unit square; the share landing within distance 1 of the corner (in a quarter circle of area pi/4) is about pi/4.</p>
+<py>
+import numpy as np
+rng = np.random.default_rng(7)
+for n in (100, 10_000, 1_000_000):
+    pts = rng.random((n, 2))
+    inside = (pts ** 2).sum(axis=1) <= 1.0
+    print(n, round(4 * inside.mean(), 4))
+rolls = rng.integers(1, 7, size=(100000, 2)).sum(axis=1)
+print(round(float((rolls == 7).mean()), 3), round(6 / 36, 3))
+</py>
+<ol><li><code>(pts ** 2).sum(axis=1) &lt;= 1.0</code> tests x<sup>2</sup> + y<sup>2</sup> &lt;= 1 for every point; the mean of that boolean is the inside share; times 4 estimates pi.</li><li>The second experiment rolls two dice 100,000 times as a (100000, 2) array and sums across axis 1.</li></ol>
+<figure><img src="images/lib16_montecarlo.png" alt="Left: random points in the unit square coloured by inside or outside a quarter circle. Right: the running estimate of pi settling near 3.14 as points increase" loading="lazy"/><figcaption>Monte Carlo estimate of pi. The error shrinks roughly like one over the square root of the number of points.</figcaption></figure>
+<p><strong>How to read it:</strong> on the left, blue points fall inside the quarter circle and orange points outside. On the right, the horizontal axis is logarithmic. The blue estimate swings widely at first and then hugs the red dashed line at pi. To halve the error you need about four times as many points, which is why Monte Carlo is simple but slow to be very precise.</p>
+
+<h3>Recipe 8. How do I compute a numerically stable softmax?</h3>
+<p>Softmax turns scores into probabilities: exp(z<sub>i</sub>) / sum of exp(z). The danger: exp of a large number overflows. The fix uses the fact that subtracting the same constant from every score changes nothing, so subtract the maximum.</p>
+<py>
+import numpy as np
+def softmax_naive(z):
+    e = np.exp(z)
+    return e / e.sum(axis=-1, keepdims=True)
+
+def softmax(z):
+    z = z - z.max(axis=-1, keepdims=True)
+    e = np.exp(z)
+    return e / e.sum(axis=-1, keepdims=True)
+
+z = np.array([1000.0, 1001.0, 1002.0])
+with np.errstate(all="ignore"):
+    print(softmax_naive(z))
+print(softmax(z).round(4))
+print(np.allclose(softmax(np.array([2.0, 1.0, 0.1])), softmax(np.array([102.0, 101.0, 100.1]))))
+batch = np.array([[2.0, 1.0, 0.1], [0.0, 0.0, 0.0]])
+print(softmax(batch).round(3), softmax(batch).sum(axis=1))
+def log_softmax(z):
+    z = z - z.max(axis=-1, keepdims=True)
+    return z - np.log(np.exp(z).sum(axis=-1, keepdims=True))
+print(log_softmax(z).round(4))
+</py>
+<ol><li>The naive version computes <code>exp(1000)</code>, which is infinity in float64, and then infinity divided by infinity is NaN: the output is all <code>nan</code>.</li><li>The stable version subtracts the row maximum first. The largest score becomes 0, so <code>exp</code> of it is 1 and nothing overflows.</li><li>Shifting all scores by 100 gives identical probabilities, which the <code>allclose</code> check proves (see the right panel of the figure).</li><li><code>axis=-1</code> with <code>keepdims=True</code> makes the function work on a single vector or on a whole batch, one softmax per row.</li></ol>
+<figure><img src="images/lib16_softmax.png" alt="Left: exp of z on a log axis crossing the float32 maximum near z of 88. Right: three flat probability lines showing that adding a constant to all scores changes nothing" loading="lazy"/><figcaption>Why subtract the maximum. Left: exp(z) leaves the float32 range quickly. Right: adding any constant to all three scores leaves the probabilities unchanged.</figcaption></figure>
+<p><strong>How to read it:</strong> on the left the blue line is exp(z) on a log scale, a straight line meaning "multiplies by the same factor each step". It crosses the red dashed float32 limit at about z = 88; float64 survives to about z = 709. On the right, the horizontal axis is the constant added to the scores and the three lines are the three class probabilities. They stay flat: this is the freedom the max-subtraction trick uses.</p>
+
+<h3>Recipe 9. How do I split data into train and test sets by hand?</h3>
+<py>
+import numpy as np
+rng = np.random.default_rng(42)
+X = np.arange(20).reshape(10, 2)
+y = np.array([0, 1] * 5)
+perm = rng.permutation(len(X))
+n_test = int(len(X) * 0.3)
+test_idx, train_idx = perm[:n_test], perm[n_test:]
+X_train, X_test = X[train_idx], X[test_idx]
+y_train, y_test = y[train_idx], y[test_idx]
+print(X_train.shape, X_test.shape)
+print(sorted(train_idx.tolist() + test_idx.tolist()) == list(range(10)))
+print(y_test, y_train.mean())
+def stratified_split(y, test_frac, rng):
+    test = []
+    for cls in np.unique(y):
+        members = rng.permutation(np.flatnonzero(y == cls))
+        test.append(members[: round(len(members) * test_frac)])
+    test = np.concatenate(test)
+    train = np.setdiff1d(np.arange(len(y)), test)
+    return train, test
+tr, te = stratified_split(np.array([0] * 8 + [1] * 2), 0.5, np.random.default_rng(0))
+print(len(tr), len(te), np.bincount(np.array([0] * 8 + [1] * 2)[te]))
+</py>
+<ol><li>Shuffle the row numbers once with <code>permutation</code>, then cut the shuffled list. The same index arrays split <code>X</code> and <code>y</code> so rows stay paired.</li><li>30 percent of 10 rows is 3 test rows, 7 training rows. The check confirms every row appears exactly once, with no overlap and nothing lost.</li><li>Plain random splits can leave rare classes missing from the test set. The stratified version splits each class separately, so class proportions are kept.</li></ol>
+
+<h3>Recipe 10. How do I do a group-by sum or a histogram without a loop?</h3>
+<py>
+import numpy as np
+store = np.array([0, 2, 1, 0, 2, 2, 1])
+amount = np.array([10.0, 5.0, 7.5, 2.5, 1.0, 4.0, 2.5])
+print(np.bincount(store, weights=amount))
+print(np.bincount(store))
+totals = np.zeros(3)
+np.add.at(totals, store, amount)
+print(totals)
+ages = np.array([3, 17, 25, 31, 44, 52, 67, 71])
+counts, edges = np.histogram(ages, bins=[0, 18, 40, 65, 120])
+print(counts, edges)
+print(np.digitize(ages, [18, 40, 65]))
+</py>
+<ol><li><code>bincount(store, weights=amount)</code> adds the amounts per store number: store 0 has 10 + 2.5 = 12.5, store 1 has 10, store 2 has 10.</li><li><code>np.add.at</code> is the general "scatter-add"; it handles repeated indexes correctly, which plain <code>totals[store] += amount</code> does not (it applies only one update per distinct index).</li><li><code>np.histogram</code> with explicit bin edges counts values in each age band; <code>digitize</code> gives each value's band number. For labelled group-bys on strings, use pandas (the next chapter).</li></ol>
+

@@ -1,0 +1,97 @@
+
+<h2>19.9 Performance and Pitfalls</h2>
+<h3>Speed and memory: what actually matters</h3>
+<p>Most scikit-learn slowness comes from three causes: the wrong algorithm for the data size, dense arrays where sparse would do, and unused CPU cores. The timings below were measured once on one laptop (20,000 rows by 30 columns, a synthetic binary problem). They vary by machine, version and data, so use them only for the ratios.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Fit</th><th>Seconds (one run)</th><th>Lesson</th></tr></thead><tbody>
+<tr><td><code>SVC()</code> (RBF kernel)</td><td>2.3</td><td>Kernel SVM cost grows faster than linearly in rows; fine at 20,000, painful at 500,000</td></tr>
+<tr><td><code>LinearSVC(dual=False)</code></td><td>0.05</td><td>A linear model is orders of magnitude cheaper when it is accurate enough</td></tr>
+<tr><td><code>GradientBoostingClassifier()</code></td><td>11.7</td><td>The original boosting is single-threaded and exact</td></tr>
+<tr><td><code>HistGradientBoostingClassifier(max_iter=100)</code></td><td>1.5</td><td>Binning plus multithreading: the default choice for big tables</td></tr>
+<tr><td><code>RandomForestClassifier(200, n_jobs=1)</code></td><td>9.7</td><td>Trees are independent, so they parallelise well</td></tr>
+<tr><td><code>RandomForestClassifier(200, n_jobs=-1)</code></td><td>1.3</td><td>Same model on all cores (this laptop has 12 threads)</td></tr>
+</tbody></table></div>
+<p>Memory: one-hot encoding a text column with 5,000 distinct values over 100,000 rows gives a 100,000 by 5,000 matrix. Stored densely as float64 that would be 4 GB; scikit-learn's default sparse output stores it in about 1.6 MB (measured with <code>OneHotEncoder</code>), because only one value per row is non-zero. Keep sparse until a step demands dense; tell <code>ColumnTransformer</code> with <code>sparse_threshold</code> if you need to control it.</p>
+<ul>
+<li><strong>Use all cores:</strong> <code>n_jobs=-1</code> for forests, searches and <code>cross_val_score</code>. Nested parallelism (a parallel search around a parallel forest) can oversubscribe the CPU; set it on the outer level only.</li>
+<li><strong>Search smarter:</strong> randomised search before grid search; halving search for large grids; early stopping inside boosting.</li>
+<li><strong>Shrink the problem:</strong> develop on a 10% sample, then scale up. Use <code>float32</code> inputs where precision allows.</li>
+<li><strong>Out of memory:</strong> <code>partial_fit</code> estimators (<code>SGDClassifier</code>, <code>MultinomialNB</code>, <code>MiniBatchKMeans</code>, <code>IncrementalPCA</code>) read the data in chunks.</li>
+<li><strong>Profile first:</strong> time the steps separately before optimising; the slow part is often a custom transformer or a data conversion, not the model.</li>
+</ul>
+<h3>Common mistakes, with the wrong code, the symptom and the fix</h3>
+<div class="callout red"><div class="lab">COMMON MISTAKE 1: fit_transform on the test set</div><div class="txt"><strong>Wrong:</strong> <code>X_te_s = StandardScaler().fit_transform(X_te)</code>. <strong>Symptom:</strong> no error; the test set is scaled with its own mean and spread, so a shift in the new data is hidden and the model sees a different scaling than it was trained on. Scores look fine, but predictions on a single row are impossible (its standard deviation is 0). <strong>Fix:</strong> <code>fit_transform</code> on train, only <code>transform</code> on test, or use a Pipeline.</div></div>
+@@PY
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+
+train = np.array([[10.0], [20.0], [30.0]])
+test = np.array([[100.0], [110.0], [120.0]])      # the world has shifted upward
+
+right = StandardScaler().fit(train).transform(test)
+wrong = StandardScaler().fit_transform(test)
+print("right:", right.ravel().round(2))
+print("wrong:", wrong.ravel().round(2))
+@@END
+<ol>
+<li>Training values average 20; new values are around 110, a large upward shift.</li>
+<li>The correct route scales with the training statistics, so the shifted values come out far from zero (9.8 to 12.25 standard deviations away), which tells the model the data has drifted.</li>
+<li>The wrong route re-centres the test set on itself, producing -1.22, 0, 1.22: the shift is erased and the model sees nothing unusual.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE 2: scoring on the training data</div><div class="txt"><strong>Wrong:</strong> <code>model.fit(X, y); print(model.score(X, y))</code>. <strong>Symptom:</strong> an unlimited decision tree or a 1-nearest-neighbour model scores 1.000 and then disappoints in production. <strong>Fix:</strong> report scores from held-out rows or cross-validation only; show train and test side by side to detect overfitting.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 3: preprocessing or selecting features before the split</div><div class="txt"><strong>Wrong:</strong> <code>X = SelectKBest(k=20).fit_transform(X, y)</code> and then <code>cross_val_score(model, X, y)</code>. <strong>Symptom:</strong> 0.92 accuracy on random noise (Recipe 6). <strong>Fix:</strong> every learned step goes inside the Pipeline.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 4: tuning on the test set</div><div class="txt"><strong>Wrong:</strong> try ten models, keep the one with the best test score, report that score. <strong>Symptom:</strong> the reported number is the maximum of ten noisy estimates, so it is optimistic, and a fresh dataset disappoints. <strong>Fix:</strong> tune with CV on the training part; open the test set once, for the final chosen model.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 5: accuracy on imbalanced data</div><div class="txt"><strong>Wrong:</strong> <code>accuracy_score(y, p)</code> for a 1% fraud problem. <strong>Symptom:</strong> 99% accuracy from a model that never flags anything (section 19.6). <strong>Fix:</strong> compare to a <code>DummyClassifier</code>, use recall, precision, average precision, and choose the threshold on purpose.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 6: integer codes for unordered categories</div><div class="txt"><strong>Wrong:</strong> <code>OrdinalEncoder().fit_transform(df[["city"]])</code> feeding a linear or kNN model. <strong>Symptom:</strong> the model treats "Paris = 2" as twice "Berlin = 1" and "Rome = 3" as between them, which is meaningless, so accuracy is poor and coefficients are nonsense. <strong>Fix:</strong> <code>OneHotEncoder</code> for nominal categories (ordinal codes are acceptable for trees, or for categories with a real order).</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 7: forgetting to scale</div><div class="txt"><strong>Wrong:</strong> <code>KNeighborsClassifier().fit(X, y)</code> with a salary column in the tens of thousands next to a 0-1 flag. <strong>Symptom:</strong> accuracy near chance (0.518 in section 19.4). <strong>Fix:</strong> <code>make_pipeline(StandardScaler(), model)</code> for SVM, kNN, k-means, PCA, MLP, and penalised linear models.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 8: target leakage through a feature</div><div class="txt"><strong>Wrong:</strong> predicting churn with a column <code>cancellation_reason</code> or <code>days_since_last_login_at_cancellation</code>, which only exists after the outcome. <strong>Symptom:</strong> AUC of 0.99 and one dominating feature importance. <strong>Fix:</strong> for every feature ask "will I know this at the moment I must predict?"; remove anything that is a consequence of the label; look at the top permutation importances with suspicion.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 9: random folds on grouped or ordered data</div><div class="txt"><strong>Wrong:</strong> <code>KFold(5, shuffle=True)</code> over repeated patients or over time. <strong>Symptom:</strong> CV 0.99 against 0.52 with <code>GroupKFold</code> (section 19.5). <strong>Fix:</strong> <code>GroupKFold</code> or <code>TimeSeriesSplit</code>.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 10: column order or names changed at prediction time</div><div class="txt"><strong>Wrong:</strong> fit on a DataFrame, predict on a NumPy array with columns in another order (or a DataFrame with different names). <strong>Symptom:</strong> a <code>ValueError</code> about feature names for a bare model, or silently wrong predictions when a plain NumPy array has its columns in another order. <strong>Fix:</strong> always predict with a DataFrame with the same column names, and put a <code>ColumnTransformer</code> first so selection is by name.</div></div>
+@@PY
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+X = pd.DataFrame({"age": [20, 30, 40, 50], "income": [10, 20, 30, 40]})
+y = [0, 0, 1, 1]
+bare = LogisticRegression().fit(X, y)
+safe = make_pipeline(ColumnTransformer([("s", StandardScaler(), ["age", "income"])]),
+                     LogisticRegression()).fit(X, y)
+
+for label, bad in (("renamed", X.rename(columns={"income": "salary"})),
+                   ("reordered", X[["income", "age"]])):
+    try:
+        bare.predict(bad)
+    except ValueError as e:
+        print(label, "-> bare model:", str(e).splitlines()[1])
+print("reordered -> pipeline with ColumnTransformer:", safe.predict(X[["income", "age"]]))
+@@END
+<ol>
+<li>The model is fitted on a DataFrame, so it stores <code>feature_names_in_</code> and checks it at predict time.</li>
+<li>A renamed column and a merely reordered DataFrame both make the bare model raise a <code>ValueError</code>. We print the second line of each message, which says what is wrong.</li>
+<li>A pipeline that starts with a <code>ColumnTransformer</code> selects columns by name, so it accepts the reordered frame and puts the columns back in the trained order.</li>
+<li>A plain NumPy array has no names to check, so it is interpreted by position and a shuffled order would give silently wrong answers.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE 11: dense one-hot on high-cardinality columns</div><div class="txt"><strong>Wrong:</strong> <code>OneHotEncoder(sparse_output=False)</code> on a column of 50,000 user IDs. <strong>Symptom:</strong> <code>MemoryError</code>, or a model that memorises IDs. <strong>Fix:</strong> keep sparse output, set <code>min_frequency</code> or <code>max_categories</code> to group rare values, or use <code>TargetEncoder</code> (which cross-fits internally) for a high-cardinality predictive column. A pure identifier should not be a feature at all.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 12: reading negative scores as bad</div><div class="txt"><strong>Wrong:</strong> <code>cross_val_score(m, X, y, scoring="neg_mean_squared_error")</code> returns <code>[-4.1, -3.9, ...]</code>, and you conclude the model is broken. <strong>Symptom:</strong> confusion and sign errors in reports. <strong>Fix:</strong> scikit-learn maximises, so errors are negated; negate back to report them (<code>-scores.mean()</code>). Higher (closer to zero) is better.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 13: trusting raw probabilities and unscaled coefficients</div><div class="txt"><strong>Wrong:</strong> using <code>RandomForest.predict_proba</code> or <code>GaussianNB</code> output as a literal risk percentage, or ranking features by <code>coef_</code> when columns have different units. <strong>Symptom:</strong> "80% risk" cases come true 55% of the time; a column measured in small units looks hugely important. <strong>Fix:</strong> check <code>calibration_curve</code> and calibrate when probabilities are used as numbers; scale before comparing coefficients, or use permutation importance.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 14: unseeded randomness and unfair comparisons</div><div class="txt"><strong>Wrong:</strong> comparing two models on different random splits, with no <code>random_state</code>. <strong>Symptom:</strong> the "winner" changes every run. <strong>Fix:</strong> create one CV splitter with a fixed seed and use it for every model; set <code>random_state</code> on every random estimator.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 15: a 2-D column vector as y, or 1-D X</div><div class="txt"><strong>Wrong:</strong> <code>model.fit(X, df[["target"]])</code> or <code>model.fit(df["age"], y)</code>. <strong>Symptom:</strong> a <code>DataConversionWarning</code> about a column-vector y, or <code>Expected 2D array, got 1D array</code>. <strong>Fix:</strong> <code>y = df["target"]</code> (one bracket) and <code>X = df[["age"]]</code> (two brackets).</div></div>
+@@PY
+import numpy as np
+from sklearn.dummy import DummyRegressor
+from sklearn.model_selection import cross_val_score
+
+X = np.arange(20).reshape(-1, 1)
+y = np.arange(20) * 1.0
+scores = cross_val_score(DummyRegressor(), X, y, cv=4, scoring="neg_mean_squared_error")
+print(scores.round(1))
+print("report as MSE:", round(-scores.mean(), 1))
+@@END
+<ol>
+<li>A mean-only baseline on a perfectly linear target gives sizeable errors.</li>
+<li>Folds 1 and 4 hold the extremes of the range, so they score -102.0; the middle folds score -13.1.</li>
+<li>Every score is negative because the scorer returns the negated MSE.</li>
+<li>We flip the sign before reporting: an MSE of 57.6 is the typical squared error of this baseline.</li>
+</ol>

@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 6: Training Pipelines, Distributed Training and GPU Cost Control</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 6</div><h1>Training Pipelines, Distributed Training and GPU Cost Control</h1><p>From &quot;I ran a script by hand&quot; to &quot;the system retrains itself, safely, on a budget&quot;.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-6-1-training-pipelines-and-orchestration">6.1 Training Pipelines and Orchestration</a></li><li><a href="#s2-6-2-distributed-training-basics">6.2 Distributed Training Basics</a></li><li><a href="#s3-6-3-gpu-management-and-cost-control">6.3 GPU Management and Cost Control</a></li><li><a href="#s4-chapter-recap">Chapter recap</a></li><li><a href="#s5-practice-set">Practice set</a></li><li><a href="#s6-prompt-pack">Prompt pack</a></li></ol></details><p>Retraining a model is rarely one command. You extract data, validate it, build features, train, evaluate, and register. If any step fails at 2 a.m., somebody must know and the rerun must not corrupt anything. An <strong>orchestrator</strong> (Airflow, Kubeflow, Metaflow and friends) runs these steps in the right order, retries failures and keeps a history. And when the data or model is large, you need more than one GPU, which brings new problems: communication cost and a very real bill. This chapter teaches the orchestration ideas with a runnable dependency-graph example, the basics of distributed training with a numeric proof that data parallelism works, and the cost-control habits (checkpoints, spot instances, mixed precision) that keep experiments affordable. GPU and cluster code is <strong>not run here</strong>; this machine has no GPU, so we use arithmetic and small simulations.</p>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 6: Training Pipelines, Distributed Training and GPU Cost Control</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 6</div><h1>Training Pipelines, Distributed Training and GPU Cost Control</h1><p>From &quot;I ran a script by hand&quot; to &quot;the system retrains itself, safely, on a budget&quot;.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-6-1-training-pipelines-and-orchestration">6.1 Training Pipelines and Orchestration</a></li><li><a href="#s2-6-2-distributed-training-basics">6.2 Distributed Training Basics</a></li><li><a href="#s3-6-3-gpu-management-and-cost-control">6.3 GPU Management and Cost Control</a></li><li><a href="#s4-6-4-distributed-training-arithmetic-memory-communication-and-failures">6.4 Distributed Training Arithmetic: Memory, Communication and Failures</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>Retraining a model is rarely one command. You extract data, validate it, build features, train, evaluate, and register. If any step fails at 2 a.m., somebody must know and the rerun must not corrupt anything. An <strong>orchestrator</strong> (Airflow, Kubeflow, Metaflow and friends) runs these steps in the right order, retries failures and keeps a history. And when the data or model is large, you need more than one GPU, which brings new problems: communication cost and a very real bill. This chapter teaches the orchestration ideas with a runnable dependency-graph example, the basics of distributed training with a numeric proof that data parallelism works, and the cost-control habits (checkpoints, spot instances, mixed precision) that keep experiments affordable. GPU and cluster code is <strong>not run here</strong>; this machine has no GPU, so we use arithmetic and small simulations.</p>
 <p>Words you need:</p>
 <div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>DAG</td><td>Directed acyclic graph: tasks with arrows "A before B", and no loops.</td></tr><tr><td>Orchestrator</td><td>The program that runs a DAG: order, retries, schedules, logs.</td></tr><tr><td>Idempotent</td><td>Running it twice gives the same result as running it once.</td></tr><tr><td>Epoch</td><td>One full pass through the training data.</td></tr><tr><td>Checkpoint</td><td>A saved snapshot of training state so you can resume.</td></tr><tr><td>GPU</td><td>A chip with thousands of small cores, good at the matrix maths in deep learning.</td></tr><tr><td>Spot / preemptible</td><td>Cheap cloud machines that the provider may take back with short notice.</td></tr></tbody></table></div>
 <h2 id="s1-6-1-training-pipelines-and-orchestration">6.1 Training Pipelines and Orchestration</h2>
@@ -184,10 +184,164 @@ spot, checkpoint every    20 h: billed 652.5 GPU-h -&gt; $652.50</code></pre>
 <p>Answer: A preemption then loses only the work since the last checkpoint.</p>
 <ol><li>What happened to 60,000 + 60,000 in float16?</li></ol>
 <p>Answer: It overflowed to <code>inf</code>, because float16 maxes out near 65,500.</p>
-<h2 id="s4-chapter-recap">Chapter recap</h2>
+<h2 id="s4-6-4-distributed-training-arithmetic-memory-communication-and-failures">6.4 Distributed Training Arithmetic: Memory, Communication and Failures</h2>
+<p>Section 6.2 showed data parallelism and its speedup limits. Large models break that picture in three ways: the model state does not fit on one GPU, the gradient exchange takes longer than the compute, and with hundreds of GPUs something fails every few hours. This section gives you the arithmetic for each. All numbers are computed by code that ran here. I did not train anything on a real cluster: PyTorch and GPUs are not available here, so the training snippet is labelled not run here.</p>
+<h3>Beginner: where the memory goes</h3>
+<p>Training a model needs far more memory than the model file. For every parameter you keep the weight, its gradient (the direction to change it), and the optimizer's memory. The Adam optimizer keeps two extra numbers per parameter (m and v, running averages). In mixed precision (computing in 16-bit, keeping an accurate 32-bit master copy), the bytes per parameter are:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Piece</th><th>Bytes per parameter</th></tr></thead><tbody><tr><td>fp16 weights</td><td>2</td></tr><tr><td>fp16 gradients</td><td>2</td></tr><tr><td>fp32 master weights</td><td>4</td></tr><tr><td>Adam m (momentum)</td><td>4</td></tr><tr><td>Adam v (variance)</td><td>4</td></tr><tr><td>Total</td><td>16</td></tr></tbody></table></div>
+<p>So a 7 billion parameter model needs 7e9 × 16 = 112 GB of model state, before activations (the temporary values kept for the backward pass). Compare that with the 14 GB the chapter gave for the weights alone in 16-bit: training costs 8 times the weights. Real output, including what each ZeRO stage does:</p>
+<pre class="code lang-python"><code># Memory per parameter in mixed-precision training with Adam
+fp16_weights, fp16_grads = 2, 2
+fp32_master, adam_m, adam_v = 4, 4, 4
+per_param = fp16_weights + fp16_grads + fp32_master + adam_m + adam_v
+print("bytes per parameter:", per_param)
+
+params = 7e9
+print("7B model state:", round(params * per_param / 1e9), "GB (before activations)")
+
+def per_gpu(stage, n):
+    """GB of model state per GPU. stage 0 = plain data parallel."""
+    opt = 12 / (n if stage &gt;= 1 else 1)        # fp32 master + m + v
+    grad = 2 / (n if stage &gt;= 2 else 1)
+    weight = 2 / (n if stage &gt;= 3 else 1)
+    return params * (opt + grad + weight) / 1e9
+
+names = {0: "DDP (copy everything)", 1: "ZeRO-1 (shard optimizer)", 2: "ZeRO-2 (+ gradients)", 3: "ZeRO-3 / FSDP (+ weights)"}
+for stage in range(4):
+    print(f"{names[stage]:28s} 8 GPUs: {per_gpu(stage, 8):6.1f} GB   64 GPUs: {per_gpu(stage, 64):6.1f} GB")</code></pre>
+<pre class="code lang-text"><code>bytes per parameter: 16
+7B model state: 112 GB (before activations)
+DDP (copy everything)        8 GPUs:  112.0 GB   64 GPUs:  112.0 GB
+ZeRO-1 (shard optimizer)     8 GPUs:   38.5 GB   64 GPUs:   29.3 GB
+ZeRO-2 (+ gradients)         8 GPUs:   26.2 GB   64 GPUs:   15.5 GB
+ZeRO-3 / FSDP (+ weights)    8 GPUs:   14.0 GB   64 GPUs:    1.8 GB</code></pre>
+<figure><img src="images/ch06_zero_memory.png" alt="Stacked bars of per-GPU memory for DDP and ZeRO stages" loading="lazy"/><figcaption>Per-GPU model state for a 7B model on 8 GPUs.</figcaption></figure>
+<p>How to read it: each bar is the memory one GPU needs for its share of the model state. Blue is weights, green gradients, orange the optimizer state. Plain data parallel (DDP) keeps all 112 GB on every GPU and crosses the red 80 GB line, so it fails. Each ZeRO stage shards one more piece across the 8 GPUs. Optimizer state is the biggest piece (12 of 16 bytes per parameter), so ZeRO-1 gives the largest single saving.</p>
+<p class="problem"><span class="pl">Problem 6.4.1</span> You want to fine-tune a 7B model with Adam in mixed precision on one node of 8 GPUs with 80 GB each. Does plain data parallel work? What is the simplest fix?</p>
+<table class="steps"><tr><th>State</th><td>7e9 × 16 bytes = 112 GB of state per GPU in plain DDP.</td></tr><tr><th>Compare</th><td>112 GB is more than 80 GB. It does not fit, before counting activations.</td></tr><tr><th>Fix</th><td>Shard the state: FSDP (PyTorch's version of ZeRO-3) leaves 112 ÷ 8 = 14 GB per GPU.</td></tr><tr><th>Headroom</th><td>80 − 14 = 66 GB per GPU left for activations, which is plenty for a decent batch.</td></tr><tr><th>Meaning</th><td>The same 8 GPUs go from impossible to comfortable, with no new hardware.</td></tr></table>
+<div class="callout blue"><div class="lab">KEY IDEA</div><div class="txt">ZeRO and FSDP are still data parallelism: every GPU processes different data. What changes is that no GPU keeps a full copy of the state. A GPU borrows the pieces it needs from the others just before a layer runs, then drops them. You pay in network traffic to save memory.</div></div>
+<h3>Intermediate: what sharding costs</h3>
+<p>DDP exchanges gradients once per step with an all-reduce. In a ring all-reduce each GPU sends and receives 2 × (N − 1) ÷ N times the data size. For 7B parameters the fp16 gradients are 14 GB. How long that takes depends on the link:</p>
+<pre class="code lang-python"><code># Ring all-reduce time: each GPU sends and receives 2 (N-1)/N x bytes.
+def allreduce_s(nbytes, n, bandwidth):
+    return 2 * (n - 1) / n * nbytes / bandwidth
+grads = 7e9 * 2                          # fp16 gradients of a 7B model: 14 GB
+for name, bw in (("NVLink 450 GB/s", 450e9), ("InfiniBand 50 GB/s", 50e9), ("Ethernet 100 Gb/s = 12.5 GB/s", 12.5e9)):
+    print(f"{name:32s} {allreduce_s(grads, 8, bw):6.2f} s per step")</code></pre>
+<pre class="code lang-text"><code>NVLink 450 GB/s                    0.05 s per step
+InfiniBand 50 GB/s                 0.49 s per step
+Ethernet 100 Gb/s = 12.5 GB/s      1.96 s per step</code></pre>
+<p class="problem"><span class="pl">Problem 6.4.2</span> A step computes for 400 ms. Gradients are 14 GB over 8 GPUs. Which network keeps the GPUs busy?</p>
+<table class="steps"><tr><th>NVLink</th><td>0.05 s = 50 ms, 12% on top of 400 ms. Fine, and often overlapped with the backward pass.</td></tr><tr><th>InfiniBand</th><td>0.49 s, more than the compute. The GPUs wait unless the exchange overlaps with compute.</td></tr><tr><th>Ethernet 100 Gb/s</th><td>1.96 s: about five times the compute. Multi-node training over plain Ethernet is wasteful for a model this size.</td></tr><tr><th>Answer</th><td>Keep the sharded or all-reduce traffic inside a node (NVLink) and use fast interconnect between nodes. Overlapping communication with compute hides part of the cost.</td></tr><tr><th>Meaning</th><td>Network bandwidth, not GPU count, is often the limit. Section 6.2 showed the same pattern: the communication part does not shrink as you add GPUs.</td></tr></table>
+<p>ZeRO-3 moves more data than DDP: weights are gathered for each layer in the forward pass and again in the backward pass, plus the gradient reduce-scatter. The commonly quoted figure is about 1.5 times the traffic of DDP. If the network is fast, that is a good trade. If the network is slow, use ZeRO-1 or ZeRO-2, which add almost no traffic and still save most of the memory.</p>
+<h3>Gradient accumulation: a big batch from small steps</h3>
+<p>When even sharded memory cannot hold the batch you want, run several small micro-batches, add up their gradients, and update once. The result equals one big batch. Real check with a small linear model:</p>
+<pre class="code lang-python"><code>import numpy as np
+# Gradient accumulation gives the same gradient as one big batch.
+rng = np.random.default_rng(0)
+X = rng.normal(size=(64, 3)); y = X @ np.array([1.0, -2.0, 0.5]) + rng.normal(scale=0.1, size=64)
+w = np.zeros(3)
+
+def grad(Xb, yb, w):                   # gradient of mean squared error
+    return 2 * Xb.T @ (Xb @ w - yb) / len(yb)
+
+full = grad(X, y, w)
+accum = np.zeros(3)
+for i in range(4):                     # 4 micro-batches of 16
+    accum += grad(X[i*16:(i+1)*16], y[i*16:(i+1)*16], w) / 4
+print(np.round(full, 6))
+print(np.round(accum, 6))
+print("same:", np.allclose(full, accum))
+# effective batch = micro_batch x accumulation_steps x GPUs
+print("effective batch:", 16 * 4 * 8)</code></pre>
+<pre class="code lang-text"><code>[-2.265977  2.899352 -0.855204]
+[-2.265977  2.899352 -0.855204]
+same: True
+effective batch: 512</code></pre>
+<p class="problem"><span class="pl">Problem 6.4.3</span> Micro-batch 16, accumulation 4 steps, 8 GPUs. What is the effective batch size, and why do you divide each micro-batch gradient by 4?</p>
+<table class="steps"><tr><th>Effective batch</th><td>16 × 4 × 8 = 512 samples per update.</td></tr><tr><th>Why divide</th><td>The loss is a mean. The mean over 64 samples equals the average of four means over 16 each. Without the division the gradient would be 4 times too large, equal to using a 4 times larger learning rate.</td></tr><tr><th>Check</th><td>The code above prints identical gradients for the full batch and the accumulated one.</td></tr><tr><th>Meaning</th><td>Accumulation trades time (4 forward-backward passes) for memory (a 16-sample batch).</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Changing the number of GPUs and forgetting that the effective batch size changed. Going from 8 to 64 GPUs with the same per-GPU batch multiplies the batch by 8. At the old learning rate, training may be slower or unstable. Adjust the learning rate (a common first guess is to scale it with the batch size, with a warmup) and re-check the loss curve against the old run.</div></div>
+<h3>Pipeline and tensor parallelism (when one layer set is still too big)</h3>
+<p>For models beyond about 30B parameters, one GPU cannot even hold one layer's work comfortably, and sharding alone is slow across nodes. Two other splits exist.</p>
+<ul><li><strong>Tensor parallel.</strong> Split each big matrix multiplication over 2, 4 or 8 GPUs. It needs very fast links (NVLink), so you keep it inside one node.</li><li><strong>Pipeline parallel.</strong> Put layers 1 to 20 on GPU group A, layers 21 to 40 on group B and so on. Micro-batches flow like cars on an assembly line. At the start and end, some stages are idle, which is the bubble.</li></ul>
+<p>With p stages and m micro-batches, the idle fraction is (p − 1) ÷ (m + p − 1). Real output for 4 stages:</p>
+<pre class="code lang-python"><code># Pipeline parallel: with p stages and m micro-batches, the idle "bubble" fraction is (p-1)/(m+p-1)
+p = 4
+for m in (1, 4, 8, 16, 32, 64):
+    print(f"p={p}, micro-batches={m:3d}: bubble {(p-1)/(m+p-1):.1%}")</code></pre>
+<pre class="code lang-text"><code>p=4, micro-batches=  1: bubble 75.0%
+p=4, micro-batches=  4: bubble 42.9%
+p=4, micro-batches=  8: bubble 27.3%
+p=4, micro-batches= 16: bubble 15.8%
+p=4, micro-batches= 32: bubble 8.6%
+p=4, micro-batches= 64: bubble 4.5%</code></pre>
+<p class="problem"><span class="pl">Problem 6.4.4</span> You have 64 GPUs for a 70B model: 8 GPUs per node. Propose a layout using data (DP), tensor (TP) and pipeline (PP) parallelism, and check the product.</p>
+<table class="steps"><tr><th>Rule 1</th><td>TP stays inside a node: TP = 8.</td></tr><tr><th>Rule 2</th><td>Use PP to cut across nodes only as much as needed. 70B in fp16 is 140 GB of weights, so 8 GPUs of 80 GB (640 GB) hold the weights, but the full state is 70e9 × 16 = 1,120 GB. TP 8 × PP 2 spreads it over 16 GPUs, which is 70 GB each: too tight. Also shard the optimizer (12 bytes) over the DP replicas (ZeRO-1).</td></tr><tr><th>Choose</th><td>TP = 8, PP = 2, DP = 4. Per GPU: weights and gradients 280 GB ÷ 16 = 17.5 GB, optimizer 840 GB ÷ 16 ÷ 4 = 13.1 GB, about 31 GB in total before activations.</td></tr><tr><th>Check</th><td>8 × 2 × 4 = 64 GPUs. Pipeline bubble with 32 micro-batches and 2 stages: (2−1) ÷ (32+2−1) = 3.0%.</td></tr><tr><th>Meaning</th><td>Real frameworks (Megatron-LM, DeepSpeed) take these three numbers as settings. This is the planning step before you launch.</td></tr></table>
+<h3>Checkpoint cadence: the Young-Daly rule</h3>
+<p>Spot capacity, hardware faults and out-of-memory crashes mean long jobs fail. A checkpoint saves progress. Write it too often and you waste time saving. Write it too rarely and a failure throws away hours. The Young-Daly rule gives the best interval T from the cost of one checkpoint C and the mean time between failures M:</p>
+<div class="eq">T = √(2 × C × M)</div>
+<p>The time wasted is about C ÷ T (saving) plus T ÷ (2M) (average half-interval lost per failure, as a share of time). Take a 512-GPU job that fails on average every 6 hours (M = 360 minutes; an illustrative number, since failure rates vary by cluster) with a 3-minute checkpoint. I checked the formula with a simulation of random failures. Real output:</p>
+<pre class="code lang-python"><code>import math, random
+# Checkpoint interval. C = minutes to write a checkpoint, M = mean minutes between failures.
+C_min, M = 3.0, 360.0
+print("Young-Daly interval:", round(math.sqrt(2 * C_min * M), 1), "minutes")
+
+def waste_formula(T):                      # first-order estimate of the lost fraction
+    return C_min / T + T / (2 * M)
+
+def simulate(T, horizon=3_000_000, seed=1):
+    rnd = random.Random(seed)
+    t = 0.0; saved = 0.0                   # saved = useful minutes safely written to a checkpoint
+    fail_at = rnd.expovariate(1 / M)
+    while t &lt; horizon:
+        if t + T + C_min &lt;= fail_at:       # a whole work-then-checkpoint cycle completes
+            t += T + C_min; saved += T
+        else:                              # a failure inside the cycle loses the unsaved work
+            t = fail_at + 5.0              # 5 minutes to restart
+            fail_at = t + rnd.expovariate(1 / M)
+    return 1 - saved / t
+
+print("interval  formula  simulated waste")
+for T in (10, 20, 46, 90, 180, 360):
+    print(f"{T:6d} min  {waste_formula(T):6.1%}   {simulate(T):6.1%}")</code></pre>
+<pre class="code lang-text"><code>Young-Daly interval: 46.5 minutes
+interval  formula  simulated waste
+    10 min   31.4%    25.5%
+    20 min   17.8%    17.0%
+    46 min   12.9%    13.5%
+    90 min   15.8%    16.4%
+   180 min   26.7%    25.7%
+   360 min   50.8%    43.7%</code></pre>
+<figure><img src="images/ch06_young_daly.png" alt="Wasted time against checkpoint interval" loading="lazy"/><figcaption>Wasted time against checkpoint interval, formula and simulation.</figcaption></figure>
+<p>How to read it: the x axis is how often you checkpoint, the y axis the share of cluster time that is wasted (writing checkpoints plus redoing lost work). The U-shape has its bottom near 46 minutes (green line). Dots from the simulation sit close to the blue formula near the bottom and drift away at the ends, where the formula is only a first-order guess. The bottom is flat: anything from 25 to 90 minutes is fine.</p>
+<p class="problem"><span class="pl">Problem 6.4.5</span> With the numbers above, is checkpointing every 10 minutes sensible? What would you do if checkpoint time dropped to 30 seconds?</p>
+<table class="steps"><tr><th>Optimum</th><td>T = √(2 × 3 × 360) = 46.5 minutes.</td></tr><tr><th>10 minutes</th><td>Simulation: 25.5% of the time wasted. About twice the minimum of 13%.</td></tr><tr><th>Faster saves</th><td>C = 0.5 min: T = √(2 × 0.5 × 360) = 19 minutes. Waste is about 0.5 ÷ 19 + 19 ÷ 720 = 5.3%.</td></tr><tr><th>Answer</th><td>No, 10 minutes is too often at 3 minutes per save. Cut the save time first (async checkpoints to local disk, sharded writes), then checkpoint more often.</td></tr><tr><th>Meaning</th><td>The cost of a checkpoint sets how often you can afford to take one.</td></tr></table>
+<h3>A sharded training script (not run here)</h3>
+<p>In PyTorch, the change from DDP to FSDP is small. This needs GPUs and the <code>torch</code> package, which are not available here, so I did not run it. Start it with <code>torchrun --nproc_per_node=8 train.py</code>.</p>
+<pre class="code lang-python"><code>import torch
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import MixedPrecision
+
+torch.distributed.init_process_group("nccl")
+model = build_model().cuda()
+model = FSDP(
+    model,
+    mixed_precision=MixedPrecision(param_dtype=torch.bfloat16,
+                                   reduce_dtype=torch.bfloat16),
+)
+opt = torch.optim.AdamW(model.parameters(), lr=2e-4)
+for step, (x, y) in enumerate(loader):
+    loss = loss_fn(model(x.cuda()), y.cuda())
+    loss.backward()                 # gradients are reduce-scattered here
+    if (step + 1) % 4 == 0:         # gradient accumulation of 4
+        opt.step(); opt.zero_grad()</code></pre>
+<h3>Going deeper</h3>
+<ul><li><strong>bf16 or fp16?</strong> fp16 has a narrow range, so training needs loss scaling to stop small gradients turning to zero. bf16 has the range of fp32 with fewer fine digits, needs no loss scaling, and is the default on modern GPUs (A100, H100).</li><li><strong>Activation checkpointing</strong> (different from saving model checkpoints) drops activations in the forward pass and recomputes them in the backward pass. It costs about 30% more compute and saves most activation memory.</li><li><strong>Utilisation is the real KPI.</strong> MFU (model FLOPs utilisation) is useful work divided by the hardware peak. 40 to 55% is good for large models. A job at 15% is either data-starved or network-bound. Profile before buying GPUs.</li><li><strong>Elastic and fault-tolerant jobs.</strong> torchrun can restart a job with fewer workers. Combined with sharded async checkpoints, a node loss costs minutes, not hours.</li></ul>
+
+<h2 id="s5-chapter-recap">Chapter recap</h2>
 <ul><li>Orchestrators run a DAG: ordering, scheduling, retries, logging; tasks must be idempotent.</li><li>Retries make flaky steps reliable: three attempts at 5% failure each fail together only 0.0125% of the time.</li><li>Data parallel training averages gradients; we proved the average equals the full-batch gradient.</li><li>Scaling is not linear: at 8 GPUs we got 4.88 times speedup (61% efficiency) in our model.</li><li>Check memory with arithmetic: 7 billion parameters is 14 GB in fp16.</li><li>Mixed precision saves memory but needs care (float16 overflows near 65,500).</li><li>Spot instances plus frequent checkpoints cut our simulated cost from $60 to about $22.</li><li>Utilization, data loading format, early stopping, budgets and auto-shutdown control cost.</li></ul>
 <div class="tablewrap"><table class="data"><thead><tr><th>Formula / Pattern</th><th>Meaning</th></tr></thead><tbody><tr><td><code>P(fail all) = p^(1+retries)</code></td><td>Retry reliability</td></tr><tr><td><code>speedup = t₁ ÷ tₙ</code>; <code>efficiency = speedup ÷ N</code></td><td>Scaling quality</td></tr><tr><td><code>GB = params × bytes ÷ 1e9</code></td><td>Weight memory</td></tr><tr><td><code>saving % = (old − new) ÷ old × 100</code></td><td>Cost saving</td></tr><tr><td><code>TopologicalSorter(dag).static_order()</code></td><td>Valid task order</td></tr><tr><td><code>torchrun --nproc_per_node=N train.py</code></td><td>Launch DDP (not run here)</td></tr></tbody></table></div>
-<h2 id="s5-practice-set">Practice set</h2>
+<h2 id="s6-practice-set">Practice set</h2>
 <p class="problem"><span class="pl">Problem 6.1</span> Order these tasks: train, extract, evaluate, features. <strong>Answer:</strong> extract, features, train, evaluate.</p>
 <p class="problem"><span class="pl">Problem 6.2</span> A task fails 10% of the time; 3 retries. Chance of permanent failure? <strong>Answer:</strong> 0.1⁴ = 0.0001, or 0.01%.</p>
 <p class="problem"><span class="pl">Problem 6.3</span> What is the output? <code>list(TopologicalSorter({"b": {"a"}, "a": set()}).static_order())</code> <strong>Answer:</strong> <code>['a', 'b']</code>.</p>
@@ -198,9 +352,16 @@ spot, checkpoint every    20 h: billed 652.5 GPU-h -&gt; $652.50</code></pre>
 <p class="problem"><span class="pl">Problem 6.8</span> GPU utilization is 25%. The model is small. List two likely fixes. <strong>Answer:</strong> Speed up data loading (parallel workers, columnar or sharded formats, caching) and increase batch size.</p>
 <p class="problem"><span class="pl">Problem 6.9 (interview)</span> "How would you automate retraining?" <strong>Answer:</strong> An orchestrated DAG (extract, validate, features, train, evaluate, register) triggered by schedule, new data or drift alerts; idempotent tasks; evaluation against the champion with a margin; human approval for risky models; all runs tracked and data versioned.</p>
 <p class="problem"><span class="pl">Problem 6.10 (interview)</span> "Training cost doubled this month. How do you investigate?" <strong>Answer:</strong> Use cost tags to find the project, then check forgotten instances, low utilization, failed jobs restarting from scratch without checkpoints, larger trial counts, and a change in instance type. Then set budgets, alerts and auto-shutdown.</p>
-<h2 id="s6-prompt-pack">Prompt pack</h2>
+<p class="problem"><span class="pl">Problem 6.11</span> A 13B model is trained with Adam in mixed precision. How much model state does it need, in total and per GPU on 16 GPUs with ZeRO-3? <strong>Answer:</strong> 13e9 × 16 = 208 GB in total. On 16 GPUs with ZeRO-3: 208 ÷ 16 = 13 GB per GPU (plus activations).</p>
+<p class="problem"><span class="pl">Problem 6.12</span> Which ZeRO stage shards the largest piece first, and why? <strong>Answer:</strong> ZeRO-1. It shards the optimizer state, which is 12 of the 16 bytes per parameter (75%).</p>
+<p class="problem"><span class="pl">Problem 6.13</span> Pipeline with 8 stages and 24 micro-batches. What fraction of time is the bubble? <strong>Answer:</strong> (8 − 1) ÷ (24 + 8 − 1) = 7 ÷ 31 = 22.6%. More micro-batches shrink it.</p>
+<p class="problem"><span class="pl">Problem 6.14</span> Checkpoint time is 5 minutes and the mean time between failures is 10 hours. What interval do you pick? <strong>Answer:</strong> M = 600 minutes. T = √(2 × 5 × 600) = √6,000 = 77.5 minutes. Round to 75 or 80.</p>
+<p class="problem"><span class="pl">Problem 6.15 (find the bug)</span> A team scales from 8 to 32 GPUs, keeps the per-GPU batch of 32 and the learning rate, and the loss now diverges. Explain. <strong>Answer:</strong> The global batch grew from 256 to 1,024, four times larger. The learning rate was tuned for the smaller batch. Re-tune (scale it up with warmup, or reduce the per-GPU batch) and compare the first 1,000 steps against the old run.</p>
+<p class="problem"><span class="pl">Problem 6.16</span> All-reduce of 10 GB gradients across 8 GPUs on 25 GB/s links. How long? <strong>Answer:</strong> 2 × 7 ÷ 8 × 10 ÷ 25 = 0.70 seconds.</p>
+<p class="problem"><span class="pl">Problem 6.17 (interview)</span> "Your 13B fine-tune runs out of memory on a single 80 GB GPU. List your options in order." <strong>Answer:</strong> (1) Use bf16 and a smaller micro-batch with gradient accumulation. (2) Turn on activation checkpointing. (3) Use LoRA or QLoRA so only a small set of weights has optimizer state (Chapter 13). (4) Use an 8-bit optimizer. (5) Shard with FSDP or ZeRO over several GPUs. State the numbers: full fine-tuning needs 13e9 × 16 = 208 GB, so a single 80 GB GPU cannot do it without a parameter-efficient method.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps, and English is my second language. Explain ML training pipelines and orchestration: DAGs, retries, idempotency and scheduling. Use a recipe analogy, then walk through an Airflow DAG for retraining a churn model line by line. Ask me one check question after each part.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Compare Airflow, Kubeflow Pipelines, Argo Workflows, Metaflow, Dagster, ZenML, Vertex Pipelines and SageMaker Pipelines in a table: style, strengths, and when NOT to use each. Keep claims general so they do not go stale, and then give me 8 graded exercises without solutions.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Teach distributed training basics: data parallel (DDP), model parallel, FSDP, DeepSpeed, Horovod, Ray Train. Use exam-grading analogies, show with small numbers why averaged gradients equal the full-batch gradient, and explain why scaling efficiency drops. Quiz me one question at a time.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Review my plan to control GPU training cost: spot instances, checkpoint frequency, mixed precision, data loading, budgets and idle shutdown. Point out risks and missing steps, and do cost arithmetic with my numbers. My plan and numbers: [PASTE HERE]</pre></div>
-<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Run a mock interview on training pipelines, orchestration, distributed training and GPU cost control. Ask one question at a time, grade each answer out of 10, show a model answer, and end with my weakest topics and a one-week plan.</pre></div><div class="readbtn"><button class="btn" data-read="study:mlops:ch06">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch05.html">← Chapter 5: Feature Stores and Data Validation for M</a><a class="btn" href="ch07.html">Chapter 7: Model Serving →</a></div></div><script src="../../assets/study.js"></script></body></html>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Run a mock interview on training pipelines, orchestration, distributed training and GPU cost control. Ask one question at a time, grade each answer out of 10, show a model answer, and end with my weakest topics and a one-week plan.</pre></div><div class="readbtn"><button class="btn" data-read="study:mlops:ch06">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch05.html">← Chapter 5: Feature Stores and Data Validation for ML</a><a class="btn" href="ch07.html">Chapter 7: Model Serving →</a></div></div><script src="../../assets/study.js"></script></body></html>

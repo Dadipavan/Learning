@@ -1,0 +1,87 @@
+<h2>11.6 Mixed Models in Depth</h2>
+<p>Section 11.4 built the random-intercept model. Here we add the next three ideas that appear in real analyses: random slopes, the cost of ignoring clusters (the design effect), and cluster-robust standard errors as the cheap alternative. Everything is run with numpy and scipy, so the numbers are real; <code>statsmodels</code> is not installed here.</p>
+<h3>Random slopes and the shrinkage picture</h3>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A random intercept says each depot starts at its own level. A random slope says each depot also reacts to order volume at its own rate. With only 12 deliveries per depot, a separate line fitted to each depot has a wobbly slope. The mixed model borrows strength: each depot's slope is pulled toward the average slope, and depots whose lines look extreme because of noise are pulled the most.</div></div>
+<p>The model for depot g, delivery j: <code>y = (β₀ + a<sub>g</sub>) + (β₁ + b<sub>g</sub>) × volume + ε</code>, where (a<sub>g</sub>, b<sub>g</sub>) are drawn from a two-dimensional normal with standard deviations τ<sub>a</sub> and τ<sub>b</sub> and a correlation. Within a depot the covariance of the 12 observations is <code>V = Z D Zᵀ + σ² I</code>, with Z the design matrix [1, volume] and D the 2×2 covariance of (a, b). We maximise the likelihood over β, D and σ.</p>
+<p class="problem"><span class="pl">Problem 11.6.1</span> Simulate 30 depots with 12 deliveries each. True values: intercept 200, slope 8, SD of intercepts 20, SD of slopes 3, residual SD 15. Fit the random-slope model by maximum likelihood and compare slope estimates from separate lines with the partially pooled ones.</p>
+@CODE ch11_slopes
+@S
+Step 1 | The fixed effects are 201.3 and 6.91 (true 200 and 8). With only 30 depots, the average slope has real uncertainty.
+Step 2 | The estimated SD of the random intercept is 19.4 (true 20), of the random slope 2.57 (true 3), and the residual SD is 16.6 (true 15). The variance parts are recovered roughly, as expected for 30 groups.
+Step 3 | For each depot compute the best linear unbiased prediction of its slope, which is β₁ plus the predicted deviation b<sub>g</sub>. This is the shrunken slope.
+Step 4 | The RMSE of the slope falls from 1.97 (separate lines) to 1.39 (partial pooling). The spread of slopes shrinks from SD 3.09 (raw) to 2.18 (shrunk), which is the shrinkage.
+Answer | Partial pooling gives better slope estimates on average. The raw slopes are too spread out because they contain noise as well as real differences.
+@FIG ch11_shrinkage.png | Left: each grey line joins a depot's separately fitted slope (orange) to its partially pooled slope (blue); the dashed line is the overall slope. Right: estimates against the true slope for both methods, with the identity line dashed. | Partial pooling pulls extreme slopes toward the centre and lands closer to the truth on average. | On the left, long lines are depots whose own slope looked extreme; their blue dots end near the middle. On the right, a perfect estimate would sit on the dashed diagonal. The blue dots are closer to it than the orange ones overall, although a few individual depots get slightly worse.
+@C red | COMMON MISTAKE | Reading shrunken estimates as the "true" group values and ranking groups by them with no uncertainty. Shrinkage reduces noise on average, but each group's estimate still has an interval. And never conclude "there are no group differences" because the shrunken values look similar: shrinkage compresses them by design.
+<h3>The design effect: what clustering costs</h3>
+<p>Suppose m rows come from each cluster (user, depot, store) and the intraclass correlation is ρ (the ICC from 11.4). The variance of an overall mean is inflated by the <strong>design effect</strong>:</p>
+<div class="eq">deff = 1 + (m − 1) ρ,&nbsp;&nbsp; effective sample size = N / deff</div>
+<p>Rows inside a cluster partly repeat each other, so 1,000 rows from 20 users carry far less information than 1,000 independent rows.</p>
+<p class="problem"><span class="pl">Problem 11.6.2</span> 20 users each load the page 50 times. The ICC is 0.3. Compare the naive standard error of the mean, the cluster-aware one (treat each user's mean as one data point), and the truth found by repeating the whole study 2,000 times.</p>
+@CODE ch11_cluster
+@S
+Step 1 | Design effect: 1 + 49 × 0.3 = 15.7. The 1,000 rows are worth about 1,000 / 15.7 = 63.7 independent rows.
+Step 2 | The true SD of the overall mean, from 2,000 repeats of the study, is 0.1259.
+Step 3 | The naive SE, which treats 1,000 rows as independent, is 0.0329, about four times too small. A 95% interval from it would be about four times too narrow.
+Step 4 | The cluster SE, built from the 20 user means, is 0.1391, close to the truth. The naive SE times √deff is 0.1304, also close.
+Answer | When rows are clustered, the cluster is the real sample size. Either use the cluster means, multiply the naive SE by √deff, or fit a mixed model.
+<h3>Cluster-robust standard errors and GEE</h3>
+<p>A mixed model describes <em>how</em> clusters differ. Sometimes you only want a correct standard error for a regression coefficient and do not care about the cluster-level story. Two tools do that. <strong>Cluster-robust (sandwich) standard errors</strong> keep the ordinary regression but estimate the variance from the cluster-level sums of residuals, so within-cluster correlation of any form is allowed. <strong>GEE</strong> (generalised estimating equations) fits the same kind of regression using a working guess for the within-cluster correlation (exchangeable is common) and then uses sandwich errors, so it stays valid even if the guess is wrong. A key difference: mixed-model coefficients describe a typical cluster (subject-specific); GEE coefficients describe the population average. For linear models they coincide; for logistic and Poisson models they differ.</p>
+@T
+Need | Tool | Watch out for
+Population-average effect, correct SE | Cluster-robust SE or GEE | Needs many clusters (a common rule is at least 30 to 50)
+Cluster-level variation, predictions for each cluster | Mixed model | Normality of random effects is an assumption
+Few clusters (under 10) | Aggregate to cluster means, or use a Bayesian hierarchical model (Chapter 9) | Robust SEs are unreliable with few clusters
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Count your <em>independent units</em>, not your rows. Randomize by user, analyse by user. The same lesson appeared in Chapter 12 for ratio metrics.</div></div>
+<h2>11.7 Cox Regression in Practice, and Competing Risks</h2>
+<p>Section 11.3 fitted a Cox model on ten customers, where the interval was enormous. Here we use 600 simulated customers so the results mean something, then cover the three traps that decide whether a survival analysis is believed: non-proportional hazards, covariates that change over time, and more than one way to leave.</p>
+<h3>A Cox model with several covariates</h3>
+<p>We simulate 600 customers. The hazard is 0.05 × exp(−0.7 × annual + 0.25 × tickets), where <code>annual</code> is 1 for the annual plan and <code>tickets</code> counts support tickets in the first month. Customers are censored at a random time between 6 and 36 months. The code below fits Cox regression with Newton's method on the partial likelihood from Section 11.3, extended to two covariates.</p>
+<p class="problem"><span class="pl">Problem 11.7.1</span> Fit the Cox model and report hazard ratios with 95% intervals.</p>
+@CODE ch11_cox
+@S
+Step 1 | 388 of 600 customers cancelled; the rest are censored.
+Step 2 | Annual plan: β = −0.737 (true −0.7), SE 0.110, HR = e<sup>−0.737</sup> = 0.479, interval (0.386, 0.594). The annual plan cuts the cancellation hazard by about half.
+Step 3 | Tickets: β = 0.179 (true 0.25), SE 0.041, HR 1.196 per extra ticket, interval (1.103, 1.296). The truth, HR = e<sup>0.25</sup> = 1.284, is inside the interval; our estimate is 1.7 standard errors below it, which happens by chance in about 1 in 11 fits.
+Answer | Each extra ticket raises the cancellation hazard by about 20%, holding plan fixed. The code was checked against a direct minimisation of the partial likelihood and agrees to three decimals.
+@FIG ch11_km.png | Kaplan-Meier survival curves for the monthly and annual plans with 95% confidence bands, censoring ticks, and the number at risk at 0, 6, 12, 18, 24 and 30 months. | The annual curve sits above the monthly one, and the bands widen to the right as fewer customers remain. | Read across at 0.5 (the dotted line) to get the median: about 9.7 months for monthly and 18.6 for annual. Read up at month 12: S = 0.425 for monthly and 0.677 for annual. At month 30 only 6 monthly customers are still at risk, so the right-hand end is uncertain, as the wide band says.
+<h3>Checking proportional hazards</h3>
+<p>The Cox model assumes the hazard ratio is constant over time. A promotion that halves the hazard for three months and then does nothing breaks this. One check is to ask whether the effect of x changes with log time: add the term x × log(t) to the model and test its coefficient with a likelihood-ratio test. (The <code>lifelines</code> function <code>check_assumptions</code>, not run here, uses scaled Schoenfeld residuals, which probe the same thing.)</p>
+<p class="problem"><span class="pl">Problem 11.7.2</span> Simulate two data sets of 800 customers. In one, a promotion halves the hazard forever (hazard ratio about 0.50). In the other it works only during months 0 to 3. Test proportional hazards in each.</p>
+@CODE ch11_schoenfeld
+@S
+Step 1 | Constant effect: the fitted HR is 0.46 and the log-time trend is +0.00 (p = 0.95). No sign of trouble.
+Step 2 | Effect fades: one HR of 0.86 is reported, but the trend term is +0.29 per unit of log time (LR = 16.26, p = 0.0001). The effect weakens over time.
+Answer | In the second data set a single HR of 0.86 hides the story: early on the promotion is strong, later it does nothing. Fixes: split follow-up into periods and report an HR for each, stratify on the variable, or add a time interaction.
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reporting a single hazard ratio without checking proportionality. A p-value from the assumption test is also not an effect size: with thousands of customers a tiny, harmless departure will be "significant". Look at the plot of the effect over time, not just the p-value.</div></div>
+<h3>Covariates that change over time</h3>
+<p>Many drivers are not fixed at sign-up: support contacts, upgrades, price changes. The data layout for these is the <strong>counting-process format</strong>: one row per customer per interval in which the covariate is constant, with (start, stop] and an event flag that is 1 only on the last row if the customer left. A customer who contacts support at month 2 and cancels at month 5 becomes two rows.</p>
+@T
+Customer | start | stop | contacted support | event
+A | 0 | 2 | 0 | 0
+A | 2 | 5 | 1 | 1
+B | 0 | 8 | 0 | 0 (censored at month 8)
+<p>In the Cox likelihood each customer enters a risk set with the covariate value valid at that time. This avoids the most dangerous error with time-varying groups, <strong>immortal time bias</strong>: classifying someone as "upgraded" because they upgraded at any time, which credits the group for the months they had to survive in order to upgrade.</p>
+<p class="problem"><span class="pl">Problem 11.7.3</span> Simulate 20,000 customers, all with the same hazard (mean tenure 10 months). Each would upgrade at a random month between 0 and 24 if still subscribed. Upgrading has no effect. Compare tenure for "ever upgraded" versus "never upgraded".</p>
+@CODE ch11_immortal
+@S
+Step 1 | 37.6% of customers ever upgraded (those who survived past their upgrade date).
+Step 2 | Mean tenure of "ever upgraded" is 17.74 months versus 5.34 for "never upgraded", so upgraders look 3.3 times better, but upgrading did nothing by construction.
+Step 3 | The correct comparison measures time at risk after the upgrade point. Mean time after upgrading is 10.13, matching the true mean of 10 (the exponential distribution forgets its past).
+Answer | The gap was manufactured by a rule that required survival to enter the group. Model upgrading as a time-varying covariate, or start the clock at the upgrade.
+<h3>Competing risks</h3>
+<p>A customer can leave in different ways: cancel on purpose, or be removed for failed payment. These <strong>compete</strong>: once one happens the other cannot. If you want "the probability of voluntary cancellation by month 24" and you treat payment failures as ordinary censoring and compute 1 − Kaplan-Meier, you answer a different question ("what if payment failures could never happen?") and overstate the probability. The right quantity is the <strong>cumulative incidence function</strong> (CIF), estimated by Aalen-Johansen: add up, over event times, S<sub>all</sub>(t<sup>−</sup>) × d<sub>cause</sub> / n, where S<sub>all</sub> is the Kaplan-Meier curve for leaving by any cause.</p>
+<p class="problem"><span class="pl">Problem 11.7.4</span> Both causes have a constant hazard of 0.05 per month. Find the chance of voluntary cancellation by month 24 exactly, then estimate it by (a) 1 − KM and (b) Aalen-Johansen from 20,000 simulated customers.</p>
+@CODE ch11_compete
+@S
+Idea | With two constant hazards the total hazard is 0.10, and the share of exits that are cancellations is 0.05 / 0.10 = 0.5.
+Exact | CIF(24) = 0.5 × (1 − e<sup>−0.10 × 24</sup>) = 0.5 × (1 − 0.0907) = 0.4546.
+Naive | 1 − KM with payment failures censored gives 0.7042, which equals 1 − e<sup>−0.05 × 24</sup> = 0.699 up to noise. It is far too high.
+Right | Aalen-Johansen gives 0.4592, near the exact 0.4546.
+Check | The CIFs of the two causes plus the share still active must add to 1: 0.4592 + about 0.4514 + 0.0894 = 1, so this also checks out.
+Answer | The naive curve implies that 70% of customers cancel, while only 45% do. The rest were removed for payment failure before they could.
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">Hospitals, lenders and subscription businesses care about the <em>cause-specific</em> picture: "of 100 new customers, how many cancel, how many are removed, how many are still here at month 24?" Competing-risk curves answer exactly that. For driver analysis, fit one Cox model per cause, treating the other causes as censored: that gives cause-specific hazard ratios, which are valid, but they do not translate directly into probabilities.</div></div>
+<h3>Going deeper</h3>
+<ul><li><strong>Fine-Gray</strong> regression models the CIF directly (subdistribution hazard). Use cause-specific Cox models to understand mechanisms and Fine-Gray to predict absolute risk.</li><li><strong>Ties</strong>: real data has many customers cancelling in the same month. Breslow and Efron are two approximations to the tied partial likelihood; Efron is more accurate when ties are common.</li><li><strong>Stratified Cox</strong> lets each stratum (for example country) have its own baseline hazard while sharing the coefficients, a fix when proportionality fails for a nuisance variable.</li><li><strong>Frailty models</strong> are the survival version of a random intercept: each cluster multiplies its hazard by a random factor, linking Sections 11.4 and 11.3.</li></ul>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why does a fading effect break the Cox model? Answer: the model forces one constant hazard ratio, so a single HR averages a large early effect and no later effect.</li><li>Why is "ever upgraded" a bad group label? Answer: customers must survive until the upgrade to join it, giving the group free survival time (immortal time).</li><li>If 1 − KM and the CIF disagree, which one answers "what share of customers actually cancel"? Answer: the CIF.</li></ol>

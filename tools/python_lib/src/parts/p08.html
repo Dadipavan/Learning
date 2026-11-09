@@ -1,0 +1,171 @@
+<h2>16.16 Cross-Library Integration</h2>
+<p>NumPy is the common language of the scientific Python world. Knowing where memory is shared and where it is copied lets you pass data between libraries without surprises. This section was run with pandas 3.0.6, SciPy 1.18.1, scikit-learn 1.9.1 and matplotlib 3.11.2.</p>
+<h3>pandas</h3>
+<p>A pandas <code>DataFrame</code> is a labelled table whose columns are NumPy-based arrays (strings use pandas' own string dtype, which is not a NumPy dtype). Use <code>.to_numpy()</code> to leave pandas, and NumPy functions work directly on Series. Since pandas 3.0, copy-on-write is always on: changing a derived object never changes the parent, and arrays handed out as views are marked read-only so you cannot corrupt the table by accident.</p>
+<p class="problem"><span class="pl">Problem 16.16.1</span> Move data between pandas and NumPy and observe dtypes and write protection.</p>
+<table class="steps"><tr><th>Idea</th><td><code>to_numpy()</code> on mixed columns picks a common dtype; a single numeric column comes back as a read-only view. Make a <code>.copy()</code> if you need to write.</td></tr></table>
+<py>
+import numpy as np
+import pandas as pd
+df = pd.DataFrame({"price": [10.0, 12.5, 9.0], "qty": [3, 1, 4], "name": ["a", "b", "c"]})
+print({k: str(v) for k, v in df.dtypes.items()})
+nums = df[["price", "qty"]].to_numpy()
+print(nums.dtype, nums.shape)
+col = df["price"].to_numpy()
+print(col.flags.writeable)
+try:
+    col[0] = 99.0
+except ValueError as e:
+    print("ValueError:", e)
+safe = df["price"].to_numpy().copy()
+safe[0] = 99.0
+print(df["price"].iloc[0], safe[0])
+print(np.log(df["price"]).round(3).tolist())
+df["total"] = df["price"] * df["qty"]
+print(df["total"].to_numpy(), np.sum(df["total"]))
+back = pd.DataFrame(np.arange(6).reshape(3, 2), columns=["x", "y"])
+print(back.dtypes.to_dict())
+</py>
+<p><strong>Line by line.</strong></p>
+<ol><li>Taking two numeric columns and calling <code>to_numpy()</code> upcasts the integers to a shared <code>float64</code>, giving a (3, 2) array.</li><li>A single numeric column is exposed without a copy, so pandas marks it read-only (<code>writeable</code> is <code>False</code>).</li><li>Copy first, then edit: the DataFrame still holds 10.0 while the copy holds 99.0.</li><li>NumPy ufuncs accept Series and return Series, keeping the index. Arithmetic between columns is vectorised, exactly like arrays.</li></ol>
+<h3>scikit-learn</h3>
+<p>scikit-learn takes NumPy arrays (or DataFrames) of shape (n_samples, n_features) and returns arrays. Remember: <code>X</code> must be 2D, <code>y</code> 1D.</p>
+<py>
+import numpy as np
+from sklearn.linear_model import LinearRegression
+from sklearn.preprocessing import StandardScaler
+rng = np.random.default_rng(3)
+X = rng.normal(10, 2, size=(100, 3))
+y = X @ np.array([1.0, -2.0, 0.5]) + 4.0 + rng.normal(0, 0.1, 100)
+sc = StandardScaler().fit(X)
+print(np.allclose(sc.transform(X), (X - X.mean(axis=0)) / X.std(axis=0)))
+model = LinearRegression().fit(X, y)
+print(model.coef_.round(2), round(float(model.intercept_), 2))
+A = np.column_stack([X, np.ones(len(X))])
+coef = np.linalg.lstsq(A, y, rcond=None)[0]
+print(coef.round(2))
+try:
+    LinearRegression().fit(np.arange(5.0), np.arange(5.0))
+except ValueError:
+    print("ValueError: X must be 2D")
+print(LinearRegression().fit(np.arange(5.0).reshape(-1, 1), np.arange(5.0) * 2).coef_)
+</py>
+<p><strong>Line by line.</strong></p>
+<ol><li>The data follow y = X . [1, -2, 0.5] + 4 plus small noise, so the fitted coefficients recover roughly 1, -2, 0.5 and an intercept near 4 (3.85 here, because noise and the small sample move it a little).</li><li>The same least-squares fit with <code>np.linalg.lstsq</code> and a column of ones gives the same four numbers; scikit-learn is wrapping this kind of linear algebra with a friendly interface.</li><li>Passing a 1D array as <code>X</code> raises a <code>ValueError</code> asking for a 2D array. The fix is <code>reshape(-1, 1)</code> (one feature, many samples), as the last line shows with the slope 2.</li></ol>
+<h3>PyTorch and other array libraries (not run here)</h3>
+<p>PyTorch is not installed in this study environment, so the following is clearly <strong>not run here</strong>. The idiom is standard and documented by PyTorch:</p>
+<pre class="code lang-text"><code># not run here (needs: pip install torch)
+import numpy as np, torch
+a = np.arange(6, dtype=np.float32).reshape(2, 3)
+t = torch.from_numpy(a)      # shares memory with a, no copy
+t[0, 0] = 100.0              # a[0, 0] is now 100.0 as well
+b = t.numpy()                # back to NumPy, again shared (CPU tensors only)
+c = torch.tensor(a)          # explicit copy</code></pre>
+<h2>16.17 How to Solve Any NumPy Problem: a Playbook</h2>
+<h3>The decision flow</h3>
+<ol><li><strong>Write down the shapes</strong> of the input and the output you want. Most NumPy problems are shape problems.</li><li><strong>Ask: is it element-by-element?</strong> Use ufuncs, <code>where</code>, <code>select</code>, <code>clip</code>.</li><li><strong>Does it summarise along a direction?</strong> Use a reduction and decide the axis: the axis that should disappear.</li><li><strong>Does every item need to meet every other item?</strong> Add axes with <code>None</code> and broadcast, or use a matrix product.</li><li><strong>Does it select or rearrange?</strong> Boolean mask (by value), fancy index (by position), <code>argsort</code> (by rank).</li><li><strong>Does each step depend on earlier steps?</strong> Look for <code>cumsum</code>, <code>accumulate</code>, <code>convolve</code>, <code>sliding_window_view</code>; if none fits, write a loop, and consider Numba.</li><li><strong>Check it</strong> on a tiny case by hand and against a slow reference.</li></ol>
+<h3>Eight recurring problem patterns</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Signal in the problem</th><th>Tool</th></tr></thead><tbody>
+<tr><td>1. Conditional rule per element</td><td>"if ... then ... else" on each value</td><td><code>np.where</code>, <code>np.select</code></td></tr>
+<tr><td>2. Summary per row or column</td><td>"per customer", "for each column"</td><td>reduction with <code>axis</code>, <code>keepdims</code></td></tr>
+<tr><td>3. All pairs</td><td>"distance between every two", "table of products"</td><td><code>a[:, None] op b[None, :]</code></td></tr>
+<tr><td>4. Count or group by key</td><td>"how many of each", "total per store id"</td><td><code>unique</code>, <code>bincount</code>, <code>add.at</code></td></tr>
+<tr><td>5. Running or windowed</td><td>"cumulative", "last 7 days"</td><td><code>cumsum</code>, <code>sliding_window_view</code></td></tr>
+<tr><td>6. Filter</td><td>"only rows where", "remove missing"</td><td>boolean mask, <code>isnan</code></td></tr>
+<tr><td>7. Rank or top</td><td>"best 5", "order by"</td><td><code>argsort</code>, <code>argpartition</code></td></tr>
+<tr><td>8. Solve or fit</td><td>"find the weights", "solve for x"</td><td><code>solve</code>, <code>lstsq</code>, <code>@</code></td></tr>
+</tbody></table></div>
+<p class="problem"><span class="pl">Problem 16.17.1</span> One solved example for each of the eight patterns, on a small order table. Orders have a customer id (0 to 2), a price, a quantity and a rating (NaN if missing).</p>
+<table class="steps"><tr><th>Data</th><td>8 orders: customer ids, prices, quantities and ratings, with two missing ratings.</td></tr></table>
+<py>
+import numpy as np
+cust = np.array([0, 1, 0, 2, 1, 0, 2, 1])
+price = np.array([20.0, 35.0, 15.0, 50.0, 10.0, 25.0, 40.0, 30.0])
+qty = np.array([1, 2, 3, 1, 5, 2, 1, 1])
+rating = np.array([4.0, np.nan, 5.0, 3.0, 4.0, np.nan, 2.0, 5.0])
+revenue = price * qty
+
+size = np.where(revenue >= 60, "large", "small")
+print("1", size)
+
+table = np.zeros((3, 2))
+for c in range(3):
+    table[c] = [revenue[cust == c].sum(), qty[cust == c].sum()]
+by_cust = np.bincount(cust, weights=revenue)
+print("2", by_cust, table[:, 0])
+
+P = np.column_stack([price, qty]).astype(float)
+D = np.abs(P[:, None, 0] - P[None, :, 0])
+print("3", D.shape, D[0, :3])
+
+print("4", np.bincount(cust), np.unique(cust, return_counts=True)[1])
+
+running = np.cumsum(revenue)
+print("5", running, np.cumsum(revenue)[-1] == revenue.sum())
+
+ok = ~np.isnan(rating)
+print("6", rating[ok], round(float(rating[ok].mean()), 2), round(float(np.nanmean(rating)), 2))
+
+top2 = np.argsort(-revenue, kind="stable")[:2]
+print("7", top2, revenue[top2])
+
+A = np.column_stack([price, np.ones(len(price))])
+coef = np.linalg.lstsq(A, qty, rcond=None)[0]
+print("8", coef.round(3))
+</py>
+<p><strong>Line by line.</strong></p>
+<ol><li><strong>Pattern 1.</strong> Revenue is price times quantity for every order at once. <code>where</code> labels orders of 60 or more as large: only order 1, with revenue 70, qualifies.</li><li><strong>Pattern 2.</strong> A loop over three customers builds the by-customer table; <code>bincount</code> with weights gives the same revenue per customer in one call, and the second print shows that they agree.</li><li><strong>Pattern 3.</strong> <code>price[:, None]</code> against <code>price[None, :]</code> forms the 8 by 8 table of absolute price gaps; the first row, restricted to three entries, starts with 0 (an order versus itself).</li><li><strong>Pattern 4.</strong> Counts of orders per customer, computed two ways, agree: customer 0 has 3, customer 1 has 3, customer 2 has 2.</li><li><strong>Pattern 5.</strong> A running revenue total; its last element must equal the plain sum, a cheap built-in check.</li><li><strong>Pattern 6.</strong> The mask <code>~isnan</code> keeps the six known ratings; their mean is 3.83 and equals <code>nanmean</code>.</li><li><strong>Pattern 7.</strong> The two biggest orders by revenue: order 1 (70) and then order 3 (50). Orders 3, 4 and 5 all earn 50, and the stable sort keeps the earliest of the tie.</li><li><strong>Pattern 8.</strong> A least-squares line of quantity against price: a slope of about -0.076 units per currency unit and an intercept of about 4.14, so pricier orders tend to have smaller quantities in this tiny table.</li></ol>
+<h3>How to verify</h3>
+<ul><li><strong>Tiny case by hand:</strong> shrink the input to 3 or 4 items you can calculate on paper.</li><li><strong>Slow reference:</strong> write the obvious loop, compare with <code>np.testing.assert_allclose</code> on random inputs.</li><li><strong>Invariants:</strong> probabilities sum to 1, a distance matrix is symmetric with a zero diagonal, a split covers every row exactly once, a sorted array has non-negative <code>np.diff</code>.</li><li><strong>Shapes:</strong> assert expected shapes at function boundaries.</li></ul>
+<py>
+import numpy as np
+rng = np.random.default_rng(11)
+P = rng.random((40, 3))
+D = np.sqrt(((P[:, None] - P[None]) ** 2).sum(-1))
+ref = np.zeros((40, 40))
+for i in range(40):
+    for j in range(40):
+        ref[i, j] = np.sqrt(sum((P[i, k] - P[j, k]) ** 2 for k in range(3)))
+np.testing.assert_allclose(D, ref, rtol=1e-12)
+print("matches loop:", True)
+print("symmetric:", np.allclose(D, D.T), "zero diagonal:", np.allclose(np.diag(D), 0))
+print("triangle inequality holds:", bool((D[0, 1] + D[1, 2] >= D[0, 2] - 1e-12)))
+</py>
+<p><strong>Line by line.</strong></p>
+<ol><li>The slow reference uses three nested loops. If the arrays disagree, <code>assert_allclose</code> raises with a readable report of the worst mismatch.</li><li>Then property checks that must hold for any distance matrix: symmetric, zero diagonal, and the triangle inequality on one triple.</li></ol>
+<h3>How to debug</h3>
+<ul><li>Print <code>shape</code>, <code>dtype</code> and a few values after every step. Most bugs show up as an unexpected shape.</li><li>Reproduce on a tiny seeded input, so that you can read the whole array.</li><li>Turn silent float warnings into errors with <code>np.errstate(all="raise")</code>, so that a divide by zero stops the program at the exact line.</li><li>Check <code>x.base</code> and <code>np.shares_memory</code> when data changes unexpectedly.</li><li>Split a long chain into named intermediate variables and inspect each one.</li></ul>
+<h2>16.18 Going Deeper: Internals, Memory, Speed and Interview Questions</h2>
+<h3>How a ufunc works</h3>
+<p>A ufunc such as <code>np.add</code> is an object with several compiled inner loops, one per dtype combination. When you call it, NumPy (1) works out the result dtype from the inputs, (2) works out the broadcast shape, (3) allocates the output and (4) calls the matching loop over the buffers, with the strides handling the broadcast. Modern CPUs also use SIMD instructions in many of these loops. The ufunc object also carries methods that generalise it.</p>
+<py>
+import numpy as np
+print(np.add.reduce([1, 2, 3]), np.add.accumulate([1, 2, 3]))
+print(np.multiply.outer([1, 2], [3, 4]))
+print(np.maximum.accumulate([1, 3, 2, 5, 4]))
+a = np.zeros(3)
+np.add.at(a, [0, 0, 2], 1.0)
+print(a)
+print(np.add.types[:4])
+</py>
+<p><strong>Line by line.</strong></p>
+<ol><li><code>reduce</code> folds an array with the operation: <code>add.reduce</code> is the sum, 6. <code>accumulate</code> keeps the running result: <code>[1 3 6]</code>, which is <code>cumsum</code>.</li><li><code>maximum.accumulate</code> gives a running maximum, a pattern with no dedicated function name: <code>[1 3 3 5 5]</code>.</li><li><code>np.add.at</code> adds with repeated indexes counted properly: index 0 appears twice, so <code>a[0]</code> is 2.</li></ol>
+<h3>Type promotion in NumPy 2</h3>
+<p>NumPy 2 changed how Python numbers mix with arrays (NEP 50). A plain Python int or float is "weak": it takes the dtype of the array. So <code>uint8_array + 100</code> stays <code>uint8</code> (and wraps around), and a Python integer that does not fit raises an error rather than silently changing the result type. Two arrays of different dtypes still promote to a common type, which can be surprising: unsigned 64-bit with signed 64-bit goes to <code>float64</code>.</p>
+<py>
+import numpy as np
+a = np.array([200], dtype=np.uint8)
+print((a + 100), (a + 100).dtype)
+print((np.array([1.0], dtype=np.float32) + 3.0).dtype)
+try:
+    np.array([1], dtype=np.uint8) + 300
+except OverflowError as e:
+    print("OverflowError:", e)
+print(np.result_type(np.uint64, np.int64), np.result_type(np.int32, np.float32))
+</py>
+<p><strong>Line by line.</strong></p>
+<ol><li>200 + 100 does not fit in uint8, so the answer wraps to 44, and the dtype remains <code>uint8</code>.</li><li>Adding the integer 300 to a uint8 array raises <code>OverflowError</code>, because 300 cannot be represented in uint8 at all.</li><li>Mixing unsigned 64-bit and signed 64-bit integers has no integer type that holds both, so the result is <code>float64</code>. int32 with float32 also goes to <code>float64</code>, to avoid losing integer digits.</li></ol>
+<h3>Speed: what actually matters</h3>
+<ul><li><strong>Contiguity and bandwidth.</strong> Contiguous data is friendlier to the CPU cache; for big arrays memory traffic dominates, so fewer passes and smaller dtypes help more than clever arithmetic.</li><li><strong>BLAS threads.</strong> Matrix products use multi-threaded libraries, usually controlled by environment variables such as <code>OMP_NUM_THREADS</code>. Check your build with <code>np.show_config()</code>.</li><li><strong>Sorting.</strong> The default <code>quicksort</code> is not stable; <code>kind="stable"</code> selects a stable method.</li><li><strong>When NumPy is not enough:</strong> Numba or Cython for loops that cannot be vectorised (not run here); memmap, Dask or a database for data larger than memory; CuPy or PyTorch for the GPU.</li></ul>
+<h3>What interviewers probe</h3>
+<div class="callout cream"><div class="lab">INTERVIEW</div><div class="txt"><ul><li><strong>"Why is NumPy faster than lists?"</strong> Same-type values in one contiguous buffer, compiled loops, no per-element Python object, SIMD and cache-friendly access.</li><li><strong>"View or copy?"</strong> Basic slicing, reshape and transpose are views; boolean and fancy indexing copy.</li><li><strong>"Explain broadcasting."</strong> Right-aligned shapes; each axis must match or be 1; size-1 axes are stretched with stride 0.</li><li><strong>"Subtract row means from a matrix."</strong> <code>X - X.mean(axis=1, keepdims=True)</code>.</li><li><strong>"Why not <code>inv</code> to solve a system?"</strong> <code>solve</code> is faster and more accurate.</li><li><strong>"Reproducible randomness in parallel code?"</strong> One <code>default_rng(seed)</code>, then <code>spawn</code>.</li></ul></div></div>

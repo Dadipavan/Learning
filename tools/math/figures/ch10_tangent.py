@@ -1,0 +1,15 @@
+import numpy as np, matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+x = np.linspace(15, 40, 300)
+fig, axs = plt.subplots(1, 2, figsize=(8, 4.2))
+axs[0].plot(x, np.sqrt(x), color="#2b4fd6", lw=2.2, label="√x")
+axs[0].plot(x, 5 + (x - 25) / 10, color="#b84a22", ls="--", lw=1.8, label="tangent at 25")
+axs[0].plot([26], [np.sqrt(26)], "o", color="#357a70"); axs[0].plot([25], [5], "ko")
+axs[0].set_title("Tangent line approximates √x near 25", fontsize=10); axs[0].legend(fontsize=9)
+err = np.abs(np.sqrt(x) - (5 + (x - 25) / 10))
+axs[1].plot(x, err, color="#aa2d26", lw=2, label="actual error")
+axs[1].plot(x, 0.5 * (1 / (4 * 125)) * (x - 25) ** 2, color="#6a2fd0", ls=":", lw=2, label="½·|f''(25)|·h²")
+axs[1].set_title("Error grows like h²", fontsize=10); axs[1].legend(fontsize=9)
+for a in axs: a.grid(alpha=0.3); a.set_xlabel("x")
+fig.tight_layout(); fig.savefig("ch10_tangent.png", dpi=110)

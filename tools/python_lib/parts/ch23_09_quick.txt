@@ -1,0 +1,291 @@
+
+<h2>23.8 Recipes: "How Do I ...?"</h2>
+<p>Short, solved, runnable answers to questions that come up every week. Each is standalone.</p>
+<h3>How do I load a YAML config into a typed object?</h3>
+@@py
+from dataclasses import dataclass, fields
+import yaml
+
+@dataclass(frozen=True)
+class Config:
+    csv: str
+    C: float = 1.0
+    seed: int = 0
+
+text = "csv: data/train.csv\nC: 0.5\n"
+raw = yaml.safe_load(text)
+cfg = Config(**raw)
+print(cfg)
+try:
+    Config(**yaml.safe_load("csv: a.csv\nlearning_rate: 0.1\n"))
+except TypeError as exc:
+    print("unknown key rejected:", "learning_rate" in str(exc))
+print([f.name for f in fields(Config)])
+@@end
+<ol><li><code>yaml.safe_load</code> parses text to a dict. Always use <code>safe_load</code>, never <code>yaml.load</code> on untrusted text, because the unsafe loader can build arbitrary Python objects.</li>
+<li><code>Config(**raw)</code> unpacks the dict into keyword arguments, so missing defaults apply (<code>seed=0</code>) and unknown keys raise <code>TypeError</code>, which catches typos in the YAML.</li>
+<li>Note: YAML turns <code>0.5</code> into a float and <code>yes</code> into <code>True</code>; check types in <code>__post_init__</code> if it matters.</li></ol>
+<h3>How do I retry a flaky call and log each attempt?</h3>
+@@py
+import functools
+import logging
+import sys
+
+logging.basicConfig(level=logging.INFO, stream=sys.stdout, format="%(levelname)s %(message)s")
+log = logging.getLogger("retry")
+
+def retry(times=3, exceptions=(ConnectionError,)):
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            for attempt in range(1, times + 1):
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as exc:
+                    log.warning("%s failed (attempt %d/%d): %s", fn.__name__, attempt, times, exc)
+                    if attempt == times:
+                        raise
+        return wrapper
+    return deco
+
+state = {"n": 0}
+
+@retry(times=3)
+def fetch():
+    state["n"] += 1
+    if state["n"] < 3:
+        raise ConnectionError("timeout")
+    return "data"
+
+print(fetch())
+@@end
+<ol><li>A decorator with arguments needs three levels: <code>retry(...)</code> returns <code>deco</code>, which takes the function and returns <code>wrapper</code>. <code>functools.wraps</code> keeps the original name and docstring.</li>
+<li>Only the listed exceptions are retried; a <code>ValueError</code> from a bug would propagate at once, as it should.</li>
+<li>Two warnings are logged, then the third attempt returns <code>data</code>. Real code adds a growing delay (backoff) between attempts, and a limit so a dead service does not hang forever.</li></ol>
+<h3>How do I process a big CSV in chunks?</h3>
+@@py
+import tempfile
+from pathlib import Path
+
+import pandas as pd
+
+with tempfile.TemporaryDirectory() as tmp:
+    path = Path(tmp) / "big.csv"
+    pd.DataFrame({"user": range(10), "amount": [5.0] * 10}).to_csv(path, index=False)
+    total, rows = 0.0, 0
+    for i, chunk in enumerate(pd.read_csv(path, chunksize=4)):
+        total += chunk["amount"].sum()
+        rows += len(chunk)
+        print(f"chunk {i}: {len(chunk)} rows")
+print(rows, total)
+@@end
+<ol><li><code>chunksize=4</code> makes <code>read_csv</code> return an iterator of DataFrames of at most 4 rows (use 100,000 or more in real life). Only one chunk is in memory at a time.</li>
+<li>Keep running totals outside the loop; anything that needs all rows at once (a median, a sort) needs a different plan, such as a database or Parquet.</li>
+<li>The output shows chunks of 4, 4 and 2 rows and the final totals <code>10 50.0</code>.</li></ol>
+<h3>How do I fingerprint a dataset so I know it changed?</h3>
+@@py
+import hashlib
+import pandas as pd
+
+def df_hash(df):
+    row_hashes = pd.util.hash_pandas_object(df, index=True).to_numpy()
+    return hashlib.sha256(row_hashes.tobytes()).hexdigest()[:10]
+
+a = pd.DataFrame({"x": [1, 2, 3], "y": ["a", "b", "c"]})
+b = a.copy()
+c = a.copy()
+c.loc[1, "x"] = 99
+print(df_hash(a) == df_hash(b), df_hash(a) == df_hash(c))
+print(len(df_hash(a)))
+@@end
+<ol><li><code>hash_pandas_object</code> returns one 64-bit hash per row (including the index), which we combine with SHA-256 into one short string.</li>
+<li>An unchanged copy has the same fingerprint (<code>True</code>); changing one cell changes it (<code>False</code>).</li>
+<li>For a file on disk, hash the file bytes in blocks with <code>hashlib</code> instead; that is what DVC does.</li></ol>
+<h3>How do I test code that calls an HTTP API without the network?</h3>
+@@py
+import httpx
+
+def get_user_name(client, user_id):
+    r = client.get(f"/users/{user_id}")
+    r.raise_for_status()
+    return r.json()["name"]
+
+def handler(request):
+    if request.url.path == "/users/1":
+        return httpx.Response(200, json={"name": "Ada"})
+    return httpx.Response(404, json={"detail": "not found"})
+
+client = httpx.Client(transport=httpx.MockTransport(handler), base_url="http://api.test")
+print(get_user_name(client, 1))
+try:
+    get_user_name(client, 2)
+except httpx.HTTPStatusError as exc:
+    print(exc.response.status_code)
+@@end
+<ol><li><code>httpx.MockTransport</code> replaces the network with a Python function that receives the request and returns a response. No server and no patching.</li>
+<li>The code under test receives the client as an argument (dependency injection), which is why it is easy to test. If it built its own client inside, you would have to patch.</li>
+<li>User 1 gives <code>Ada</code>; user 2 gives a 404, which <code>raise_for_status</code> turns into <code>HTTPStatusError</code>, printing <code>404</code>.</li></ol>
+<h3>How do I find the newest file matching a pattern?</h3>
+@@py
+import os
+import tempfile
+from pathlib import Path
+
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp)
+    for i, name in enumerate(["export_01.csv", "export_02.csv", "notes.txt", "export_03.csv"]):
+        f = root / name
+        f.write_text("x")
+        os.utime(f, (1_700_000_000 + i * 100, 1_700_000_000 + i * 100))   # set modified times
+    newest = max(root.glob("export_*.csv"), key=lambda p: p.stat().st_mtime)
+    print(newest.name)
+    print(sorted(p.name for p in root.glob("export_*.csv"))[-1])
+@@end
+<ol><li>We set the modification times with <code>os.utime</code> so the example is deterministic.</li>
+<li><code>max(..., key=...)</code> picks the file with the largest modification time, <code>st_mtime</code>. Both lines print <code>export_03.csv</code>.</li>
+<li>The second line shows a common alternative: if file names contain sortable dates, sorting names is simpler and does not depend on file times (which copying can change).</li></ol>
+<h3>How do I cache an expensive feature computation across runs?</h3>
+@@py
+import tempfile
+
+import numpy as np
+import pandas as pd
+from joblib import Memory
+
+counter = {"n": 0}
+
+def build_features(n_rows, seed):
+    counter["n"] += 1
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame({"a": rng.normal(size=n_rows)}).assign(b=lambda d: d["a"] ** 2)
+
+with tempfile.TemporaryDirectory() as tmp:
+    cached = Memory(tmp, verbose=0).cache(build_features)
+    f1 = cached(1000, 7)
+    f2 = cached(1000, 7)
+    f3 = cached(1000, 8)
+print(counter["n"], f1.equals(f2), f1.equals(f3), f1.shape)
+@@end
+<ol><li>The cache key is made from the arguments (and the function's code), so a different seed gives a separate entry, and changing the function body invalidates old entries.</li>
+<li>Three calls, but the function body ran only twice (<code>counter</code> is 2); the repeat returned the stored frame, equal to the first.</li>
+<li>Cache only pure functions (same inputs, same output, no hidden dependence on files or time). A function that reads a file whose content changes would serve stale results; pass a file fingerprint as an argument.</li></ol>
+<h3>How do I read my run log (JSON lines) into pandas?</h3>
+@@py
+import io
+import pandas as pd
+
+log = io.StringIO(
+    '{"run": "a", "C": 0.1, "acc": 0.81}\n'
+    '{"run": "b", "C": 1.0, "acc": 0.84}\n'
+    '{"run": "c", "C": 10.0, "acc": 0.83}\n'
+)
+df = pd.read_json(log, lines=True)
+print({c: str(t) for c, t in df.dtypes.items()})
+print(df.sort_values("acc", ascending=False).head(1).to_string(index=False))
+@@end
+<ol><li><code>lines=True</code> tells pandas that each line is one JSON record.</li>
+<li>Types are inferred: <code>run</code> is text (a string column in pandas 3), <code>C</code> and <code>acc</code> are floats.</li>
+<li>Sorting by accuracy puts run <code>b</code> first. Append-only JSON lines make experiment history trivial to analyse.</li></ol>
+<h3>How do I save a dataclass with Path and datetime fields as JSON?</h3>
+@@py
+import json
+from dataclasses import asdict, dataclass
+from datetime import datetime
+from pathlib import Path
+
+@dataclass
+class RunInfo:
+    data: Path
+    started: datetime
+    C: float
+
+def encode(obj):
+    if isinstance(obj, Path):
+        return obj.as_posix()
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    raise TypeError(f"cannot serialise {type(obj).__name__}")
+
+info = RunInfo(Path("data/train.csv"), datetime(2026, 11, 9, 6, 0), 0.5)
+text = json.dumps(asdict(info), default=encode)
+print(text)
+print(json.loads(text)["started"][:10])
+@@end
+<ol><li><code>json.dumps</code> does not know <code>Path</code> or <code>datetime</code>. The <code>default</code> function is called for every object it cannot handle and must return something serialisable.</li>
+<li>Paths become POSIX strings (forward slashes) so the file reads the same everywhere; datetimes become ISO 8601 text, which sorts correctly as text.</li>
+<li>Raise <code>TypeError</code> for anything unknown rather than guessing; silent <code>str()</code> conversions hide bugs.</li></ol>
+<h3>How do I check a DataFrame's schema before training?</h3>
+@@py
+import pandas as pd
+
+EXPECTED = {"customer_id": "int64", "plan": "str", "monthly_spend": "float64"}
+
+def check_schema(df):
+    problems = []
+    for col, dtype in EXPECTED.items():
+        if col not in df.columns:
+            problems.append(f"missing column {col}")
+        elif str(df[col].dtype) != dtype:
+            problems.append(f"{col}: expected {dtype}, got {df[col].dtype}")
+    if "monthly_spend" in df and (df["monthly_spend"] < 0).any():
+        problems.append("monthly_spend has negative values")
+    return problems
+
+good = pd.DataFrame({"customer_id": [1, 2], "plan": ["a", "b"], "monthly_spend": [9.5, 20.0]})
+bad = pd.DataFrame({"customer_id": ["1", "2"], "monthly_spend": [-1.0, 3.0]})
+print(check_schema(good))
+for p in check_schema(bad):
+    print(p)
+@@end
+<ol><li>In pandas 3.0 text columns have the dedicated <code>str</code> dtype by default (before 3.0 they were <code>object</code>), so the expected name is <code>"str"</code>. Check your pandas version if this fails.</li>
+<li>The function collects all problems instead of stopping at the first, so one run reports everything wrong with a file.</li>
+<li>The good frame returns an empty list. The bad frame reports a wrong type (<code>customer_id</code> is text), a missing column and negative values. For larger projects use pandera or pydantic models for the same idea.</li></ol>
+<h3>How do I read a .env file without extra packages?</h3>
+@@py
+import os
+
+def parse_env(text):
+    values = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+sample = '# demo\nDB_URL="sqlite:///demo.db"\nDEBUG=1\n\nTOKEN = abc=def\n'
+env = parse_env(sample)
+print(env)
+for k, v in env.items():
+    os.environ.setdefault(k, v)           # real environment variables win
+print(os.environ["DEBUG"])
+@@end
+<ol><li>Blank lines and comments are skipped. <code>partition("=")</code> splits at the <em>first</em> equals sign, so a value containing <code>=</code> (like <code>abc=def</code>) survives.</li>
+<li>Surrounding quotes are removed. The printed dictionary has three keys.</li>
+<li><code>setdefault</code> only sets a variable that is not already set, so the real environment (from the server) overrides the file. In practice use the <code>python-dotenv</code> package, which handles more edge cases.</li></ol>
+<h3>How do I run an external command safely?</h3>
+@@py
+import subprocess
+import sys
+
+result = subprocess.run([sys.executable, "-c", "print('hello from child')"],
+                        capture_output=True, text=True, check=True, timeout=30)
+print(result.stdout.strip(), result.returncode)
+
+try:
+    subprocess.run([sys.executable, "-c", "import sys; sys.exit(3)"], check=True)
+except subprocess.CalledProcessError as exc:
+    print("failed with", exc.returncode)
+@@end
+<ol><li>Pass the command as a <strong>list</strong> of arguments, not one string with <code>shell=True</code>, so spaces and special characters in values cannot change the command (shell injection).</li>
+<li><code>capture_output=True, text=True</code> collects stdout and stderr as strings. <code>timeout</code> stops a hung child. <code>sys.executable</code> is the current interpreter, so the child uses the same environment.</li>
+<li><code>check=True</code> turns a non-zero exit status into <code>CalledProcessError</code>. The output is <code>hello from child 0</code> and then <code>failed with 3</code>.</li></ol>
+<h3>How do I run a job every Monday morning?</h3>
+<p>Not run here. The simplest scheduler is cron on a server (fields: minute, hour, day of month, month, day of week). Make the job safe to run twice (idempotent) and give it a lock or a unique output name.</p>
+@@file bash
+# crontab -e
+# minute hour day-of-month month day-of-week  command
+0 6 * * 1 cd /srv/churn && /srv/churn/.venv/bin/python -m churn_tools.cli >> /var/log/churn.log 2>&1
+@@end
+<p>Use full paths (cron has a minimal environment), redirect output to a log, and move to Airflow or Prefect as soon as you need retries, dependencies between jobs or alerts.</p>

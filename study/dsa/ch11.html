@@ -1,0 +1,1258 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 11: Designing Data Structures: LRU Cache, Autocomplete and More</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Structures & Algorithms</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 11</div><h1>Designing Data Structures: LRU Cache, Autocomplete and More</h1><p>Combine structures to build the systems that interviews and real products need.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-11-1-how-to-talk-through-a-design-question">11.1 How to Talk Through a Design Question</a></li><li><a href="#s2-11-2-lru-cache-ordereddict-and-lfu-awareness">11.2 LRU Cache, OrderedDict and LFU Awareness</a></li><li><a href="#s3-11-3-stack-and-queue-designs-min-stack-queue-from-stacks-iterators">11.3 Stack and Queue Designs: Min Stack, Queue from Stacks, Iterators</a></li><li><a href="#s4-11-4-time-based-designs-rate-limiter-time-store-and-snapshot-array">11.4 Time-Based Designs: Rate Limiter, Time Store and Snapshot Array</a></li><li><a href="#s5-11-5-randomised-set-insert-delete-and-random-pick-in-o-1">11.5 Randomised Set: Insert, Delete and Random Pick in O(1)</a></li><li><a href="#s6-11-6-autocomplete-trie-plus-heap">11.6 Autocomplete: Trie plus Heap</a></li><li><a href="#s7-11-7-union-find-applications">11.7 Union-Find Applications</a></li><li><a href="#s8-11-8-bloom-filters-consistent-hashing-and-thread-safety-awareness">11.8 Bloom Filters, Consistent Hashing and Thread-Safety Awareness</a></li><li><a href="#s9-chapter-recap">Chapter recap</a></li><li><a href="#s10-practice-set">Practice set</a></li><li><a href="#s11-prompt-pack">Prompt pack</a></li></ol></details><p>Picture your phone keyboard. You type "ca" and it offers "car", "care" and "cat" before you finish. A web server remembers the last 1,000 pages it built so it does not rebuild them. A login page refuses your 11th wrong password in one minute. None of these needs a new algorithm. Each is a <strong>design</strong>: you take two or three structures you already know and glue them into one object whose operations are all fast. A dictionary alone cannot remember order. A list alone cannot find things quickly. Together they can do both.</p>
+<p>Interviewers love these questions because they test whether you know what each tool is good at, and can say so out loud. After this chapter you will build an LRU cache, a min stack, a queue from two stacks, a rate limiter, a time-based store, a snapshot array, an O(1) random set, an autocomplete engine and an accounts merger from memory. You will also know what a Bloom filter and consistent hashing are for, why threads break naive code, and how to talk through a design question calmly.</p>
+<p>Earlier chapters used: hashing (Chapter 2), binary search (Chapter 4), linked lists, stacks and deques (Chapter 5), heaps and tries (Chapter 7), union-find (Chapter 8). Chapter 12 shows how to spot design questions among all the other patterns. For a shorter tour, see also Chapter 8 and Chapter 9 of the Linux, Git, Algorithms and CS Foundations document. All code below was run and the printed output is real; every block is standalone.</p>
+
+<h2 id="s1-11-1-how-to-talk-through-a-design-question">11.1 How to Talk Through a Design Question</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Designing a data structure is packing a toolbox for one job. List the actions the job needs (the <em>operations</em>), then choose the fewest tools so every action is quick. A hash map is the "find by name" tool. A linked list is the "remove from the middle" tool. A heap is the "give me the biggest" tool.</div></div>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody>
+<tr><td>API</td><td>The operations a user may call, with inputs and outputs, such as <code>get(key)</code> and <code>put(key, value)</code></td></tr>
+<tr><td>Invariant</td><td>A fact that must be true after every operation, such as "the dict and the list hold the same keys"</td></tr>
+<tr><td>Amortised O(1)</td><td>One call may be slow now and then, but the average over many calls is constant (Chapter 1)</td></tr>
+<tr><td>Sentinel</td><td>A dummy node at the ends of a list, so there is never an "empty" or "first" special case</td></tr>
+</tbody></table></div>
+<h3>How to recognise a design question</h3>
+<ul>
+<li>"Design a class" with methods such as <code>put</code>, <code>get</code>, <code>push</code>, <code>pop</code>, <code>add</code>, <code>remove</code>, each with a required speed (usually average O(1) or O(log n)).</li>
+<li>One structure cannot meet every speed. That tension tells you to combine two.</li>
+<li>The wording mentions order (recent, oldest), a limit (capacity, k per window) or time.</li>
+</ul>
+<h3>The eight-step talk-through</h3>
+<ol>
+<li><strong>Clarify</strong> the edges: capacity 0? duplicates? are timestamps increasing?</li>
+<li><strong>Write the API</strong>: every method, input and output.</li>
+<li><strong>State the target</strong>: "get and put must be O(1)".</li>
+<li><strong>Say the brute force</strong> in one sentence, with its cost.</li>
+<li><strong>Match each slow operation to a tool</strong> (the table below). This is the heart of the answer.</li>
+<li><strong>Name the invariant</strong> that keeps the structures in sync.</li>
+<li><strong>Code, then dry run</strong> one tiny example out loud.</li>
+<li><strong>State complexity and extensions</strong>: threads (add a lock), scale (shard by key).</li>
+</ol>
+<div class="tablewrap"><table class="data"><thead><tr><th>If you need fast...</th><th>Reach for</th><th>Cost</th></tr></thead><tbody>
+<tr><td>Find by key</td><td>dict / set</td><td>O(1) average</td></tr>
+<tr><td>Move or remove a node you already hold</td><td>doubly linked list</td><td>O(1)</td></tr>
+<tr><td>Delete from an array when order is free</td><td>swap with last, pop</td><td>O(1)</td></tr>
+<tr><td>Newest or oldest only</td><td>stack / deque</td><td>O(1) at both ends</td></tr>
+<tr><td>Smallest or largest, repeatedly</td><td>heap (<code>heapq</code>)</td><td>O(log n)</td></tr>
+<tr><td>Latest value at or before a time</td><td>sorted list + <code>bisect</code></td><td>O(log n)</td></tr>
+<tr><td>All words with a prefix</td><td>trie</td><td>O(prefix length)</td></tr>
+<tr><td>"Same group?" with merges</td><td>union-find</td><td>almost O(1)</td></tr>
+</tbody></table></div>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Almost every design has the shape <strong>"a dictionary for lookup + an ordered structure for the rule"</strong>. The dictionary answers "where is it?". The second structure answers "which one goes next?". Two structures, one invariant.</div></div>
+<div class="callout cream"><div class="lab">INTERVIEW</div><div class="txt">Say your plan before you type: "My brute force is a list with linear scans. To make every operation O(1) I will combine a hash map and a doubly linked list, and keep one invariant: the map holds exactly the nodes in the list." Ten seconds of that earns more trust than ten minutes of silent coding.</div></div>
+
+<h2 id="s2-11-2-lru-cache-ordereddict-and-lfu-awareness">11.2 LRU Cache, OrderedDict and LFU Awareness</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Your desk fits 3 books. The book you just used goes on top. When a fourth arrives, you shelve the one at the bottom, the one untouched longest. That is <strong>Least Recently Used</strong> (LRU): what you used lately, you will probably use again soon.</div></div>
+<h3>How to recognise it</h3>
+<ul>
+<li>Words like "cache", "capacity", "evict", "least recently used".</li>
+<li><code>get</code> and <code>put</code> must both be O(1), and reading an item counts as using it.</li>
+</ul>
+<p>A dictionary finds a key in O(1) but knows nothing about "oldest". A doubly linked list keeps order and removes any node in O(1) <em>if you hold the node</em>, but cannot find one by key. Combine them: the dictionary maps key to node, and the list orders nodes from newest (next to HEAD) to oldest (next to TAIL).</p>
+<figure><img src="images/dsa11_lru.png" alt="A doubly linked list HEAD, c, a, b, TAIL with a dictionary pointing from each key to its node" loading="lazy"/><figcaption>LRU = dictionary (purple) pointing into a doubly linked list. The node next to TAIL is evicted first.</figcaption></figure>
+<p>How to read it: the purple arrows let you jump to a node. The two-way arrows let you cut it out and re-insert it next to HEAD with no walking. HEAD and TAIL are sentinels.</p>
+<h3>Template: OrderedDict</h3>
+<p><code>collections.OrderedDict</code> already is "dict + linked list". <code>move_to_end(key)</code> marks a key newest; <code>popitem(last=False)</code> removes the oldest. Ask whether you may use it; if not, build it by hand (Problem 11.2.1).</p>
+<pre class="code lang-python"><code>from collections import OrderedDict
+
+class LRUCache:
+    def __init__(self, capacity):
+        self.cap = capacity
+        self.data = OrderedDict()           # oldest first, newest last
+
+    def get(self, key):
+        if key not in self.data:
+            return -1
+        self.data.move_to_end(key)          # reading counts as using
+        return self.data[key]
+
+    def put(self, key, value):
+        if key in self.data:
+            self.data.move_to_end(key)
+        self.data[key] = value
+        if len(self.data) &gt; self.cap:
+            self.data.popitem(last=False)   # drop the oldest
+
+c = LRUCache(2)
+c.put(1, 10)
+c.put(2, 20)
+print(c.get(1))
+c.put(3, 30)
+print(c.get(2))
+print(list(c.data.items()))</code></pre>
+<pre class="code lang-text"><code>10
+-1
+[(1, 10), (3, 30)]</code></pre>
+<h3>Trace: capacity 2 (state is oldest to newest)</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Step</th><th>Operation</th><th>What happens</th><th>State after</th><th>Returns</th></tr></thead><tbody>
+<tr><td>1</td><td>put(1, 10)</td><td>new key, room left</td><td>[1]</td><td>-</td></tr>
+<tr><td>2</td><td>put(2, 20)</td><td>new key, room left</td><td>[1, 2]</td><td>-</td></tr>
+<tr><td>3</td><td>get(1)</td><td>found, move 1 to newest</td><td>[2, 1]</td><td>10</td></tr>
+<tr><td>4</td><td>put(3, 30)</td><td>size 3 &gt; 2, evict oldest (2)</td><td>[1, 3]</td><td>-</td></tr>
+<tr><td>5</td><td>get(2)</td><td>2 was evicted</td><td>[1, 3]</td><td>-1</td></tr>
+<tr><td>6</td><td>put(4, 40)</td><td>size 3 &gt; 2, evict oldest (1)</td><td>[3, 4]</td><td>-</td></tr>
+<tr><td>7</td><td>get(3)</td><td>found, move 3 to newest</td><td>[4, 3]</td><td>30</td></tr>
+</tbody></table></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>get</code> returns the value but does not refresh the order, so the cache evicts a key you just read. <strong>Right:</strong> every successful <code>get</code> and every <code>put</code> of an existing key moves that key to newest. Test: capacity 2, put 1, put 2, get 1, put 3. Key 2 must go.</div></div>
+<p class="problem"><span class="pl">Problem 11.2.1</span> (medium) Build the LRU cache by hand: a dictionary of nodes plus a doubly linked list with HEAD and TAIL sentinels. No OrderedDict. <code>get</code> and <code>put</code> must be O(1).</p>
+<table class="steps">
+<tr><th>Idea</th><td>Dictionary: key to node. List: newest after HEAD, oldest before TAIL. Helpers <code>_remove</code> and <code>_add_front</code> do all the pointer work.</td></tr>
+<tr><th>Brute force</th><td>One list of pairs: search O(n), move O(n).</td></tr>
+<tr><th>Better approach</th><td>The dictionary gives the node in O(1); its <code>prev</code>/<code>next</code> let us unlink it in O(1).</td></tr>
+<tr><th>Code</th><td>Below. Each node stores its <em>key</em>, so evicting the tail tells us which dictionary entry to delete.</td></tr>
+<tr><th>Dry run</th><td>The trace above. After step 4 the list reads HEAD, 3, 1, TAIL.</td></tr>
+<tr><th>Complexity</th><td>O(1) per call, O(capacity) space.</td></tr>
+<tr><th>Edge cases</th><td>Capacity 1; updating an existing key (no eviction); capacity 0 (guard it, or the sentinel is evicted).</td></tr>
+</table>
+<pre class="code lang-python"><code>class Node:
+    def __init__(self, key=0, val=0):
+        self.key, self.val = key, val
+        self.prev = self.next = None
+
+class LRUCache:
+    def __init__(self, capacity):
+        self.cap = capacity
+        self.map = {}                          # key -&gt; Node
+        self.head, self.tail = Node(), Node()  # sentinels
+        self.head.next, self.tail.prev = self.tail, self.head
+
+    def _remove(self, node):                   # unlink in O(1)
+        node.prev.next = node.next
+        node.next.prev = node.prev
+
+    def _add_front(self, node):                # newest sits right after head
+        node.prev = self.head
+        node.next = self.head.next
+        self.head.next.prev = node
+        self.head.next = node
+
+    def get(self, key):
+        if key not in self.map:
+            return -1
+        node = self.map[key]
+        self._remove(node)
+        self._add_front(node)
+        return node.val
+
+    def put(self, key, value):
+        if self.cap == 0:
+            return
+        if key in self.map:                    # update value and refresh
+            node = self.map[key]
+            node.val = value
+            self._remove(node)
+            self._add_front(node)
+            return
+        if len(self.map) == self.cap:          # full: evict the oldest
+            oldest = self.tail.prev
+            self._remove(oldest)
+            del self.map[oldest.key]
+        node = Node(key, value)
+        self.map[key] = node
+        self._add_front(node)
+
+c = LRUCache(2)
+out = []
+c.put(1, 10); c.put(2, 20)
+out.append(c.get(1))
+c.put(3, 30)
+out.append(c.get(2))
+c.put(4, 40)
+out += [c.get(1), c.get(3), c.get(4)]
+print(out)
+assert out == [10, -1, -1, 30, 40]
+one = LRUCache(1)
+one.put(5, 1); one.put(5, 2); one.put(6, 3)
+print(one.get(5), one.get(6))</code></pre>
+<pre class="code lang-text"><code>[10, -1, -1, 30, 40]
+-1 3</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> evicting the tail node but forgetting <code>del self.map[oldest.key]</code>. The map keeps pointing at a node that left the list, and its size never shrinks. <strong>Right:</strong> store the key in the node and delete from both structures in the same method. That is the invariant.</div></div>
+<h3>LFU awareness: least frequently used</h3>
+<p>LFU evicts the key used the <em>fewest times</em>; ties go to the least recently used among them. The O(1) design is: a use-count per key, one OrderedDict (a mini LRU list) per count, and a variable <code>min_freq</code> naming the lowest count present. A use moves a key from bucket f to bucket f + 1; eviction takes the oldest key in bucket <code>min_freq</code>; a brand-new key always starts at count 1. LRU adapts quickly to change but a one-off scan can flush it. LFU protects popular items but is slow to forget an item that was popular last week (Practice problem 11.9.20).</p>
+<h3>Going deeper</h3>
+<ul>
+<li><code>functools.lru_cache</code> is an LRU cache for function results, written in C and guarded by a lock (see 11.8).</li>
+<li>Real caches add a time-to-live per entry (Practice problem 11.9.14).</li>
+</ul>
+
+<h2 id="s3-11-3-stack-and-queue-designs-min-stack-queue-from-stacks-iterators">11.3 Stack and Queue Designs: Min Stack, Queue from Stacks, Iterators</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A stack is a pile of plates: you touch only the top. A queue is a shop line: first in, first served. Suppose you own only plate piles but must build a line. Move plates one by one from pile A to pile B. The order flips, and the plate that was at the bottom is now on top. That is the whole trick.</div></div>
+<h3>How to recognise it</h3>
+<ul>
+<li>"Implement X using only Y" (queue using stacks).</li>
+<li>An extra O(1) query on a stack: minimum, maximum.</li>
+<li>"Iterator", "next", "has_next", "peek": produce items one at a time without building the whole list.</li>
+</ul>
+<h3>Min stack: remember the minimum at every height</h3>
+<p>A stack only changes at the top, so next to each item we can store the <em>minimum of everything at or below it</em>, and it never goes stale. (Chapter 5 drew this; see its min-stack figure.) Trace: push 5, 3, 7, 3, 8, then pop three times.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Step</th><th>Operation</th><th>items</th><th>mins</th><th>get_min()</th></tr></thead><tbody>
+<tr><td>1</td><td>push 5</td><td>[5]</td><td>[5]</td><td>5</td></tr>
+<tr><td>2</td><td>push 3</td><td>[5, 3]</td><td>[5, 3]</td><td>3</td></tr>
+<tr><td>3</td><td>push 7</td><td>[5, 3, 7]</td><td>[5, 3, 3]</td><td>3</td></tr>
+<tr><td>4</td><td>push 3</td><td>[5, 3, 7, 3]</td><td>[5, 3, 3, 3]</td><td>3</td></tr>
+<tr><td>5</td><td>push 8</td><td>[5, 3, 7, 3, 8]</td><td>[5, 3, 3, 3, 3]</td><td>3</td></tr>
+<tr><td>6</td><td>pop (8)</td><td>[5, 3, 7, 3]</td><td>[5, 3, 3, 3]</td><td>3</td></tr>
+<tr><td>7</td><td>pop (3)</td><td>[5, 3, 7]</td><td>[5, 3, 3]</td><td>3</td></tr>
+<tr><td>8</td><td>pop (7)</td><td>[5, 3]</td><td>[5, 3]</td><td>3</td></tr>
+</tbody></table></div>
+<p class="problem"><span class="pl">Problem 11.3.1</span> (easy) Design a stack with <code>push</code>, <code>pop</code>, <code>top</code> and <code>get_min</code>, all O(1).</p>
+<table class="steps">
+<tr><th>Idea</th><td>A second stack <code>mins</code> where <code>mins[i]</code> is the smallest of <code>items[0..i]</code>.</td></tr>
+<tr><th>Brute force</th><td><code>get_min</code> scans the stack: O(n).</td></tr>
+<tr><th>Better approach</th><td>Push <code>min(x, mins[-1])</code>; pop both stacks together. Nothing is recomputed.</td></tr>
+<tr><th>Code</th><td>Below.</td></tr>
+<tr><th>Dry run</th><td>Step 7 above: a 3 is popped but another 3 remains below, and <code>mins</code> still says 3.</td></tr>
+<tr><th>Complexity</th><td>All O(1); O(n) extra space.</td></tr>
+<tr><th>Edge cases</th><td>Duplicate minimums; popping the minimum; one item.</td></tr>
+</table>
+<pre class="code lang-python"><code>class MinStack:
+    def __init__(self):
+        self.items = []
+        self.mins = []          # mins[i] = smallest of items[0..i]
+
+    def push(self, x):
+        self.items.append(x)
+        self.mins.append(x if not self.mins else min(x, self.mins[-1]))
+
+    def pop(self):
+        self.mins.pop()
+        return self.items.pop()
+
+    def get_min(self):
+        return self.mins[-1]
+
+s = MinStack()
+for x in (5, 3, 7, 3, 8):
+    s.push(x)
+print(s.get_min(), s.pop(), s.pop(), s.get_min())
+print(s.pop(), s.pop(), s.get_min())
+assert s.items == [5]</code></pre>
+<pre class="code lang-text"><code>3 8 3 3
+7 3 5</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong (space-saving version):</strong> push to <code>mins</code> only when <code>x &lt; mins[-1]</code>. With duplicates it fails: push 2, push 2, pop empties <code>mins</code> while a 2 is still on the stack. <strong>Right:</strong> push when <code>x &lt;= mins[-1]</code>, or use the always-in-step version above.</div></div>
+<h3>Queue from two stacks</h3>
+<figure><img src="images/dsa11_twostacks.png" alt="Two stacks: in_stack holds 1,2,3 with 3 on top; out_stack holds 3,2,1 with 1 on top" loading="lazy"/><figcaption>Pouring one stack into the other reverses it. The oldest item ends on top of out_stack.</figcaption></figure>
+<p>How to read it: new items go on <code>in_stack</code>; items leave from <code>out_stack</code>; when <code>out_stack</code> is empty, pour <code>in_stack</code> into it.</p>
+<p class="problem"><span class="pl">Problem 11.3.2</span> (easy) Build a FIFO queue with <code>push</code>, <code>pop</code>, <code>peek</code> and <code>empty</code> using only two Python lists as stacks (<code>append</code> and <code>pop</code>).</p>
+<table class="steps">
+<tr><th>Idea</th><td>Inbox for arrivals, outbox for departures. Pour inbox into outbox only when the outbox is empty.</td></tr>
+<tr><th>Brute force</th><td>On every <code>pop</code>, pour all items across, pop, pour back: O(n) per call.</td></tr>
+<tr><th>Better approach</th><td>Pour lazily. Each item is poured at most once, so m calls cost O(m): amortised O(1).</td></tr>
+<tr><th>Code</th><td>Below.</td></tr>
+<tr><th>Dry run</th><td>Table after the code.</td></tr>
+<tr><th>Complexity</th><td>push O(1); pop, peek amortised O(1), worst single call O(n).</td></tr>
+<tr><th>Edge cases</th><td>Pop right after the first push; pushes while the outbox still has items (they wait in the inbox).</td></tr>
+</table>
+<pre class="code lang-python"><code>class MyQueue:
+    def __init__(self):
+        self.inbox = []     # new items land here
+        self.outbox = []    # items leave from here (oldest on top)
+
+    def push(self, x):
+        self.inbox.append(x)
+
+    def _shift(self):
+        if not self.outbox:               # pour only when outbox is empty
+            while self.inbox:
+                self.outbox.append(self.inbox.pop())
+
+    def pop(self):
+        self._shift()
+        return self.outbox.pop()
+
+    def peek(self):
+        self._shift()
+        return self.outbox[-1]
+
+    def empty(self):
+        return not self.inbox and not self.outbox
+
+q = MyQueue()
+q.push(1); q.push(2); q.push(3)
+print(q.pop())
+q.push(4)
+print(q.pop(), q.pop(), q.pop(), q.empty())</code></pre>
+<pre class="code lang-text"><code>1
+2 3 4 True</code></pre>
+<div class="tablewrap"><table class="data"><thead><tr><th>Step</th><th>Operation</th><th>inbox</th><th>outbox (top on right)</th><th>Returns</th></tr></thead><tbody>
+<tr><td>1-3</td><td>push 1, push 2, push 3</td><td>[1, 2, 3]</td><td>[]</td><td>-</td></tr>
+<tr><td>4</td><td>pop: outbox empty, pour, then pop</td><td>[]</td><td>[3, 2]</td><td>1</td></tr>
+<tr><td>5</td><td>push 4</td><td>[4]</td><td>[3, 2]</td><td>-</td></tr>
+<tr><td>6</td><td>pop: outbox not empty, no pour</td><td>[4]</td><td>[3]</td><td>2</td></tr>
+<tr><td>7</td><td>pop</td><td>[4]</td><td>[]</td><td>3</td></tr>
+<tr><td>8</td><td>pop: outbox empty, pour, then pop</td><td>[]</td><td>[]</td><td>4</td></tr>
+</tbody></table></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> pouring on every <code>pop</code>. In step 6, pouring the inbox onto the outbox [3, 2] puts 4 on top, so <code>pop</code> returns 4 instead of 2. <strong>Right:</strong> pour only when the outbox is empty, so everything in the outbox is older than everything in the inbox.</div></div>
+<h3>Iterator design</h3>
+<p>An <strong>iterator</strong> hands out the next item on request instead of building the whole list first. Design rule: <code>has_next</code> must answer <em>before</em> <code>next</code> is called, so the object must already hold the next item.</p>
+<p class="problem"><span class="pl">Problem 11.3.3</span> (medium) A list may contain integers and other lists, nested to any depth, such as <code>[1, [4, [6]], [], 2]</code>. Design an iterator with <code>has_next()</code> and <code>next()</code> that yields 1, 4, 6, 2 without flattening everything first.</p>
+<table class="steps">
+<tr><th>Idea</th><td>A stack of Python iterators, one per list we are inside. Look at the top: a list pushes a new iterator, an integer is our next value, an exhausted iterator is popped.</td></tr>
+<tr><th>Brute force</th><td>Flatten everything in the constructor: O(n) time and extra memory before the first <code>next</code>.</td></tr>
+<tr><th>Better approach</th><td>The stack does the work lazily; the constructor prepares only the first value.</td></tr>
+<tr><th>Code</th><td>Below, plus a generator version (<code>yield from</code>) for comparison.</td></tr>
+<tr><th>Dry run</th><td>Read 1: ready. Next call reads list [4,[6]]: push, 4 is ready. Then [6] is pushed, 6 is ready. Inner iterators run out and pop; outer yields [] (push, pop), then 2.</td></tr>
+<tr><th>Complexity</th><td>O(total size) overall; O(depth) extra space.</td></tr>
+<tr><th>Edge cases</th><td>Empty lists inside lists; only empty lists (<code>has_next</code> must be False); calling <code>has_next</code> twice.</td></tr>
+</table>
+<pre class="code lang-python"><code>class NestedIterator:
+    def __init__(self, nested):
+        self.stack = [iter(nested)]   # one iterator per list we are inside
+        self.nxt = None               # the next integer, ready to hand out
+        self._advance()
+
+    def _advance(self):
+        self.nxt = None
+        while self.stack:
+            try:
+                item = next(self.stack[-1])
+            except StopIteration:
+                self.stack.pop()      # this list is finished
+                continue
+            if isinstance(item, list):
+                self.stack.append(iter(item))   # go one level deeper
+            else:
+                self.nxt = item
+                return
+
+    def has_next(self):
+        return self.nxt is not None
+
+    def next(self):
+        value = self.nxt
+        self._advance()
+        return value
+
+def flatten(nested):                 # generator version
+    for item in nested:
+        if isinstance(item, list):
+            yield from flatten(item)
+        else:
+            yield item
+
+data = [1, [4, [6]], [], 2]
+it = NestedIterator(data)
+got = []
+while it.has_next():
+    got.append(it.next())
+print(got)
+assert got == list(flatten(data))
+print(NestedIterator([[], [[]]]).has_next())</code></pre>
+<pre class="code lang-text"><code>[1, 4, 6, 2]
+False</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>has_next</code> peeks one level only, so <code>[[], [[]]]</code> says True and then <code>next()</code> crashes. <strong>Right:</strong> keep digging in <code>_advance</code> until you hold a real integer or the stack is empty. The <code>None</code> sentinel works only because the data are integers.</div></div>
+<h3>Going deeper</h3>
+<ul>
+<li>Queue-from-stacks is the classic <strong>amortised analysis</strong>: charge each item 2 units on push (one for itself, one saved for its later pour).</li>
+</ul>
+<h2 id="s4-11-4-time-based-designs-rate-limiter-time-store-and-snapshot-array">11.4 Time-Based Designs: Rate Limiter, Time Store and Snapshot Array</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A club door allows at most 3 people in any 10 minutes. The bouncer writes each entry time on a notepad. When someone arrives, he first crosses out every time older than 10 minutes, then counts what is left. Fewer than 3? The guest enters and the time is written down. That notepad is a <strong>queue of timestamps</strong>, oldest at the front.</div></div>
+<h3>How to recognise it</h3>
+<ul>
+<li>Every call has a timestamp, and old events stop mattering after a fixed time ("at most k per w seconds").</li>
+<li>"Value of a key at time t" or "state at snapshot s": you must look <em>into the past</em>.</li>
+<li>Timestamps arrive in increasing order. That one fact makes a deque (windows) or a sorted list with binary search (history) work.</li>
+</ul>
+<figure><img src="images/dsa11_ratelimit.png" alt="Timeline with six requests at times 1,3,4,8,12,13; the one at 8 is denied; a window covers times 4 to 13" loading="lazy"/><figcaption>Limit 3 per 10 seconds. The request at 8 is denied because 1, 3 and 4 are inside its window. At 12 the 1 has expired.</figcaption></figure>
+<p>How to read it: green dots were allowed, the red dot was denied. The blue bar is the window ending at t = 13. Only times after 13 - 10 = 3 count, so the deque holds [4, 12, 13]. Denied requests are <em>not</em> stored.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>t</th><th>Drop times &lt;= t - 10</th><th>Deque before deciding</th><th>Size &lt; 3?</th><th>Result</th><th>Deque after</th></tr></thead><tbody>
+<tr><td>1</td><td>none</td><td>[]</td><td>yes</td><td>allow</td><td>[1]</td></tr>
+<tr><td>3</td><td>none</td><td>[1]</td><td>yes</td><td>allow</td><td>[1, 3]</td></tr>
+<tr><td>4</td><td>none</td><td>[1, 3]</td><td>yes</td><td>allow</td><td>[1, 3, 4]</td></tr>
+<tr><td>8</td><td>none (8 - 10 = -2)</td><td>[1, 3, 4]</td><td>no</td><td>deny</td><td>[1, 3, 4]</td></tr>
+<tr><td>12</td><td>drop 1 (1 &lt;= 2)</td><td>[3, 4]</td><td>yes</td><td>allow</td><td>[3, 4, 12]</td></tr>
+<tr><td>13</td><td>drop 3 (3 &lt;= 3)</td><td>[4, 12]</td><td>yes</td><td>allow</td><td>[4, 12, 13]</td></tr>
+</tbody></table></div>
+<p class="problem"><span class="pl">Problem 11.4.1</span> (medium) Build a rate limiter. <code>allow(t)</code> returns True if fewer than <code>limit</code> allowed requests happened in the last <code>window</code> seconds, the half-open range (t - window, t], and records the request if so.</p>
+<table class="steps">
+<tr><th>Idea</th><td>A deque of allowed timestamps. Pop expired ones from the front, then compare the length with the limit.</td></tr>
+<tr><th>Brute force</th><td>Keep every timestamp in a list and count those in the window on each call: O(n).</td></tr>
+<tr><th>Better approach</th><td>Time only moves forward, so expired entries are always at the front and each is removed once: amortised O(1).</td></tr>
+<tr><th>Code</th><td>Below.</td></tr>
+<tr><th>Dry run</th><td>The trace above: True, True, True, False, True, True.</td></tr>
+<tr><th>Complexity</th><td>Amortised O(1) time; O(limit) space per user.</td></tr>
+<tr><th>Edge cases</th><td>A request exactly <code>window</code> seconds after an old one (expired: use <code>&lt;=</code>); equal timestamps; limit 0.</td></tr>
+</table>
+<pre class="code lang-python"><code>from collections import deque
+
+class RateLimiter:
+    def __init__(self, limit, window):
+        self.limit, self.window = limit, window
+        self.times = deque()                 # allowed timestamps, oldest first
+
+    def allow(self, t):
+        while self.times and self.times[0] &lt;= t - self.window:
+            self.times.popleft()             # expired: outside (t - window, t]
+        if len(self.times) &lt; self.limit:
+            self.times.append(t)
+            return True
+        return False                         # denied requests are not recorded
+
+r = RateLimiter(3, 10)
+results = [r.allow(t) for t in (1, 3, 4, 8, 12, 13)]
+print(results)
+print(list(r.times))
+assert results == [True, True, True, False, True, True]</code></pre>
+<pre class="code lang-text"><code>[True, True, True, False, True, True]
+[4, 12, 13]</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>self.times[0] &lt; t - self.window</code>. At t = 13 the request at time 3 still counts, so the window is 11 seconds wide. <strong>Right:</strong> decide the boundary in words first ("a request exactly 10 seconds old has expired"), then pick <code>&lt;=</code> or <code>&lt;</code>. Also never record a denied request, or a spammer locks himself out forever.</div></div>
+<h3>History lookup with bisect</h3>
+<p>A <strong>time-based key-value store</strong> remembers every value a key ever had, with the time it was set. <code>get(key, t)</code> returns the value current at time t: the latest one set at or before t. When timestamps increase, each key's history is a sorted list, and binary search (Chapter 4) answers in O(log n).</p>
+<figure><img src="images/dsa11_timemap.png" alt="Times 1,4,9,12 with values a,b,c,d; a query at time 6 lands after index 1 so the answer is b" loading="lazy"/><figcaption><code>bisect_right</code> returns how many timestamps are at most t. The answer sits just before that position.</figcaption></figure>
+<p>How to read it: the query 6 is bigger than 1 and 4 but smaller than 9. Two timestamps are at most 6, so <code>bisect_right</code> gives 2, and the last of those two is index 1, value b.</p>
+<p class="problem"><span class="pl">Problem 11.4.2</span> (medium) Design <code>TimeMap</code> with <code>set(key, value, t)</code> (t increases per key) and <code>get(key, t)</code> returning the value with the largest timestamp not above t, or an empty string if none.</p>
+<table class="steps">
+<tr><th>Idea</th><td>Per key, two parallel lists: timestamps and values. <code>set</code> appends; <code>get</code> binary-searches.</td></tr>
+<tr><th>Brute force</th><td>Scan the history from the end until a timestamp is at most t: O(n).</td></tr>
+<tr><th>Better approach</th><td><code>bisect_right(times, t)</code> in O(log n). A result of 0 means nothing was set yet.</td></tr>
+<tr><th>Code</th><td>Below.</td></tr>
+<tr><th>Dry run</th><td>Times [1,4,9,12]. t = 6: index 1, b. t = 9: bisect_right 3, index 2, c. t = 0: bisect_right 0, "".</td></tr>
+<tr><th>Complexity</th><td>set O(1); get O(log n); space O(total sets).</td></tr>
+<tr><th>Edge cases</th><td>Unknown key; t before the first set; t equal to a stored timestamp.</td></tr>
+</table>
+<pre class="code lang-python"><code>from bisect import bisect_right
+from collections import defaultdict
+
+class TimeMap:
+    def __init__(self):
+        self.times = defaultdict(list)    # key -&gt; timestamps, increasing
+        self.vals = defaultdict(list)     # key -&gt; values, same order
+
+    def set(self, key, value, t):
+        self.times[key].append(t)
+        self.vals[key].append(value)
+
+    def get(self, key, t):
+        ts = self.times.get(key)          # .get: do not create empty entries
+        if not ts:
+            return ""
+        i = bisect_right(ts, t)           # how many timestamps are &lt;= t
+        return self.vals[key][i - 1] if i else ""
+
+m = TimeMap()
+for t, v in ((1, "a"), (4, "b"), (9, "c"), (12, "d")):
+    m.set("k", v, t)
+print([m.get("k", t) for t in (0, 1, 3, 6, 9, 100)])
+print(repr(m.get("nope", 5)))</code></pre>
+<pre class="code lang-text"><code>['', 'a', 'a', 'b', 'c', 'd']
+''</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>bisect_left(ts, t) - 1</code>. For t = 9 it lands on b, but the value set at exactly 9 is c. <strong>Right:</strong> "at or before t" means <code>bisect_right(ts, t) - 1</code>. Use <code>bisect_left</code> only for "strictly before".</div></div>
+<p class="problem"><span class="pl">Problem 11.4.3</span> (hard) Design <code>SnapshotArray(length)</code>, all zeros. <code>set(i, v)</code> changes a cell, <code>snap()</code> freezes the array and returns an id (0, 1, 2, ...), and <code>get(i, snap_id)</code> returns cell i as it was at that snapshot. The array and the number of snapshots can be huge.</p>
+<table class="steps">
+<tr><th>Idea</th><td>Never copy the array. Each cell stores only its <em>changes</em>: a list of (snapshot id, value). This is TimeMap with the snapshot id as the time.</td></tr>
+<tr><th>Brute force</th><td>Copy all n cells on every <code>snap</code>: O(n) time and memory each.</td></tr>
+<tr><th>Better approach</th><td><code>snap</code> just increments a counter. <code>get</code> binary-searches the cell's list for the last pair with id at most <code>snap_id</code>.</td></tr>
+<tr><th>Code</th><td>Below. Each cell starts as (0, 0). A <code>set</code> in the same snapshot as the last pair overwrites it.</td></tr>
+<tr><th>Dry run</th><td>set(0,5); snap 0; set(0,6); get(0,0) = 5; snap 1; set(1,9); snap 2. Then get(1,1) = 0, get(1,2) = 9.</td></tr>
+<tr><th>Complexity</th><td>set, snap O(1); get O(log c) for c changes of that cell; space O(n + total sets).</td></tr>
+<tr><th>Edge cases</th><td>Two sets of one cell between snapshots; a cell never set; an old snapshot read after many later changes.</td></tr>
+</table>
+<pre class="code lang-python"><code>from bisect import bisect_right
+
+class SnapshotArray:
+    def __init__(self, length):
+        # history[i] = [(snap_id, value), ...] with increasing snap_id
+        self.history = [[(0, 0)] for _ in range(length)]
+        self.snap_id = 0
+
+    def set(self, index, val):
+        h = self.history[index]
+        if h[-1][0] == self.snap_id:
+            h[-1] = (self.snap_id, val)      # same snapshot: overwrite
+        else:
+            h.append((self.snap_id, val))
+
+    def snap(self):
+        self.snap_id += 1
+        return self.snap_id - 1
+
+    def get(self, index, snap_id):
+        h = self.history[index]
+        i = bisect_right(h, (snap_id, float("inf"))) - 1
+        return h[i][1]
+
+a = SnapshotArray(3)
+a.set(0, 5)
+s0 = a.snap()
+a.set(0, 6)
+r1 = a.get(0, s0)
+s1 = a.snap()
+a.set(1, 9)
+s2 = a.snap()
+print(s0, s1, s2, r1, a.get(1, s0), a.get(1, s1), a.get(1, s2), a.get(0, s1))
+assert (r1, a.get(1, s2), a.get(0, s1)) == (5, 9, 6)</code></pre>
+<pre class="code lang-text"><code>0 1 2 5 0 0 9 6</code></pre>
+<h3>Going deeper</h3>
+<ul>
+<li>Rate limiter cousins: a <em>fixed-window counter</em> (O(1) memory but allows up to 2 x limit around a window edge) and a <em>token bucket</em> (O(1) memory, tokens refill at a steady rate, short bursts allowed). A distributed limiter must make "check and increment" one atomic step (see 11.8).</li>
+<li>O(1)-memory hit counter with 300 circular buckets: Practice problem 11.9.15.</li>
+</ul>
+
+<h2 id="s5-11-5-randomised-set-insert-delete-and-random-pick-in-o-1">11.5 Randomised Set: Insert, Delete and Random Pick in O(1)</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A raffle drawer holds numbered tickets. To draw fairly you must jump to a random position, which works only if tickets are packed with no gaps. When a ticket is withdrawn from the middle, you do not shuffle everyone left. You take the <em>last</em> ticket, drop it into the gap, and close the drawer by one. Order does not matter, so nobody notices.</div></div>
+<h3>How to recognise it</h3>
+<ul>
+<li>"Insert, delete and get a random element, each O(1) on average."</li>
+<li>A <code>set</code> deletes in O(1) but cannot pick randomly (no index). A <code>list</code> picks in O(1) but deleting from the middle is O(n).</li>
+<li>Order of the items is irrelevant. That freedom lets you swap.</li>
+</ul>
+<figure><img src="images/dsa11_randset.png" alt="Array 10,20,30,40 becomes 10,40,30 after removing 20 by copying the last element over it and popping" loading="lazy"/><figcaption>Delete in O(1): overwrite the hole with the last element, pop the end, fix the dictionary entry of the moved element.</figcaption></figure>
+<p>How to read it: the red arrow shows 40 jumping into 20's place. The bottom row is the array after popping the last slot. The dictionary (not drawn) must now say 40 lives at index 1.</p>
+<p class="problem"><span class="pl">Problem 11.5.1</span> (medium) Design <code>RandomSet</code>: <code>insert(x)</code> returns True if x was new; <code>remove(x)</code> returns True if x was present; <code>get_random()</code> returns a member with equal probability. All average O(1).</p>
+<table class="steps">
+<tr><th>Idea</th><td>A packed list <code>items</code> plus a dictionary <code>pos</code> from value to index. Invariant: <code>items[pos[x]] == x</code> for every x.</td></tr>
+<tr><th>Brute force</th><td>Only a list: <code>list.remove</code> is O(n). Only a set: converting to a list per pick is O(n).</td></tr>
+<tr><th>Better approach</th><td>The dictionary finds the index in O(1); swap-with-last deletes in O(1); a random index picks in O(1).</td></tr>
+<tr><th>Code</th><td>Below. Order inside <code>remove</code>: move last into the hole, fix its index, pop, and only then delete <code>x</code> from the dictionary.</td></tr>
+<tr><th>Dry run</th><td>Items [10,20,30,40]. remove 20: i = 1, last = 40; slot 1 becomes 40, pop: [10,40,30]; pos[40] = 1.</td></tr>
+<tr><th>Complexity</th><td>All O(1) average; O(n) space.</td></tr>
+<tr><th>Edge cases</th><td>Removing the last element (moved value is x itself); removing the only element; <code>get_random</code> on an empty set.</td></tr>
+</table>
+<pre class="code lang-python"><code>import random
+
+class RandomSet:
+    def __init__(self, seed=0):
+        self.items = []          # values, packed with no gaps
+        self.pos = {}            # value -&gt; its index in items
+        self.rng = random.Random(seed)
+
+    def insert(self, x):
+        if x in self.pos:
+            return False
+        self.pos[x] = len(self.items)
+        self.items.append(x)
+        return True
+
+    def remove(self, x):
+        if x not in self.pos:
+            return False
+        i = self.pos[x]
+        last = self.items[-1]
+        self.items[i] = last     # move the last value into the hole
+        self.pos[last] = i       # ...and tell the dictionary
+        self.items.pop()
+        del self.pos[x]          # delete AFTER the fix (x may equal last)
+        return True
+
+    def get_random(self):
+        return self.items[self.rng.randrange(len(self.items))]
+
+s = RandomSet()
+print([s.insert(v) for v in (10, 20, 30, 40, 20)])
+print(s.remove(20), s.items, s.pos)
+print(s.remove(30), s.items, s.pos)
+print(s.remove(99))
+draws = {s.get_random() for _ in range(200)}
+print(sorted(draws))</code></pre>
+<pre class="code lang-text"><code>[True, True, True, True, False]
+True [10, 40, 30] {10: 0, 30: 2, 40: 1}
+True [10, 40] {10: 0, 40: 1}
+False
+[10, 40]</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>del self.pos[x]</code> first, then <code>self.pos[last] = i</code>. When x is the last element, <code>last</code> equals x, so the second line adds x back and the set "contains" a value that is gone. <strong>Right:</strong> fix first, delete last. Also never skip updating <code>pos[last]</code>: a later remove would read a stale index and corrupt the list.</div></div>
+<h3>Going deeper</h3>
+<ul>
+<li>"Swap with the last, then pop" is the general way to delete from an array when order is free. With <em>duplicates</em>, map each value to a <em>set of indices</em>: to remove one copy, pop any index, move the last item into that slot and update that item's index set.</li>
+<li>For <em>weighted</em> picks, keep prefix sums and binary-search a random number (Chapters 3 and 4). To sample k items from a stream of unknown length, use reservoir sampling (Chapter 10).</li>
+</ul>
+
+<h2 id="s6-11-6-autocomplete-trie-plus-heap">11.6 Autocomplete: Trie plus Heap</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A phone book is sorted, so every name starting "Ca" sits together. A <strong>trie</strong> (say "try") turns that into a tree: each step down follows one letter, so words with the same beginning share a path. Typing "ca" walks two steps and lands on the root of exactly the words you want. A <strong>heap</strong> then picks the best few.</div></div>
+<h3>How to recognise it</h3>
+<ul>
+<li>"Suggest words that start with this prefix", "search as you type", "dictionary".</li>
+<li>Many queries on one word set, each query a prefix, plus a ranking rule (most frequent, alphabetical). The rule is the heap's key.</li>
+</ul>
+<figure><img src="images/dsa11_trie.png" alt="Trie for car, card, care, cat with counts; the subtree under ca is boxed and the top two are care and car" loading="lazy"/><figcaption>The prefix "ca" is found in two steps. Everything in the dashed box is a candidate; the heap keeps the best two.</figcaption></figure>
+<p>How to read it: teal circles end a word and show its count (popularity). Blue circles are stepping stones. To answer "ca" you never look at a word that does not start with c-a.</p>
+<p>A trie node holds a dictionary from letter to child, plus an "a word ends here" flag (Chapter 7 built one). A path only proves a <em>prefix</em>: a word needs its end flag. Below we use the shortest form, nested dictionaries, with the key <code>"$"</code> marking a word end and storing its count.</p>
+<p class="problem"><span class="pl">Problem 11.6.1</span> (medium) Words with counts: car 5, card 3, care 7, cat 2, dog 4. Given a prefix, return the best k words: higher count first, ties alphabetical.</p>
+<table class="steps">
+<tr><th>Idea</th><td>Walk the prefix, collect every word in the subtree below, keep the best k with a heap.</td></tr>
+<tr><th>Brute force</th><td>Filter all N words by prefix and sort the M matches: O(N L + M log M).</td></tr>
+<tr><th>Better approach</th><td>The walk skips all non-matching words at once; <code>heapq.nsmallest(k, ...)</code> with key (-count, word) costs O(M log k). Python's heap is a min-heap, so "smallest" -count means highest count.</td></tr>
+<tr><th>Code</th><td>Below.</td></tr>
+<tr><th>Dry run</th><td>Table after the code.</td></tr>
+<tr><th>Complexity</th><td>O(L + S + M log k): L prefix length, S trie nodes below it, M matches. Space O(S).</td></tr>
+<tr><th>Edge cases</th><td>No match (empty list); k larger than M; ties; empty prefix.</td></tr>
+</table>
+<pre class="code lang-python"><code>import heapq
+
+def build(words):
+    root = {}
+    for w, count in words.items():
+        node = root
+        for ch in w:
+            node = node.setdefault(ch, {})
+        node["$"] = count                 # "$" marks a word end and stores its count
+    return root
+
+def suggest(root, prefix, k):
+    node = root
+    for ch in prefix:                     # step 1: walk the prefix
+        if ch not in node:
+            return []
+        node = node[ch]
+    found = []                            # step 2: collect all words below
+    stack = [(node, prefix)]
+    while stack:
+        cur, word = stack.pop()
+        for ch, child in cur.items():
+            if ch == "$":
+                found.append((word, child))
+            else:
+                stack.append((child, word + ch))
+    best = heapq.nsmallest(k, found, key=lambda p: (-p[1], p[0]))   # step 3
+    return [w for w, _ in best]
+
+root = build({"car": 5, "card": 3, "care": 7, "cat": 2, "dog": 4})
+print(suggest(root, "ca", 2))
+print(suggest(root, "ca", 10))
+print(suggest(root, "", 3))
+print(suggest(root, "x", 3))</code></pre>
+<pre class="code lang-text"><code>['care', 'car']
+['care', 'car', 'card', 'cat']
+['care', 'car', 'dog']
+[]</code></pre>
+<div class="tablewrap"><table class="data"><thead><tr><th>Step</th><th>Action for prefix "ca", k = 2</th><th>State</th></tr></thead><tbody>
+<tr><td>1-2</td><td>Walk "c", then "a"</td><td>both nodes exist; 4 words below</td></tr>
+<tr><td>3</td><td>Collect by DFS (order may vary)</td><td>(car,5) (card,3) (care,7) (cat,2)</td></tr>
+<tr><td>4</td><td>Keys (-count, word)</td><td>(-5,car) (-3,card) (-7,care) (-2,cat)</td></tr>
+<tr><td>5</td><td>Two smallest keys, return words</td><td>["care", "car"]</td></tr>
+</tbody></table></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> pushing (count, word) into a max-heap, so ties come out in <em>reverse</em> alphabetical order. <strong>Right:</strong> build the key so "better" always means "smaller": (-count, word). Ties are then alphabetical for free.</div></div>
+<p class="problem"><span class="pl">Problem 11.6.2</span> (hard) Design a typing system over sentences with counts. <code>input(c)</code> receives one character. A normal character extends the typed text and returns the best 3 stored sentences with that prefix (higher count, then alphabetical). The character <code>#</code> ends the sentence: store it (count +1, or 1 if new), clear the text, return [].</p>
+<table class="steps">
+<tr><th>Idea</th><td>Same dictionary trie, but remember the <em>current node</em> between calls, so each key press moves one step. At the first missing letter set a <code>dead</code> flag and return [] until <code>#</code>.</td></tr>
+<tr><th>Brute force</th><td>Re-walk the whole prefix from the root on every key: O(L) extra per key.</td></tr>
+<tr><th>Better approach</th><td>Keep <code>node</code>, <code>typed</code> and <code>dead</code>. Only collect-and-rank costs more than O(1).</td></tr>
+<tr><th>Code</th><td>Below.</td></tr>
+<tr><th>Dry run</th><td>Key "i": you (5), island (3), then the tie at 2 goes to "i love leetcode" (space sorts before r). Key " ": two match. Key "a": none, dead. Key "#": "i a" stored with count 1.</td></tr>
+<tr><th>Complexity</th><td>Per key O(1) to move plus O(S + M log 3) to rank; O(L) to store a sentence.</td></tr>
+<tr><th>Edge cases</th><td>No match, then more characters; a sentence that already exists; <code>#</code> with nothing typed.</td></tr>
+</table>
+<pre class="code lang-python"><code>import heapq
+
+class AutocompleteSystem:
+    def __init__(self, sentences, times):
+        self.root = {}
+        for s, t in zip(sentences, times):
+            self._add(s, t)
+        self._reset()
+
+    def _add(self, s, t):
+        node = self.root
+        for ch in s:
+            node = node.setdefault(ch, {})
+        node["$"] = node.get("$", 0) + t
+
+    def _reset(self):
+        self.node, self.typed, self.dead = self.root, "", False
+
+    def input(self, c):
+        if c == "#":
+            self._add(self.typed, 1)
+            self._reset()
+            return []
+        self.typed += c
+        if self.dead or c not in self.node:
+            self.dead = True              # nobody starts with this text
+            return []
+        self.node = self.node[c]          # move ONE step, not from the root
+        found, stack = [], [(self.node, self.typed)]
+        while stack:
+            cur, word = stack.pop()
+            for ch, child in cur.items():
+                if ch == "$":
+                    found.append((word, child))
+                else:
+                    stack.append((child, word + ch))
+        best = heapq.nsmallest(3, found, key=lambda p: (-p[1], p[0]))
+        return [w for w, _ in best]
+
+ac = AutocompleteSystem(["i love you", "island", "iroman", "i love leetcode"], [5, 3, 2, 2])
+print(ac.input("i"))
+print(ac.input(" "))
+print(ac.input("a"))
+print(ac.input("#"))
+print(ac.input("i"))
+print(ac.input(" "))</code></pre>
+<pre class="code lang-text"><code>['i love you', 'island', 'i love leetcode']
+['i love you', 'i love leetcode']
+[]
+[]
+['i love you', 'island', 'i love leetcode']
+['i love you', 'i love leetcode', 'i a']</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> after a missing letter, leaving <code>self.node</code> unchanged and carrying on. The next key may match a child of the <em>old</em> node, so you suggest sentences for text nobody typed. <strong>Right:</strong> set <code>dead</code> at the first miss and return [] until <code>#</code>.</div></div>
+<h3>Going deeper</h3>
+<ul>
+<li><strong>Faster queries:</strong> store the top-k list inside every node. A query is then O(L), at the price of updating up to L lists when a count changes. Search engines make this trade: heavy precompute, instant answers.</li>
+<li><strong>Memory:</strong> a dict per node is costly in Python. A compressed trie (radix tree) merges single-child chains.</li>
+</ul>
+<h2 id="s7-11-7-union-find-applications">11.7 Union-Find Applications</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">At a party, people shake hands and learn they share friends. After "Asha knows Ben" and "Ben knows Carl", Asha and Carl are in one friend circle although they never met. Union-find (disjoint set union, DSU) keeps the circles. Each circle has one leader. To ask "same circle?", ask both people for their leader and compare. To merge, make one leader report to the other.</div></div>
+<p>Chapter 8 introduced the structure for graphs. Here it is a <em>design building block</em>.</p>
+<h3>How to recognise it</h3>
+<ul>
+<li>Items are merged into groups and never split. Questions: "same group?", "how many groups?", "size of the group?".</li>
+<li>Input arrives as pairs: edges, friendships, "a equals b", "these accounts share an email".</li>
+<li>You must find the first edge that closes a cycle, or group things by a hidden shared property.</li>
+</ul>
+<h3>Template</h3>
+<pre class="code lang-python"><code>class DSU:
+    def __init__(self, n):
+        self.parent = list(range(n))   # everyone starts as their own leader
+        self.size = [1] * n            # group size, valid at leaders
+        self.groups = n
+
+    def find(self, x):
+        while self.parent[x] != x:
+            self.parent[x] = self.parent[self.parent[x]]   # path halving
+            x = self.parent[x]
+        return x
+
+    def union(self, a, b):
+        ra, rb = self.find(a), self.find(b)
+        if ra == rb:
+            return False               # already in the same group
+        if self.size[ra] &lt; self.size[rb]:
+            ra, rb = rb, ra            # attach the smaller group to the bigger
+        self.parent[rb] = ra
+        self.size[ra] += self.size[rb]
+        self.groups -= 1
+        return True
+
+d = DSU(6)
+for a, b in ((0, 1), (2, 3), (1, 3), (4, 5), (0, 3)):
+    merged = d.union(a, b)
+    print((a, b), merged, d.parent, d.groups)</code></pre>
+<pre class="code lang-text"><code>(0, 1) True [0, 0, 2, 3, 4, 5] 5
+(2, 3) True [0, 0, 2, 2, 4, 5] 4
+(1, 3) True [0, 0, 0, 2, 4, 5] 3
+(4, 5) True [0, 0, 0, 2, 4, 4] 2
+(0, 3) False [0, 0, 0, 0, 4, 4] 2</code></pre>
+<div class="tablewrap"><table class="data"><thead><tr><th>Step</th><th>union(a, b)</th><th>Leaders found</th><th>Action</th><th>parent array</th><th>groups</th></tr></thead><tbody>
+<tr><td>0</td><td>start</td><td>-</td><td>everyone is a leader</td><td>[0, 1, 2, 3, 4, 5]</td><td>6</td></tr>
+<tr><td>1</td><td>(0, 1)</td><td>0 and 1</td><td>sizes tie, parent[1] = 0</td><td>[0, 0, 2, 3, 4, 5]</td><td>5</td></tr>
+<tr><td>2</td><td>(2, 3)</td><td>2 and 3</td><td>parent[3] = 2</td><td>[0, 0, 2, 2, 4, 5]</td><td>4</td></tr>
+<tr><td>3</td><td>(1, 3)</td><td>0 and 2</td><td>sizes tie, parent[2] = 0</td><td>[0, 0, 0, 2, 4, 5]</td><td>3</td></tr>
+<tr><td>4</td><td>(4, 5)</td><td>4 and 5</td><td>parent[5] = 4</td><td>[0, 0, 0, 2, 4, 4]</td><td>2</td></tr>
+<tr><td>5</td><td>(0, 3)</td><td>0 and 0</td><td>same leader, no merge; find(3) shortcuts parent[3] to 0</td><td>[0, 0, 0, 0, 4, 4]</td><td>2</td></tr>
+</tbody></table></div>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Two tricks make DSU nearly O(1): <strong>union by size</strong> (hang the small tree under the big one) and <strong>path compression</strong> (point nodes closer to the leader while walking up). Together the cost per operation is O(alpha(n)), where alpha stays under 5 for any input you will ever see.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>self.parent[a] = b</code> in <code>union</code> without <code>find</code>. If a is not a leader, you detach it from its group's tree and break the group. Also wrong: comparing <code>parent[a] == parent[b]</code>; people in one group can have different parents. <strong>Right:</strong> link <em>leader to leader</em> and compare <code>find(a) == find(b)</code>.</div></div>
+<p class="problem"><span class="pl">Problem 11.7.1</span> (medium) A tree on nodes 1 to n got one extra edge. Given the n edges in order, return the edge whose removal restores a tree; if several work, return the one that appears last.</p>
+<table class="steps">
+<tr><th>Idea</th><td>Add edges one by one with union. An edge whose ends are <em>already in one group</em> closes a cycle.</td></tr>
+<tr><th>Brute force</th><td>Remove each edge (last first) and test with DFS whether a tree remains: O(n squared).</td></tr>
+<tr><th>Better approach</th><td>One pass with DSU. The first edge that fails to merge is the answer.</td></tr>
+<tr><th>Code</th><td>Below.</td></tr>
+<tr><th>Dry run</th><td>[1,2], [2,3], [3,4] merge. [1,4]: find(1) and find(4) share a leader, so return [1,4].</td></tr>
+<tr><th>Complexity</th><td>About O(n) time, O(n) space.</td></tr>
+<tr><th>Edge cases</th><td>A triangle; labels start at 1, so allocate n + 1 slots.</td></tr>
+</table>
+<pre class="code lang-python"><code>def redundant_edge(edges):
+    parent = list(range(len(edges) + 1))   # labels run 1..n, so n + 1 slots
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in edges:
+        ra, rb = find(a), find(b)
+        if ra == rb:
+            return [a, b]                  # a and b were already connected
+        parent[rb] = ra
+    return []
+
+print(redundant_edge([[1, 2], [1, 3], [2, 3]]))
+print(redundant_edge([[1, 2], [2, 3], [3, 4], [1, 4], [1, 5]]))</code></pre>
+<pre class="code lang-text"><code>[2, 3]
+[1, 4]</code></pre>
+<p class="problem"><span class="pl">Problem 11.7.2</span> (hard) Each account is a name followed by emails, such as <code>["John", "a@x", "b@x"]</code>. Accounts sharing at least one email belong to one person. Merge them. Return one list per person: the name, then that person's emails sorted; sort the final list too. Different people may share a name.</p>
+<table class="steps">
+<tr><th>Idea</th><td>Make each <em>email</em> a node. Link all emails of one account. Emails with the same leader are one person.</td></tr>
+<tr><th>Brute force</th><td>Compare every pair of accounts for a shared email and merge until nothing changes: many rounds, each O(a squared x e).</td></tr>
+<tr><th>Better approach</th><td>Dictionary-based DSU over emails: union the first email with each other email of the account, then group by leader.</td></tr>
+<tr><th>Code</th><td>Below.</td></tr>
+<tr><th>Dry run</th><td>a-b and b-c link a, b, c into one leader. d and e stay alone. Sorted: John a b c; John e; Mary d.</td></tr>
+<tr><th>Complexity</th><td>O(E alpha(E) + E log E) for E emails (the log is the sorting).</td></tr>
+<tr><th>Edge cases</th><td>Same name, different people; the same email twice in one account; an account with one email.</td></tr>
+</table>
+<figure><img src="images/dsa11_accounts.png" alt="Four email nodes; edges a-b and b-c from accounts 1 and 2 form one component; d is alone" loading="lazy"/><figcaption>Accounts become edges between emails. A connected component is one person.</figcaption></figure>
+<p>How to read it: account 1 draws an edge a@x to b@x, account 2 draws b@x to c@x. The dashed box is one component, one merged person. The shared email b@x is the bridge.</p>
+<pre class="code lang-python"><code>from collections import defaultdict
+
+def merge_accounts(accounts):
+    parent = {}                           # email -&gt; parent email
+    owner = {}                            # email -&gt; name
+
+    def find(x):
+        parent.setdefault(x, x)
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for name, *emails in accounts:
+        for e in emails:
+            owner[e] = name
+            parent[find(e)] = find(emails[0])   # link to the first email
+
+    groups = defaultdict(list)
+    for e in owner:
+        groups[find(e)].append(e)
+    return sorted([owner[r]] + sorted(es) for r, es in groups.items())
+
+accts = [["John", "a@x", "b@x"], ["John", "b@x", "c@x"], ["Mary", "d@x"], ["John", "e@x"]]
+result = merge_accounts(accts)
+print(result)
+assert result == [["John", "a@x", "b@x", "c@x"], ["John", "e@x"], ["Mary", "d@x"]]</code></pre>
+<pre class="code lang-text"><code>[['John', 'a@x', 'b@x', 'c@x'], ['John', 'e@x'], ['Mary', 'd@x']]</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> merging accounts that have the same <em>name</em>; two different Johns become one person. <strong>Right:</strong> only a shared email links accounts. Names are labels, not identities. Also call <code>find</code> again when collecting groups, because a stored parent may not yet be the final leader.</div></div>
+<p>Other uses: counting friend circles (<code>groups</code>), Kruskal's spanning tree (Chapter 8), and checking equations such as "a == b, b != c" (apply all "==" first, then check each "!=" has different leaders).</p>
+<h3>Going deeper</h3>
+<ul>
+<li>DSU supports <strong>merging only</strong>. If edges must also be deleted, process the operations backwards (deletions become additions) or use another structure.</li>
+<li>A <strong>weighted</strong> DSU stores each node's ratio or offset to its leader; it solves "a / b = 2, b / c = 3, so a / c?".</li>
+</ul>
+
+<h2 id="s8-11-8-bloom-filters-consistent-hashing-and-thread-safety-awareness">11.8 Bloom Filters, Consistent Hashing and Thread-Safety Awareness</h2>
+<p>Some design questions ask whether you <em>know a structure exists</em> and when to choose it. This section gives each idea, a small working version, and the sentence to say in an interview.</p>
+<h3>Bloom filter: "definitely not" or "maybe"</h3>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A club bouncer cannot remember every face. For each member he stamps three spots on a big wall chart, chosen by the member's name. To check a visitor, he looks at the visitor's three spots. Any spot blank: the visitor is <strong>surely not</strong> a member. All three stamped: <strong>probably</strong> a member, since other members' stamps may have covered those spots by chance.</div></div>
+<h3>How to recognise it</h3>
+<ul>
+<li>"Have I seen this before?" for millions of items, where a full set costs too much memory.</li>
+<li>A wrong "yes" now and then is fine (you double-check in the slow store); a wrong "no" is not.</li>
+</ul>
+<figure><img src="images/dsa11_bloom.png" alt="A 16-bit array with bits 2,5,7,11,14 set; query emu finds all its bits set (maybe), query owl finds bit 3 empty (definitely not)" loading="lazy"/><figcaption>Adding sets k bits; asking checks k bits. One empty bit proves absence. All set bits only suggest presence.</figcaption></figure>
+<p>How to read it: the positions are made up to show the idea. "cat" set bits 2, 7, 11; "dog" set 5, 7, 14. "emu" was never added, yet its bits 2, 5, 11 are all set by others: a <strong>false positive</strong>. "owl" has an empty bit 3: a certain no.</p>
+<pre class="code lang-python"><code>import hashlib
+import math
+
+class BloomFilter:
+    def __init__(self, m, k):
+        self.m, self.k = m, k             # m bits, k hash functions
+        self.bits = bytearray(m)          # one byte per bit, for clarity
+
+    def _positions(self, item):
+        for i in range(self.k):           # k different hashes: salt with i
+            h = hashlib.md5(f"{i}:{item}".encode()).hexdigest()
+            yield int(h, 16) % self.m
+
+    def add(self, item):
+        for p in self._positions(item):
+            self.bits[p] = 1
+
+    def might_contain(self, item):
+        return all(self.bits[p] for p in self._positions(item))
+
+bf = BloomFilter(m=1000, k=3)
+for i in range(100):
+    bf.add(f"user{i}")
+assert all(bf.might_contain(f"user{i}") for i in range(100))   # never a false "no"
+false_yes = sum(bf.might_contain(f"guest{i}") for i in range(1000))
+theory = (1 - math.exp(-3 * 100 / 1000)) ** 3                  # (1 - e^(-kn/m))^k
+print(false_yes, round(theory * 1000, 1))</code></pre>
+<pre class="code lang-text"><code>15 17.4</code></pre>
+<p>We add 100 users to 1,000 bits with 3 hashes. Every added user is found (no false negatives). Of 1,000 never-added guests, the first number counts those wrongly reported "maybe"; the second is the standard estimate (1 - e<sup>-kn/m</sup>)<sup>k</sup> times 1,000, with n the number of items added. They are close, not equal: the formula is an approximation and 1,000 trials are a small sample. Deleting is not possible in the basic version (clearing a bit may erase other items); a counting Bloom filter keeps small counters instead.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> Python's built-in <code>hash()</code> on strings for a filter you save or share. Since Python 3.3 string hashes change from run to run, so a filter built in one run is nonsense in the next. <strong>Right:</strong> a stable hash such as <code>hashlib</code>, whenever the result must repeat across runs or machines. The same warning applies to consistent hashing below.</div></div>
+<h3>Consistent hashing: add a server without reshuffling everything</h3>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Three cache servers hold your data, and a key lives on server <code>hash(key) % 3</code>. Add a fourth and the rule becomes <code>% 4</code>: almost every key now maps elsewhere, and the whole cache goes cold. Consistent hashing puts servers and keys on one <strong>circle</strong>. A key belongs to the first server met going round from the key's spot. A new server steals only the keys just before it.</div></div>
+<h3>How to recognise it</h3>
+<ul>
+<li>"Distribute keys over servers that come and go", "minimise keys that move", cache cluster, sharding.</li>
+</ul>
+<figure><img src="images/dsa11_ring.png" alt="A ring with servers A, B, C and a dashed new server D, keys k1, k2, k3; adding D moves only k2" loading="lazy"/><figcaption>Servers sit on a ring; each key goes to the next server along the ring. Adding D takes over only the keys between C and D.</figcaption></figure>
+<p>How to read it: the angles are illustrative. k2 sat between B and C, so C owned it. When D appears just before C, k2 meets D first. k1 and k3 do not move.</p>
+<p>In code the ring is a <strong>sorted list of positions</strong> searched with binary search. To avoid one server getting an unlucky big arc, each server is placed at many positions called <strong>virtual nodes</strong>.</p>
+<pre class="code lang-python"><code>import hashlib
+from bisect import bisect_right
+
+def h(s):
+    return int(hashlib.md5(s.encode()).hexdigest(), 16) % (2 ** 32)
+
+class Ring:
+    def __init__(self, nodes, vnodes=100):
+        self.vnodes = vnodes
+        self.points = []                  # sorted positions on the ring
+        self.owner = {}                   # position -&gt; server name
+        for n in nodes:
+            self.add(n)
+
+    def add(self, node):
+        for v in range(self.vnodes):      # many virtual spots per server
+            p = h(f"{node}#{v}")
+            self.owner[p] = node
+            self.points.append(p)
+        self.points.sort()
+
+    def get(self, key):
+        i = bisect_right(self.points, h(key)) % len(self.points)   # wrap around
+        return self.owner[self.points[i]]
+
+keys = [f"key{i}" for i in range(2000)]
+ring = Ring(["A", "B", "C"])
+before = {k: ring.get(k) for k in keys}
+ring.add("D")
+after = {k: ring.get(k) for k in keys}
+moved = [k for k in keys if before[k] != after[k]]
+print("ring moved:", len(moved), "of", len(keys))
+print("all moved keys went to D:", all(after[k] == "D" for k in moved))
+mod3 = {k: h(k) % 3 for k in keys}
+mod4 = {k: h(k) % 4 for k in keys}
+print("mod N moved:", sum(mod3[k] != mod4[k] for k in keys), "of", len(keys))</code></pre>
+<pre class="code lang-text"><code>ring moved: 557 of 2000
+all moved keys went to D: True
+mod N moved: 1525 of 2000</code></pre>
+<p>A fair share for the new fourth server is a quarter of the keys, so the ring should move about 500 of 2,000, while the plain modulo rule moves about three quarters. The exact numbers depend on the hashes; the pattern does not. Notice that on the ring <em>every</em> moved key went to the new server: nothing shuffled between old servers.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> one spot per server. With three servers the arcs are very uneven and one server may hold half the keys. <strong>Right:</strong> 100 or more virtual nodes per server. The arcs average out, and a stronger machine can get more virtual nodes than a weaker one.</div></div>
+<h3>Thread-safety awareness</h3>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Two cashiers update one paper ledger. Both read "balance 100", both add 10, both write 110. One deposit is lost. The cure is a pen only one cashier may hold: a <strong>lock</strong>. Whoever holds it does the whole read-change-write; the other waits. A <strong>thread</strong> is a separate line of execution inside one program, and the lost update is a <strong>race condition</strong>.</div></div>
+<h3>How to recognise it</h3>
+<ul>
+<li>The question says "thread-safe", "concurrent" or "multiple clients", or a method does <strong>check then act</strong> (<code>if key in d: d[key] += 1</code>) or <strong>read, change, write</strong> (<code>count += 1</code>).</li>
+</ul>
+<pre class="code lang-python"><code>import threading
+from collections import OrderedDict
+
+class SafeLRU:
+    def __init__(self, capacity):
+        self.cap = capacity
+        self.data = OrderedDict()
+        self.lock = threading.Lock()       # one lock guards the whole structure
+
+    def get(self, key):
+        with self.lock:                    # the whole method runs as one unit
+            if key not in self.data:
+                return -1
+            self.data.move_to_end(key)
+            return self.data[key]
+
+    def put(self, key, value):
+        with self.lock:
+            if key in self.data:
+                self.data.move_to_end(key)
+            self.data[key] = value
+            if len(self.data) &gt; self.cap:
+                self.data.popitem(last=False)
+
+cache = SafeLRU(8)
+
+def worker(base):
+    for i in range(500):
+        cache.put(base + i % 10, i)
+        cache.get(base + (i + 3) % 10)
+
+threads = [threading.Thread(target=worker, args=(b,)) for b in (0, 100, 200, 300)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print(len(cache.data))
+assert len(cache.data) == 8</code></pre>
+<pre class="code lang-text"><code>8</code></pre>
+<p>Four threads hammer the cache with 40 different keys, yet it always ends with exactly 8 entries, because the lock makes each <code>get</code> and <code>put</code> one indivisible step. Without it, <code>move_to_end</code> and <code>popitem</code> from different threads can interleave and break the size limit or raise errors.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> "each dictionary operation is atomic in Python, so my class is safe". A single operation may be; a <em>sequence</em> is not, because another thread can run between your <code>if key in d</code> and your <code>d[key] += 1</code>. <strong>Right:</strong> protect the whole sequence with one lock, keep the locked part short, and never take two locks in different orders in two places (a <strong>deadlock</strong>: both wait forever).</div></div>
+<h3>Going deeper</h3>
+<ul>
+<li>The global interpreter lock (GIL) lets one thread run Python bytecode at a time, but threads can still switch between bytecode steps, so compound operations are not safe.</li>
+<li>Locking choices: one big lock (simple, threads wait) or one lock per shard of keys (more parallel, harder across shards).</li>
+<li>"How would you scale this?" Shard by key with consistent hashing, cache hot reads, put a Bloom filter in front of misses (skip the disk read on "definitely not").</li>
+</ul>
+<h2 id="s9-chapter-recap">Chapter recap</h2>
+<ul>
+<li>A design question matches operations to structures. Name the slow operation, then the structure that makes it fast.</li>
+<li>Typical shape: <strong>dictionary for lookup + ordered structure for the rule</strong>, with one invariant keeping them in sync.</li>
+<li>LRU = dictionary + doubly linked list (or <code>OrderedDict</code>). Every read and write moves the key to newest; eviction deletes from <em>both</em> structures. LFU adds a count per key and one ordered bucket per count.</li>
+<li>Min stack: aux stack of running minimums. Queue from two stacks: pour only when the outbox is empty. Iterator: hold the next value ready; stack of iterators for nesting.</li>
+<li>Rate limiter: deque of allowed timestamps, drop expired from the front. Time store and snapshot array: store changes only, read with <code>bisect_right(...) - 1</code>.</li>
+<li>Random set: packed list + value-to-index dict; move the last element into the hole and fix its index before deleting the key.</li>
+<li>Autocomplete: trie walk, then a heap keyed (-count, word). Union-find: leader to leader, union by size, path compression.</li>
+<li>Awareness: a Bloom filter never says a false "no"; consistent hashing moves only about 1/N of the keys when a server joins; a lock must guard a whole sequence, not one operation.</li>
+</ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>When to use</th><th>Template idea</th><th>Time</th><th>Space</th></tr></thead><tbody>
+<tr><td>LRU cache</td><td>Fixed capacity, evict least recently used</td><td>dict key to node + doubly linked list with sentinels; move to front on every use</td><td>O(1) get and put</td><td>O(capacity)</td></tr>
+<tr><td>LFU cache</td><td>Evict least frequently used, ties by recency</td><td>key to count, count to OrderedDict, track <code>min_freq</code></td><td>O(1) get and put</td><td>O(capacity)</td></tr>
+<tr><td>Min stack</td><td>Stack plus O(1) minimum or maximum</td><td>second stack of running minimums, pushed and popped in step</td><td>O(1) all</td><td>O(n)</td></tr>
+<tr><td>Queue from two stacks</td><td>FIFO using only LIFO tools</td><td>inbox for pushes, outbox for pops, pour only when outbox is empty</td><td>O(1) amortised</td><td>O(n)</td></tr>
+<tr><td>Lazy iterator</td><td>next / has_next over nested or merged data</td><td>stack of iterators; keep the next value ready</td><td>O(1) amortised per item</td><td>O(depth)</td></tr>
+<tr><td>Sliding-window rate limiter</td><td>At most k events per w seconds</td><td>deque of timestamps; pop expired from the front</td><td>O(1) amortised</td><td>O(k) per user</td></tr>
+<tr><td>Time store / snapshot array</td><td>Value of a key at a past time or snapshot</td><td>per-key sorted (time, value) lists; <code>bisect_right(...) - 1</code></td><td>O(1) write, O(log n) read</td><td>O(changes)</td></tr>
+<tr><td>Random set</td><td>Insert, delete, random pick all O(1)</td><td>packed list + dict value to index; swap with last, pop</td><td>O(1) average</td><td>O(n)</td></tr>
+<tr><td>Trie + heap autocomplete</td><td>Top k words for a typed prefix</td><td>walk prefix, collect subtree, <code>nsmallest</code> with key (-count, word)</td><td>O(L + S + M log k)</td><td>O(total letters)</td></tr>
+<tr><td>Union-find (DSU)</td><td>Merge groups, same-group queries, first cycle edge</td><td>parent array, union by size, path compression</td><td>about O(1) per op</td><td>O(n)</td></tr>
+<tr><td>Bloom filter</td><td>Huge "seen before?" set; rare false yes is fine</td><td>k stable hashes set and check k bits</td><td>O(k)</td><td>m bits</td></tr>
+<tr><td>Consistent hashing</td><td>Spread keys over servers that come and go</td><td>sorted ring of virtual nodes; binary search the next position</td><td>O(log V) lookup</td><td>O(V)</td></tr>
+<tr><td>Lock for thread safety</td><td>Many threads share one structure</td><td>one lock around each whole operation; shard locks if needed</td><td>adds waiting</td><td>O(1) per lock</td></tr>
+</tbody></table></div>
+
+<h2 id="s10-practice-set">Practice set</h2>
+<p>Try each problem on paper first. They run from easy to hard and mix concepts, hand traces, predict-the-output, find-the-bug, code and interview questions. Code for predict and find-the-bug problems is shown without output so you can run it yourself.</p>
+<p class="problem"><span class="pl">Problem 11.9.1</span> (easy) Which two structures make an LRU cache O(1), and what job does each do?</p>
+<p><strong>Answer:</strong> A hash map and a doubly linked list. The map finds a key's node in O(1) (a list alone would scan). The list keeps nodes from newest to oldest and unlinks any node you hold in O(1) (a map alone has no order). Sentinels remove the empty-list special cases.</p>
+<p class="problem"><span class="pl">Problem 11.9.2</span> (easy) A min stack gets push 4, 2, 6, 2, then pop twice. Give <code>items</code>, <code>mins</code> and <code>get_min()</code> at the end.</p>
+<p><strong>Answer:</strong> After four pushes: items [4, 2, 6, 2], mins [4, 2, 2, 2]. Two pops remove the 2 and the 6: items [4, 2], mins [4, 2], <code>get_min()</code> = 2, because the earlier 2 is still there.</p>
+<p class="problem"><span class="pl">Problem 11.9.3</span> (easy, predict the output) What does this print?</p>
+<pre class="code lang-python"><code>from collections import OrderedDict
+
+d = OrderedDict()
+d["a"] = 1
+d["b"] = 2
+d["c"] = 3
+d.move_to_end("a")
+d.popitem(last=False)
+print(list(d))</code></pre>
+<p><strong>Answer:</strong> <code>['c', 'a']</code>. Start a, b, c. <code>move_to_end("a")</code> gives b, c, a. <code>popitem(last=False)</code> removes the first item, b.</p>
+<p class="problem"><span class="pl">Problem 11.9.4</span> (easy) A limiter allows 2 requests per 5 seconds (drop timestamps &lt;= t - 5). Requests come at 1, 2, 3, 6, 7. Which are allowed?</p>
+<p><strong>Answer:</strong> t=1: allow, [1]. t=2: allow, [1, 2]. t=3: nothing expires (3 - 5 = -2), size 2, deny. t=6: drop times &lt;= 1, so [2], allow, [2, 6]. t=7: drop times &lt;= 2, so [6], allow, [6, 7]. Result: allow, allow, deny, allow, allow.</p>
+<p class="problem"><span class="pl">Problem 11.9.5</span> (easy) A random set has items [5, 6, 7, 8] and pos {5: 0, 6: 1, 7: 2, 8: 3}. Show both after <code>remove(5)</code>.</p>
+<p><strong>Answer:</strong> i = 0, last = 8. Set items[0] = 8 and pos[8] = 0, pop the last slot: items [8, 6, 7]. Delete pos[5]: pos {6: 1, 7: 2, 8: 0}. Check: items[pos[x]] == x for 6, 7 and 8.</p>
+<p class="problem"><span class="pl">Problem 11.9.6</span> (medium, find the bug) This LRU returns a wrong answer for one input. What does it print, what should it print, and what is the fix?</p>
+<pre class="code lang-python"><code>from collections import OrderedDict
+
+class BadLRU:
+    def __init__(self, cap):
+        self.cap, self.d = cap, OrderedDict()
+
+    def get(self, k):
+        return self.d.get(k, -1)
+
+    def put(self, k, v):
+        if k in self.d:
+            self.d.move_to_end(k)
+        self.d[k] = v
+        if len(self.d) &gt; self.cap:
+            self.d.popitem(last=False)
+
+c = BadLRU(2)
+c.put(1, 1)
+c.put(2, 2)
+print(c.get(1))
+c.put(3, 3)
+print(c.get(1))</code></pre>
+<p><strong>Answer:</strong> It prints 1, then -1. A correct LRU prints 1, then 1: reading key 1 should make it newest, so key 2 is evicted when 3 arrives. The bug: <code>get</code> never calls <code>move_to_end</code>. Fix: if the key exists, move it to the end, then return it.</p>
+<p class="problem"><span class="pl">Problem 11.9.7</span> (medium, find the bug) This min stack fails on a tiny input. Find it, say what is printed, and fix it.</p>
+<pre class="code lang-python"><code>class BadMinStack:
+    def __init__(self):
+        self.items, self.mins = [], []
+
+    def push(self, x):
+        self.items.append(x)
+        if not self.mins or x &lt; self.mins[-1]:
+            self.mins.append(x)
+
+    def pop(self):
+        x = self.items.pop()
+        if x == self.mins[-1]:
+            self.mins.pop()
+        return x
+
+    def get_min(self):
+        return self.mins[-1]
+
+s = BadMinStack()
+s.push(2)
+s.push(2)
+s.pop()
+try:
+    print(s.get_min())
+except IndexError:
+    print("crash: mins is empty")</code></pre>
+<p><strong>Answer:</strong> Duplicate minimum: push 2, push 2, pop. The second 2 is not strictly smaller, so it is never recorded. The pop then removes the only record, leaving <code>mins</code> empty while a 2 is still on the stack. It prints "crash: mins is empty". Fix: record when <code>x &lt;= self.mins[-1]</code>.</p>
+<p class="problem"><span class="pl">Problem 11.9.8</span> (medium, predict the output) What does this print?</p>
+<pre class="code lang-python"><code>inbox, outbox = [], []
+
+def push(x):
+    inbox.append(x)
+
+def pop():
+    if not outbox:
+        while inbox:
+            outbox.append(inbox.pop())
+    return outbox.pop()
+
+push(1)
+push(2)
+a = pop()
+push(3)
+b = pop()
+c = pop()
+print(a, b, c, inbox, outbox)</code></pre>
+<p><strong>Answer:</strong> <code>1 2 3 [] []</code>. After push 1, 2: inbox [1, 2]. First pop pours: outbox [2, 1], returns 1, leaving [2]. push 3: inbox [3]. Second pop finds the outbox non-empty and returns 2. Third pop finds it empty, pours [3], returns 3.</p>
+<p class="problem"><span class="pl">Problem 11.9.9</span> (medium, find the bug) The function should return the value current at time t. For which queries is it wrong? Fix it.</p>
+<pre class="code lang-python"><code>from bisect import bisect_left
+
+ts = [1, 4, 9]
+vals = ["a", "b", "c"]
+
+def get(t):
+    i = bisect_left(ts, t)
+    return vals[i - 1] if i else ""
+
+print(repr(get(9)), repr(get(5)), repr(get(1)))</code></pre>
+<p><strong>Answer:</strong> It prints <code>'b' 'b' ''</code>. The query 5 is right, but 9 should give 'c' and 1 should give 'a'. <code>bisect_left</code> counts only timestamps strictly below t, so an exact match is skipped. Fix: <code>bisect_right(ts, t)</code>, which counts timestamps at most t.</p>
+<p class="problem"><span class="pl">Problem 11.9.10</span> (medium, design) A limiter serves 1,000,000 users at 100 requests per minute each. What does the sliding-window log cost, and what would you use instead?</p>
+<p><strong>Answer:</strong> Up to 100 timestamps per user: up to 100,000,000 numbers. A fixed-window counter or a token bucket keeps two numbers per user (about 2,000,000 in total). The trade-off: the log is exact but heavy; the counter can allow up to 200 requests around a window edge; the token bucket allows controlled bursts.</p>
+<p class="problem"><span class="pl">Problem 11.9.11</span> (medium) Nodes 0 to 6 start apart. Apply union(0,1), (1,2), (3,4), (5,6), (4,5), (2,0). How many groups after each step, and which union returns False?</p>
+<p><strong>Answer:</strong> 7 at the start, then 6, 5, 4, 3, 2 after the first five unions ((4,5) joins {3,4} and {5,6}). union(2,0) joins nodes already in {0,1,2}: it returns False and the count stays 2. Final groups {0,1,2} and {3,4,5,6}.</p>
+<p class="problem"><span class="pl">Problem 11.9.12</span> (medium) A Bloom filter has 8 bits, 2 hashes, and bits 1, 3, 4, 6 set. X hashes to (1, 4), Y to (3, 5), Z to (0, 6). What does the filter answer for each? Can you conclude X was added?</p>
+<p><strong>Answer:</strong> X: both bits set, "maybe". Y: bit 5 is 0, "definitely not". Z: bit 0 is 0, "definitely not". You cannot conclude X was added: other items may have set bits 1 and 4 (a false positive). A "no" is always trustworthy; a "maybe" is not.</p>
+<p class="problem"><span class="pl">Problem 11.9.13</span> (medium) Words and counts: apple 4, app 6, apply 4, ape 1, bat 9. Autocomplete for "ap" with k = 2, and for "a" with k = 4? Higher count first, ties alphabetical.</p>
+<p><strong>Answer:</strong> Keys (-count, word): app (-6), apple (-4), apply (-4), ape (-1). "ap", k = 2: <code>['app', 'apple']</code> (apple beats apply since "e" is before "y"). "a", k = 4: <code>['app', 'apple', 'apply', 'ape']</code>. "bat" never starts with "a", so it is never considered.</p>
+<p class="problem"><span class="pl">Problem 11.9.14</span> (hard) Add a time-to-live to the OrderedDict LRU: an entry expires <code>ttl</code> units after it was set. A <code>get</code> at or after expiry returns -1 and removes the entry. Time is passed in as <code>now</code>.</p>
+<p><strong>Answer:</strong> Store (value, expires_at). On <code>get</code>, check expiry before refreshing, with an explicit boundary (<code>expires &lt;= now</code> means expired). Limitation: expired entries nobody reads still occupy room until evicted; production caches add a sweep or a min-heap of expiry times.</p>
+<pre class="code lang-python"><code>from collections import OrderedDict
+
+class TTLCache:
+    def __init__(self, capacity, ttl):
+        self.cap, self.ttl = capacity, ttl
+        self.data = OrderedDict()               # key -&gt; (value, expires_at)
+
+    def get(self, key, now):
+        item = self.data.get(key)
+        if item is None:
+            return -1
+        value, expires = item
+        if expires &lt;= now:                      # expired: treat as missing
+            del self.data[key]
+            return -1
+        self.data.move_to_end(key)
+        return value
+
+    def put(self, key, value, now):
+        if key in self.data:
+            self.data.move_to_end(key)
+        self.data[key] = (value, now + self.ttl)
+        if len(self.data) &gt; self.cap:
+            self.data.popitem(last=False)
+
+c = TTLCache(2, 10)
+c.put("a", 1, now=0)
+c.put("b", 2, now=1)
+print(c.get("a", 5), c.get("a", 10), c.get("b", 10), c.get("b", 11))</code></pre>
+<pre class="code lang-text"><code>1 -1 2 -1</code></pre>
+<p class="problem"><span class="pl">Problem 11.9.15</span> (hard) A hit counter has <code>hit(t)</code> and <code>count(t)</code> (hits in (t - 300, t]), calls in non-decreasing time. A deque of timestamps works, but memory grows with hits. Use a fixed 300 buckets instead.</p>
+<p><strong>Answer:</strong> Bucket t mod 300 stores the second it holds (<code>stamp</code>) and its hit count. A hit resets the bucket if its stamp is old. <code>count(t)</code> sums buckets with a stamp in (t - 300, t]. Memory is 600 numbers, whatever the number of hits.</p>
+<pre class="code lang-python"><code>class HitCounter300:
+    def __init__(self):
+        self.stamp = [0] * 300       # the second each bucket currently holds
+        self.hits = [0] * 300
+
+    def hit(self, t):
+        i = t % 300
+        if self.stamp[i] != t:       # bucket holds an old second: reset it
+            self.stamp[i] = t
+            self.hits[i] = 0
+        self.hits[i] += 1
+
+    def count(self, t):
+        return sum(h for s, h in zip(self.stamp, self.hits) if t - 300 &lt; s &lt;= t)
+
+h = HitCounter300()
+for t in (1, 2, 3):
+    h.hit(t)
+r = [h.count(4)]
+h.hit(300)
+r.append(h.count(300))
+h.hit(301)
+r.append(h.count(301))
+r.append(h.count(302))
+print(r)
+assert r == [3, 4, 4, 3]</code></pre>
+<pre class="code lang-text"><code>[3, 4, 4, 3]</code></pre>
+<p class="problem"><span class="pl">Problem 11.9.16</span> (hard) Design an iterator over several lists in round-robin order: the first item of each list, then the second of each, skipping lists that run out. [[1, 2, 3], [4], [], [5, 6]] gives 1, 4, 5, 2, 6, 3.</p>
+<p><strong>Answer:</strong> A deque of (list, index) pairs for lists that still have items. <code>next</code> takes the front pair, reads the item, and puts the pair at the back with index + 1 only if more items remain. <code>has_next</code> is "the deque is not empty". O(1) per item.</p>
+<pre class="code lang-python"><code>from collections import deque
+
+class RoundRobin:
+    def __init__(self, lists):
+        self.q = deque((lst, 0) for lst in lists if lst)
+
+    def has_next(self):
+        return bool(self.q)
+
+    def next(self):
+        lst, i = self.q.popleft()
+        if i + 1 &lt; len(lst):
+            self.q.append((lst, i + 1))   # go to the back of the line
+        return lst[i]
+
+it = RoundRobin([[1, 2, 3], [4], [], [5, 6]])
+out = []
+while it.has_next():
+    out.append(it.next())
+print(out)
+assert out == [1, 4, 5, 2, 6, 3]</code></pre>
+<pre class="code lang-text"><code>[1, 4, 5, 2, 6, 3]</code></pre>
+<p class="problem"><span class="pl">Problem 11.9.17</span> (hard) Servers go from 4 to 5 and keys sit on server <code>h % N</code>. What fraction of keys keep their server? Compare with consistent hashing.</p>
+<p><strong>Answer:</strong> The pair (h mod 4, h mod 5) repeats every 20 values, and r mod 4 equals r mod 5 only for r = 0, 1, 2, 3: 4 of 20. So 20 percent stay and <strong>80 percent move</strong>. Consistent hashing moves only the new server's share, about 1/5 = 20 percent.</p>
+<pre class="code lang-python"><code>same = [r for r in range(20) if r % 4 == r % 5]
+print(same, len(same), "of 20")
+print(sum(k % 4 == k % 5 for k in range(100000)), "of 100000")</code></pre>
+<pre class="code lang-text"><code>[0, 1, 2, 3] 4 of 20
+20000 of 100000</code></pre>
+<p class="problem"><span class="pl">Problem 11.9.18</span> (hard, thread safety) Two threads call this with "x" while it is absent from <code>counts</code>. What can go wrong, and what is the fix?</p>
+<pre class="code lang-python"><code>def add_word(counts, w):
+    if w in counts:
+        counts[w] += 1
+    else:
+        counts[w] = 1</code></pre>
+<p><strong>Answer:</strong> A check-then-act race. Both threads see "x" absent, both take the else branch and set the count to 1: two words added, count 1, an update lost. Fix: make check and update one locked step. Four threads adding "x" 1,000 times each then always give 4,000.</p>
+<pre class="code lang-python"><code>import threading
+
+counts = {}
+lock = threading.Lock()
+
+def add_word(w):
+    with lock:                          # check and update as one unit
+        counts[w] = counts.get(w, 0) + 1
+
+def work():
+    for _ in range(1000):
+        add_word("x")
+
+threads = [threading.Thread(target=work) for _ in range(4)]
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+print(counts)</code></pre>
+<pre class="code lang-text"><code>{'x': 4000}</code></pre>
+<p class="problem"><span class="pl">Problem 11.9.19</span> (hard) Design a leaderboard. <code>add_score(player, score)</code> adds to a total (creating the player if needed). <code>top(k)</code> returns the sum of the k highest totals. <code>reset(player)</code> removes the player. Give complexities and one way to speed up <code>top</code>.</p>
+<p><strong>Answer:</strong> A dictionary gives O(1) add and reset. <code>heapq.nlargest(k, values)</code> scans n totals with a heap of size k: O(n log k). If <code>top</code> is called far more often than scores change, keep totals in a sorted structure so <code>top</code> reads the first k directly.</p>
+<pre class="code lang-python"><code>import heapq
+
+class Leaderboard:
+    def __init__(self):
+        self.score = {}
+
+    def add_score(self, player, s):
+        self.score[player] = self.score.get(player, 0) + s
+
+    def top(self, k):
+        return sum(heapq.nlargest(k, self.score.values()))
+
+    def reset(self, player):
+        self.score.pop(player, None)
+
+lb = Leaderboard()
+for p, s in ((1, 73), (2, 56), (3, 39), (4, 51), (5, 4)):
+    lb.add_score(p, s)
+a = lb.top(1)
+lb.reset(1)
+lb.reset(2)
+lb.add_score(2, 51)
+print(a, lb.top(3))
+assert (a, lb.top(3)) == (73, 141)</code></pre>
+<pre class="code lang-text"><code>73 141</code></pre>
+<p class="problem"><span class="pl">Problem 11.9.20</span> (hard, interview) A cache fronts a database; most requests hit a few popular rows. Once a night a job reads a huge table once, start to end. What happens to an LRU cache, to an LFU cache, and how do you protect the LRU?</p>
+<p><strong>Answer:</strong> LRU: every scanned row is "most recent" and pushes out the older, popular rows, so the hit rate collapses until the cache warms up (cache pollution). LFU: scanned rows have count 1 and are evicted first, so popular rows survive; the cost is that LFU is slow to forget something popular long ago. Protect LRU by letting the scan bypass the cache, or use a scan-resistant variant such as segmented LRU or 2Q, which promotes an item only on its second use.</p>
+
+<h2 id="s11-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>&#10024; AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient DSA coach. I am learning Python data structure design for interviews. Quiz me on LRU and LFU caches, min stack, queue from two stacks, iterators, rate limiters, time-based stores, snapshot arrays, O(1) random sets, trie plus heap autocomplete, union-find applications, Bloom filters, consistent hashing and thread safety. Ask ONE question at a time, easy first, then harder. After each answer, say if I am right, show the reasoning step by step, and name the two structures I should have combined and the invariant that keeps them in sync. After 10 questions, list my weakest topics and give me three practice problems for each.</pre></div>
+<div class="prompt"><div class="ph"><span>&#10024; AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>Review my design solution like a strict interviewer. I will paste a Python class. Check in this order: (1) does every method meet the required complexity, and which line breaks it if not; (2) what is the invariant between the structures, and can you find an input that breaks it (duplicates, capacity 0 or 1, removing the last element, empty structure, equal timestamps); (3) boundary choices such as less-than versus less-than-or-equal; (4) what goes wrong with two threads. Point to exact lines first, then show three tiny tests that catch the most likely bug. Do not rewrite everything.</pre></div>
+<div class="prompt"><div class="ph"><span>&#10024; AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>Run a 30-minute mock design-a-data-structure interview with me in Python. Pick one problem at random from: LRU cache, LFU cache, min stack, queue using stacks, hit counter, rate limiter, time-based key-value store, snapshot array, insert-delete-getRandom O(1), autocomplete system, accounts merge, nested list iterator. State it in plain words with one example and let me ask clarifying questions. Wait for my API and brute force BEFORE I code, then ask which structures I will combine and why. Give hints only if I am stuck for a minute. At the end score me out of 10 on clarifying questions, API and target complexity, brute force, choice of structures, correct code, a small trace, and threads or scale.</pre></div>
+<div class="readbtn"><button class="btn" data-read="study:dsa:ch11">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch10.html">← Chapter 10: Greedy, Intervals, Bits and Math Tricks</a><a class="btn" href="ch12.html">Chapter 12: Pattern Recognition, Mock Interviews and a 12-Week Plan →</a></div></div><script src="../../assets/study.js"></script></body></html>

@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 11: Concurrency and Performance</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Python &amp; Software Engineering</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 11</div><h1>Concurrency and Performance</h1><p>Measure first, then make it faster: threads, processes, asyncio, profiling and vectorization.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-11-1-measure-first-timeit-cprofile-and-tracemalloc">11.1 Measure First: timeit, cProfile and tracemalloc</a></li><li><a href="#s2-11-2-the-gil-threads-processes-and-who-wins">11.2 The GIL: Threads, Processes and Who Wins</a></li><li><a href="#s3-11-3-concurrent-futures-and-asyncio">11.3 concurrent.futures and asyncio</a></li><li><a href="#s4-11-4-vectorization-algorithms-and-native-speed">11.4 Vectorization, Algorithms and Native Speed</a></li><li><a href="#s5-11-5-queues-back-pressure-and-little-s-law">11.5 Queues, Back-Pressure and Little&#x27;s Law</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p>Your script takes 40 minutes to call 2,000 URLs, and a data job that should finish overnight is still running at breakfast. Every programmer learns the golden rule: do not guess where the time goes, measure it. In this chapter you will learn to measure Python code (<code>timeit</code>, <code>cProfile</code>, <code>tracemalloc</code>), to understand why Python threads do not speed up some jobs (the GIL), and to choose between threads, processes and <code>asyncio</code>. You will also see why a loop in pure Python is slow, and connect all this to Little's law, a formula from queueing theory. All the timings below are real runs on one laptop (12 CPU cores, Python 3.14). Your numbers will differ, but the <em>shapes</em> will match.</p>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 11: Concurrency and Performance</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Python &amp; Software Engineering</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 11</div><h1>Concurrency and Performance</h1><p>Measure first, then make it faster: threads, processes, asyncio, profiling and vectorization.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-11-1-measure-first-timeit-cprofile-and-tracemalloc">11.1 Measure First: timeit, cProfile and tracemalloc</a></li><li><a href="#s2-11-2-the-gil-threads-processes-and-who-wins">11.2 The GIL: Threads, Processes and Who Wins</a></li><li><a href="#s3-11-3-concurrent-futures-and-asyncio">11.3 concurrent.futures and asyncio</a></li><li><a href="#s4-11-4-vectorization-algorithms-and-native-speed">11.4 Vectorization, Algorithms and Native Speed</a></li><li><a href="#s5-11-5-queues-back-pressure-and-little-s-law">11.5 Queues, Back-Pressure and Little's Law</a></li><li><a href="#s6-11-6-modern-asyncio-taskgroup-timeouts-limits-queues-and-cancellation">11.6 Modern asyncio: TaskGroup, Timeouts, Limits, Queues and Cancellation</a></li><li><a href="#s7-11-7-locks-deadlocks-memory-and-data-structure-speed">11.7 Locks, Deadlocks, Memory and Data-Structure Speed</a></li><li><a href="#s8-chapter-recap">Chapter recap</a></li><li><a href="#s9-practice-set">Practice set</a></li><li><a href="#s10-prompt-pack">Prompt pack</a></li></ol></details><p>Your script takes 40 minutes to call 2,000 URLs, and a data job that should finish overnight is still running at breakfast. Every programmer learns the golden rule: do not guess where the time goes, measure it. In this chapter you will learn to measure Python code (<code>timeit</code>, <code>cProfile</code>, <code>tracemalloc</code>), to understand why Python threads do not speed up some jobs (the GIL), and to choose between threads, processes and <code>asyncio</code>. You will also see why a loop in pure Python is slow, and connect all this to Little's law, a formula from queueing theory. All the timings below are real runs on one laptop (12 CPU cores, Python 3.14). Your numbers will differ, but the <em>shapes</em> will match.</p>
 <blockquote><p><strong>A note on what was run.</strong> Only the Python 3.14 standard library was available, with no network. <code>numpy</code>, <code>pandas</code>, <code>numba</code>, <code>line_profiler</code> and <code>memory_profiler</code> were <strong>not run here</strong>. Their snippets are standard usage and marked as such.</p></blockquote>
 <h2 id="s1-11-1-measure-first-timeit-cprofile-and-tracemalloc">11.1 Measure First: timeit, cProfile and tracemalloc</h2>
 <div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A doctor does not operate before the scan. Slow code is the same: the slow part is almost never where you think. You first measure the whole, then find the one hot spot, then fix only that. In code terms: first time the whole script, then drill into the slowest function.</div></div>
@@ -436,11 +436,236 @@ concurrency 20: measured   370.6 req/s   predicted   400.0 req/s</code></pre>
 <div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting the stop signal. Consumers wait forever on <code>q.get()</code> and the program never exits. Use a sentinel per consumer, or <code>q.task_done()</code> with <code>q.join()</code>.</div></div>
 <p><strong>Check yourself</strong></p>
 <ol><li>State Little's law and its units. Answer: <code>L = λ × W</code>: requests in system = requests per second × seconds each.</li><li>Latency is 0.1 s and you run 30 concurrent workers. What throughput do you expect? Answer: 30 ÷ 0.1 = 300 requests per second (at best).</li><li>What is back-pressure? Answer: a full bounded queue makes the producer wait, so it slows to the speed of the consumers.</li></ol>
-<h2 id="s6-chapter-recap">Chapter recap</h2>
+<h2 id="s6-11-6-modern-asyncio-taskgroup-timeouts-limits-queues-and-cancellation">11.6 Modern asyncio: TaskGroup, Timeouts, Limits, Queues and Cancellation</h2>
+<p>Section 11.3 introduced <code>async</code> and <code>await</code>. Real programs also need to stop work that takes too long, cap how much runs at once, pass work between tasks, and clean up after cancellation. Python 3.11 and newer give you clean tools for each. All blocks below were run.</p>
+<figure><img src="images/ch11_event_loop.png" alt="Timeline of three fetch tasks on one thread: short blue running bursts, long grey waits that overlap" loading="lazy"/><figcaption>One thread, three tasks. The loop runs a task until it hits <code>await</code>, then switches. The waits overlap, so the total is about 1.8 s, not 3.6 s.</figcaption></figure>
+<p>How to read it: blue means Python code is running and nothing else can. Grey means the task is parked waiting on the network and the loop is free to run another. Asyncio helps exactly when the grey is much longer than the blue.</p>
+<h3>TaskGroup and timeout</h3>
+<p>A <code>TaskGroup</code> runs several tasks and waits for all of them when the <code>async with</code> block ends. If one task fails, the group cancels the others and raises an <code>ExceptionGroup</code> (section 6.6), which you catch with <code>except*</code>. This beats <code>gather</code>, which can leave siblings running after a failure. <code>asyncio.timeout(seconds)</code> cancels the block inside it and raises <code>TimeoutError</code>.</p>
+<p class="problem"><span class="pl">Problem 11.6.1</span> Run two fetches together and read both results. Then run a slow fetch beside one that fails, and show that the failure surfaces cleanly and the slow one does not keep running. Finally, put a 0.05 s limit on a 1 s wait.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>async with asyncio.TaskGroup() as tg:</code> then <code>tg.create_task(...)</code> for each job. After the block, every task is done, so <code>.result()</code> is safe.</td></tr><tr><th>Step 2</th><td>The failing task raises <code>ValueError("bad")</code> after 0.01 s. The group cancels the 0.5 s task and raises an <code>ExceptionGroup</code>. <code>except* ValueError</code> unpacks it.</td></tr><tr><th>Step 3</th><td><code>async with asyncio.timeout(0.05):</code> around <code>await asyncio.sleep(1)</code> raises <code>TimeoutError</code> after 0.05 s.</td></tr></table>
+<pre class="code lang-python"><code>import asyncio
+
+async def fetch(name, delay, fail=False):
+    await asyncio.sleep(delay)
+    if fail:
+        raise ValueError(name)
+    return name
+
+async def main():
+    async with asyncio.TaskGroup() as tg:
+        t1 = tg.create_task(fetch("a", 0.02))
+        t2 = tg.create_task(fetch("b", 0.01))
+    print(t1.result(), t2.result())
+    try:
+        async with asyncio.TaskGroup() as tg:
+            tg.create_task(fetch("ok", 0.5))
+            tg.create_task(fetch("bad", 0.01, fail=True))
+    except* ValueError as eg:
+        print("caught", [str(e) for e in eg.exceptions])
+    try:
+        async with asyncio.timeout(0.05):
+            await asyncio.sleep(1)
+    except TimeoutError:
+        print("timed out")
+asyncio.run(main())</code></pre>
+<pre class="code lang-text"><code>a b
+caught ['bad']
+timed out</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Calling a blocking function such as <code>time.sleep(1)</code> or <code>requests.get(...)</code> inside an <code>async def</code>. The whole loop freezes, and every other task stalls with it. Use <code>await asyncio.sleep</code>, an async client such as httpx (not run here), or hand the blocking call to a thread with <code>await asyncio.to_thread(fn, ...)</code>.</div></div>
+<h3>Limiting concurrency, queues and threads</h3>
+<p>Starting 10,000 requests at once will get you banned or crash a server. A <code>Semaphore(n)</code> lets at most <code>n</code> tasks into a section at the same time. An <code>asyncio.Queue</code> with <code>maxsize</code> lets a producer and a consumer work at different speeds: when the queue is full, <code>put</code> waits, which is back-pressure from section 11.5. <code>to_thread</code> runs an ordinary blocking function in a worker thread and gives you an awaitable.</p>
+<p class="problem"><span class="pl">Problem 11.6.2</span> Run 10 jobs with at most 3 at a time and prove the limit held. Then pass 6 numbers through a queue of size 2 and square them. Then run a blocking <code>sum</code> in a thread.</p>
+<table class="steps"><tr><th>Limit</th><td>Each worker enters <code>async with sem</code>, raises a counter, sleeps, lowers it. The largest counter value seen is the peak.</td></tr><tr><th>Queue</th><td>The producer puts 0..5 and then <code>None</code> as a stop signal. The consumer loops until it sees <code>None</code>.</td></tr><tr><th>Thread</th><td><code>await asyncio.to_thread(sum, range(1000))</code> returns 499500 (the sum 0+1+...+999 is 999 x 1000 / 2).</td></tr></table>
+<pre class="code lang-python"><code>import asyncio
+
+async def worker(i, sem, state):
+    async with sem:
+        state["now"] += 1
+        state["peak"] = max(state["peak"], state["now"])
+        await asyncio.sleep(0.01)
+        state["now"] -= 1
+    return i
+
+async def producer(q, n):
+    for i in range(n):
+        await q.put(i)
+    await q.put(None)
+
+async def consumer(q, out):
+    while (item := await q.get()) is not None:
+        out.append(item * item)
+
+async def main():
+    sem = asyncio.Semaphore(3)
+    state = {"now": 0, "peak": 0}
+    res = await asyncio.gather(*(worker(i, sem, state) for i in range(10)))
+    print(res, "peak concurrency", state["peak"])
+    q = asyncio.Queue(maxsize=2)
+    out = []
+    await asyncio.gather(producer(q, 6), consumer(q, out))
+    print(out)
+    r = await asyncio.to_thread(sum, range(1000))
+    print("thread result", r)
+asyncio.run(main())</code></pre>
+<pre class="code lang-text"><code>[0, 1, 2, 3, 4, 5, 6, 7, 8, 9] peak concurrency 3
+[0, 1, 4, 9, 16, 25]
+thread result 499500</code></pre>
+<h3>Cancellation</h3>
+<p><code>task.cancel()</code> does not kill a task. It raises <code>CancelledError</code> inside the task at its next <code>await</code>, so <code>finally</code> blocks and <code>except</code> handlers can clean up. Always re-raise the error after cleanup, otherwise the task refuses to stop.</p>
+<p class="problem"><span class="pl">Problem 11.6.3</span> Start a task that waits 10 seconds, cancel it after 0.01 s, and show that its cleanup code ran.</p>
+<table class="steps"><tr><th>Step 1</th><td><code>create_task</code> starts the task. <code>await asyncio.sleep(0.01)</code> lets it begin.</td></tr><tr><th>Step 2</th><td><code>t.cancel()</code> schedules <code>CancelledError</code> inside the task.</td></tr><tr><th>Step 3</th><td>The task prints, then <code>raise</code> re-raises. Awaiting the task from outside raises <code>CancelledError</code> there too, and <code>t.cancelled()</code> is <code>True</code>.</td></tr></table>
+<pre class="code lang-python"><code>import asyncio
+
+async def forever():
+    try:
+        await asyncio.sleep(10)
+    except asyncio.CancelledError:
+        print("cleanup ran")
+        raise
+
+async def main():
+    t = asyncio.create_task(forever())
+    await asyncio.sleep(0.01)
+    t.cancel()
+    try:
+        await t
+    except asyncio.CancelledError:
+        print("task cancelled:", t.cancelled())
+asyncio.run(main())</code></pre>
+<pre class="code lang-text"><code>cleanup ran
+task cancelled: True</code></pre>
+<h3>Going deeper</h3>
+<ul><li><strong>contextvars.</strong> A <code>ContextVar</code> holds a value that is separate per task (and per thread), for example a request id for logging. Unlike a global, each task started with <code>create_task</code> gets a copy of the current context, so concurrent requests do not overwrite each other.</li><li><strong>Hidden tasks.</strong> A task made with <code>create_task</code> and not stored may be garbage collected before it finishes, because the loop keeps only a weak reference. A <code>TaskGroup</code> holds the references for you, another reason to prefer it.</li><li><strong>Not run here:</strong> a rate-limited crawler needs a real network and httpx. The pattern is the Semaphore above plus one <code>async with httpx.AsyncClient() as c:</code> shared by all tasks.</li></ul>
+<h2 id="s7-11-7-locks-deadlocks-memory-and-data-structure-speed">11.7 Locks, Deadlocks, Memory and Data-Structure Speed</h2>
+<p>Threads share memory, and that is where the trouble starts. This section shows the lost update, the lock that cures it, a deadlock and its fix, then moves to memory: reference counting, cycles, weak references and the data structure that makes queues cheap.</p>
+<figure><img src="images/ch11_lost_update.png" alt="Two threads both read counter 5, both write 6, final value 6 instead of 7" loading="lazy"/><figcaption>A lost update. Both threads read 5 before either writes, so one increment vanishes.</figcaption></figure>
+<p>How to read it: time runs downward. The danger is the gap between reading the counter and writing it back. A lock closes that gap by making the read-modify-write one indivisible step.</p>
+<p class="problem"><span class="pl">Problem 11.7.1</span> Four threads each add 1 to a shared counter 200,000 times. Compute the correct total, then run it with a lock, and without.</p>
+<table class="steps"><tr><th>Expected</th><td>4 threads x 200,000 = 800,000.</td></tr><tr><th>With lock</th><td><code>with lock:</code> around <code>counter += 1</code> means only one thread is inside at a time. Result must be exactly 800,000.</td></tr><tr><th>Without lock</th><td>The result can be lower than 800,000, or happen to equal it. The only safe claim is "at most 800,000".</td></tr></table>
+<pre class="code lang-python"><code>import threading
+
+def run(use_lock, n=200_000):
+    counter = {"v": 0}
+    lock = threading.Lock()
+    def work():
+        for _ in range(n):
+            if use_lock:
+                with lock:
+                    counter["v"] += 1
+            else:
+                v = counter["v"]
+                counter["v"] = v + 1
+    ts = [threading.Thread(target=work) for _ in range(4)]
+    for t in ts: t.start()
+    for t in ts: t.join()
+    return counter["v"]
+print(run(True))
+print(run(False) &lt;= 800_000)</code></pre>
+<pre class="code lang-text"><code>800000
+True</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Concluding "my code is thread safe" because an unlocked test printed the right number once. Races depend on timing, and on this machine and Python version the unlocked run may well print exactly 800,000 and still be wrong on another. Protect shared writes with a lock by design, not by experiment.</div></div>
+<p class="problem"><span class="pl">Problem 11.7.2</span> Thread 1 takes lock A then wants B. Thread 2 takes B then wants A. Reproduce the deadlock safely (with timeouts so the script ends) and then fix it.</p>
+<table class="steps"><tr><th>Cause</th><td>Each thread holds one lock and waits for the other: a cycle, so neither can ever proceed.</td></tr><tr><th>Safe repro</th><td>Use <code>acquire(timeout=0.3)</code> so a stuck thread gives up and logs it. Real code with a plain <code>with</code> would hang forever.</td></tr><tr><th>Fix</th><td>Every thread takes the locks in the same global order (A, then B). A cycle becomes impossible.</td></tr></table>
+<pre class="code lang-python"><code>import threading, time
+a, b = threading.Lock(), threading.Lock()
+log = []
+def t1():
+    with a:
+        time.sleep(0.05)
+        if b.acquire(timeout=0.3):
+            b.release(); log.append("t1 got both")
+        else:
+            log.append("t1 gave up")
+def t2():
+    with b:
+        time.sleep(0.05)
+        if a.acquire(timeout=0.3):
+            a.release(); log.append("t2 got both")
+        else:
+            log.append("t2 gave up")
+x = [threading.Thread(target=t1), threading.Thread(target=t2)]
+for t in x: t.start()
+for t in x: t.join()
+print(sorted(log))
+def ordered(name):
+    with a:
+        with b:
+            log.append(name + " ordered ok")
+log.clear()
+y = [threading.Thread(target=ordered, args=(n,)) for n in ("t1", "t2")]
+for t in y: t.start()
+for t in y: t.join()
+print(sorted(log))</code></pre>
+<pre class="code lang-text"><code>['t1 gave up', 't2 gave up']
+['t1 ordered ok', 't2 ordered ok']</code></pre>
+<h3>Reference counting, cycles and weak references</h3>
+<p>CPython frees most objects the instant their reference count hits zero. Two objects that point at each other never reach zero, so a second mechanism, the cyclic garbage collector in the <code>gc</code> module, finds and frees such cycles. A <code>weakref</code> points at an object without keeping it alive, which makes it ideal for caches: when nothing else uses the value, the cache entry vanishes.</p>
+<p class="problem"><span class="pl">Problem 11.7.3</span> Build a two-object cycle, delete your names, and show it survives until <code>gc.collect()</code>. Then show a <code>WeakValueDictionary</code> cache that drops an entry on its own.</p>
+<table class="steps"><tr><th>Step 1</th><td>Disable automatic collection so the demo is deterministic. <code>a.other = b</code> and <code>b.other = a</code> make a cycle. Keep a weak reference <code>r</code> to <code>a</code>.</td></tr><tr><th>Step 2</th><td><code>del a, b</code>: the objects are unreachable from your code, but each still has one reference from the other, so <code>r()</code> still returns <code>a</code>.</td></tr><tr><th>Step 3</th><td><code>gc.collect()</code> returns the number of objects it freed (more than 0), and <code>r()</code> becomes <code>None</code>.</td></tr><tr><th>Step 4</th><td>A <code>WeakValueDictionary</code> holding an object has length 1. After <code>del obj</code> (the last strong reference) it has length 0.</td></tr></table>
+<pre class="code lang-python"><code>import gc, weakref
+
+class Node:
+    def __init__(self): self.other = None
+gc.disable()
+a, b = Node(), Node()
+a.other, b.other = b, a
+r = weakref.ref(a)
+del a, b
+print("alive after del:", r() is not None)
+print("collected objects > 0:", gc.collect() &gt; 0)
+print("alive after gc:", r() is not None)
+gc.enable()
+
+class Big: pass
+cache = weakref.WeakValueDictionary()
+obj = Big()
+cache["k"] = obj
+print(len(cache))
+del obj
+print(len(cache))</code></pre>
+<pre class="code lang-text"><code>alive after del: True
+collected objects &gt; 0: True
+alive after gc: False
+1
+0</code></pre>
+<h3>Choosing the right structure: deque versus list</h3>
+<p><code>list.pop(0)</code> shifts every remaining item one place left, so it costs time proportional to the list length (O(n)). <code>collections.deque.popleft()</code> is O(1). Draining a queue of 50,000 items with <code>list.pop(0)</code> is therefore quadratic in total. The exact times depend on your machine, so the check below prints only whether the ratio exceeded 10x.</p>
+<pre class="code lang-python"><code>import timeit
+
+n = 50_000
+tl = timeit.timeit("l.pop(0)", setup=f"l=list(range({n}))", number=n-1)
+td = timeit.timeit("d.popleft()", setup=f"from collections import deque; d=deque(range({n}))", number=n-1)
+print("deque faster than list.pop(0) by more than 10x:", tl / td &gt; 10)</code></pre>
+<pre class="code lang-text"><code>deque faster than list.pop(0) by more than 10x: True</code></pre>
+<h3>Going deeper</h3>
+<ul><li><strong>Free-threaded build.</strong> Python 3.13 added an optional build without the GIL, supported officially from 3.14. It is not the default, some C extensions are not yet compatible, and single-thread code can run somewhat slower. Even without the GIL, <code>counter += 1</code> is still not atomic, so locks stay necessary.</li><li><strong>multiprocessing start methods.</strong> <code>spawn</code> starts a fresh interpreter and re-imports your module (the default on macOS and Windows, and from 3.14 on Linux), <code>fork</code> copies the parent. With <code>spawn</code>, guard code with <code>if __name__ == "__main__":</code> and remember that arguments and results must be picklable: lambdas and open files are not.</li><li><strong>Leak patterns.</strong> A module-level dict used as a cache that is never trimmed is the classic Python memory leak. Use <code>functools.lru_cache(maxsize=...)</code> or a weak-value dictionary.</li></ul>
+<h3>More practice: concurrency and memory</h3>
+<p class="problem"><span class="pl">Problem 11.P.12</span> (warm-up) A function does 2 s of CPU-bound maths. Would 4 threads speed up 4 calls on a standard (GIL) build? What would?</p>
+<p><strong>Answer:</strong> No. Only one thread runs Python bytecode at a time, so the total stays near 8 s. Use <code>ProcessPoolExecutor</code> (about 2 s on 4 free cores) or a vectorised library. Threads help for waiting, not computing.</p>
+<p class="problem"><span class="pl">Problem 11.P.13</span> (build) Using <code>asyncio.gather</code>, run <code>fetch("a", 0.03)</code> and <code>fetch("b", 0.01)</code> from 11.6.1 and print the result list. In what order do the results appear?</p>
+<pre class="code lang-python"><code>import asyncio
+
+async def fetch(name, delay):
+    await asyncio.sleep(delay)
+    return name
+
+async def main():
+    print(await asyncio.gather(fetch("a", 0.03), fetch("b", 0.01)))
+asyncio.run(main())</code></pre>
+<pre class="code lang-text"><code>['a', 'b']</code></pre>
+<p><strong>Answer:</strong> <code>['a', 'b']</code>. <code>gather</code> returns results in the order you passed the awaitables, not the order they finished, even though b finished first.</p>
+<p class="problem"><span class="pl">Problem 11.P.14</span> (find the bug) A worker does <code>except asyncio.CancelledError: print("bye")</code> and never re-raises. What goes wrong?</p>
+<p><strong>Answer:</strong> The task swallows the cancellation and carries on (or finishes normally), so a <code>TaskGroup</code> or <code>timeout</code> that relies on cancelling it cannot stop it cleanly. Add <code>raise</code> after cleanup.</p>
+<p class="problem"><span class="pl">Problem 11.P.15</span> (stretch) Two threads each need locks A and B for a transfer between two accounts. Design a rule that prevents deadlock when the order of accounts varies by call. Rubric: (1) a total order on locks, (2) acquire in that order whatever the argument order, (3) one sentence on why a cycle then cannot form.</p>
+<p><strong>Answer:</strong> Sort the two accounts by a fixed key such as account id and always lock the lower id first: <code>first, second = sorted([acc1, acc2], key=lambda a: a.id)</code>. A deadlock needs a cycle of waits, and a global order means a thread holding the higher lock never waits for a lower one.</p>
+<p class="problem"><span class="pl">Problem 11.P.16</span> (interview) Your service leaks memory slowly. Name three Python-specific causes and one tool for each.</p>
+<p><strong>Answer:</strong> (1) An unbounded cache or global list: find it with <code>tracemalloc</code> snapshots compared over time (section 11.1). (2) Reference cycles holding large objects with <code>__del__</code> or long-lived callbacks: inspect with <code>gc.get_objects()</code> and <code>gc.collect()</code>, and break cycles with <code>weakref</code>. (3) Tasks or threads that are started and never finished or awaited: list them with <code>asyncio.all_tasks()</code> or <code>threading.enumerate()</code>.</p>
+<h2 id="s8-chapter-recap">Chapter recap</h2>
 <ul><li>Measure first: <code>timeit</code> for small comparisons, <code>cProfile</code> to find the hot spot, <code>tracemalloc</code> for memory.</li><li>The biggest wins come from better algorithms and data structures (set against list: about 20,000 times faster in our test), not style tricks.</li><li>The GIL lets only one thread run Python bytecode at a time. Threads help I/O-bound work and do not help CPU-bound work. Free-threaded builds exist but are not the default.</li><li>Processes bypass the GIL, with costs: start-up, pickling, copying. Speed-up is less than the worker count.</li><li><code>concurrent.futures</code> is the easy interface to thread and process pools. Handle errors per future.</li><li><code>asyncio</code> runs many waiting tasks on one thread. Never block inside a coroutine; limit concurrency with a semaphore and add timeouts.</li><li>Vectorization moves the loop into compiled code (NumPy, pandas). Avoid row loops and <code>apply(axis=1)</code> on big data.</li><li>Shared mutable data between threads needs a lock or a queue. Bounded queues give back-pressure.</li><li>Little's law <code>L = λ × W</code> links concurrency, latency and throughput, the same three numbers as in a bank queue: customers inside, time spent, arrival rate.</li></ul>
 <h3>Cheat-sheet</h3>
 <div class="tablewrap"><table class="data"><thead><tr><th>Need</th><th>Tool or formula</th></tr></thead><tbody><tr><td>Compare two snippets</td><td><code>timeit.timeit(stmt, number=n)</code></td></tr><tr><td>Find the slow function</td><td><code>python3 -m cProfile -s cumulative script.py</code></td></tr><tr><td>Memory by line of code</td><td><code>tracemalloc.start()</code>, <code>take_snapshot().statistics("lineno")</code></td></tr><tr><td>Many waits (I/O)</td><td><code>ThreadPoolExecutor</code> or <code>asyncio.gather</code></td></tr><tr><td>Many calculations (CPU)</td><td><code>ProcessPoolExecutor</code> or <code>Pool.map</code></td></tr><tr><td>Limit parallel tasks</td><td><code>asyncio.Semaphore(n)</code></td></tr><tr><td>Call blocking code from async</td><td><code>await asyncio.to_thread(fn, ...)</code></td></tr><tr><td>Protect shared data</td><td><code>with threading.Lock():</code> or <code>queue.Queue(maxsize=n)</code></td></tr><tr><td>Throughput</td><td><code>λ = L / W</code></td></tr><tr><td>Workers needed</td><td><code>L = λ × W</code></td></tr></tbody></table></div>
-<h2 id="s7-practice-set">Practice set</h2>
+<h2 id="s9-practice-set">Practice set</h2>
 <p class="problem"><span class="pl">Problem 11.P.1</span> (easy) A job has <code>L = 10</code> concurrent workers and each request takes <code>W = 0.2 s</code>. What is the throughput?</p>
 <p><strong>Answer:</strong> λ = L ÷ W = 10 ÷ 0.2 = 50 requests per second.</p>
 <p class="problem"><span class="pl">Problem 11.P.2</span> (easy) You must download 100 files, each taking about 1 s of network wait, with a pool of 20 threads. About how long will it take?</p>
@@ -469,9 +694,9 @@ print(f())</code></pre>
 <p><strong>Answer:</strong> The GIL is a lock in CPython that lets only one thread run Python bytecode at a time. Threads still help when they wait, because a waiting thread releases the lock. For CPU-bound work you use processes, each with its own GIL. I use threads for a moderate number of I/O tasks with normal libraries, asyncio for thousands of connections with async libraries, and processes (or vectorized code) for CPU-bound work.</p>
 <p class="problem"><span class="pl">Problem 11.P.11</span> (hard, interview) A teammate says "just add more threads, the API is slow." Using Little's law, explain what may go wrong.</p>
 <p><strong>Answer:</strong> more threads raise concurrency L, which raises throughput only while latency W stays flat. If the server is saturated, extra concurrency just raises W (requests queue), and throughput stays flat or drops, with more errors and timeouts. I would try 10, 20, 40, 80 threads, find where throughput stops growing, and use a rate limit and a timeout.</p>
-<h2 id="s8-prompt-pack">Prompt pack</h2>
+<h2 id="s10-prompt-pack">Prompt pack</h2>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles, and English is my second language, so use simple words. Teach me the Python GIL, threads, processes and the difference between I/O-bound and CPU-bound work. Explain step by step with small timed experiments and real numbers, and connect each idea to everyday examples like a kitchen or a bank where it helps. After each part, ask me one question to check my understanding and wait for my answer before moving on.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles, and English is my second language. The topic is asyncio in Python: coroutines, await, gather, Semaphore, timeout and to_thread. Give me 8 graded exercises from easy to hard, using sleep to simulate network calls so I can run them offline. Do not give solutions yet. After I send my answers, review each one, show the bug if any, and explain the event loop in simple English.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles. Chapter topic: profiling and speeding up Python code with timeit, cProfile, tracemalloc and vectorization. Here is my slow code: [PASTE HERE]. Guide me to find the hot spot by measurement, not guessing. Ask me to run each profiling step and paste the output, then explain how to read it, propose one change at a time, and help me verify that results stay identical and the code is faster.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles, and English is my second language. Topic: Little's law (L = lambda x W), queues, back-pressure and worker pool sizing in Python services. Teach it using everyday examples (a bank queue, tellers, waiting time, customers served per hour). Then give me 6 sizing problems with real numbers, one at a time, and check each answer. Include one problem where the system saturates and explain why throughput stops growing.</pre></div>
-<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles. Run a mock interview on Python concurrency and performance for a data engineer job. Ask me one question at a time: the GIL, threads versus processes versus asyncio, race conditions and locks, profiling workflow, vectorization, multiprocessing with pandas, and queues. Grade each answer from 1 to 5, give a model answer, and one improvement tip. After 10 questions, summarise my weak areas and what to practise next.</pre></div><div class="readbtn"><button class="btn" data-read="study:python:ch11">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch10.html">← Chapter 10: Testing and Code Quality</a><a class="btn" href="ch12.html">Chapter 12: APIs, the Web, Scraping and Command-Line →</a></div></div><script src="../../assets/study.js"></script></body></html>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data, ML and AI roles. Run a mock interview on Python concurrency and performance for a data engineer job. Ask me one question at a time: the GIL, threads versus processes versus asyncio, race conditions and locks, profiling workflow, vectorization, multiprocessing with pandas, and queues. Grade each answer from 1 to 5, give a model answer, and one improvement tip. After 10 questions, summarise my weak areas and what to practise next.</pre></div><div class="readbtn"><button class="btn" data-read="study:python:ch11">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch10.html">← Chapter 10: Testing and Code Quality</a><a class="btn" href="ch12.html">Chapter 12: APIs, the Web, Scraping and Command-Line Tools →</a></div></div><script src="../../assets/study.js"></script></body></html>

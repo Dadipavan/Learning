@@ -1,0 +1,924 @@
+<p>Your delivery company asks you to predict the delivery time of each parcel from distance, traffic and the number of stops. You write a linear model with three weights, a loss that measures how wrong the predictions are, and a loop that nudges the weights to make the loss smaller. On Monday the loop works and the loss falls smoothly. On Tuesday you add a feature, the square footage of the warehouse, whose values are in the thousands, and the loss shoots up to 10<sup>38</sup> and then prints <code>nan</code>. You halve the learning rate, and now it works but takes four hours. A colleague says "just use Adam" and it trains in four minutes, and nobody can tell you why.</p>
+<p>This chapter explains why. Almost everything in data science and AI is the same move: define a number that says how bad the current choice is (the <strong>loss</strong>), then search for the choice that makes it small. That search is <strong>optimization</strong>. You will build gradient descent from a Taylor expansion, hand-iterate it on small functions, prove when it converges and how fast, see why badly scaled features make it crawl, and then climb the ladder that leads to the optimizers used to train every modern neural network: momentum, RMSProp, Adam and AdamW. You will also learn the second-order and constrained tools (Newton, BFGS, Lagrange and KKT conditions, duality), the linear programs that run logistics and production planning, and the practical methods for searching hyperparameters.</p>
+<p>After the chapter you will be able to: test whether a problem is convex; run gradient descent, momentum and Adam by hand and in NumPy from scratch; choose a learning rate and a schedule with reasons; diagnose zig-zagging, divergence and ill-conditioning; use <code>scipy.optimize</code> for BFGS, constrained problems and linear programs; explain why L1 gives sparse weights; and answer the optimization questions that appear in data science interviews. The running examples are the delivery-time regression and a small bakery that must decide how much to produce. This chapter builds on derivatives and Taylor series (Chapters 10 and 11), gradients and Hessians (Chapter 12), the chain rule (Chapter 13) and eigenvalues (Chapter 8).</p>
+
+<h2>14.1 What Optimization Is, and Why Convexity Makes It Easy</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You are blindfolded on a hillside and want to reach the lowest point of the valley. You cannot see the valley, but you can feel the slope under your feet. Optimization is the art of using only local information (the slope here, maybe the curvature here) to walk to a low place. If the whole landscape is one smooth bowl, any downhill walk ends at the bottom. If it has many bowls, where you end up depends on where you started.</div></div>
+<h3>The three ingredients</h3>
+<p>Every optimization problem has an <strong>objective function</strong> f (the number to make small, also called loss, cost or error), <strong>variables</strong> x (the things you may change: weights, prices, quantities) and optionally <strong>constraints</strong> (rules the variables must obey, such as "x ≥ 0" or "total hours ≤ 100"). We write it as</p>
+<div class="eq">minimize f(x) over x, subject to g<sub>i</sub>(x) ≤ 0 and h<sub>j</sub>(x) = 0</div>
+<p>Maximizing is the same problem in disguise: maximize f(x) is minimize −f(x). So we only ever talk about minimizing. A point x* is a <strong>global minimum</strong> if f(x*) ≤ f(x) for every allowed x. It is a <strong>local minimum</strong> if that holds only for x close to x*.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Problem</th><th>Variables</th><th>Objective</th><th>Constraints</th></tr></thead><tbody>
+<tr><td>Linear regression</td><td>weights w</td><td>mean squared error</td><td>none</td></tr>
+<tr><td>Logistic regression</td><td>weights w</td><td>cross-entropy</td><td>none</td></tr>
+<tr><td>Lasso regression</td><td>weights w</td><td>squared error</td><td>‖w‖<sub>1</sub> ≤ t (or a penalty)</td></tr>
+<tr><td>Bakery product mix</td><td>trays of each product</td><td>profit (maximize)</td><td>oven hours, labour hours, x ≥ 0</td></tr>
+<tr><td>Neural network</td><td>millions of weights</td><td>cross-entropy over data</td><td>none (but the loss is not convex)</td></tr>
+<tr><td>Hyperparameter search</td><td>learning rate, depth, ...</td><td>validation error</td><td>ranges</td></tr>
+</tbody></table></div>
+<h3>Local versus global, by hand</h3>
+<p>Take f(x) = x<sup>4</sup> − 3x<sup>2</sup> + x. Its slope is f′(x) = 4x<sup>3</sup> − 6x + 1. The slope is zero at three places. Two are minima (near x = −1.30 and x = 1.13) and one is a hill between them. At x = −1.3008 the function value is f ≈ 2.863 − 5.076 − 1.301 = −3.514, and at x = 1.1309 it is f ≈ 1.636 − 3.837 + 1.131 = −1.070. Both are local minima, but only the left one is global. Gradient descent started on the left side of the hill ends in the left valley and gradient descent started on the right ends in the right valley. The code confirms it.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+def f(x):  return x**4 - 3*x**2 + x
+def df(x): return 4*x**3 - 6*x + 1
+
+for x0 in (-2.0, 2.0):
+    x = x0
+    for _ in range(200):
+        x = x - 0.01 * df(x)             # plain gradient descent, step 0.01
+    print(f"start {x0:+.1f} -&gt; x = {x:+.4f}, f(x) = {f(x):+.4f}")</code></pre>
+<pre class="code lang-text"><code>start -2.0 -&gt; x = -1.3008, f(x) = -3.5139
+start +2.0 -&gt; x = +1.1309, f(x) = -1.0702</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Wrong: "my optimizer converged, so I found the best model." Right: converged only means the slope is nearly zero, which also happens at a local minimum, a flat region or a saddle point. For non-convex problems (neural networks) you always found <em>a</em> solution, never a proof of <em>the</em> best one. Check by restarting from different seeds and comparing the final loss.</div></div>
+<h3>Convex sets and convex functions</h3>
+<p>A <strong>convex set</strong> is a set where the straight segment between any two of its points stays inside the set. A disk is convex, a filled square is convex, a line is convex. A ring (annulus) is not: two points on opposite sides of the hole have a segment passing through the hole. The union of two separate disks is not convex either.</p>
+<div class="callout green"><div class="lab">DEFINITION</div><div class="txt">A function f is <strong>convex</strong> if for every two points x and y and every t between 0 and 1,
+<div class="eq">f(t·x + (1 − t)·y) ≤ t·f(x) + (1 − t)·f(y)</div>
+In words: the graph never rises above the straight chord joining two of its points. It is <strong>strictly convex</strong> if the inequality is strict for x ≠ y, which means a unique minimizer.</div></div>
+<p class="problem"><span class="pl">Problem 14.1.1</span> Check the definition for f(x) = x<sup>2</sup> with x = 1, y = 3, t = 0.5, and then for f(x) = −x<sup>2</sup>.</p>
+<table class="steps"><tr><th>Left side (x²)</th><td>t·x + (1−t)·y = 0.5·1 + 0.5·3 = 2, so f(2) = 4</td></tr>
+<tr><th>Right side (x²)</th><td>0.5·f(1) + 0.5·f(3) = 0.5·1 + 0.5·9 = 5</td></tr>
+<tr><th>Compare</th><td>4 ≤ 5, the chord is above the curve, consistent with convexity</td></tr>
+<tr><th>Now −x²</th><td>Left: f(2) = −4. Right: 0.5·(−1) + 0.5·(−9) = −5</td></tr>
+<tr><th>Compare</th><td>−4 ≤ −5 is false, so −x² is not convex (it is concave: the chord is below the curve)</td></tr></table>
+<h3>Tests you can actually use</h3>
+<p>Checking the definition for every pair of points is impossible, so we use calculus. For one variable: <strong>f is convex on an interval if f″(x) ≥ 0 everywhere on it.</strong> Curvature that never turns negative means the slope never decreases, so the graph bends upward only. For several variables the second derivative becomes the Hessian matrix H (Chapter 12), the matrix of all second partial derivatives. The test is: <strong>f is convex if H(x) is positive semi-definite (PSD) at every x</strong>, meaning all eigenvalues of H are ≥ 0 (Chapter 8). For a quadratic form f(x) = ½xᵀAx the Hessian is just A, the same everywhere.</p>
+<p class="problem"><span class="pl">Problem 14.1.2</span> Is f(x, y) = x<sup>2</sup> + xy + y<sup>2</sup> convex? Is g(x, y) = x<sup>2</sup> + 3xy + y<sup>2</sup>?</p>
+<table class="steps"><tr><th>Hessian of f</th><td>f<sub>xx</sub> = 2, f<sub>xy</sub> = 1, f<sub>yy</sub> = 2, so H = [[2, 1], [1, 2]]</td></tr>
+<tr><th>Eigenvalues</th><td>Trace 4, determinant 4 − 1 = 3. Solve λ² − 4λ + 3 = 0, so λ = 1 and λ = 3</td></tr>
+<tr><th>Verdict f</th><td>Both ≥ 0 (in fact &gt; 0), so f is convex, even strictly</td></tr>
+<tr><th>Hessian of g</th><td>g<sub>xx</sub> = 2, g<sub>xy</sub> = 3, g<sub>yy</sub> = 2, so H = [[2, 3], [3, 2]]</td></tr>
+<tr><th>Eigenvalues</th><td>Trace 4, determinant 4 − 9 = −5. λ² − 4λ − 5 = 0, so λ = 5 and λ = −1</td></tr>
+<tr><th>Verdict g</th><td>One eigenvalue is negative, so g is not convex: it curves down along the direction (1, −1), a saddle</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+
+# Hessians of three quadratic functions f(x, y) = 0.5 * [x y] H [x y]^T
+mats = {
+    "x^2 + x*y + y^2": np.array([[2.0, 1.0], [1.0, 2.0]]),
+    "x^2 + 3*x*y + y^2": np.array([[2.0, 3.0], [3.0, 2.0]]),
+    "x^2 + y^2": np.array([[2.0, 0.0], [0.0, 2.0]]),
+}
+for name, H in mats.items():
+    eig = np.linalg.eigvalsh(H)          # eigenvalues of a symmetric matrix
+    verdict = "convex" if eig.min() &gt;= 0 else "NOT convex"
+    print(f"{name:28s} eigenvalues {np.round(eig, 3)} -&gt; {verdict}")</code></pre>
+<pre class="code lang-text"><code>x^2 + x*y + y^2              eigenvalues [1. 3.] -&gt; convex
+x^2 + 3*x*y + y^2            eigenvalues [-1.  5.] -&gt; NOT convex
+x^2 + y^2                    eigenvalues [2. 2.] -&gt; convex</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Wrong: "the determinant of the Hessian is positive, so it is convex." For H = [[−1, 0], [0, −1]] the determinant is (−1)(−1) = 1 &gt; 0 but both eigenvalues are −1, a concave bowl pointing down. Right: for a 2×2 matrix you need <em>both</em> trace ≥ 0 and determinant ≥ 0 (equivalently both eigenvalues ≥ 0), and it must hold at every point, not just one.</div></div>
+<h3>Why convex is easy</h3>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">For a convex function, <strong>every local minimum is a global minimum</strong>. Proof: suppose x* is a local minimum but some point y has f(y) &lt; f(x*). Walk from x* toward y along the segment, at point z<sub>t</sub> = x* + t(y − x*). Convexity gives f(z<sub>t</sub>) ≤ (1 − t)f(x*) + t·f(y) = f(x*) − t(f(x*) − f(y)) which is strictly less than f(x*) for every t &gt; 0. Taking t tiny puts z<sub>t</sub> as close to x* as you like with a lower value, contradicting "local minimum". So no such y exists.</div></div>
+<p>That one fact is why convex problems are called "easy": any method that goes downhill and stops where the slope is zero is guaranteed to have found the best answer. Convex functions you meet constantly: squared error of a linear model, cross-entropy of logistic regression (as a function of the weights), the hinge loss of an SVM, the L1 and L2 norms, and sums of convex functions with non-negative weights, so "loss + λ·penalty" stays convex. The loss of a neural network with ReLU units is <strong>not</strong> convex in its weights, which is the reason deep learning needs the careful tricks of the later sections.</p>
+<h3>Going deeper</h3>
+<p>Convexity has a first-order characterization that explains gradient descent: f is convex exactly when f(y) ≥ f(x) + ∇f(x)·(y − x) for all x, y, so the tangent plane is a global lower bound. At a point where ∇f(x*) = 0 this says f(y) ≥ f(x*) for all y: a zero gradient is automatically a global minimum. Operations preserving convexity: a non-negative sum, a maximum, and composition with a linear map f(Ax + b). That is why a lasso objective (squared error plus λ·‖w‖<sub>1</sub>) is convex even though the absolute value has a kink and no derivative at 0. Interview question: "is k-means convex? is PCA convex?" Neither objective is convex in its raw variables, yet PCA is solved exactly through the SVD (Chapter 9) and k-means converges only to a local optimum, which is why <code>n_init</code> restarts exist.</p>
+
+<h2>14.2 Gradient Descent, Learning Rates and Conditioning</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Standing on the hillside, you feel which direction is steepest downhill and take one step that way. The <strong>learning rate</strong> is the length of your step. Tiny steps are safe but you arrive next week. Giant steps overshoot the valley and land on the opposite slope, higher than you started. The art is choosing a step that is as big as the terrain allows.</div></div>
+<h3>Deriving the update from the Taylor expansion</h3>
+<p>Near a point x, a function behaves like its tangent (Chapter 11): f(x + d) ≈ f(x) + ∇f(x)·d, where d is a small move. We want f(x + d) as small as possible for a move of fixed length ‖d‖. By the Cauchy-Schwarz inequality (Chapter 5), ∇f·d ≥ −‖∇f‖·‖d‖, with equality when d points exactly opposite to the gradient. So the steepest-descent direction is −∇f(x), and with a step length α (the learning rate) we get</p>
+<div class="eq">x<sub>k+1</sub> = x<sub>k</sub> − α · ∇f(x<sub>k</sub>)</div>
+<p>That is the whole algorithm: compute the gradient, take a step against it, repeat. The linear approximation is only trustworthy for small steps, which is why α cannot be arbitrarily large. Add the next Taylor term to see how large: f(x − αg) ≈ f(x) − α‖g‖² + ½α² gᵀHg, where g = ∇f(x) and H is the Hessian. The loss goes down only if α‖g‖² &gt; ½α² gᵀHg, i.e. if α &lt; 2‖g‖²/(gᵀHg). The curvature gᵀHg is what limits the step.</p>
+<h3>Hand iterations in one dimension</h3>
+<p class="problem"><span class="pl">Problem 14.2.1</span> Run gradient descent on f(x) = x² from x<sub>0</sub> = 4 with α = 0.1.</p>
+<table class="steps"><tr><th>Gradient</th><td>f′(x) = 2x, so the update is x ← x − 0.1·2x = 0.8x</td></tr>
+<tr><th>Step 1</th><td>x<sub>1</sub> = 0.8 · 4 = 3.2</td></tr>
+<tr><th>Step 2</th><td>x<sub>2</sub> = 0.8 · 3.2 = 2.56</td></tr>
+<tr><th>Step 3</th><td>x<sub>3</sub> = 0.8 · 2.56 = 2.048</td></tr>
+<tr><th>Step 4</th><td>x<sub>4</sub> = 0.8 · 2.048 = 1.6384</td></tr>
+<tr><th>Step 5</th><td>x<sub>5</sub> = 0.8 · 1.6384 = 1.31072</td></tr>
+<tr><th>Pattern</th><td>x<sub>k</sub> = 0.8<sup>k</sup> · 4, a geometric sequence (Chapter 4) that shrinks by 20% per step</td></tr></table>
+<p>Now change only the learning rate. With α = 0.5 the factor is 1 − 2·0.5 = 0, so x<sub>1</sub> = 0 in one step. With α = 1.0 the factor is −1, so the iterates are 4, −4, 4, −4, forever: the walker jumps from one side of the bowl to the mirror point and never improves. With α = 1.1 the factor is 1 − 2.2 = −1.2, so the iterates are 4, −4.8, 5.76, −6.912, ...: each jump lands higher on the wall than before and the loss explodes. The code reproduces all four.</p>
+<pre class="code lang-python"><code># Gradient descent on f(x) = x^2 with different learning rates
+def run(alpha, x0=4.0, steps=5):
+    xs = [x0]
+    for _ in range(steps):
+        xs.append(xs[-1] - alpha * 2 * xs[-1])   # f'(x) = 2x
+    return xs
+
+for alpha in (0.1, 0.5, 1.0, 1.1):
+    print(f"alpha={alpha}:", [round(v, 4) for v in run(alpha)])</code></pre>
+<pre class="code lang-text"><code>alpha=0.1: [4.0, 3.2, 2.56, 2.048, 1.6384, 1.3107]
+alpha=0.5: [4.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+alpha=1.0: [4.0, -4.0, 4.0, -4.0, 4.0, -4.0]
+alpha=1.1: [4.0, -4.8, 5.76, -6.912, 8.2944, -9.9533]</code></pre>
+<figure><img src="images/ch14_lr_effects.png" alt="Gradient descent on x squared with six learning rates: slow, steady, one-step, oscillating, stuck and diverging, and the zig-zag drawn on the parabola" loading="lazy"/><figcaption>Figure 14.1. The same function, six learning rates. Left: x against iteration. Right: the iterates drawn on the curve.</figcaption></figure>
+<p>How to read it: the left panel is a race to the line x = 0. The purple curve (α = 0.01) barely moves, blue (0.1) glides, teal (0.5) arrives in one jump, orange (0.9) zig-zags across zero while still shrinking (the factor is −0.8), gray (1.0) bounces forever between 4 and −4, and red (1.05) escapes outwards. The right panel shows why: with α = 0.9 each step crosses the valley floor and lands on the other wall at a slightly lower height.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Wrong: "a bigger learning rate is always faster, so make it large." Right: speed improves only up to a limit (here α = 0.5 is perfect) and beyond 1.0 it diverges. The safe region for f(x) = x² is 0 &lt; α &lt; 1. Signs of a too-large rate: the loss goes up or oscillates, then becomes <code>inf</code> and <code>nan</code>. Signs of a too-small rate: the loss falls, but so slowly the curve looks flat.</div></div>
+<h3>Hand iterations in two dimensions</h3>
+<p>Take the bowl f(x, y) = ½(x² + 10y²). Its gradient is (x, 10y). It is steep in the y direction and gentle in the x direction. Start at (4, 2) with α = 0.15.</p>
+<p class="problem"><span class="pl">Problem 14.2.2</span> Compute the first three iterations.</p>
+<table class="steps"><tr><th>Update rule</th><td>x ← x − 0.15·x = 0.85x and y ← y − 0.15·10y = y − 1.5y = −0.5y</td></tr>
+<tr><th>Step 1</th><td>(0.85·4, −0.5·2) = (3.4, −1)</td></tr>
+<tr><th>Step 2</th><td>(0.85·3.4, −0.5·(−1)) = (2.89, 0.5)</td></tr>
+<tr><th>Step 3</th><td>(0.85·2.89, −0.5·0.5) = (2.4565, −0.25)</td></tr>
+<tr><th>Observe</th><td>y flips sign every step (zig-zag across the steep direction) but its size halves. x shrinks only by 15% per step, so x is the slow coordinate and it decides how long we wait</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+
+# f(x, y) = 0.5 * (x^2 + 10 y^2), gradient = (x, 10 y)
+def grad(p): return np.array([p[0], 10 * p[1]])
+
+p = np.array([4.0, 2.0])
+alpha = 0.15
+print(0, p)
+for k in range(1, 6):
+    p = p - alpha * grad(p)
+    print(k, np.round(p, 4))</code></pre>
+<pre class="code lang-text"><code>0 [4. 2.]
+1 [ 3.4 -1. ]
+2 [2.89 0.5 ]
+3 [ 2.4565 -0.25  ]
+4 [2.088 0.125]
+5 [ 1.7748 -0.0625]</code></pre>
+<h3>Convergence analysis: the 1D proof</h3>
+<p>The quadratic f(x) = ½ a x² with a &gt; 0 has gradient a·x, so the update is x<sub>k+1</sub> = x<sub>k</sub> − α a x<sub>k</sub> = (1 − αa)·x<sub>k</sub>. Applying it k times: x<sub>k</sub> = (1 − αa)<sup>k</sup>·x<sub>0</sub>. A geometric sequence goes to 0 exactly when its ratio satisfies |1 − αa| &lt; 1, i.e. −1 &lt; 1 − αa &lt; 1, which rearranges to <strong>0 &lt; α &lt; 2/a</strong>. The fastest choice makes the ratio zero: α = 1/a, which jumps to the minimum in one step (this is the α = 0.5 case for a = 2). Here <em>a</em> is the curvature f″, so the rule reads: stay below two divided by the curvature.</p>
+<h3>The eigenvalue picture for many dimensions</h3>
+<p>Now take a general quadratic f(x) = ½xᵀHx − bᵀx with H symmetric positive definite. Its minimizer x* solves Hx* = b. Let e<sub>k</sub> = x<sub>k</sub> − x* be the error. Then ∇f(x<sub>k</sub>) = Hx<sub>k</sub> − b = He<sub>k</sub> and the update becomes e<sub>k+1</sub> = (I − αH)e<sub>k</sub>. Write H = QΛQᵀ (Chapter 8), where the columns of Q are orthonormal eigenvectors and Λ holds the eigenvalues λ<sub>1</sub>, ..., λ<sub>n</sub>. In the rotated coordinates z = Qᵀe the update decouples completely: z<sub>i</sub> ← (1 − αλ<sub>i</sub>)·z<sub>i</sub>. So an n-dimensional quadratic is n independent 1D problems, one per eigen-direction, each with its own curvature λ<sub>i</sub>.</p>
+<p>All of them must converge, so we need α &lt; 2/λ<sub>max</sub>. The slowest direction is the one with the smallest curvature λ<sub>min</sub>. Call μ = λ<sub>min</sub>, L = λ<sub>max</sub>. The worst-case shrink factor per step is ρ(α) = max(|1 − αμ|, |1 − αL|). It is smallest when the two terms are equal in size and opposite in sign: 1 − αμ = −(1 − αL), giving α = 2/(μ + L) and</p>
+<div class="eq">ρ<sub>best</sub> = <span class="frac"><span>L − μ</span><span>L + μ</span></span> = <span class="frac"><span>κ − 1</span><span>κ + 1</span></span>, where κ = L/μ is the <strong>condition number</strong></div>
+<p>For our 2D example μ = 1, L = 10. With α = 0.15 the factors are |1 − 0.15| = 0.85 and |1 − 1.5| = 0.5, so ρ = 0.85, matching the x coordinate that shrank 15% per step. The best step 2/11 ≈ 0.1818 gives ρ = 9/11 ≈ 0.818, only a little better. To shrink the error by a factor ε we need k steps with ρ<sup>k</sup> ≤ ε, i.e. k ≥ ln(1/ε)/ln(1/ρ). For large κ, ln((κ+1)/(κ−1)) ≈ 2/κ, so k ≈ (κ/2)·ln(1/ε): <strong>the number of steps grows in proportion to the condition number.</strong></p>
+<pre class="code lang-python"><code>import numpy as np
+
+# Quadratic with Hessian eigenvalues mu (smallest) and L (largest)
+for mu, L in ((1.0, 10.0), (1.0, 100.0), (1.0, 1000.0)):
+    kappa = L / mu
+    alpha = 2 / (mu + L)                          # best fixed step
+    rho = (kappa - 1) / (kappa + 1)               # per-step shrink factor
+    steps = np.log(1e-6) / np.log(rho)            # steps to shrink error 1,000,000 times
+    print(f"kappa={kappa:6.0f}  rho={rho:.5f}  steps for 1e-6: {steps:8.1f}")</code></pre>
+<pre class="code lang-text"><code>kappa=    10  rho=0.81818  steps for 1e-6:     68.8
+kappa=   100  rho=0.98020  steps for 1e-6:    690.8
+kappa=  1000  rho=0.99800  steps for 1e-6:   6907.8</code></pre>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">On a quadratic bowl, gradient descent needs about (κ/2)·ln(1/ε) steps to cut the error by a factor ε. A condition number of 10 costs ~69 steps for a millionfold improvement, 1,000 costs ~6,900. Reducing κ is worth more than any tuning of α.</div></div>
+<h3>Ill-conditioning and the zig-zag</h3>
+<p>The condition number measures how stretched the bowl is. The level curves of a quadratic are ellipses whose axis lengths are proportional to 1/√λ<sub>i</sub>: a large κ means a long thin ellipse, a canyon. The gradient is perpendicular to the level curve, which in a canyon points almost straight across it rather than along it. A step big enough to make progress along the canyon (limited by α &lt; 2/L) overshoots across it. The result is the zig-zag of Figure 14.2: huge effort across the canyon, tiny progress along its floor.</p>
+<figure><img src="images/ch14_illcond.png" alt="Contour plot of an elongated quadratic bowl with a zig-zag gradient descent path and a smoother momentum path" loading="lazy"/><figcaption>Figure 14.2. A bowl with condition number 10. Orange: gradient descent with α = 0.18 bounces across the steep direction. Blue: momentum (Section 14.4) cancels the bouncing.</figcaption></figure>
+<p>How to read it: the grey ellipses are level curves of equal loss, the star is the minimum. Each dot is one iterate. The orange path alternates above and below the floor of the valley because the y-direction factor is 1 − 0.18·10 = −0.8: it flips sign every step. The x-direction factor is 0.82, so the path creeps left slowly. Momentum (blue) spirals in with fewer wasted sideways moves.</p>
+<h3>Feature scaling, the practical cure</h3>
+<p>For linear regression with mean squared error the Hessian is 2XᵀX/n, so the condition number is set by the features. If one feature is square footage (about 500 to 3,000) and another is the number of rooms (1 to 5), the second moment matrix has one huge eigenvalue and one small one, so κ is enormous. Standardizing (subtract the mean, divide by the standard deviation) puts every feature on the same scale and brings κ close to 1.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+rng = np.random.default_rng(0)
+size = rng.uniform(500, 3000, 200)         # square feet
+rooms = rng.integers(1, 6, 200).astype(float)
+X = np.column_stack([size, rooms])
+
+def condition(X):
+    H = X.T @ X / len(X)                   # Hessian of mean squared error is 2 * this
+    e = np.linalg.eigvalsh(H)
+    return e.max() / e.min()
+
+Xs = (X - X.mean(axis=0)) / X.std(axis=0)  # standardise: mean 0, std 1
+print("condition number raw:         ", round(condition(X), 1))
+print("condition number standardised:", round(condition(Xs), 3))</code></pre>
+<pre class="code lang-text"><code>condition number raw:          1334566.1
+condition number standardised: 1.259</code></pre>
+<p>That drops κ from about 1.3 million to 1.26, so gradient descent goes from needing millions of steps (about (κ/2)·ln(10<sup>6</sup>) ≈ 9 million) to a handful (ρ = 0.26/2.26 ≈ 0.115 per step, so about 6 steps for a millionfold improvement). This is the real reason every ML tutorial says "scale your features" and why batch normalization and layer normalization exist inside deep networks: they keep the curvature of each layer similar.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Wrong: fit the scaler on the whole dataset, then split into train and test. The test rows then influenced the mean and the standard deviation (data leakage). Right: <code>mean = X_train.mean(0)</code> and <code>std = X_train.std(0)</code> computed on the training rows only, then applied unchanged to validation and test rows. Also remember to apply the same transformation at prediction time in production.</div></div>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">You inherit a notebook where the model "trains for 3 hours and still has not converged". Before touching the optimizer, print the standard deviation of each input column. If they range from 0.01 to 10,000, you have found the problem, and a one-line <code>StandardScaler</code> beats any new optimizer.</div></div>
+<h3>Going deeper</h3>
+<p>The decoupling argument is exact for quadratics, and every smooth function looks quadratic near a minimum (Taylor, Chapter 11), with H the Hessian there. So the eigenvalue spectrum of the Hessian at the optimum predicts the local convergence of gradient descent for any smooth loss. In deep learning the Hessian eigenvalues of a trained network are spread over many orders of magnitude, a few huge and a very large bulk near zero, which is why plain gradient descent is slow and why adaptive methods help. A condition number is also a statement about numerical stability: solving the normal equations XᵀX w = Xᵀy squares the condition number of X (κ(XᵀX) = κ(X)²), which is why practitioners prefer QR or the SVD (Chapters 7 and 9).</p>
+
+<h2>14.3 Batch, Stochastic and Mini-Batch Gradient Descent</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">To find out which way a crowd of 10,000 people leans, you can ask everyone (exact but slow), ask one random person (instant but noisy), or ask 100 random people (a good compromise). Machine learning losses are averages over training rows, so their gradients are averages too, and a random handful of rows gives a noisy but honest estimate of the full gradient.</div></div>
+<h3>The three flavours</h3>
+<p>For a dataset of n rows the loss is an average, f(w) = (1/n)·∑ ℓ<sub>i</sub>(w), where ℓ<sub>i</sub> is the loss on row i. The full gradient is ∇f = (1/n)·∑ ∇ℓ<sub>i</sub>. That sum is what costs time when n is a million.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Method</th><th>Rows per step B</th><th>Cost per step</th><th>Gradient noise</th><th>Typical use</th></tr></thead><tbody>
+<tr><td>Batch (full) gradient descent</td><td>n</td><td>O(n·d)</td><td>none</td><td>small data, convex problems, L-BFGS</td></tr>
+<tr><td>Stochastic gradient descent (SGD)</td><td>1</td><td>O(d)</td><td>very high</td><td>streaming data, theory</td></tr>
+<tr><td>Mini-batch gradient descent</td><td>32 to 4096</td><td>O(B·d)</td><td>moderate</td><td>all deep learning</td></tr>
+</tbody></table></div>
+<p>Here d is the number of parameters. One pass through all the rows is an <strong>epoch</strong>. Mini-batch gradient descent does n/B updates per epoch. People say "SGD" for mini-batch methods in general.</p>
+<h3>Why a random batch works</h3>
+<p>Pick a row i uniformly at random. Its expected gradient is E[∇ℓ<sub>i</sub>] = ∑ (1/n)·∇ℓ<sub>i</sub> = ∇f: the single-row gradient is an <strong>unbiased</strong> estimate of the full gradient. It is noisy: with per-row gradient variance σ², a batch average of B independent rows has variance σ²/B (the standard-error rule from Statistics, Chapter 3, applied to gradients). So the noise <em>standard deviation</em> falls like 1/√B: batch 100 is 10 times less noisy than batch 1 but costs 100 times more per step, which is a bad trade in terms of noise per cost. This is why moderate batches on GPUs are efficient, until the hardware is saturated.</p>
+<p class="problem"><span class="pl">Problem 14.3.1</span> A model has per-row gradient standard deviation σ = 4. What is the noise (standard deviation) of the gradient estimate for B = 1, 16 and 256, and how much does each step cost relative to B = 1?</p>
+<table class="steps"><tr><th>Formula</th><td>noise = σ/√B</td></tr>
+<tr><th>B = 1</th><td>4/√1 = 4, cost 1×</td></tr>
+<tr><th>B = 16</th><td>4/√16 = 4/4 = 1, cost 16×</td></tr>
+<tr><th>B = 256</th><td>4/√256 = 4/16 = 0.25, cost 256×</td></tr>
+<tr><th>Meaning</th><td>Going from 16 to 256 rows makes each step 16× more expensive but only 4× less noisy. Beyond some size, it is better to take more steps than to average more rows</td></tr></table>
+<h3>Simulation on linear regression</h3>
+<p>We generate 10,000 rows from y = 2 + 3x + noise (noise standard deviation 1), so the best possible mean squared error is the noise variance, 1.0. All three runs get the same budget of 20,000 row-gradient evaluations. Full batch can take only 2 steps with that budget; mini-batch of 100 takes 200 steps; pure SGD takes 20,000 tiny steps.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+rng = np.random.default_rng(1)
+n = 10_000
+X = np.column_stack([np.ones(n), rng.normal(size=n)])     # intercept + one feature
+true_w = np.array([2.0, 3.0])
+y = X @ true_w + rng.normal(scale=1.0, size=n)            # noise std 1
+
+def loss(w):      return np.mean((X @ w - y) ** 2)
+def grad(w, idx): # gradient of the mean squared error on rows idx
+    Xb, yb = X[idx], y[idx]
+    return 2 * Xb.T @ (Xb @ w - yb) / len(idx)
+
+def train(batch, alpha, steps):
+    w = np.zeros(2)
+    for _ in range(steps):
+        idx = rng.choice(n, size=batch, replace=False) if batch &lt; n else np.arange(n)
+        w = w - alpha * grad(w, idx)
+    return w
+
+# same budget of 20,000 row-gradients per run
+for name, batch, steps in (("full batch", n, 2), ("mini-batch 100", 100, 200), ("stochastic (1)", 1, 20000)):
+    w = train(batch, 0.1 if batch &gt; 1 else 0.01, steps)
+    print(f"{name:15s} steps={steps:6d} w={np.round(w, 3)} loss={loss(w):.4f}")</code></pre>
+<pre class="code lang-text"><code>full batch      steps=     2 w=[0.705 1.082] loss=6.3644
+mini-batch 100  steps=   200 w=[1.968 3.078] loss=0.9808
+stochastic (1)  steps= 20000 w=[2.055 3.175] loss=1.0027</code></pre>
+<p>Full batch has barely started (loss 6.36, weights still far from (2, 3)). Mini-batch has nearly reached the noise floor of 1.0 (loss 0.98 is slightly below 1 only because the model has fit a few random fluctuations of this sample). Pure SGD lands at 1.0027 but its weights (2.055, 3.175) are still jittering around the truth: with a constant step size, SGD never settles exactly, it hovers in a noise ball whose radius grows with α. <strong>Decaying the learning rate</strong> (Section 14.4) shrinks that ball.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Wrong: "I trained with batch size 1 so I need one update per epoch" or "I changed batch size from 32 to 1024 and kept the learning rate, so only speed changed." Right: bigger batches mean fewer, less noisy steps per epoch, so the learning rate usually has to be raised too (a common rule of thumb is to scale it up in proportion to the batch size, with warmup). Also always <strong>shuffle</strong> the data each epoch: sorted data gives batches that all lean the same way and the gradient estimate is no longer unbiased.</div></div>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">In PyTorch the batch is set by <code>DataLoader(dataset, batch_size=64, shuffle=True)</code>. In scikit-learn, <code>SGDRegressor</code> and <code>SGDClassifier</code> use the single-row version with a decaying rate, <code>MLPClassifier(solver="adam", batch_size=200)</code> uses mini-batches. If memory is short, gradient accumulation sums gradients over several small batches before one update to mimic a larger batch.</div></div>
+<h3>Going deeper</h3>
+<p>The noise is not only a nuisance. In a non-convex landscape it can push the iterate off a saddle point (Section 14.4), and many practitioners observe that small batches generalize slightly better than very large ones, an effect often linked to preferring wide, flat minima (Section 14.8). The cost model matters too: one pass of full-batch descent costs the same as an epoch of SGD that makes n updates. For a well-conditioned problem SGD makes real progress long before it has seen all the data once, which is the whole reason the method dominates large-scale learning. Theory says, for a smooth strongly convex loss with a decaying step size, SGD converges at rate O(1/k) in the loss, whereas full-batch gradient descent converges linearly (geometric), but each of its steps is n times more expensive. For a huge n, SGD wins in time to a "good enough" answer.</p>
+
+<h2>14.4 Momentum, AdaGrad, RMSProp, Adam and AdamW</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Plain gradient descent is a hiker with no memory: each step depends only on the slope right here. <strong>Momentum</strong> gives the hiker a heavy ball: it keeps rolling in the direction it was already going, so sideways wobbles cancel and consistent downhill pushes accumulate. <strong>Adaptive methods</strong> (AdaGrad, RMSProp, Adam) give each parameter its own step size: steep, jumpy directions get small steps, flat quiet directions get large steps.</div></div>
+<h3>Momentum (heavy ball)</h3>
+<p>Keep a velocity v, which is an exponentially weighted sum of past gradients, and move along it:</p>
+<div class="eq">v<sub>k+1</sub> = β · v<sub>k</sub> + ∇f(x<sub>k</sub>)</div>
+<div class="eq">x<sub>k+1</sub> = x<sub>k</sub> − α · v<sub>k+1</sub></div>
+<p>Here β in [0, 1) is the momentum coefficient (typically 0.9) and v starts at 0. Unrolling the first line gives v = g<sub>k</sub> + βg<sub>k−1</sub> + β²g<sub>k−2</sub> + ...: old gradients fade geometrically, so the velocity averages roughly the last 1/(1 − β) gradients (10 for β = 0.9). If the gradient is constant, v → g/(1 − β), so β = 0.9 makes the effective step 10 times larger along consistent directions. If the gradient flips sign every step (the zig-zag), the terms cancel and v stays small. That is exactly the cure for ill-conditioned canyons.</p>
+<p class="problem"><span class="pl">Problem 14.4.1</span> Momentum on f(x) = x² (gradient 2x) with x<sub>0</sub> = 4, α = 0.1, β = 0.9, v<sub>0</sub> = 0. Do four steps.</p>
+<table class="steps"><tr><th>Step 1</th><td>g = 2·4 = 8. v = 0.9·0 + 8 = 8. x = 4 − 0.1·8 = 3.2</td></tr>
+<tr><th>Step 2</th><td>g = 6.4. v = 0.9·8 + 6.4 = 13.6. x = 3.2 − 1.36 = 1.84</td></tr>
+<tr><th>Step 3</th><td>g = 3.68. v = 0.9·13.6 + 3.68 = 15.92. x = 1.84 − 1.592 = 0.248</td></tr>
+<tr><th>Step 4</th><td>g = 0.496. v = 0.9·15.92 + 0.496 = 14.824. x = 0.248 − 1.4824 = −1.2344</td></tr>
+<tr><th>Meaning</th><td>The ball is moving fast when it passes the bottom at x = 0 and overshoots to −1.23. Gradients of opposite sign then drain the velocity and it oscillates back. Momentum trades monotone descent for speed</td></tr></table>
+<pre class="code lang-python"><code># Heavy-ball momentum on f(x) = x^2, alpha = 0.1, beta = 0.9
+x, v = 4.0, 0.0
+alpha, beta = 0.1, 0.9
+for k in range(1, 5):
+    g = 2 * x
+    v = beta * v + g
+    x = x - alpha * v
+    print(f"step {k}: g={g:.4f} v={v:.4f} x={x:.4f}")</code></pre>
+<pre class="code lang-text"><code>step 1: g=8.0000 v=8.0000 x=3.2000
+step 2: g=6.4000 v=13.6000 x=1.8400
+step 3: g=3.6800 v=15.9200 x=0.2480
+step 4: g=0.4960 v=14.8240 x=-1.2344</code></pre>
+<h3>Nesterov momentum</h3>
+<p>Heavy-ball momentum computes the gradient where you are, then adds the velocity. Nesterov noticed that the velocity is going to move you anyway, so measure the slope at the <em>look-ahead</em> point instead. With the same notation:</p>
+<div class="eq">v<sub>k+1</sub> = β · v<sub>k</sub> + ∇f(x<sub>k</sub> − αβ · v<sub>k</sub>)</div>
+<div class="eq">x<sub>k+1</sub> = x<sub>k</sub> − α · v<sub>k+1</sub></div>
+<p>If the ball is about to overshoot the bottom, the look-ahead gradient already points back, so it brakes earlier. For smooth convex functions this is provably faster (rate O(1/k²) against O(1/k) for plain gradient descent; Section 14.8). Deep learning libraries implement an algebraically rearranged version (<code>torch.optim.SGD(..., momentum=0.9, nesterov=True)</code>) that needs just one gradient per step.</p>
+<h3>AdaGrad and RMSProp: a step size per parameter</h3>
+<p>Different parameters see very different gradients: the weight of a rare word gets a gradient only occasionally, the bias gets one every step. <strong>AdaGrad</strong> divides each coordinate's step by the root of its accumulated squared gradient:</p>
+<div class="eq">G<sub>k+1</sub> = G<sub>k</sub> + g<sub>k</sub>² &nbsp;&nbsp;&nbsp; x<sub>k+1</sub> = x<sub>k</sub> − α · g<sub>k</sub> / (√G<sub>k+1</sub> + ε)</div>
+<p>All operations are element-wise. Coordinates with large past gradients get small steps; rarely updated coordinates keep large steps. The weakness: G only grows, so the effective step size shrinks forever and learning stalls. <strong>RMSProp</strong> fixes that by replacing the sum with a moving average that forgets the old past:</p>
+<div class="eq">s<sub>k+1</sub> = ρ · s<sub>k</sub> + (1 − ρ) · g<sub>k</sub>² &nbsp;&nbsp;&nbsp; x<sub>k+1</sub> = x<sub>k</sub> − α · g<sub>k</sub> / (√s<sub>k+1</sub> + ε)</div>
+<p>With ρ = 0.9 and ε = 10<sup>−8</sup> (a tiny number preventing division by zero). The quantity g/√s is a gradient divided by its own recent typical size, so it is always about ±1, and every parameter moves by roughly α per step regardless of how big or small its gradient is.</p>
+<h3>Adam: momentum plus RMSProp plus bias correction</h3>
+<p>Adam keeps both a moving average of the gradient (first moment, like momentum) and a moving average of its square (second moment, like RMSProp):</p>
+<div class="eq">m<sub>t</sub> = β<sub>1</sub> · m<sub>t−1</sub> + (1 − β<sub>1</sub>) · g<sub>t</sub></div>
+<div class="eq">v<sub>t</sub> = β<sub>2</sub> · v<sub>t−1</sub> + (1 − β<sub>2</sub>) · g<sub>t</sub>²</div>
+<div class="eq">m̂<sub>t</sub> = m<sub>t</sub> / (1 − β<sub>1</sub><sup>t</sup>) &nbsp;&nbsp;&nbsp; v̂<sub>t</sub> = v<sub>t</sub> / (1 − β<sub>2</sub><sup>t</sup>)</div>
+<div class="eq">θ<sub>t</sub> = θ<sub>t−1</sub> − α · m̂<sub>t</sub> / (√v̂<sub>t</sub> + ε)</div>
+<p>The defaults are α = 0.001, β<sub>1</sub> = 0.9, β<sub>2</sub> = 0.999, ε = 10<sup>−8</sup>. The index t counts steps starting at 1.</p>
+<p><strong>Why bias correction?</strong> Both averages start at 0, so early on they are biased toward 0. The weights of the first t terms of m<sub>t</sub> are (1 − β<sub>1</sub>)·β<sub>1</sub><sup>t−i</sup> and they add up to 1 − β<sub>1</sub><sup>t</sup>, not 1. So if the gradient were a constant g, m<sub>t</sub> = (1 − β<sub>1</sub><sup>t</sup>)·g, and dividing by (1 − β<sub>1</sub><sup>t</sup>) restores g. At t = 1 without the correction, m<sub>1</sub> = 0.1g and v<sub>1</sub> = 0.001g², which are 10 and 1,000 times too small.</p>
+<p class="problem"><span class="pl">Problem 14.4.2</span> Three Adam steps on f(x) = x² (gradient 2x) from x<sub>0</sub> = 4 with α = 0.1, β<sub>1</sub> = 0.9, β<sub>2</sub> = 0.999, ε = 10<sup>−8</sup>.</p>
+<table class="steps"><tr><th>t = 1</th><td>g = 8. m = 0.1·8 = 0.8. v = 0.001·64 = 0.064. m̂ = 0.8/(1 − 0.9) = 8. v̂ = 0.064/(1 − 0.999) = 64, √v̂ = 8. x = 4 − 0.1·8/8 = 3.9</td></tr>
+<tr><th>t = 2</th><td>g = 7.8. m = 0.9·0.8 + 0.1·7.8 = 0.72 + 0.78 = 1.5. v = 0.999·0.064 + 0.001·60.84 = 0.063936 + 0.06084 = 0.124776. m̂ = 1.5/(1 − 0.81) = 1.5/0.19 = 7.8947. v̂ = 0.124776/(1 − 0.998001) = 0.124776/0.001999 = 62.419, √v̂ = 7.9006. x = 3.9 − 0.1·7.8947/7.9006 = 3.9 − 0.09993 = 3.80007</td></tr>
+<tr><th>t = 3</th><td>g = 7.6001. m = 0.9·1.5 + 0.1·7.6001 = 1.35 + 0.76001 = 2.1100. v = 0.999·0.124776 + 0.001·57.762 = 0.124651 + 0.057762 = 0.182413. m̂ = 2.1100/0.271 = 7.7860. v̂ = 0.182413/0.002997 = 60.865, √v̂ = 7.8016. x = 3.80007 − 0.1·7.7860/7.8016 = 3.80007 − 0.09980 = 3.70027</td></tr>
+<tr><th>Observe</th><td>Every step moved the parameter by almost exactly α = 0.1, even though the gradient (8, 7.8, 7.6) is far from 0.1. Adam steps are about α in size whatever the gradient scale. That is the main reason it is so forgiving on badly scaled problems</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+
+# Adam by hand on f(x) = x^2 (gradient 2x), start x = 4
+alpha, b1, b2, eps = 0.1, 0.9, 0.999, 1e-8
+x, m, v = 4.0, 0.0, 0.0
+for t in range(1, 4):
+    g = 2 * x
+    m = b1 * m + (1 - b1) * g
+    v = b2 * v + (1 - b2) * g * g
+    m_hat = m / (1 - b1 ** t)
+    v_hat = v / (1 - b2 ** t)
+    x = x - alpha * m_hat / (np.sqrt(v_hat) + eps)
+    print(f"t={t} g={g:.4f} m={m:.4f} v={v:.6f} m_hat={m_hat:.4f} v_hat={v_hat:.4f} x={x:.6f}")</code></pre>
+<pre class="code lang-text"><code>t=1 g=8.0000 m=0.8000 v=0.064000 m_hat=8.0000 v_hat=64.0000 x=3.900000
+t=2 g=7.8000 m=1.5000 v=0.124776 m_hat=7.8947 v_hat=62.4192 x=3.800074
+t=3 g=7.6001 m=2.1100 v=0.182413 m_hat=7.7860 v_hat=60.8653 x=3.700274</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Wrong: skipping the bias correction in a hand-written Adam. At t = 1, step = α·m/√v = α·0.1g/√(0.001g²) = α·0.1/0.0316 ≈ 3.16·α in the sign direction of g, over 3 times too large; and for the early steps (t = 10 gives a factor (1 − 0.9<sup>10</sup>)/√(1 − 0.999<sup>10</sup>) ≈ 0.651/0.0999 ≈ 6.5) the steps stay inflated. Right: divide by (1 − β<sup>t</sup>) exactly as above. Also never start t at 0, since 1 − β<sup>0</sup> = 0 gives a division by zero.</div></div>
+<h3>AdamW: weight decay done right</h3>
+<p><strong>Weight decay</strong> shrinks every weight a little each step, θ ← θ − αλθ, to keep weights small. For plain SGD this is identical to adding an L2 penalty (λ/2)‖θ‖² to the loss, because the penalty's gradient is λθ. With Adam it is not identical: if you add λθ to the gradient, it is then divided by √v̂ like everything else, so weights with historically large gradients are decayed <em>less</em>, which defeats the purpose. <strong>AdamW</strong> (Loshchilov and Hutter) applies the decay directly, outside the adaptive scaling:</p>
+<div class="eq">θ<sub>t</sub> = θ<sub>t−1</sub> − α · ( m̂<sub>t</sub> / (√v̂<sub>t</sub> + ε) + λ · θ<sub>t−1</sub> )</div>
+<p>Typical values are λ = 0.01 to 0.1. AdamW is the default optimizer for training transformers and most modern language and vision models.</p>
+<h3>All of them from scratch, on one loss surface</h3>
+<p>Here is one NumPy implementation of every method in this section. Each takes a gradient function and returns the whole path. Our first test surface is a <strong>ravine</strong>, f(x, y) = ½(x² + 100y²): it has condition number 100, steep in y and gentle in x. All runs start at (10, 1) and take 200 steps, with step sizes picked from a small sweep for each method.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+# ---- from-scratch optimisers: each takes grad(p) and returns the path ----
+def gd(grad, p0, alpha, steps):
+    p = np.array(p0, float); path = [p.copy()]
+    for _ in range(steps):
+        p = p - alpha * grad(p); path.append(p.copy())
+    return np.array(path)
+
+def momentum(grad, p0, alpha, steps, beta=0.9):
+    p = np.array(p0, float); v = np.zeros_like(p); path = [p.copy()]
+    for _ in range(steps):
+        v = beta * v + grad(p); p = p - alpha * v; path.append(p.copy())
+    return np.array(path)
+
+def nesterov(grad, p0, alpha, steps, beta=0.9):
+    p = np.array(p0, float); v = np.zeros_like(p); path = [p.copy()]
+    for _ in range(steps):
+        v = beta * v + grad(p - alpha * beta * v)   # gradient at the look-ahead point
+        p = p - alpha * v; path.append(p.copy())
+    return np.array(path)
+
+def adagrad(grad, p0, alpha, steps, eps=1e-8):
+    p = np.array(p0, float); G = np.zeros_like(p); path = [p.copy()]
+    for _ in range(steps):
+        g = grad(p); G += g * g
+        p = p - alpha * g / (np.sqrt(G) + eps); path.append(p.copy())
+    return np.array(path)
+
+def rmsprop(grad, p0, alpha, steps, rho=0.9, eps=1e-8):
+    p = np.array(p0, float); s = np.zeros_like(p); path = [p.copy()]
+    for _ in range(steps):
+        g = grad(p); s = rho * s + (1 - rho) * g * g
+        p = p - alpha * g / (np.sqrt(s) + eps); path.append(p.copy())
+    return np.array(path)
+
+def adam(grad, p0, alpha, steps, b1=0.9, b2=0.999, eps=1e-8, wd=0.0):
+    p = np.array(p0, float); m = np.zeros_like(p); v = np.zeros_like(p); path = [p.copy()]
+    for t in range(1, steps + 1):
+        g = grad(p)
+        m = b1 * m + (1 - b1) * g
+        v = b2 * v + (1 - b2) * g * g
+        m_hat = m / (1 - b1 ** t); v_hat = v / (1 - b2 ** t)
+        p = p - alpha * (m_hat / (np.sqrt(v_hat) + eps) + wd * p)   # wd &gt; 0 gives AdamW
+        path.append(p.copy())
+    return np.array(path)
+
+# ---- the ravine: f = 0.5 * (x^2 + 100 y^2), minimum at (0, 0) ----
+def ravine(p):  return 0.5 * (p[0] ** 2 + 100 * p[1] ** 2)
+def ravine_grad(p): return np.array([p[0], 100 * p[1]])
+
+start = [10.0, 1.0]
+runs = {
+    "GD (alpha 0.015)":       gd(ravine_grad, start, 0.015, 200),
+    "Momentum (0.01, 0.9)":   momentum(ravine_grad, start, 0.01, 200),
+    "Nesterov (0.01, 0.9)":   nesterov(ravine_grad, start, 0.01, 200),
+    "AdaGrad (2.0)":          adagrad(ravine_grad, start, 2.0, 200),
+    "RMSProp (0.05)":         rmsprop(ravine_grad, start, 0.05, 200),
+    "Adam (0.2)":             adam(ravine_grad, start, 0.2, 200),
+}
+for name, path in runs.items():
+    print(f"{name:24s} final loss after 200 steps: {ravine(path[-1]):.3e}")</code></pre>
+<pre class="code lang-text"><code>GD (alpha 0.015)         final loss after 200 steps: 1.184e-01
+Momentum (0.01, 0.9)     final loss after 200 steps: 1.592e-08
+Nesterov (0.01, 0.9)     final loss after 200 steps: 3.229e-09
+AdaGrad (2.0)            final loss after 200 steps: 1.448e-18
+RMSProp (0.05)           final loss after 200 steps: 2.370e-01
+Adam (0.2)               final loss after 200 steps: 4.611e-08</code></pre>
+<p>Reading the table: plain gradient descent is stuck at loss 0.118 because the stability limit α &lt; 2/100 = 0.02 forces a tiny step, so the gentle x direction advances only by 0.985 per step (10·0.985<sup>200</sup> ≈ 0.49, loss ½·0.49² ≈ 0.118). Momentum and Nesterov are seven to eight orders of magnitude better. Adam is excellent. RMSProp with a constant α = 0.05 plateaus at loss 0.24, since its steps never shrink below about α: it keeps bouncing in a small ball. AdaGrad wins by a mile here (10<sup>−18</sup>), but be careful: this ravine is aligned with the coordinate axes, which is exactly the situation where per-coordinate scaling is perfect. A rotated ravine would erase that advantage. A related warning: Nesterov with α = 0.015, which looks harmless next to momentum's, diverged (loss 2×10<sup>46</sup>), because Nesterov's stability region is smaller. Hyperparameters transfer poorly between methods.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Wrong: "Adam always beats SGD, so I do not need to tune the learning rate." Right: Adam's α still matters. On our ravine α = 0.2 gave loss 5×10<sup>−8</sup> but α = 0.1 only reached 0.012 in 200 steps. Adam is more forgiving than SGD, not tuning-free, and a well-tuned SGD with momentum often matches or beats it on image models. Always sweep α over a log scale (1e-4, 3e-4, 1e-3, 3e-3).</div></div>
+<h3>The Rosenbrock banana valley</h3>
+<p>The classic test is the Rosenbrock function f(x, y) = (1 − x)² + 100(y − x²)². Its minimum is at (1, 1), where f = 0. The minimum lies at the end of a long, curved, flat-bottomed valley, and the valley walls are steep. The gradient is (−2(1 − x) − 400x(y − x²), 200(y − x²)). We start at (−1.5, 1.5) and run 5,000 steps. The learning rates were chosen so that each method is stable.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+def rosen(p):  return (1 - p[0]) ** 2 + 100 * (p[1] - p[0] ** 2) ** 2
+def rosen_grad(p):
+    return np.array([-2 * (1 - p[0]) - 400 * p[0] * (p[1] - p[0] ** 2),
+                     200 * (p[1] - p[0] ** 2)])
+
+def run(update, state, p, steps):
+    """Generic loop: update(p, g, state, t) returns the new p and the new state."""
+    for t in range(1, steps + 1):
+        p, state = update(p, rosen_grad(p), state, t)
+    return p
+
+def gd(a):
+    return lambda p, g, s, t: (p - a * g, s)
+
+def momentum(a, b=0.9):
+    def u(p, g, v, t):
+        v = b * v + g
+        return p - a * v, v
+    return u
+
+def rmsprop(a, rho=0.9, eps=1e-8):
+    def u(p, g, s, t):
+        s = rho * s + (1 - rho) * g * g
+        return p - a * g / (np.sqrt(s) + eps), s
+    return u
+
+def adam(a, b1=0.9, b2=0.999, eps=1e-8):
+    def u(p, g, st, t):
+        m, v = st
+        m = b1 * m + (1 - b1) * g
+        v = b2 * v + (1 - b2) * g * g
+        step = (m / (1 - b1 ** t)) / (np.sqrt(v / (1 - b2 ** t)) + eps)
+        return p - a * step, (m, v)
+    return u
+
+start = np.array([-1.5, 1.5]); z = np.zeros(2)
+for name, upd, st in (("GD 0.001", gd(0.001), None), ("Momentum 0.0002", momentum(0.0002), z),
+                      ("RMSProp 0.005", rmsprop(0.005), z), ("Adam 0.05", adam(0.05), (z, z))):
+    p = run(upd, st, start, 5000)
+    print(f"{name:16s} end at {np.round(p, 3)}  loss {rosen(p):.6f}")</code></pre>
+<pre class="code lang-text"><code>GD 0.001         end at [0.93  0.864]  loss 0.004951
+Momentum 0.0002  end at [0.992 0.984]  loss 0.000061
+RMSProp 0.005    end at [0.997 0.986]  loss 0.005602
+Adam 0.05        end at [1. 1.]  loss 0.000000</code></pre>
+<figure><img src="images/ch14_optimizers.png" alt="Rosenbrock contours with four optimizer trajectories and a log-scale loss versus step plot" loading="lazy"/><figcaption>Figure 14.3. Left: the four paths all drop into the curved valley and follow its floor. Right: how fast the loss falls with the number of steps.</figcaption></figure>
+<p>How to read it: on the left, every path funnels into the same banana-shaped floor, so the pictures look alike. The real difference is in the right panel, which uses a log scale: GD (orange) is still at loss 0.005 after 5,000 steps because the valley floor is almost flat and the steep walls forbid a big step. Momentum (purple) keeps accelerating along the floor. RMSProp (teal) plateaus near 0.005 because its step never shrinks. Adam (blue) hits the plotted floor of 10<sup>−16</sup> around step 3,700: momentum plus per-parameter scaling lets it speed up on the flat floor. Remember that this is one problem with hand-picked rates; the lesson is the mechanism, not a ranking.</p>
+<h3>Learning-rate schedules</h3>
+<p>A constant α is rarely best. Early in training a large rate makes fast progress. Late in training a large rate keeps the iterate bouncing in a noise ball, so you want it small. Common schedules, with α<sub>max</sub> = 0.1, α<sub>min</sub> = 0.001 and T = 100 total steps:</p>
+<ul><li><strong>Step decay:</strong> α<sub>t</sub> = α<sub>max</sub>·0.5<sup>⌊t/30⌋</sup> (halve every 30 steps).</li>
+<li><strong>Cosine decay:</strong> α<sub>t</sub> = α<sub>min</sub> + ½(α<sub>max</sub> − α<sub>min</sub>)(1 + cos(πt/T)). Smooth, falls slowly at first, fast in the middle, slowly at the end.</li>
+<li><strong>Linear warmup then cosine:</strong> ramp from near 0 to α<sub>max</sub> over the first few steps, then decay. Warmup protects Adam, because early on v̂ is a noisy estimate from a few gradients and large steps are risky, and it protects deep networks whose initial gradients are erratic.</li></ul>
+<pre class="code lang-python"><code>import numpy as np
+
+lr_max, lr_min, T, warm = 0.1, 0.001, 100, 10
+
+def step_decay(t):  return lr_max * 0.5 ** (t // 30)          # halve every 30 steps
+def cosine(t):      return lr_min + 0.5 * (lr_max - lr_min) * (1 + np.cos(np.pi * t / T))
+def warmup_cosine(t):
+    if t &lt; warm: return lr_max * (t + 1) / warm               # linear ramp up
+    progress = (t - warm) / (T - warm)                        # 0 to 1 over the rest
+    return lr_min + 0.5 * (lr_max - lr_min) * (1 + np.cos(np.pi * progress))
+
+print("t    step    cosine  warmup+cosine")
+for t in (0, 5, 10, 30, 50, 90, 99):
+    print(f"{t:&lt;4d} {step_decay(t):.4f}  {cosine(t):.4f}  {warmup_cosine(t):.4f}")</code></pre>
+<pre class="code lang-text"><code>t    step    cosine  warmup+cosine
+0    0.1000  0.1000  0.0100
+5    0.1000  0.0994  0.0600
+10   0.1000  0.0976  0.1000
+30   0.0500  0.0796  0.0884
+50   0.0500  0.0505  0.0591
+90   0.0125  0.0034  0.0040
+99   0.0125  0.0010  0.0010</code></pre>
+<p>Check by hand: cosine at t = 50 is 0.001 + ½·0.099·(1 + cos(π/2)) = 0.001 + 0.0495·1 = 0.0505. Warmup at t = 5 is 0.1·(5 + 1)/10 = 0.06.</p>
+<h3>Gradient clipping</h3>
+<p>Sometimes one batch has a freak gradient (an outlier, or a recurrent network whose gradient explodes, Chapter 13). A single giant step can wreck the weights. <strong>Clipping by norm</strong> rescales the gradient when its length exceeds a threshold c: g ← g · min(1, c/‖g‖). The direction is kept and only the length is capped. For g = (30, 40), ‖g‖ = √(900 + 1600) = 50. With c = 5 the factor is 5/50 = 0.1 and the clipped gradient is (3, 4), norm 5. A gradient (0.3, 0.4) has norm 0.5 &lt; 5, so min(1, 10) = 1 and it is unchanged. Transformer training typically clips at norm 1.0 (<code>torch.nn.utils.clip_grad_norm_</code>).</p>
+<pre class="code lang-python"><code>import numpy as np
+
+def clip_by_norm(g, c):
+    norm = np.linalg.norm(g)
+    return g * min(1.0, c / norm)        # shrink only if the norm is above c
+
+g = np.array([30.0, 40.0])               # norm = 50
+print("clipped to 5  :", clip_by_norm(g, 5.0))
+print("small gradient:", clip_by_norm(np.array([0.3, 0.4]), 5.0))</code></pre>
+<pre class="code lang-text"><code>clipped to 5  : [3. 4.]
+small gradient: [0.3 0.4]</code></pre>
+<h3>Saddle points and local minima in deep learning</h3>
+<p>A <strong>saddle point</strong> has zero gradient but is a minimum in some directions and a maximum in others, like a mountain pass. For f(x, y) = x² − y² the origin is a saddle: the Hessian eigenvalues are +2 (x) and −2 (y). In n dimensions a random critical point has each Hessian eigenvalue positive or negative with roughly equal chance, so a critical point where <em>all</em> n are positive (a true local minimum) becomes exponentially rare as n grows, while saddles are everywhere. This is the argument (Dauphin et al., 2014) that in deep networks saddles and flat plateaus, not bad local minima, are the main obstacle.</p>
+<p>Gradient descent started exactly on the unstable direction would sit at the saddle for ever; any tiny perturbation grows by the factor (1 + 2α) per step in the y direction. Below, with α = 0.1, a y of 10<sup>−6</sup> grows by 1.2<sup>100</sup> ≈ 8.3×10<sup>7</sup>, to 82.8 after 100 steps, while the exactly-zero start stays stuck. Mini-batch noise and momentum provide such perturbations automatically.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+# f(x, y) = x^2 - y^2 has a saddle at (0, 0); gradient = (2x, -2y)
+def grad(p): return np.array([2 * p[0], -2 * p[1]])
+
+for y0 in (0.0, 1e-6):
+    p = np.array([1.0, y0]); alpha = 0.1
+    for k in range(100):
+        p = p - alpha * grad(p)
+    print(f"start y = {y0:g}: after 100 steps p = ({p[0]:.2e}, {p[1]:.2e})")</code></pre>
+<pre class="code lang-text"><code>start y = 0: after 100 steps p = (2.04e-10, 0.00e+00)
+start y = 1e-06: after 100 steps p = (2.04e-10, 8.28e+01)</code></pre>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">A training recipe that works in practice: AdamW with a short linear warmup, cosine decay to a small value, gradient clipping at 1.0, standardized inputs. Each part answers a specific failure from this chapter: noisy early v̂ (warmup), noise ball late in training (decay), freak gradients (clipping), ill-conditioning (scaling and Adam's per-parameter steps).</div></div>
+<h3>Going deeper</h3>
+<p>Adam's update is a form of sign descent in disguise: when gradients are consistent, m̂/√v̂ is near ±1, so each coordinate moves by about α. Its second-moment division is a <em>diagonal preconditioner</em>, an approximation of the inverse square root of the Hessian's diagonal-like scale, which is why it helps when parameters have very different gradient magnitudes. Known limits: Adam with β<sub>2</sub> too small can fail to converge even on simple convex problems (the AMSGrad analysis of Reddi et al.), the choice ε = 10<sup>−8</sup> matters when v̂ is tiny (some large models use 10<sup>−6</sup> or higher), and Adam can generalize slightly worse than SGD on some vision tasks, a claim still debated and dependent on tuning. Interview staples: "what is the difference between Adam and AdamW", "why bias correction", "why warmup", and "write SGD with momentum".</p>
+
+<h2>14.5 Second-Order Methods: Newton, BFGS and Line Search</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Gradient descent knows the slope but not the shape of the valley, so it must be cautious. Newton's method also measures the <em>curvature</em>: it fits a parabola to the function at the current point and jumps straight to the bottom of that parabola. If the function really is a parabola, one jump is enough.</div></div>
+<h3>Deriving Newton's method</h3>
+<p>Use the second-order Taylor expansion (Chapter 11) around x: f(x + d) ≈ f(x) + f′(x)·d + ½f″(x)·d². Minimize the right side over d: set the derivative with respect to d to zero, f′(x) + f″(x)·d = 0, so d = −f′(x)/f″(x). The update is</p>
+<div class="eq">x<sub>k+1</sub> = x<sub>k</sub> − f′(x<sub>k</sub>) / f″(x<sub>k</sub>)</div>
+<p>This is exactly the Newton root-finding iteration from Chapter 11 applied to the equation f′(x) = 0. In many variables the gradient replaces f′ and the Hessian H replaces f″, and division becomes solving a linear system (Chapter 7): <strong>x<sub>k+1</sub> = x<sub>k</sub> − H⁻¹∇f(x<sub>k</sub>)</strong>. Notice what happens to the learning rate: it is replaced by 1/f″, the exact right step size for the local curvature, and in many dimensions by H⁻¹, which also rotates and rescales the direction so the canyon becomes round.</p>
+<p class="problem"><span class="pl">Problem 14.5.1</span> Minimize f(x) = e<sup>x</sup> − 2x with Newton's method from x<sub>0</sub> = 0. (The true minimizer solves e<sup>x</sup> = 2, so x* = ln 2 ≈ 0.693147.)</p>
+<table class="steps"><tr><th>Derivatives</th><td>f′(x) = e<sup>x</sup> − 2 and f″(x) = e<sup>x</sup></td></tr>
+<tr><th>Step 1</th><td>f′(0) = 1 − 2 = −1, f″(0) = 1. x<sub>1</sub> = 0 − (−1)/1 = 1</td></tr>
+<tr><th>Step 2</th><td>f′(1) = e − 2 = 0.71828, f″(1) = 2.71828. x<sub>2</sub> = 1 − 0.71828/2.71828 = 1 − 0.26424 = 0.73576</td></tr>
+<tr><th>Step 3</th><td>x<sub>2</sub> is exactly 2/e, and e<sup>2/e</sup> ≈ 2.0871, so f′ ≈ 0.0871 and f″ ≈ 2.0871. x<sub>3</sub> = 0.73576 − 0.0871/2.0871 = 0.73576 − 0.04172 = 0.69404 (the code gives 0.694042)</td></tr>
+<tr><th>Errors</th><td>|x<sub>k</sub> − ln 2| = 0.307, 0.0426, 0.00090, 4×10<sup>−7</sup>, 8×10<sup>−14</sup></td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+
+# Minimise f(x) = e^x - 2x.  f'(x) = e^x - 2, f''(x) = e^x.  True minimum: x = ln 2
+x = 0.0
+print("true answer", round(np.log(2), 10))
+for k in range(1, 6):
+    x = x - (np.exp(x) - 2) / np.exp(x)       # Newton step: x - f'/f''
+    print(f"step {k}: x = {x:.10f}  error = {abs(x - np.log(2)):.2e}")</code></pre>
+<pre class="code lang-text"><code>true answer 0.6931471806
+step 1: x = 1.0000000000  error = 3.07e-01
+step 2: x = 0.7357588823  error = 4.26e-02
+step 3: x = 0.6940422999  error = 8.95e-04
+step 4: x = 0.6931475811  error = 4.00e-07
+step 5: x = 0.6931471806  error = 8.02e-14</code></pre>
+<p>Look at the error column: 0.0426, then 0.00090, then 4×10<sup>−7</sup>, then 8×10<sup>−14</sup>. Each error is about half the <em>square</em> of the previous one (0.0426² = 0.00181, half of that is 0.0009). This is <strong>quadratic convergence</strong>: once you are close, the number of correct digits roughly doubles each step, from 1 digit to 3, to 6, to 13. Compare gradient descent whose errors shrink by a constant factor.</p>
+<p class="problem"><span class="pl">Problem 14.5.2</span> One Newton step on f(x, y) = x² + 10y² from (4, 2).</p>
+<table class="steps"><tr><th>Gradient</th><td>(2x, 20y) = (8, 40)</td></tr>
+<tr><th>Hessian</th><td>[[2, 0], [0, 20]]</td></tr>
+<tr><th>Solve H s = g</th><td>2·s<sub>1</sub> = 8 gives s<sub>1</sub> = 4. 20·s<sub>2</sub> = 40 gives s<sub>2</sub> = 2</td></tr>
+<tr><th>Update</th><td>(4, 2) − (4, 2) = (0, 0), the exact minimum, whatever the condition number</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+
+# f(x, y) = x^2 + 10 y^2: one Newton step lands on the minimum
+H = np.array([[2.0, 0.0], [0.0, 20.0]])
+p = np.array([4.0, 2.0])
+g = np.array([2 * p[0], 20 * p[1]])
+step = np.linalg.solve(H, g)                  # solve H s = g, never form H^-1
+print("gradient", g, " Newton step", step, " new point", p - step)</code></pre>
+<pre class="code lang-text"><code>gradient [ 8. 40.]  Newton step [4. 2.]  new point [0. 0.]</code></pre>
+<p>Gradient descent on this same bowl needs about 69 steps per millionfold improvement (κ = 10 as in Problem 14.2.2); Newton needs one. The catch is the cost.</p>
+<h3>The cost: why we do not use Newton for neural networks</h3>
+<p>With n parameters the Hessian has n² entries (memory O(n²)) and solving H s = g costs O(n³) arithmetic. Concretely: n = 10,000 gives 10<sup>8</sup> entries (800 MB in 64-bit floats) and about 10<sup>12</sup> operations per step; n = 10<sup>6</sup> gives 10<sup>12</sup> entries, 8 terabytes; n = 10<sup>9</sup> parameters (a small language model) gives 10<sup>18</sup> entries, impossible. Newton also has failure modes. If H has a negative eigenvalue (non-convex region, saddle) the Newton step points toward a maximum or saddle. Far from the minimum the quadratic model can be wildly wrong and the step overshoots. Practical Newton uses <strong>damping</strong> (use H + λI, the Levenberg idea) and a line search.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Wrong: "Newton's method converges faster per step, so it must be better for deep learning." Right: it is fast per <em>step</em> but each step costs O(n³) time and O(n²) memory, and on non-convex losses it is attracted to saddles. Also, never compute <code>np.linalg.inv(H) @ g</code>; use <code>np.linalg.solve(H, g)</code>, which is faster and numerically more stable.</div></div>
+<h3>Quasi-Newton: BFGS and L-BFGS</h3>
+<p>Quasi-Newton methods get most of Newton's benefit without computing the Hessian. After each step they know the step s = x<sub>k+1</sub> − x<sub>k</sub> and the gradient change y = ∇f(x<sub>k+1</sub>) − ∇f(x<sub>k</sub>). For a quadratic y = Hs exactly, so the pair (s, y) carries curvature information along the direction s. <strong>BFGS</strong> maintains an approximation of H⁻¹ and updates it so that it satisfies this secant relation, with O(n²) memory and no linear solve. <strong>L-BFGS</strong> (limited memory) stores only the last m pairs (m about 10) and rebuilds the direction from them, with O(m·n) memory, which scales to millions of parameters. It is the workhorse behind scikit-learn's default <code>LogisticRegression(solver="lbfgs")</code> and SciPy's <code>minimize</code>. In the code below, <code>jac</code> is the gradient function; without it SciPy estimates gradients by finite differences (Chapter 10), which is slower.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy.optimize import minimize
+
+def rosen(p):  return (1 - p[0]) ** 2 + 100 * (p[1] - p[0] ** 2) ** 2
+def rosen_grad(p):
+    return np.array([-2 * (1 - p[0]) - 400 * p[0] * (p[1] - p[0] ** 2),
+                     200 * (p[1] - p[0] ** 2)])
+
+for method in ("BFGS", "L-BFGS-B", "Newton-CG"):
+    r = minimize(rosen, [-1.5, 1.5], jac=rosen_grad, method=method)
+    print(f"{method:10s} x = {np.round(r.x, 4)}  iterations = {r.nit}  f evaluations = {r.nfev}")</code></pre>
+<pre class="code lang-text"><code>BFGS       x = [1. 1.]  iterations = 34  f evaluations = 41
+L-BFGS-B   x = [1. 1.]  iterations = 40  f evaluations = 49
+Newton-CG  x = [1. 1.]  iterations = 56  f evaluations = 74</code></pre>
+<p>Our Rosenbrock problem, where gradient descent was still at loss 0.005 after 5,000 steps, is solved to four decimals by BFGS in 34 iterations (41 function evaluations). The numbers vary slightly between SciPy versions, but the order of magnitude does not.</p>
+<h3>Line search</h3>
+<p>Instead of a fixed α, choose it by searching along the direction. <strong>Backtracking line search</strong> starts with a big step (α = 1) and halves it until the <em>Armijo condition</em> holds: f(x − αg) ≤ f(x) − c·α·‖g‖² (with c a small constant such as 10<sup>−4</sup>): the achieved decrease must be at least a fraction c of what the tangent line promised.</p>
+<p class="problem"><span class="pl">Problem 14.5.3</span> f(x) = x², x = 4, g = 8, c = 0.1, start with α = 1.</p>
+<table class="steps"><tr><th>Try α = 1</th><td>new x = 4 − 8 = −4, f = 16. Bound: f(x) − c·α·g² = 16 − 0.1·1·64 = 9.6. Is 16 ≤ 9.6? No. Halve</td></tr>
+<tr><th>Try α = 0.5</th><td>new x = 4 − 4 = 0, f = 0. Bound: 16 − 0.1·0.5·64 = 12.8. Is 0 ≤ 12.8? Yes. Accept</td></tr></table>
+<pre class="code lang-python"><code># Backtracking line search (Armijo) on f(x) = x^2 from x = 4
+f = lambda x: x * x
+x, g = 4.0, 8.0
+c, alpha = 0.1, 1.0
+while f(x - alpha * g) &gt; f(x) - c * alpha * g * g:      # not enough decrease yet
+    print(f"alpha={alpha}: f(new)={f(x - alpha * g):.2f} &gt; bound {f(x) - c * alpha * g * g:.2f}, halve")
+    alpha /= 2
+print(f"accepted alpha={alpha}: f(new)={f(x - alpha * g):.2f} &lt;= bound {f(x) - c * alpha * g * g:.2f}")</code></pre>
+<pre class="code lang-text"><code>alpha=1.0: f(new)=16.00 &gt; bound 9.60, halve
+accepted alpha=0.5: f(new)=0.00 &lt;= bound 12.80</code></pre>
+<p>In the code the loop halves α until the test passes, exactly the two rows above. Line search removes the need to hand-tune α for full-batch methods like L-BFGS, but it is rarely used with mini-batch SGD, where the loss is noisy and every extra function evaluation costs a pass over a batch.</p>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">Fitting logistic regression in statsmodels or scikit-learn does not use plain gradient descent: statsmodels uses Newton (the algorithm is called IRLS, iteratively reweighted least squares), scikit-learn defaults to L-BFGS. With 10 to 1,000 features, the Hessian is tiny and these converge in 5 to 50 iterations. For a 100-million-weight neural network, you switch to Adam.</div></div>
+<h3>Going deeper</h3>
+<p>Newton's method is affine invariant: rescale a variable (x → 1000x) and the iterates transform in the same way, so its performance does not depend on the condition number at all. That is the exact property gradient descent lacks. Its quadratic convergence needs f″(x*) &gt; 0. If the second derivative vanishes at the minimum, e.g. f(x) = x⁴, the Newton step is x − 4x³/(12x²) = 2x/3: convergence drops to the ordinary linear kind. The local theory: if f″ is Lipschitz with constant M and f″ ≥ m &gt; 0, then e<sub>k+1</sub> ≤ (M/2m)·e<sub>k</sub>², which is the formal version of "half the square" seen above (here M/2m ≈ 1/2). Between first-order and second-order lie Hessian-free methods (conjugate gradient on H s = g using only Hessian-vector products, which cost about the same as one gradient, Chapter 12) and K-FAC and Shampoo for neural networks, which approximate the curvature with structured blocks.</p>
+
+<h2>14.6 Constrained Optimization, KKT, Duality and Regularization</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A marble rolls downhill inside a fenced field. If the lowest point of the field is inside the fence, the fence does not matter. If the lowest point is outside, the marble rolls until it presses against the fence, and at rest the fence pushes back exactly cancelling the pull of the slope. The size of that push is the <strong>Lagrange multiplier</strong>, and a fence can only push, never pull.</div></div>
+<h3>Equality constraints: Lagrange</h3>
+<p>You met this in Chapter 12. To minimize f(x) subject to h(x) = 0, form the <strong>Lagrangian</strong> L(x, λ) = f(x) + λ·h(x) and solve ∇<sub>x</sub>L = 0 together with h(x) = 0. Geometrically, at the optimum the gradient of f is parallel to the gradient of h, because otherwise you could slide along the constraint and keep improving.</p>
+<p class="problem"><span class="pl">Problem 14.6.1</span> Minimize x² + 2y² subject to x + y = 3.</p>
+<table class="steps"><tr><th>Lagrangian</th><td>L = x² + 2y² + λ(x + y − 3)</td></tr>
+<tr><th>Stationarity</th><td>∂L/∂x = 2x + λ = 0, ∂L/∂y = 4y + λ = 0, so 2x = 4y, i.e. x = 2y</td></tr>
+<tr><th>Constraint</th><td>2y + y = 3, so y = 1, x = 2, λ = −4</td></tr>
+<tr><th>Value</th><td>f = 4 + 2 = 6</td></tr>
+<tr><th>Check by substitution</th><td>y = 3 − x gives f = x² + 2(3 − x)². f′ = 2x − 4(3 − x) = 6x − 12 = 0, so x = 2 ✓</td></tr></table>
+<h3>Inequality constraints: the KKT conditions</h3>
+<p>For the problem "minimize f(x) subject to g<sub>i</sub>(x) ≤ 0 and h<sub>j</sub>(x) = 0" with multipliers μ<sub>i</sub> for the inequalities and λ<sub>j</sub> for the equalities, the <strong>Karush-Kuhn-Tucker (KKT) conditions</strong> at an optimum x* are:</p>
+<ol><li><strong>Stationarity:</strong> ∇f(x*) + ∑ μ<sub>i</sub>∇g<sub>i</sub>(x*) + ∑ λ<sub>j</sub>∇h<sub>j</sub>(x*) = 0 (the slope pull is balanced by the constraint pushes).</li>
+<li><strong>Primal feasibility:</strong> g<sub>i</sub>(x*) ≤ 0 and h<sub>j</sub>(x*) = 0.</li>
+<li><strong>Dual feasibility:</strong> μ<sub>i</sub> ≥ 0 (a wall can only push you back inside).</li>
+<li><strong>Complementary slackness:</strong> μ<sub>i</sub>·g<sub>i</sub>(x*) = 0, meaning for each constraint either it is not touching (g<sub>i</sub> &lt; 0 so μ<sub>i</sub> = 0, no push) or it is touching (g<sub>i</sub> = 0, so a push is allowed).</li></ol>
+<p>For a convex problem (with a mild regularity condition such as Slater's: a strictly feasible point exists) the KKT conditions are both necessary and sufficient: if you find a point satisfying them, it is the global optimum.</p>
+<p class="problem"><span class="pl">Problem 14.6.2</span> Minimize (x − 3)² subject to x ≤ 1.</p>
+<table class="steps"><tr><th>Setup</th><td>g(x) = x − 1 ≤ 0. L = (x − 3)² + μ(x − 1)</td></tr>
+<tr><th>Stationarity</th><td>2(x − 3) + μ = 0</td></tr>
+<tr><th>Case A: μ = 0</th><td>x = 3, but g(3) = 2 &gt; 0, violates the constraint. Reject</td></tr>
+<tr><th>Case B: g = 0</th><td>x = 1. Then 2(1 − 3) + μ = 0, so μ = 4 ≥ 0 ✓</td></tr>
+<tr><th>Answer</th><td>x* = 1 with multiplier 4: the wall pushes with strength 4. If the constraint were x ≤ 5, Case A would give x = 3 with g = −2 &lt; 0 and μ = 0: inactive</td></tr></table>
+<p class="problem"><span class="pl">Problem 14.6.3</span> Minimize (x − 2)² + (y − 2)² subject to x + y ≤ 2.</p>
+<table class="steps"><tr><th>Setup</th><td>g = x + y − 2. Stationarity: 2(x − 2) + μ = 0 and 2(y − 2) + μ = 0, so x = y</td></tr>
+<tr><th>Case A: μ = 0</th><td>x = y = 2, but 2 + 2 − 2 = 2 &gt; 0. Violates. Reject</td></tr>
+<tr><th>Case B: active</th><td>x + y = 2 and x = y gives x = y = 1. Then 2(1 − 2) + μ = 0, so μ = 2 ≥ 0 ✓</td></tr>
+<tr><th>Check stationarity</th><td>∇f = (−2, −2), μ∇g = 2·(1, 1) = (2, 2). Sum = (0, 0) ✓</td></tr>
+<tr><th>Answer</th><td>(1, 1), objective 1 + 1 = 2</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+from scipy.optimize import minimize
+
+# minimise (x-2)^2 + (y-2)^2  subject to  x + y &lt;= 2
+obj = lambda p: (p[0] - 2) ** 2 + (p[1] - 2) ** 2
+con = {"type": "ineq", "fun": lambda p: 2 - p[0] - p[1]}      # scipy wants g(p) &gt;= 0
+r = minimize(obj, [0.0, 0.0], constraints=[con], method="SLSQP")
+x, y = r.x
+mu = -2 * (x - 2)                                             # from 2(x-2) + mu = 0
+print("solution", np.round(r.x, 4), "objective", round(r.fun, 4))
+print("multiplier mu =", round(mu, 4), " slack 2-x-y =", round(2 - x - y, 6))</code></pre>
+<pre class="code lang-text"><code>solution [1. 1.] objective 2.0
+multiplier mu = 2.0  slack 2-x-y = 0.0</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Wrong: assuming a constraint is active and accepting whatever multiplier comes out. Take minimize (x − 3)² subject to x ≤ 5 and assume x = 5: stationarity 2(5 − 3) + μ = 0 gives μ = −4. Right: with the convention g ≤ 0, μ ≥ 0, a negative μ means the wall would have to <em>pull</em> you, so the constraint is not really active. Try the inactive case: μ = 0, x = 3, and g(3) = −2 &lt; 0 is feasible. Always write constraints as g ≤ 0, solve the active and inactive cases, and check μ ≥ 0.</div></div>
+<h3>Duality, and the SVM idea</h3>
+<p>The <strong>dual function</strong> is d(μ) = min<sub>x</sub> L(x, μ) for μ ≥ 0. Because for any feasible x the penalty term μ·g(x) is ≤ 0, we get d(μ) ≤ f(x*) for every μ ≥ 0: the dual is always a lower bound (<strong>weak duality</strong>). The best bound comes from maximizing d(μ) over μ ≥ 0, the <strong>dual problem</strong>. For convex problems with Slater's condition the gap closes (<strong>strong duality</strong>): max d = min f.</p>
+<p class="problem"><span class="pl">Problem 14.6.4</span> Minimize x² subject to x ≥ 1, solved through its dual.</p>
+<table class="steps"><tr><th>Write as g ≤ 0</th><td>g(x) = 1 − x ≤ 0. L(x, μ) = x² + μ(1 − x)</td></tr>
+<tr><th>Minimize over x</th><td>∂L/∂x = 2x − μ = 0, so x = μ/2</td></tr>
+<tr><th>Dual function</th><td>d(μ) = μ²/4 + μ − μ²/2 = μ − μ²/4</td></tr>
+<tr><th>Maximize over μ ≥ 0</th><td>d′ = 1 − μ/2 = 0 gives μ = 2, d(2) = 2 − 1 = 1</td></tr>
+<tr><th>Primal</th><td>Minimum of x² with x ≥ 1 is at x = 1 with value 1. Dual value 1 = primal value 1: strong duality ✓. And x = μ/2 = 1 recovers the primal solution</td></tr></table>
+<p>This idea powers the support vector machine. The primal SVM is: minimize ½‖w‖² subject to y<sub>i</sub>(w·x<sub>i</sub> + b) ≥ 1 for every training point (find the widest-margin separating line). Its dual is: maximize ∑α<sub>i</sub> − ½∑∑α<sub>i</sub>α<sub>j</sub>y<sub>i</sub>y<sub>j</sub>(x<sub>i</sub>·x<sub>j</sub>) with α<sub>i</sub> ≥ 0 and ∑α<sub>i</sub>y<sub>i</sub> = 0, and w = ∑α<sub>i</sub>y<sub>i</sub>x<sub>i</sub>. Two things make the dual valuable. By complementary slackness, α<sub>i</sub> &gt; 0 only for points exactly on the margin (the <strong>support vectors</strong>); every other point has α<sub>i</sub> = 0. And the data enter only through dot products x<sub>i</sub>·x<sub>j</sub>, so you can replace them by a kernel function and get nonlinear boundaries without ever building the features.</p>
+<p>Tiny check: two 1-D points, x = +1 with label +1 and x = −1 with label −1. By symmetry α<sub>1</sub> = α<sub>2</sub> = a. The double sum is a²·1 + a²·1 + 2·a²·(y<sub>1</sub>y<sub>2</sub>)(x<sub>1</sub>x<sub>2</sub>) = a² + a² + 2a²·(−1)(−1) = 4a², so the dual is 2a − ½·4a² = 2a − 2a². Its derivative 2 − 4a = 0 gives a = ½ and value 1 − ½ = ½. Recover w = ½·(+1)(+1) + ½·(−1)(−1) = 1, so ½‖w‖�� = ½, equal to the dual value ✓.</p>
+<h3>Regularization as constrained optimization</h3>
+<p>Ridge regression minimizes ‖Xw − y‖² + λ‖w‖²<sub>2</sub>. By the Lagrangian logic of this section, that is the same family of solutions as "minimize ‖Xw − y‖² subject to ‖w‖²<sub>2</sub> ≤ t": each λ corresponds to some budget t, big λ to a small budget. Lasso uses the L1 norm: minimize ‖Xw − y‖² + λ‖w‖<sub>1</sub>, equivalent to ‖w‖<sub>1</sub> ≤ t. So regularization is a budget on how large the weights may be.</p>
+<h3>Ridge in closed form</h3>
+<p>Set the gradient of ‖Xw − y‖² + λ‖w‖² to zero: 2Xᵀ(Xw − y) + 2λw = 0, so (XᵀX + λI)w = Xᵀy and <strong>w = (XᵀX + λI)⁻¹Xᵀy</strong>. The matrix XᵀX + λI is invertible for every λ &gt; 0, since its eigenvalues are λ<sub>i</sub> + λ ≥ λ &gt; 0. It also has a better condition number: (λ<sub>max</sub> + λ)/(λ<sub>min</sub> + λ), which stays near 1 when λ dominates the small eigenvalues. Below, two features are nearly identical copies (the typical collinearity problem). The truth is y = 3·x<sub>1</sub> + noise.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+rng = np.random.default_rng(3)
+n = 50
+x1 = rng.normal(size=n)
+x2 = x1 + rng.normal(scale=0.05, size=n)         # almost a copy of x1
+X = np.column_stack([x1, x2])
+y = 3 * x1 + rng.normal(scale=0.5, size=n)
+
+def ridge(X, y, lam):
+    d = X.shape[1]
+    return np.linalg.solve(X.T @ X + lam * np.eye(d), X.T @ y)   # (X^T X + lam I)^-1 X^T y
+
+for lam in (0.0, 1.0, 10.0):
+    w = ridge(X, y, lam)
+    print(f"lambda={lam:5.1f} w={np.round(w, 3)}  sum={w.sum():.3f}  ||w||={np.linalg.norm(w):.3f}")</code></pre>
+<pre class="code lang-text"><code>lambda=  0.0 w=[2.109 0.932]  sum=3.042  ||w||=2.306
+lambda=  1.0 w=[1.539 1.474]  sum=3.013  ||w||=2.131
+lambda= 10.0 w=[1.402 1.403]  sum=2.804  ||w||=1.983</code></pre>
+<p>Without regularization the split between the two copies is arbitrary and unstable (2.109 versus 0.932, total near 3). With λ = 1 the weights are shared evenly (1.539, 1.474), and with λ = 10 they are pulled toward smaller values (the sum drops to 2.80): the price of stability is a small bias.</p>
+<figure><img src="images/ch14_l1l2.png" alt="Elliptical loss contours meeting a diamond at a corner on an axis, and a circle at a point with both coordinates non-zero" loading="lazy"/><figcaption>Figure 14.4. Constrained view of regularization. Left: the L1 diamond. Right: the L2 circle. The star is the best unconstrained weight vector; the red dot is the best weight vector inside the allowed region.</figcaption></figure>
+<p>How to read it: the grey ellipses are contours of the data-fit loss, which grows as you move away from the star. You want the lowest contour that still touches the allowed region. For the circle, the touching point is generically a smooth point where both weights are nonzero. A diamond has corners on the coordinate axes, so the ellipses very often first touch it at a corner, and at a corner some weights are exactly zero (here w<sub>2</sub> = 0). In d dimensions the L1 ball has many corners and edges where several coordinates vanish, which is why lasso performs feature selection and ridge does not.</p>
+<h3>Why L1 gives exact zeros: the one-dimensional proof</h3>
+<p>Take one weight with unregularized best value a and minimize ½(w − a)² + λ|w|. For w &gt; 0 the derivative is (w − a) + λ = 0, so w = a − λ, valid only if a &gt; λ. For w &lt; 0 it is w = a + λ, valid only if a &lt; −λ. When |a| ≤ λ neither works and the minimum sits at the kink w = 0. This is the <strong>soft-threshold</strong> function: w = sign(a)·max(|a| − λ, 0). Ridge, with ½(w − a)² + ½λw², gives w = a/(1 + λ): it shrinks but is never exactly zero for a ≠ 0.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+def lasso_1d(a, lam): return np.sign(a) * max(abs(a) - lam, 0.0)   # soft threshold
+def ridge_1d(a, lam): return a / (1 + lam)
+
+for a in (3.0, 0.5, -2.0):
+    print(f"a={a:+.1f}  lasso(lam=1)={lasso_1d(a, 1.0):+.3f}  ridge(lam=1)={ridge_1d(a, 1.0):+.3f}")</code></pre>
+<pre class="code lang-text"><code>a=+3.0  lasso(lam=1)=+2.000  ridge(lam=1)=+1.500
+a=+0.5  lasso(lam=1)=+0.000  ridge(lam=1)=+0.250
+a=-2.0  lasso(lam=1)=-1.000  ridge(lam=1)=-1.000</code></pre>
+<p>Check by hand: a = 3, λ = 1: lasso 3 − 1 = 2, ridge 3/2 = 1.5. a = 0.5: lasso max(0.5 − 1, 0) = 0, ridge 0.5/2 = 0.25. a = −2: lasso −(2 − 1) = −1, ridge −2/2 = −1. In gradient language: the L1 penalty pushes with constant force λ toward zero however small the weight, so it reaches zero; the L2 force 2λw fades as w shrinks.</p>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">L2 shrinks weights smoothly (all stay nonzero); L1 shrinks by a constant amount and clips small weights to exactly zero. Elastic net mixes both. Choose λ by cross-validation, and always standardize features first, otherwise the penalty treats features of different scales unfairly.</div></div>
+<h3>Going deeper</h3>
+<p>The proximal view makes L1 trainable at scale. The objective f(w) + λ‖w‖<sub>1</sub> has a smooth part and a kinked part. The <strong>proximal gradient method (ISTA)</strong> takes a gradient step on the smooth part, then applies the soft-threshold, w ← soft(w − α∇f(w), αλ). Soft-thresholding is the <em>proximal operator</em> of the L1 norm, defined as argmin<sub>w</sub> ½‖w − z‖² + τ‖w‖<sub>1</sub>. With α = 1/L (L the largest eigenvalue of XᵀX/n) ISTA converges at rate O(1/k), and its accelerated variant FISTA at O(1/k²). Below we recover a sparse truth: 10 features, only features 1, 4 and 7 matter (true weights 3, −2, 1.5).</p>
+<pre class="code lang-python"><code>import numpy as np
+
+rng = np.random.default_rng(0)
+n, d = 100, 10
+X = rng.normal(size=(n, d))
+true_w = np.zeros(d); true_w[[1, 4, 7]] = [3.0, -2.0, 1.5]       # only 3 real features
+y = X @ true_w + rng.normal(scale=0.5, size=n)
+
+def soft(z, t): return np.sign(z) * np.maximum(np.abs(z) - t, 0.0)
+
+lam = 0.2
+L = np.linalg.eigvalsh(X.T @ X / n).max()                         # smoothness of the data term
+alpha = 1 / L
+w = np.zeros(d)
+for k in range(500):
+    g = X.T @ (X @ w - y) / n                                     # gradient of 0.5 * mean squared error
+    w = soft(w - alpha * g, alpha * lam)                          # gradient step, then shrink
+print("ISTA  :", np.round(w, 2))
+print("OLS   :", np.round(np.linalg.lstsq(X, y, rcond=None)[0], 2))</code></pre>
+<pre class="code lang-text"><code>ISTA  : [ 0.    2.7  -0.   -0.   -1.7   0.    0.    1.21  0.    0.  ]
+OLS   : [ 0.1   2.92 -0.05 -0.02 -2.   -0.05 -0.04  1.54  0.01  0.05]</code></pre>
+<p>ISTA sets seven weights exactly to zero and keeps the right three (with the known shrinkage bias: 2.7 instead of 3), while ordinary least squares returns ten nonzero weights, including small noise-fitting ones. Interview line: "L1 is the convex relaxation of the count of nonzero weights, the L0 'norm'; that is why it promotes sparsity while remaining solvable."</p>
+
+<h2>14.7 Linear Programming, Integer Programming, Hyperparameter Search and Derivative-Free Methods</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A bakery has limited oven hours and limited baker hours. Each tray of croissants and each loaf uses some of both and earns some profit. How many of each should it bake? When profit and resource use are both <em>proportional</em> (twice the trays, twice the hours, twice the profit), the problem is a <strong>linear program</strong>, and its answer always sits in a corner of the feasible region. No gradient descent is needed.</div></div>
+<h3>Formulating a linear program</h3>
+<p>A linear program (LP) has a linear objective and linear constraints:</p>
+<div class="eq">maximize c·x subject to A x ≤ b, x ≥ 0</div>
+<p>Formulate the bakery. Let x = trays of croissants and y = loaves. Profit per tray is 40 and per loaf is 30. A tray needs 2 oven hours and 1 labour hour; a loaf needs 1 oven hour and 3 labour hours. This week there are 100 oven hours and 120 labour hours.</p>
+<div class="eq">maximize 40x + 30y</div>
+<div class="eq">2x + y ≤ 100 (oven), &nbsp; x + 3y ≤ 120 (labour), &nbsp; x ≥ 0, y ≥ 0</div>
+<h3>Graphical solution</h3>
+<p>Each inequality is a half-plane, and their intersection is the <strong>feasible region</strong>, a polygon. Find its corners. The axes and the two lines meet at: (0, 0); the oven line meets y = 0 at x = 50, so (50, 0); the labour line meets x = 0 at y = 40, so (0, 40); and the two lines meet where 2x + y = 100 and x + 3y = 120. From the first, y = 100 − 2x. Substitute: x + 3(100 − 2x) = 120, so x + 300 − 6x = 120, so −5x = −180, giving x = 36 and y = 100 − 72 = 28. Check labour: 36 + 84 = 120 ✓. Evaluate the profit at each corner:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Corner</th><th>Profit 40x + 30y</th></tr></thead><tbody>
+<tr><td>(0, 0)</td><td>0</td></tr><tr><td>(50, 0)</td><td>2,000</td></tr><tr><td>(36, 28)</td><td>1,440 + 840 = 2,280</td></tr><tr><td>(0, 40)</td><td>1,200</td></tr></tbody></table></div>
+<p>The best is (36, 28) with profit 2,280. Why only corners? The profit lines 40x + 30y = P are parallel lines; slide P upward until the line is about to leave the polygon. The last point it touches is a corner (or a whole edge if the line is parallel to it). The dashed purple lines in Figure 14.5 are P = 1200, 1800 and 2280.</p>
+<figure><img src="images/ch14_lp.png" alt="Feasible polygon of the bakery problem with oven and labour constraint lines, dashed profit lines and the optimum marked at 36 trays and 28 loaves" loading="lazy"/><figcaption>Figure 14.5. The bakery linear program. The green polygon is every feasible plan; the star at (36, 28) is the best corner.</figcaption></figure>
+<p>How to read it: any point inside the green region respects both resource limits. The dashed lines show equal-profit combinations; profit increases toward the top right. The highest dashed line that still touches the polygon passes through the corner where the two resource lines cross: both the oven and the labour are fully used there.</p>
+<h3>The simplex idea</h3>
+<p>The <strong>simplex method</strong> exploits the corner property: start at a corner, look at the neighbouring corners connected by an edge, move to one that improves the objective, and stop when no neighbour is better. For the bakery: start at (0, 0), profit 0. Move along the x axis to (50, 0), profit 2,000. From there the neighbours are (0, 0) (worse) and (36, 28), profit 2,280 (better), so move. At (36, 28) the neighbours are (50, 0) with 2,000 and (0, 40) with 1,200, both worse, so stop: it is optimal. Because LPs are convex, a corner that no neighbour improves is the global optimum. Simplex is exponential in the worst case but very fast in practice; interior-point methods are polynomial. The solver below (HiGHS, inside SciPy) uses both ideas.</p>
+<pre class="code lang-python"><code>from scipy.optimize import linprog
+
+# trays of croissants (x) and loaves (y): max 40x + 30y
+# oven: 2x + y &lt;= 100 hours, labour: x + 3y &lt;= 120 hours
+res = linprog(c=[-40, -30],                       # linprog minimises, so negate the profit
+              A_ub=[[2, 1], [1, 3]], b_ub=[100, 120],
+              bounds=[(0, None), (0, None)], method="highs")
+print("plan:", res.x, " profit:", -res.fun)
+print("shadow prices (profit per extra hour):", -res.ineqlin.marginals)</code></pre>
+<pre class="code lang-text"><code>plan: [36. 28.]  profit: 2280.0
+shadow prices (profit per extra hour): [18.  4.]</code></pre>
+<p>The solver matches our hand result. The second line gives <strong>shadow prices</strong>: the profit gained per extra unit of each resource. They are the dual variables of Section 14.6. Check by hand: the two active constraints give 2y<sub>1</sub> + y<sub>2</sub> = 40 and y<sub>1</sub> + 3y<sub>2</sub> = 30 (the dual constraints: prices of the resources used by one tray or loaf must cover its profit). Then y<sub>2</sub> = 40 − 2y<sub>1</sub>, so y<sub>1</sub> + 120 − 6y<sub>1</sub> = 30, so y<sub>1</sub> = 18 and y<sub>2</sub> = 4. The dual objective is 100·18 + 120·4 = 1,800 + 480 = 2,280 = the primal profit, strong duality again. Interpretation: one more oven hour adds 18 to profit, and one more labour hour only 4. Verify: with 101 oven hours the new corner has y = 101 − 2x and x + 3(101 − 2x) = 120, so x = 36.6, y = 27.8, profit 1,464 + 834 = 2,298, exactly 18 more.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Wrong: <code>linprog(c=[40, 30], ...)</code> to maximize profit. SciPy's <code>linprog</code> only minimizes, so this finds the plan with <em>least</em> profit (which is (0, 0)). Right: pass the negated objective <code>c=[-40, -30]</code> and negate the reported value. Also remember the default bounds are x ≥ 0 and that every constraint must be in the form A x ≤ b.</div></div>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">Delivery planning uses LPs all the time. The <strong>transportation problem</strong> (ship from 3 warehouses to 20 stores at minimum total cost, respecting warehouse stock and store demand) is an LP with 60 variables. Staff scheduling, diet mixing, ad-budget allocation and portfolio blends are LPs too. Choosing the actual <em>route</em> of a van (visit each stop once) is different: that is a travelling-salesman style integer problem, hard in general, handled by heuristics and tools such as Google OR-Tools.</div></div>
+<h3>Integer programming</h3>
+<p>If variables must be whole numbers (you cannot bake 1.5 trucks) the problem is an <strong>integer program</strong> (IP, or MILP if only some variables are integer), and the corner property is lost. Example: maximize 5x + 4y subject to 6x + 4y ≤ 24, x + 2y ≤ 6, x, y ≥ 0. The LP optimum is x = 3, y = 1.5 with value 15 + 6 = 21. Rounding fails: (3, 2) violates the first constraint (18 + 8 = 26 &gt; 24); (3, 1) is feasible but worth only 19. The integer optimum is (4, 0) with value 20, found by listing the feasible integer points: (4, 0) = 20, (3, 1) = 19, (2, 2) = 18. The LP value (21) is always an upper bound on the integer value (20), because dropping the integrality rule can only help.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy.optimize import linprog, milp, LinearConstraint, Bounds
+
+# max 5x + 4y  s.t.  6x + 4y &lt;= 24,  x + 2y &lt;= 6,  x, y &gt;= 0
+c = np.array([-5.0, -4.0]); A = np.array([[6.0, 4.0], [1.0, 2.0]]); b = np.array([24.0, 6.0])
+lp = linprog(c, A_ub=A, b_ub=b, bounds=[(0, None)] * 2, method="highs")
+ip = milp(c, constraints=LinearConstraint(A, ub=b), integrality=np.ones(2), bounds=Bounds(0, np.inf))
+print("LP  :", lp.x, -lp.fun)
+print("MILP:", np.round(ip.x) + 0.0, -ip.fun)
+best = max((5*x + 4*y, x, y) for x in range(5) for y in range(4) if 6*x + 4*y &lt;= 24 and x + 2*y &lt;= 6)
+print("brute force:", best)</code></pre>
+<pre class="code lang-text"><code>LP  : [3.  1.5] 21.0
+MILP: [4. 0.] 20.0
+brute force: (20, 4, 0)</code></pre>
+<p>Solvers use <strong>branch and bound</strong>: solve the LP relaxation, find a fractional variable (y = 1.5), split into two subproblems (y ≤ 1 and y ≥ 2), solve each LP, and discard branches whose LP bound cannot beat the best integer solution found so far. Integer programming is NP-hard in general, yet modern solvers handle thousands of variables for well-structured problems. In SciPy see <code>scipy.optimize.milp</code>.</p>
+<h3>Hyperparameter optimization</h3>
+<p>Hyperparameters (learning rate, number of trees, regularization strength) are not learned by gradient descent; you pick them by trying values and measuring validation error. Each trial may cost minutes or hours, so the question is how to spend, say, 9 trials.</p>
+<ul><li><strong>Grid search:</strong> try every combination of a few preset values, for example 3 learning rates × 3 depths = 9 runs. Simple, but the number of runs grows exponentially with the number of hyperparameters and each parameter is probed at only 3 distinct values.</li>
+<li><strong>Random search:</strong> draw each hyperparameter at random from its range (learning rates on a log scale). 9 runs give 9 distinct values of every hyperparameter. Bergstra and Bengio (2012) showed that this beats grid search when only a few hyperparameters matter, which is the usual case.</li>
+<li><strong>Bayesian optimization:</strong> learn from past trials. Keep a table of (settings, score). Build a cheap surrogate model that guesses the score for untried settings and also says how uncertain it is. A crude surrogate is "predict the score of the nearest tried point; uncertainty grows with distance from tried points". Pick the next trial where the optimistic guess (predicted score plus a bonus for uncertainty) is highest, which balances <em>exploitation</em> (near good results) with <em>exploration</em> (unexplored regions), run it, add it to the table and repeat. Real systems use a Gaussian process or a tree-based density model for the surrogate and the <em>expected improvement</em> as the bonus.</li></ul>
+<p>A simulation shows why grid search wastes trials. Only the first hyperparameter matters (best value 0.37, shifted randomly by up to ±0.1 each trial), the second does nothing. Both methods get 9 runs; we average the best score over 2,000 repeated experiments (higher, i.e. nearer 0, is better).</p>
+<pre class="code lang-python"><code>import numpy as np
+
+# Toy validation score: only the learning rate matters, best at 0.37; the other knob is noise
+def score(a, b): return -(a - 0.37) ** 2
+
+rng = np.random.default_rng(0)
+grid_best, rand_best = [], []
+for trial in range(2000):
+    # random shift so the optimum is not always lined up with the grid
+    shift = rng.uniform(-0.1, 0.1)
+    s = lambda a, b: score(a - shift, b)
+    g = [s(a, b) for a in (0.1, 0.5, 0.9) for b in (0.1, 0.5, 0.9)]        # 3 x 3 grid = 9 runs
+    r = [s(rng.uniform(0, 1), rng.uniform(0, 1)) for _ in range(9)]       # 9 random runs
+    grid_best.append(max(g)); rand_best.append(max(r))
+print("average best score, grid  :", round(float(np.mean(grid_best)), 5))
+print("average best score, random:", round(float(np.mean(rand_best)), 5))</code></pre>
+<pre class="code lang-text"><code>average best score, grid  : -0.01824
+average best score, random: -0.0045</code></pre>
+<p>Random search ends with a best score four times closer to 0 (−0.0045 against −0.0182), because it tried 9 distinct values of the knob that matters while the grid tried only 3. A typical Optuna study (not run here: a real study would train many models) looks like this:</p>
+<pre class="code lang-text"><code># NOT RUN: shown for the pattern only
+import optuna
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.model_selection import cross_val_score
+
+def objective(trial):
+    lr = trial.suggest_float("learning_rate", 1e-3, 0.3, log=True)
+    depth = trial.suggest_int("max_depth", 2, 8)
+    model = GradientBoostingClassifier(learning_rate=lr, max_depth=depth, random_state=0)
+    return cross_val_score(model, X, y, cv=5).mean()
+
+study = optuna.create_study(direction="maximize")   # default sampler: TPE (Bayesian-style)
+study.optimize(objective, n_trials=50)
+print(study.best_params)</code></pre>
+<p>Optuna also offers pruning (stop clearly bad trials early), related to successive halving and Hyperband, which give many configurations a small budget and keep only the best performers for larger budgets.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Wrong: tuning hyperparameters on the test set, or reporting the best cross-validation score of 200 trials as the expected performance. Right: tune on validation data (or cross-validation), then report the score once on a untouched test set. The best of many noisy trials is optimistically biased; see the Statistics document, Chapter 3 on estimation and sampling noise.</div></div>
+<h3>Derivative-free methods</h3>
+<p>Sometimes you can evaluate f but have no gradient: a simulation, a business rule, a model fed by external software. <strong>Nelder-Mead</strong> keeps a simplex (a triangle in 2D) of n + 1 points, repeatedly replaces the worst point by reflecting it through the centre of the others, and expands or shrinks the triangle depending on the outcome. <strong>Simulated annealing</strong> proposes random moves and accepts a worse point with probability exp(−Δf/T), where the temperature T slowly falls: early on it can hop out of local minima, late it behaves greedily. <strong>Genetic algorithms</strong> keep a population of candidate solutions, select the fittest, combine pairs (crossover) and randomly alter them (mutation); they are popular for discrete designs such as schedules. They need many function evaluations and give no guarantee, so use them when gradients really are unavailable.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy.optimize import minimize
+
+def rosen(p): return (1 - p[0]) ** 2 + 100 * (p[1] - p[0] ** 2) ** 2
+r = minimize(rosen, [-1.5, 1.5], method="Nelder-Mead", options={"xatol": 1e-8, "fatol": 1e-10})
+print("Nelder-Mead:", np.round(r.x, 4), " evaluations:", r.nfev)
+
+# simulated annealing on a bumpy 1-D function with many local minima
+f = lambda x: x ** 2 + 10 * np.sin(3 * x)
+rng = np.random.default_rng(0)
+x = 4.0; best = x
+for k in range(3000):
+    T = 5.0 * (1 - k / 3000) + 1e-3                       # temperature falls to ~0
+    cand = x + rng.normal(scale=0.5)
+    if f(cand) &lt; f(x) or rng.random() &lt; np.exp((f(x) - f(cand)) / T):
+        x = cand                                           # sometimes accept a worse point
+    if f(x) &lt; f(best): best = x
+grid = np.linspace(-6, 6, 120001)
+print("annealing best x:", round(best, 3), " f:", round(f(best), 3))
+print("grid search  x  :", round(grid[np.argmin(f(grid))], 3), " f:", round(f(grid).min(), 3))</code></pre>
+<pre class="code lang-text"><code>Nelder-Mead: [1. 1.]  evaluations: 252
+annealing best x: -0.512  f: -9.732
+grid search  x  : -0.512  f: -9.732</code></pre>
+<p>On Rosenbrock, Nelder-Mead finds (1, 1) with 252 function evaluations and no gradient, versus 41 for BFGS with an analytic gradient. On the bumpy function f(x) = x² + 10 sin(3x), annealing finds the global minimum x = −0.512 (matching a brute-force grid), where plain gradient descent started at x = 4 would settle in the nearest bowl.</p>
+<h3>Going deeper</h3>
+<p>Annealing's acceptance rule comes from statistical physics (the Metropolis criterion, Chapter 15's MCMC cousin). Random restarts of a local optimizer are often a simpler and stronger baseline than a fancy global method. Hyperparameter search can exploit structure: learning rate and weight decay interact, so tune on a log scale and jointly; and the cost of one trial can be cut by training on a subset or for fewer epochs and extrapolating (multi-fidelity methods).</p>
+
+<h2>14.8 The Expert Layer: Rates, Smoothness, Proximal Methods and Flat Minima</h2>
+<h3>Lipschitz smoothness and the descent lemma</h3>
+<p>A function f is <strong>L-smooth</strong> if its gradient does not change faster than L times the distance: ‖∇f(x) − ∇f(y)‖ ≤ L‖x − y‖. For twice-differentiable f this means all Hessian eigenvalues are at most L in absolute value, so L is the "largest curvature" from Section 14.2. Smoothness gives an upper bound by a parabola: f(y) ≤ f(x) + ∇f(x)·(y − x) + (L/2)‖y − x‖². Take the gradient step y = x − αg with g = ∇f(x):</p>
+<div class="eq">f(y) ≤ f(x) − α‖g‖² + (L/2)α²‖g‖² = f(x) − α(1 − Lα/2)‖g‖²</div>
+<p>For α &lt; 2/L the bracket is positive, so every step decreases the loss: this proves the stability limit we found for quadratics holds for any L-smooth function. At the choice α = 1/L the guaranteed decrease is f(x) − f(y) ≥ ‖g‖²/(2L), the best constant. Summing over k steps, the smallest gradient seen satisfies min ‖g<sub>i</sub>‖² ≤ 2L(f(x<sub>0</sub>) − f*)/k: even on a non-convex loss, gradient descent finds a point with a small gradient (an approximate stationary point), though not necessarily a minimum.</p>
+<p class="problem"><span class="pl">Problem 14.8.1</span> A loss is L-smooth with L = 4. At some point the gradient is g = 2. What is the guaranteed decrease with α = 1/L?</p>
+<table class="steps"><tr><th>Formula</th><td>decrease ≥ ‖g‖²/(2L)</td></tr><tr><th>Plug in</th><td>2² / (2·4) = 4/8 = 0.5</td></tr><tr><th>Meaning</th><td>The loss falls by at least 0.5 in this step, whatever the shape of f beyond smoothness. The actual drop is usually larger</td></tr></table>
+<h3>Convergence rates</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Setting</th><th>Method</th><th>Rate (loss gap after k steps)</th></tr></thead><tbody>
+<tr><td>Convex, L-smooth</td><td>Gradient descent, α = 1/L</td><td>≤ L‖x<sub>0</sub> − x*‖²/(2k), written O(1/k)</td></tr>
+<tr><td>Convex, L-smooth</td><td>Nesterov acceleration</td><td>O(1/k²), optimal for first-order methods</td></tr>
+<tr><td>Strongly convex (curvature ≥ μ), L-smooth</td><td>Gradient descent</td><td>linear: ((κ − 1)/(κ + 1))<sup>k</sup>, also called geometric</td></tr>
+<tr><td>Strongly convex quadratic</td><td>Heavy ball, tuned</td><td>linear with ratio (√κ − 1)/(√κ + 1)</td></tr>
+<tr><td>Convex, noisy gradients</td><td>SGD, decaying α</td><td>O(1/√k); O(1/k) if strongly convex</td></tr>
+<tr><td>Smooth, near a minimum with H ≻ 0</td><td>Newton</td><td>quadratic: e<sub>k+1</sub> ≈ C·e<sub>k</sub>²</td></tr>
+</tbody></table></div>
+<p>"O(1/k)" is slow: halving the gap needs twice as many steps. "Linear" is the fast kind: the gap shrinks by a constant factor every step, so the number of steps grows only like log(1/ε). Check the O(1/k) bound on our simplest example: for f(x) = x², L = 2, α = 1/2, x<sub>0</sub> = 4, the bound is 16/(2·0.5·k) = 16/k, while the real method reaches 0 in one step: bounds are worst-case guarantees, not predictions.</p>
+<p>The effect of acceleration for κ = 100: plain gradient descent has ρ = 99/101 = 0.9802, tuned momentum has ρ = (10 − 1)/(10 + 1) = 9/11 = 0.8182. The step counts for a millionfold error reduction are 691 and 69: the dependence moves from κ to √κ.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+# Polyak step size alpha = (f(x) - f*) / ||g||^2 on f(x) = x^2 (f* = 0), x0 = 4
+x = 4.0
+for k in range(1, 5):
+    g = 2 * x
+    alpha = (x * x - 0.0) / g ** 2
+    x = x - alpha * g
+    print(f"step {k}: alpha={alpha:.3f} x={x:.4f}")
+
+# Rate comparison on a quadratic with kappa = 100
+kappa = 100
+rho_gd = (kappa - 1) / (kappa + 1)
+rho_hb = (np.sqrt(kappa) - 1) / (np.sqrt(kappa) + 1)
+print("GD   rho", round(rho_gd, 4), " steps for 1e-6:", round(np.log(1e-6) / np.log(rho_gd)))
+print("Mom. rho", round(rho_hb, 4), " steps for 1e-6:", round(np.log(1e-6) / np.log(rho_hb)))</code></pre>
+<pre class="code lang-text"><code>step 1: alpha=0.250 x=2.0000
+step 2: alpha=0.250 x=1.0000
+step 3: alpha=0.250 x=0.5000
+step 4: alpha=0.250 x=0.2500
+GD   rho 0.9802  steps for 1e-6: 691
+Mom. rho 0.8182  steps for 1e-6: 69</code></pre>
+<h3>Polyak step size</h3>
+<p>If you know the optimal value f* (for instance 0 for a perfectly fittable loss, as in interpolating models), you can set the step from the current state: <strong>α<sub>k</sub> = (f(x<sub>k</sub>) − f*)/‖∇f(x<sub>k</sub>)‖²</strong>. On f(x) = x² from x = 4: f = 16, g = 8, so α = 16/64 = 0.25 and x becomes 4 − 0.25·8 = 2; then f = 4, g = 4, α = 4/16 = 0.25, x becomes 1; the iterates halve at every step, as the printed output shows. It adapts α to the local scale automatically, which is useful in theory and in some recent adaptive-step methods, but it needs f* and misbehaves when f* is unknown or the gradient is noisy.</p>
+<h3>Proximal methods in one paragraph</h3>
+<p>For min f(x) + h(x) with f smooth and h simple but non-differentiable (like λ‖x‖<sub>1</sub>), take the update x⁺ = argmin<sub>z</sub> ( ∇f(x)·(z − x) + (1/2α)‖z − x‖² + h(z) ). Without h this is exactly the gradient step z = x − α∇f. With h = λ‖·‖<sub>1</sub> the minimization separates per coordinate and each is the soft-threshold problem of Section 14.6, so x⁺ = soft(x − α∇f(x), αλ). Other choices of h give projections (h = indicator of a convex set, so the prox is the projection onto it, as in clipping weights to a box) and nuclear-norm shrinkage for low-rank matrix completion in recommender systems. Rates: ISTA O(1/k), FISTA O(1/k²).</p>
+<h3>Loss landscape, flatness and generalization</h3>
+<p>Two minima can have the same training loss yet differ in how fast the loss rises when the weights are nudged: a <strong>flat</strong> minimum has small Hessian eigenvalues, a <strong>sharp</strong> one has large ones. The common intuition: a flat minimum is robust to the small shifts between the training set and the real world, so it should generalize better. Supporting evidence includes the observation that very large batches tend to converge to sharper minima and generalize worse (Keskar et al., 2017), and methods such as <strong>sharpness-aware minimization (SAM)</strong> and weight averaging deliberately seek flat regions. Treat this as a useful heuristic and not a theorem: sharpness depends on the parametrization (rescale two consecutive layers by c and 1/c and the function is unchanged while the Hessian changes), so the relationship is subtler than "flat is good". Another observation: the top Hessian eigenvalue during training hovers near 2/α (the "edge of stability", Cohen et al., 2021), which is exactly the stability limit α &lt; 2/L derived in Section 14.2, as if the optimizer drove itself to the brink of divergence.</p>
+<div class="callout green"><div class="lab">WHY IT MATTERS</div><div class="txt">Everything in this chapter flows from one picture: the loss surface has a local curvature, and the step size must be matched to it. Gradient descent needs α &lt; 2/L; its speed is set by κ; momentum buys √κ; Adam rescales each coordinate; Newton rescales by the full Hessian; constraints become penalties through multipliers. Once you see the curvature, optimizer choices stop being folklore.</div></div>
+<div class="callout green"><div class="lab">INTERVIEW</div><div class="txt">Frequent questions with one-line answers. (1) "Why does gradient descent zig-zag?" Large condition number: steep walls limit the step, the gentle direction crawls. (2) "Why scale features?" It brings κ near 1. (3) "Adam versus SGD?" Adam rescales each parameter by its recent gradient size and is robust to scale; SGD with momentum is simpler and often generalizes as well after tuning. (4) "What does L1 do?" Convex relaxation of sparsity; corners of the L1 ball put weights exactly at zero. (5) "Is the loss of a neural net convex?" No, but saddles and flat regions, more than bad local minima, are the obstacle. (6) "What is a KKT condition?" Stationarity, feasibility, multipliers ≥ 0, complementary slackness.</div></div>
+
+<h2>Chapter recap</h2>
+<ul>
+<li>Optimization means choosing variables to minimize an objective under constraints; maximizing is minimizing the negative.</li>
+<li>A convex function never rises above its chords; test with f″ ≥ 0 or a positive semi-definite Hessian everywhere. For convex f every local minimum is global.</li>
+<li>Gradient descent x ← x − α∇f follows from the first-order Taylor expansion; the step must satisfy α &lt; 2/L, where L is the largest curvature.</li>
+<li>On quadratics the error shrinks by ρ = (κ − 1)/(κ + 1) per step at the best α = 2/(μ + L); steps needed grow like (κ/2)·ln(1/ε). Standardize features to reduce κ.</li>
+<li>Batch, SGD and mini-batch trade cost per step against noise; the noise falls like σ/√B and constant-α SGD hovers in a noise ball, so decay α.</li>
+<li>Momentum averages past gradients (cancels zig-zag, accelerates consistent directions); Nesterov looks ahead; AdaGrad, RMSProp and Adam scale each coordinate by gradient size; Adam adds bias correction; AdamW decouples weight decay.</li>
+<li>Use warmup plus cosine decay, clip gradient norms, and expect saddle points rather than bad local minima in high dimensions.</li>
+<li>Newton uses the Hessian: quadratic convergence, but O(n³) time and O(n²) memory; BFGS and L-BFGS approximate it from gradient differences.</li>
+<li>KKT: stationarity, primal feasibility, μ ≥ 0, complementary slackness. Duality gives lower bounds, and for the SVM only support vectors have α &gt; 0.</li>
+<li>L2 gives smooth shrinkage with closed form (XᵀX + λI)⁻¹Xᵀy; L1 gives exact zeros (soft threshold; ISTA is the algorithm).</li>
+<li>Linear programs have corner optima and are solved with <code>linprog</code>; integer programs need branch and bound; hyperparameters are best searched randomly or with Bayesian optimization, never on the test set.</li>
+</ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / pattern</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>x<sub>k+1</sub> = x<sub>k</sub> − α∇f(x<sub>k</sub>)</td><td>Gradient descent</td></tr>
+<tr><td>0 &lt; α &lt; 2/L</td><td>Stability range of the step size</td></tr>
+<tr><td>ρ = (κ − 1)/(κ + 1), κ = L/μ</td><td>Per-step shrink factor at the best α</td></tr>
+<tr><td>v ← βv + g; x ← x − αv</td><td>Heavy-ball momentum</td></tr>
+<tr><td>m̂/(√v̂ + ε), m̂ = m/(1 − β<sub>1</sub><sup>t</sup>)</td><td>Adam's bias-corrected, scaled step</td></tr>
+<tr><td>θ ← θ − α(m̂/(√v̂ + ε) + λθ)</td><td>AdamW</td></tr>
+<tr><td>x ← x − H⁻¹∇f</td><td>Newton step</td></tr>
+<tr><td>∇f + ∑μ<sub>i</sub>∇g<sub>i</sub> = 0, μ ≥ 0, μg = 0</td><td>KKT stationarity, dual feasibility, complementary slackness</td></tr>
+<tr><td>w = (XᵀX + λI)⁻¹Xᵀy</td><td>Ridge regression</td></tr>
+<tr><td>sign(a)·max(|a| − λ, 0)</td><td>Soft threshold (lasso, ISTA)</td></tr>
+<tr><td>g ← g·min(1, c/‖g‖)</td><td>Gradient clipping by norm</td></tr>
+</tbody></table></div>
+
+<h2>Practice set</h2>
+<p class="problem"><span class="pl">Problem 14.9.1</span> Run three steps of gradient descent on f(x) = (x − 3)² from x<sub>0</sub> = 0 with α = 0.25.</p>
+<p><strong>Answer:</strong> f′(x) = 2(x − 3). Step 1: x = 0 − 0.25·(−6) = 1.5. Step 2: f′ = 2(1.5 − 3) = −3, x = 1.5 + 0.75 = 2.25. Step 3: f′ = −1.5, x = 2.25 + 0.375 = 2.625. The distance to 3 halves each step (3, 1.5, 0.75, 0.375) because the factor is 1 − 2·0.25 = 0.5.</p>
+<p class="problem"><span class="pl">Problem 14.9.2</span> Decide whether f(x) = x⁴, g(x) = x³ and h(x) = e<sup>x</sup> are convex on all real numbers.</p>
+<p><strong>Answer:</strong> f″ = 12x² ≥ 0 everywhere: convex. g″ = 6x, negative for x &lt; 0: not convex on all of ℝ (it is convex only on x ≥ 0). h″ = e<sup>x</sup> &gt; 0: convex.</p>
+<p class="problem"><span class="pl">Problem 14.9.3</span> The Hessian of a loss is [[4, 2], [2, 1]]. Is the loss convex? What about [[1, 2], [2, 1]]?</p>
+<p><strong>Answer:</strong> First matrix: trace 5, determinant 4·1 − 2·2 = 0, so eigenvalues 0 and 5, both ≥ 0: positive semi-definite, convex but not strictly (it is flat along one direction, so minimizers are not unique). Second: trace 2, determinant 1 − 4 = −3 &lt; 0, eigenvalues 3 and −1: not convex.</p>
+<p class="problem"><span class="pl">Problem 14.9.4</span> For f(x) = 3x², find the range of learning rates for which gradient descent converges and the best learning rate.</p>
+<p><strong>Answer:</strong> f′ = 6x, so x ← (1 − 6α)x. Need |1 − 6α| &lt; 1, i.e. 0 &lt; α &lt; 1/3. The factor is zero at α = 1/6, so one step reaches the minimum.</p>
+<p class="problem"><span class="pl">Problem 14.9.5</span> A quadratic loss has Hessian eigenvalues 2 and 200. Give the condition number, the best learning rate, the per-step factor and the steps for a millionfold reduction.</p>
+<p><strong>Answer:</strong> κ = 200/2 = 100. Best α = 2/(2 + 200) = 1/101 ≈ 0.0099. ρ = 99/101 ≈ 0.9802. Steps ≥ ln(10<sup>6</sup>)/ln(101/99) = 13.8155/0.02 ≈ 691.</p>
+<p class="problem"><span class="pl">Problem 14.9.6</span> Do two momentum steps on f(x) = x² from x<sub>0</sub> = 2 with α = 0.1, β = 0.5.</p>
+<p><strong>Answer:</strong> Step 1: g = 4, v = 0.5·0 + 4 = 4, x = 2 − 0.4 = 1.6. Step 2: g = 3.2, v = 0.5·4 + 3.2 = 5.2, x = 1.6 − 0.52 = 1.08. Plain gradient descent would give 1.6 then 1.28; momentum is already ahead.</p>
+<p class="problem"><span class="pl">Problem 14.9.7</span> In Adam, the first update for a parameter has gradient g. What is the size of the step for g = 0.001 and for g = 1000 (α = 0.1, ε negligible)?</p>
+<p><strong>Answer:</strong> At t = 1, m̂ = g and v̂ = g², so the step is α·g/√(g²) = α·sign(g) = 0.1 in magnitude for both. Adam's step size does not depend on the gradient scale (when ε is much smaller than |g|).</p>
+<p class="problem"><span class="pl">Problem 14.9.8</span> Find the bug: a hand-written Adam skips the bias correction and uses <code>step = alpha * m / (sqrt(v) + eps)</code>. What is the first step size for α = 0.001, β<sub>1</sub> = 0.9, β<sub>2</sub> = 0.999?</p>
+<p><strong>Answer:</strong> m = 0.1g, v = 0.001g², so step = 0.001·0.1g/(√0.001·|g|) = 0.001·0.1/0.031623 = 0.001·3.162 = 0.00316 in size: 3.16 times larger than the intended 0.001, and the inflation persists for dozens of steps (6.5 at t = 10). Fix: m̂ = m/(1 − β<sub>1</sub><sup>t</sup>), v̂ = v/(1 − β<sub>2</sub><sup>t</sup>).</p>
+<p class="problem"><span class="pl">Problem 14.9.9</span> What does this print? <code>lr = 0.1 * 0.5 ** (65 // 30)</code></p>
+<p><strong>Answer:</strong> 65 // 30 = 2 (integer division), so lr = 0.1·0.5² = 0.1·0.25 = 0.025. Step decay with halving every 30 steps has halved twice by step 65.</p>
+<p class="problem"><span class="pl">Problem 14.9.10</span> Newton's method on f(x) = x − ln x (x &gt; 0) from x<sub>0</sub> = 0.5. Show three steps and comment on the error.</p>
+<p><strong>Answer:</strong> f′ = 1 − 1/x and f″ = 1/x², so x − f′/f″ = x − (1 − 1/x)x² = x − x² + x = 2x − x². Step 1: 2(0.5) − 0.25 = 0.75. Step 2: 1.5 − 0.5625 = 0.9375. Step 3: 1.875 − 0.87890625 = 0.99609375. The minimum is x = 1. Errors: 0.5, 0.25, 0.0625, 0.0039: each error is the square of the previous one (0.25² = 0.0625, 0.0625² = 0.0039): quadratic convergence.</p>
+<p class="problem"><span class="pl">Problem 14.9.11</span> Newton's method on f(x) = x⁴ from x<sub>0</sub> = 3. Compute two steps and explain why it is slow.</p>
+<p><strong>Answer:</strong> f′ = 4x³, f″ = 12x², step = x − 4x³/(12x²) = x − x/3 = 2x/3. So 3, 2, 4/3 ≈ 1.3333. The error shrinks only by the constant factor 2/3 per step (linear, not quadratic), because f″(0) = 0: the quadratic-convergence theorem needs a nonzero second derivative at the minimum.</p>
+<p class="problem"><span class="pl">Problem 14.9.12</span> Solve with a Lagrange multiplier: minimize x² + y² subject to x + y = 2. What is the multiplier and what does it mean?</p>
+<p><strong>Answer:</strong> L = x² + y² + λ(x + y − 2). 2x + λ = 0 and 2y + λ = 0 give x = y, and x + y = 2 gives x = y = 1, f = 2, λ = −2. The magnitude 2 says: raising the right-hand side from 2 to 2 + δ changes the optimum by about +2δ (check: x = y = (2 + δ)/2, f = (2 + δ)²/2 = 2 + 2δ + δ²/2).</p>
+<p class="problem"><span class="pl">Problem 14.9.13</span> Lasso in one dimension: the unregularized best weight is a = 1.2 and λ = 0.5. Give the lasso and the ridge weights. Repeat for a = 0.3.</p>
+<p><strong>Answer:</strong> a = 1.2: lasso = 1.2 − 0.5 = 0.7, ridge = 1.2/1.5 = 0.8. a = 0.3: lasso = max(0.3 − 0.5, 0) = 0 (exactly zero), ridge = 0.3/1.5 = 0.2 (nonzero). The sparse-versus-shrunk behaviour is the whole difference.</p>
+<p class="problem"><span class="pl">Problem 14.9.14</span> Maximize 3x + 2y subject to x + y ≤ 4, x + 3y ≤ 6, x, y ≥ 0. Give the corners and the solution, and write the correct <code>linprog</code> call.</p>
+<p><strong>Answer:</strong> Corners: (0, 0) = 0; (4, 0) = 12; (0, 2) = 4; the intersection of x + y = 4 and x + 3y = 6 gives 2y = 2, y = 1, x = 3: (3, 1) = 9 + 2 = 11. Best: (4, 0) with value 12. Code: <code>linprog(c=[-3, -2], A_ub=[[1, 1], [1, 3]], b_ub=[4, 6], bounds=[(0, None)]*2)</code>, then the profit is <code>-res.fun</code>.</p>
+<p class="problem"><span class="pl">Problem 14.9.15</span> Find the bug: <code>w = w + alpha * grad</code> in a gradient-descent loop for f(x) = x² starting at x = 1 with α = 0.1. Predict the first two iterates.</p>
+<p><strong>Answer:</strong> The sign is wrong: it climbs the hill (gradient ascent). The gradient is 2x, so x ← x + 0.2x = 1.2x: iterates 1.2 then 1.44, growing without bound. Fix: <code>w = w - alpha * grad</code>.</p>
+<p class="problem"><span class="pl">Problem 14.9.16</span> Interview: "Why does standardizing the inputs make gradient descent converge faster for linear regression?" Give a numeric illustration.</p>
+<p><strong>Answer:</strong> The Hessian is 2XᵀX/n, whose eigenvalue ratio is the condition number κ. Gradient descent needs about (κ/2)·ln(1/ε) steps. With a feature in the thousands and another in single digits, κ can be around 10<sup>6</sup> (we measured 1.33×10<sup>6</sup>), needing about 9 million steps for a millionfold gain; after standardizing, κ ≈ 1.26 and about 6 steps do it. The loss surface changes from a long thin canyon to a nearly round bowl.</p>
+<p class="problem"><span class="pl">Problem 14.9.17</span> Weak and strong duality: solve minimize (x − 3)² subject to x ≤ 1 by its dual and check that it equals the primal value from Problem 14.6.2.</p>
+<p><strong>Answer:</strong> L = (x − 3)² + μ(x − 1). Minimizing over x: 2(x − 3) + μ = 0, so x = 3 − μ/2. Dual function: (μ/2)² + μ(2 − μ/2) = μ²/4 + 2μ − μ²/2 = 2μ − μ²/4. Maximize: 2 − μ/2 = 0 gives μ = 4, d = 8 − 4 = 4. Primal value at x = 1 is (1 − 3)² = 4. Equal, and x = 3 − 4/2 = 1 recovers the primal solution.</p>
+<p class="problem"><span class="pl">Problem 14.9.18</span> (Expert) Prove that gradient descent on an L-smooth function with α = 1/L decreases the loss by at least ‖g‖²/(2L), and state what this implies for a non-convex loss.</p>
+<p><strong>Answer:</strong> Smoothness gives f(y) ≤ f(x) + g·(y − x) + (L/2)‖y − x‖². With y = x − g/L: g·(y − x) = −‖g‖²/L and (L/2)‖y − x‖² = ‖g‖²/(2L). So f(y) ≤ f(x) − ‖g‖²/L + ‖g‖²/(2L) = f(x) − ‖g‖²/(2L). Summing over k steps and using f ≥ f*: ∑‖g<sub>i</sub>‖² ≤ 2L(f(x<sub>0</sub>) − f*), so the smallest gradient norm is at most √(2L(f(x<sub>0</sub>) − f*)/k). The loss need not be convex: gradient descent reaches an approximate stationary point, not necessarily a minimum.</p>
+
+<h2>Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me optimization for machine learning: convexity, gradient descent, learning rates, condition number, momentum, Adam and AdamW, Newton's method, KKT conditions, L1 versus L2 regularization, and linear programming. Start by asking me three short questions to find my level. Then teach one idea at a time with a tiny numeric example I can verify by hand (for instance f(x) = x^2 starting at x = 4), and after each idea give me one quiz question and wait for my answer before continuing. Correct me gently and show the full arithmetic. Finish with five mixed questions and a score.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>Act as a careful reviewer of my optimization work. I will paste my hand calculations and my NumPy code for gradient descent, momentum, Adam, a Newton step, or a linprog call. Check every number, find sign errors (ascent instead of descent), missing bias correction, wrong learning-rate ranges, minimizing instead of maximizing in linprog, and negative KKT multipliers. For each problem say what is right, what is wrong, show the corrected steps, and tell me which test (print the loss every 10 steps, compare against scipy.optimize.minimize, check the gradient numerically) would have caught the mistake. Be specific and do not just rewrite everything.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>Run a mock data science interview on optimization. Ask one question at a time, starting easy (what is a learning rate, why is a convex loss easy) and getting harder (why does gradient descent zig-zag, derive the stability limit alpha &lt; 2/L, explain Adam's bias correction and the difference from AdamW, why L1 gives sparse weights, why Newton's method is not used for deep networks, what are the KKT conditions, formulate a small linear program). After each of my answers, grade it from 0 to 5, show the ideal answer in four sentences or fewer, and name one follow-up an interviewer would ask. After eight questions, give me a summary of my strengths and the three topics to revise.</pre></div>
+

@@ -1,0 +1,360 @@
+
+<h2>18.11 Recipes: How Do I ...?</h2>
+<p>Each recipe is a complete, standalone answer to a real task. Copy it, change the data, and keep the verification line.</p>
+
+<h3>How do I choose between several candidate distributions? (Recipe 1)</h3>
+@@PY
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(10)
+data = rng.gamma(shape=3.0, scale=2.0, size=500)
+
+rows = []
+for name in ["norm", "lognorm", "gamma", "weibull_min", "expon"]:
+    dist = getattr(stats, name)
+    params = dist.fit(data, floc=0) if name != "norm" else dist.fit(data)
+    ll = dist.logpdf(data, *params).sum()
+    aic = 2 * len(params) - 2 * ll
+    rows.append((aic, name))
+for aic, name in sorted(rows):
+    print("%-12s AIC = %.1f" % (name, aic))
+@@END
+<ol><li>The data is gamma by construction, so we know which should win.</li><li>For each candidate, <code>getattr(stats, name)</code> fetches the distribution, <code>fit</code> estimates its parameters (with location fixed at 0 for positive data), and the AIC scores it.</li><li>Lower AIC is better. Differences under about 2 are a tie; large gaps are decisive. Always follow with a plot (histogram plus pdf) before trusting the winner.</li></ol>
+
+<h3>How do I run an A/B test on conversion rates and plan the sample size? (Recipe 2)</h3>
+@@PY
+import numpy as np
+from scipy import stats
+
+conv_a, n_a = 120, 2000
+conv_b, n_b = 156, 2000
+pa, pb = conv_a / n_a, conv_b / n_b
+pool = (conv_a + conv_b) / (n_a + n_b)
+se = np.sqrt(pool * (1 - pool) * (1 / n_a + 1 / n_b))
+z = (pb - pa) / se
+print("rates %.3f vs %.3f  z = %.2f  p = %.4f" % (pa, pb, z, 2 * stats.norm.sf(abs(z))))
+
+se_diff = np.sqrt(pa * (1 - pa) / n_a + pb * (1 - pb) / n_b)
+lo, hi = (pb - pa) + np.array([-1, 1]) * stats.norm.ppf(0.975) * se_diff
+print("lift 95%% CI: (%.4f, %.4f)" % (lo, hi))
+
+# sample size per group to detect 6% -> 7.8% with 80% power, 5% two-sided
+p1, p2 = 0.06, 0.078
+zb = stats.norm.ppf(0.80) + stats.norm.ppf(0.975)
+n = zb ** 2 * (p1 * (1 - p1) + p2 * (1 - p2)) / (p2 - p1) ** 2
+print("needed per group:", int(np.ceil(n)))
+@@END
+<ol><li>The two-proportion z-test pools both groups to estimate the standard error under the null (no difference).</li><li>The confidence interval for the lift uses the unpooled standard error, because we no longer assume the groups are equal.</li><li>The planning formula says: sample more when the effect is small or the rates are close to 50%. Do this <em>before</em> the test, never after. statsmodels' <code>proportions_ztest</code> and <code>NormalIndPower</code> do the same (not run here).</li></ol>
+
+<h3>How do I get a prediction band from a curve fit? (Recipe 3)</h3>
+@@PY
+import numpy as np
+from scipy import optimize, stats
+
+def model(t, a, k):
+    return a * (1 - np.exp(-k * t))
+
+rng = np.random.default_rng(2)
+t = np.linspace(0.2, 8, 25)
+y = model(t, 10, 0.6) + rng.normal(0, 0.3, t.size)
+p, cov = optimize.curve_fit(model, t, y, p0=[5, 1])
+
+t_new = 6.0
+eps = 1e-6
+grad = np.array([(model(t_new, *(p + eps * np.eye(2)[i])) - model(t_new, *p)) / eps for i in range(2)])
+se_mean = np.sqrt(grad @ cov @ grad)                    # delta method
+s_resid = np.sqrt(np.sum((y - model(t, *p)) ** 2) / (t.size - 2))
+tc = stats.t.ppf(0.975, t.size - 2)
+fit = model(t_new, *p)
+print("fit at t=6: %.2f" % fit)
+print("95%% CI of the curve : (%.2f, %.2f)" % (fit - tc * se_mean, fit + tc * se_mean))
+print("95%% prediction range: (%.2f, %.2f)" % (fit - tc * np.hypot(se_mean, s_resid), fit + tc * np.hypot(se_mean, s_resid)))
+@@END
+<ol><li>The delta method turns parameter uncertainty (<code>cov</code>) into uncertainty of the curve at one point using the gradient of the model with respect to the parameters.</li><li>The curve interval answers "where is the true average curve?". The prediction interval adds the scatter of individual points (<code>s_resid</code>) and is wider. Use the second to warn about a single future measurement.</li></ol>
+
+<h3>How do I pick the best items under a budget? (Recipe 4, integer optimisation)</h3>
+@@PY
+import numpy as np
+from scipy import optimize
+
+value = np.array([60, 100, 120, 80, 30.0])        # expected profit per campaign
+cost = np.array([10, 20, 30, 25, 5.0])            # budget needed
+budget = 55
+res = optimize.milp(c=-value,
+                    constraints=optimize.LinearConstraint(cost[None, :], ub=budget),
+                    integrality=np.ones(5), bounds=optimize.Bounds(0, 1))
+chosen = np.round(res.x).astype(int)
+print("chosen campaigns:", chosen, " profit:", int(value @ chosen), " cost:", int(cost @ chosen))
+@@END
+<ol><li>This is a knapsack: pick items (0 or 1 each) to maximise value within a budget. <code>integrality=1</code> forces whole numbers and the bounds 0 to 1 make them yes/no.</li><li><code>milp</code> minimises, so we pass the negated values.</li><li>The check is arithmetic: cost 55 or less, and no other combination beats the profit (here the search space has only 32 combinations, so you could confirm by brute force).</li></ol>
+
+<h3>How do I get a permutation test and a bootstrap interval for a correlation? (Recipe 5)</h3>
+@@PY
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(6)
+x = rng.normal(size=40)
+y = 0.4 * x + rng.normal(size=40)
+
+stat = lambda a, b: np.corrcoef(a, b)[0, 1]
+perm = stats.permutation_test((x, y), stat, permutation_type="pairings",
+                              n_resamples=5000, random_state=1)
+print("r = %.3f  permutation p = %.4f  (pearsonr p = %.4f)" % (perm.statistic, perm.pvalue, stats.pearsonr(x, y).pvalue))
+
+boot = stats.bootstrap((x, y), lambda a, b: np.corrcoef(a, b)[0, 1], paired=True,
+                       vectorized=False, n_resamples=2000, random_state=1)
+print("bootstrap 95%% CI for r: (%.3f, %.3f)" % (boot.confidence_interval.low, boot.confidence_interval.high))
+@@END
+<ol><li><code>permutation_type="pairings"</code> shuffles y relative to x many times; if the observed r is rare among shuffled values, it is unlikely to be chance.</li><li>The permutation p-value should be close to the formula-based <code>pearsonr</code> p-value, a nice agreement check.</li><li>The bootstrap resamples (x, y) <em>pairs</em> together (<code>paired=True</code>) and recomputes r each time. <code>vectorized=False</code> tells SciPy the statistic handles one resample at a time.</li></ol>
+
+<h3>How do I flag outliers robustly?</h3>
+@@PY
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(3)
+x = np.append(rng.normal(100, 5, 200), [160, 40])
+z = stats.zscore(x)
+mad = stats.median_abs_deviation(x, scale="normal")
+robust_z = (x - np.median(x)) / mad
+print("classic |z|>3 count:", int((np.abs(z) > 3).sum()))
+print("robust  |z|>3 count:", int((np.abs(robust_z) > 3).sum()))
+print("flagged values:", np.sort(x[np.abs(robust_z) > 3]).round(1))
+@@END
+<ol><li>The classic z-score uses mean and standard deviation, both distorted by the very outliers you hunt (masking).</li><li>The median and the median absolute deviation (MAD, scaled to match a standard deviation for normal data) barely move, so the robust score is sharper.</li></ol>
+
+<h3>How do I fill gaps in a time series?</h3>
+@@PY
+import numpy as np
+import pandas as pd
+from scipy import interpolate
+
+s = pd.Series([10.0, 12.0, np.nan, np.nan, 18.0, 17.0, np.nan, 14.0],
+              index=pd.date_range("2025-01-01", periods=8, freq="D"))
+known = s.dropna()
+xk = (known.index - s.index[0]).days.to_numpy()
+pchip = interpolate.PchipInterpolator(xk, known.to_numpy())
+filled = pd.Series(pchip((s.index - s.index[0]).days), index=s.index).round(2)
+print(filled.tolist())
+print("pandas linear:", s.interpolate().round(2).tolist())
+@@END
+<ol><li>Convert dates to numbers (days since the start), because SciPy interpolators need numeric x.</li><li>Fit PCHIP only to the known points, then evaluate it on every date. PCHIP does not overshoot, which matters for non-negative quantities.</li><li>For plain linear filling, <code>Series.interpolate()</code> in pandas is enough.</li></ol>
+
+<h3>How do I match drivers to orders at the lowest total distance?</h3>
+@@PY
+import numpy as np
+from scipy import optimize
+from scipy.spatial import distance
+
+drivers = np.array([[0, 0], [5, 5], [9, 1.0]])
+orders = np.array([[8, 2], [1, 1], [6, 6.0]])
+cost = distance.cdist(drivers, orders)
+rows, cols = optimize.linear_sum_assignment(cost)
+print("driver -> order:", list(zip(rows.tolist(), cols.tolist())))
+print("total distance: %.2f" % cost[rows, cols].sum())
+print("greedy first choice would pair driver 0 with order", int(cost[0].argmin()))
+@@END
+<ol><li><code>cdist</code> builds the cost matrix: one row per driver, one column per order.</li><li><code>linear_sum_assignment</code> finds the one-to-one matching with minimum total cost (the Hungarian algorithm); it is exact, unlike matching greedily driver by driver.</li></ol>
+
+<h3>How do I find the nearest warehouse from latitude and longitude?</h3>
+@@PY
+import numpy as np
+from scipy.spatial import KDTree
+
+def to_xyz(lat, lon):
+    lat, lon = np.radians(lat), np.radians(lon)
+    return np.column_stack([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)])
+
+wh = {"Rotterdam": (51.92, 4.48), "Berlin": (52.52, 13.40), "Madrid": (40.42, -3.70), "Milan": (45.46, 9.19)}
+names = list(wh)
+tree = KDTree(to_xyz(*np.array(list(wh.values())).T))
+d, i = tree.query(to_xyz(48.86, 2.35))                 # Paris
+print("nearest to Paris:", names[int(i[0])])
+print("chord distance %.4f -> about %.0f km" % (d[0], 6371 * 2 * np.arcsin(d[0] / 2)))
+@@END
+<ol><li>Latitude/longitude are angles on a sphere, so straight-line distance in degrees is wrong (a degree of longitude shrinks toward the poles). Convert to 3-D points on the unit sphere first.</li><li>Distance through the sphere (the chord) ranks neighbours in the same order as distance along the surface. Convert a chord <em>c</em> to kilometres with 2 R arcsin(c/2), where R = 6371 km.</li></ol>
+
+<h3>How do I find the break-even point of a profit curve?</h3>
+@@PY
+import numpy as np
+from scipy import optimize
+
+price = lambda q: 50 * np.exp(-0.01 * q)          # price falls as quantity rises
+profit = lambda q: q * price(q) - (400 + 12 * q)
+low = optimize.root_scalar(profit, bracket=[1, 20])
+best = optimize.minimize_scalar(lambda q: -profit(q), bounds=(1, 200), method="bounded")
+print("break-even at q = %.2f" % low.root)
+print("max profit %.1f at q = %.1f" % (-best.fun, best.x))
+@@END
+<ol><li>Break-even is where profit equals zero: a root. The bracket [1, 20] must contain a sign change (profit is negative at 1, positive at 20).</li><li>The best quantity is a one-variable maximisation; negate to use a minimiser.</li></ol>
+
+<h3>How do I compute AUC or any area from a curve?</h3>
+@@PY
+import numpy as np
+from scipy import integrate
+
+fpr = np.array([0, 0.1, 0.3, 0.6, 1.0])
+tpr = np.array([0, 0.5, 0.75, 0.9, 1.0])
+print("AUC by trapezoid: %.4f" % integrate.trapezoid(tpr, fpr))
+print("random-guess AUC: %.4f" % integrate.trapezoid(fpr, fpr))
+@@END
+<ol><li>Values go first, positions second: <code>trapezoid(y, x)</code>. The area under a ROC curve is exactly this trapezoid sum.</li><li>The diagonal (a coin flip) must give 0.5; always run that sanity check.</li></ol>
+
+<h3>How do I test every pair of columns for correlation?</h3>
+@@PY
+import numpy as np
+import pandas as pd
+from scipy import stats
+
+rng = np.random.default_rng(9)
+df = pd.DataFrame({"a": rng.normal(size=60)})
+df["b"] = df["a"] * 0.8 + rng.normal(size=60)
+df["c"] = rng.normal(size=60)
+res = stats.spearmanr(df)                      # a table in, a matrix out
+print(pd.DataFrame(res.statistic, index=df.columns, columns=df.columns).round(2))
+print("p(a,b) = %.2g   p(a,c) = %.2f" % (res.pvalue[0, 1], res.pvalue[0, 2]))
+@@END
+<ol><li>Passing a whole DataFrame to <code>spearmanr</code> returns a correlation matrix and a matching p-value matrix. <code>df.corr(method="spearman")</code> gives the same correlations without p-values.</li><li>With many columns, apply a multiple-testing correction to the off-diagonal p-values.</li></ol>
+
+<h2>18.12 Performance and Pitfalls</h2>
+<h3>Speed rules that matter</h3>
+<ul><li><strong>Vectorise.</strong> Pass arrays to <code>cdf</code>, <code>pdf</code>, <code>interp</code>, <code>cdist</code>. Per-call overhead of SciPy distribution objects is large for scalars.</li><li><strong>Choose the right structure.</strong> A KDTree beats brute force for neighbours; a sparse matrix beats dense when over 90% of cells are zero; <code>sosfiltfilt</code> beats a Python loop.</li><li><strong>Factor once.</strong> Solving many right-hand sides with the same matrix: <code>lu_factor</code> once, <code>lu_solve</code> many times.</li><li><strong>Use <code>workers</code>.</strong> Several functions accept <code>workers=-1</code> to use all cores: <code>KDTree.query</code>, <code>fft</code> functions, <code>differential_evolution</code>.</li><li><strong>Give gradients.</strong> If you can write the derivative, pass <code>jac=</code> to <code>minimize</code>; numerical differences cost one extra call per variable.</li></ul>
+@@PY
+import time
+import numpy as np
+from scipy import stats
+
+x = np.random.default_rng(0).normal(size=20000)
+t0 = time.perf_counter()
+slow = [stats.norm.cdf(v) for v in x]
+t_loop = time.perf_counter() - t0
+t0 = time.perf_counter()
+fast = stats.norm.cdf(x)
+t_vec = time.perf_counter() - t0
+print("same values:", np.allclose(slow, fast))
+print("vectorised at least 20x faster:", t_loop > 20 * t_vec)
+@@END
+<ol><li>The loop calls <code>cdf</code> 20,000 times, paying input checking each time. The vectorised call checks once and computes in compiled code.</li><li>We print a comparison rather than seconds, since timings differ by machine; on this machine the gap was well above 20 times.</li></ol>
+<h3>Common mistakes with symptom and fix</h3>
+<div class="callout red"><div class="lab">COMMON MISTAKE 1: OFF-BY-ONE ON DISCRETE TAILS</div><div class="txt">Wrong: <code>sf(10)</code> to get "10 or more". Symptom: the probability is too small because exactly 10 is excluded. Fix: <code>sf(k - 1)</code> for "k or more".
+@@PY
+from scipy import stats
+d = stats.poisson(4)
+print("wrong  sf(10):", round(d.sf(10), 5), "  right sf(9):", round(d.sf(9), 5), "  by pmf sum:", round(sum(d.pmf(k) for k in range(10, 60)), 5))
+@@END
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 2: STUDENT T-TEST WITH UNEQUAL SPREAD</div><div class="txt">Wrong: <code>ttest_ind(a, b)</code> assumes equal variances. Symptom: p-values drift when group sizes and spreads differ. Fix: <code>equal_var=False</code> (Welch) by default.
+@@PY
+import numpy as np
+from scipy import stats
+rng = np.random.default_rng(0)
+a = rng.normal(0, 1, 10); b = rng.normal(0, 6, 100)
+print("student p = %.3f   welch p = %.3f" % (stats.ttest_ind(a, b).pvalue, stats.ttest_ind(a, b, equal_var=False).pvalue))
+@@END
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 3: curve_fit WITHOUT A STARTING GUESS</div><div class="txt">Wrong: default <code>p0</code> of all ones for an oscillating model. Symptom: no error, but a terrible fit stuck in a local minimum. Fix: give <code>p0</code> from a plot or a quick estimate, and always check the residuals.
+@@PY
+import numpy as np
+from scipy import optimize
+rng = np.random.default_rng(0)
+t = np.linspace(0, 10, 100); y = 2 * np.sin(3 * t) + rng.normal(0, 0.1, 100)
+f = lambda t, a, w: a * np.sin(w * t)
+for p0 in (None, [1, 2.9]):
+    p, _ = optimize.curve_fit(f, t, y, p0=p0)
+    print("p0=%-10s params=%s rmse=%.3f" % (p0, p.round(2), np.sqrt(np.mean((y - f(t, *p)) ** 2))))
+@@END
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 4: lognorm.fit WITHOUT floc=0</div><div class="txt">Wrong: letting the location float. Symptom: a third parameter that shifts the curve, unstable shape and scale. Fix: <code>floc=0</code> for quantities that start at zero.
+@@PY
+import numpy as np
+from scipy import stats
+d = np.random.default_rng(0).lognormal(1.2, 0.5, 200)
+print("free loc  :", np.round(stats.lognorm.fit(d), 3))
+print("floc=0    :", np.round(stats.lognorm.fit(d, floc=0), 3))
+@@END
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 5: np.interp WITH UNSORTED x</div><div class="txt">Wrong: x not increasing. Symptom: silently wrong answers, no error. Fix: sort first.
+@@PY
+import numpy as np
+x = np.array([3, 1, 2.0]); y = np.array([30, 10, 20.0])
+print("wrong:", np.interp(1.5, x, y), "  right:", np.interp(1.5, *zip(*sorted(zip(x, y)))))
+@@END
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 6: * MEANS DIFFERENT THINGS FOR SPARSE MATRIX AND ARRAY</div><div class="txt">Wrong: assuming <code>A * B</code> is matrix multiplication for every sparse type. Symptom: elementwise result from <code>csr_array</code>, matrix product from <code>csr_matrix</code>. Fix: use <code>@</code> always.
+@@PY
+import numpy as np
+from scipy import sparse
+d = np.array([[1, 2], [3, 4]])
+print("csr_matrix A*A:", (sparse.csr_matrix(d) * sparse.csr_matrix(d)).toarray().tolist())
+print("csr_array  A*A:", (sparse.csr_array(d) * sparse.csr_array(d)).toarray().tolist())
+print("csr_array  A@A:", (sparse.csr_array(d) @ sparse.csr_array(d)).toarray().tolist())
+@@END
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 7: INVERTING A MATRIX TO SOLVE A SYSTEM</div><div class="txt">Wrong: <code>inv(A) @ b</code>. Symptom: larger rounding error, especially for ill-conditioned A. Fix: <code>solve(A, b)</code>.
+@@PY
+import numpy as np
+from scipy import linalg
+H = linalg.hilbert(10); truth = np.ones(10); b = H @ truth
+err_inv = np.abs(np.linalg.inv(H) @ b - truth).max()
+err_solve = np.abs(linalg.solve(H, b) - truth).max()
+print("inverse error is larger than solve error:", err_inv > err_solve)
+@@END
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 8: FFT FREQUENCY AXIS WITHOUT THE SAMPLING STEP</div><div class="txt">Wrong: <code>fftfreq(n)</code> alone. Symptom: the 5 Hz wave shows up at 0.025 "something", meaningless units. Fix: pass the spacing <code>d = 1/fs</code>.
+@@PY
+import numpy as np
+from scipy import fft
+fs = 200; t = np.arange(0, 2, 1 / fs); x = np.sin(2 * np.pi * 5 * t)
+k = np.argmax(np.abs(fft.rfft(x)))
+print("wrong:", fft.rfftfreq(t.size)[k], "  right:", fft.rfftfreq(t.size, 1 / fs)[k], "Hz")
+@@END
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 9: A TINY P-VALUE FOR A TINY EFFECT</div><div class="txt">Wrong: reporting only p. Symptom: with 200,000 rows per group even a 0.01 standard-deviation difference is "significant". Fix: report the effect size and interval, and ask whether the size matters.
+@@PY
+import numpy as np
+from scipy import stats
+rng = np.random.default_rng(0)
+a = rng.normal(0, 1, 200000); b = rng.normal(0.01, 1, 200000)
+r = stats.ttest_ind(a, b)
+print("p = %.4f   difference = %.4f standard deviations" % (r.pvalue, abs(a.mean() - b.mean())))
+@@END
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 10: UNSEEDED RANDOMNESS</div><div class="txt">Wrong: <code>rvs(size)</code> or <code>bootstrap</code> with no seed. Symptom: every run gives different numbers, so results cannot be reviewed or tested. Fix: pass <code>random_state=</code> (an integer or a Generator).
+@@PY
+import numpy as np
+from scipy import stats
+a = stats.norm.rvs(size=3, random_state=42); b = stats.norm.rvs(size=3, random_state=42)
+c = stats.norm.rvs(size=3); d = stats.norm.rvs(size=3)
+print("seeded runs identical:", np.array_equal(a, b), "  unseeded identical:", np.array_equal(c, d))
+@@END
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 11: WRITING INTO A PANDAS ARRAY (PANDAS 3 COPY-ON-WRITE)</div><div class="txt">Wrong: <code>a = df["x"].to_numpy(); a[0] = 9</code> to "fix" a value before a SciPy call. Symptom: <code>ValueError: assignment destination is read-only</code>, and the DataFrame is never modified by accident. Fix: take an explicit <code>.copy()</code>, or use <code>df.loc</code> to change the table.
+@@PY
+import pandas as pd
+df = pd.DataFrame({"x": [1.0, 2.0, 3.0]})
+a = df["x"].to_numpy()
+try:
+    a[0] = 9
+except ValueError as e:
+    print("error:", e)
+a = df["x"].to_numpy().copy(); a[0] = 9
+print("copy edited:", a.tolist(), " table unchanged:", df["x"].tolist())
+@@END
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 12: K-MEANS ON UNSCALED COLUMNS</div><div class="txt">Wrong: clustering income (tens of thousands) with age (tens). Symptom: clusters follow only the large-scale column. Fix: <code>vq.whiten</code> or standardise first.
+@@PY
+import numpy as np
+from scipy.cluster import vq
+rng = np.random.default_rng(0)
+age = np.concatenate([rng.normal(25, 3, 100), rng.normal(55, 3, 100)])   # two clear age groups
+income = rng.normal(50000, 15000, 200)                                      # unrelated, huge scale
+X = np.column_stack([age, income])
+for name, data in [("raw", X), ("whitened", vq.whiten(X))]:
+    _, lab = vq.kmeans2(data, 2, seed=1, minit="++")
+    truth = np.arange(200) >= 100
+    agree = max(np.mean(lab == truth), np.mean(lab != truth))
+    print("%-9s agreement with the age groups: %.2f" % (name, agree))
+@@END
+</div></div>

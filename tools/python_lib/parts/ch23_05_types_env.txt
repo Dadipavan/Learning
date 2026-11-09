@@ -1,0 +1,271 @@
+
+<h2>23.4 dataclasses, typing, mypy, Environments, pre-commit and Secrets</h2>
+<h3>dataclasses: records and configuration without boilerplate</h3>
+<p>A <code>@dataclass</code> writes <code>__init__</code>, <code>__repr__</code> and <code>__eq__</code> for you from annotated fields. It is the standard way to hold configuration (learning rate, file paths) so that a typo becomes an error instead of a silent default.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>@dataclass</code></td><td>Generates init, repr, eq from annotations</td><td><code>@dataclass<br>class Cfg: lr: float = 0.1</code></td></tr>
+<tr><td>field with default</td><td>A default makes the argument optional (non-default fields must come first)</td><td><code>seed: int = 0</code></td></tr>
+<tr><td><code>field(default_factory=...)</code></td><td>A fresh mutable default per object</td><td><code>tags: list[str] = field(default_factory=list)</code></td></tr>
+<tr><td><code>frozen=True</code></td><td>Instances are read-only and hashable</td><td><code>@dataclass(frozen=True)</code></td></tr>
+<tr><td><code>slots=True</code></td><td>Less memory, no stray attributes</td><td><code>@dataclass(slots=True)</code></td></tr>
+<tr><td><code>kw_only=True</code></td><td>All fields must be passed by name</td><td><code>@dataclass(kw_only=True)</code></td></tr>
+<tr><td><code>order=True</code></td><td>Adds <code>&lt;</code>, <code>&gt;</code> comparing fields in order</td><td><code>@dataclass(order=True)</code></td></tr>
+<tr><td><code>__post_init__</code></td><td>Runs after init: validate or derive fields</td><td><code>if self.lr &lt;= 0: raise ValueError</code></td></tr>
+<tr><td><code>field(repr=False)</code></td><td>Hide a field from <code>repr</code> (secrets)</td><td><code>token: str = field(repr=False)</code></td></tr>
+<tr><td><code>field(init=False)</code></td><td>Not an init argument; set it yourself</td><td><code>total: float = field(init=False)</code></td></tr>
+<tr><td><code>asdict(obj)</code></td><td>Recursively convert to a dict</td><td><code>asdict(cfg)</code></td></tr>
+<tr><td><code>astuple(obj)</code></td><td>Convert to a tuple</td><td><code>astuple(cfg)</code></td></tr>
+<tr><td><code>replace(obj, **changes)</code></td><td>Copy with some fields changed (the way to "edit" a frozen one)</td><td><code>replace(cfg, lr=0.01)</code></td></tr>
+<tr><td><code>fields(cls)</code></td><td>Introspect field names and types</td><td><code>[f.name for f in fields(Cfg)]</code></td></tr>
+<tr><td><code>ClassVar</code>, <code>InitVar</code></td><td>Class-level constant; init-only value</td><td><code>x: ClassVar[int] = 3</code></td></tr>
+</tbody></table></div>
+<h3>Example 13: a validated, frozen training configuration</h3>
+@@py
+from dataclasses import dataclass, field, asdict, replace
+
+@dataclass(frozen=True, kw_only=True)
+class TrainConfig:
+    csv: str
+    lr: float = 0.1
+    epochs: int = 20
+    seed: int = 0
+    features: tuple[str, ...] = field(default_factory=tuple)
+
+    def __post_init__(self):
+        if self.lr <= 0:
+            raise ValueError(f"lr must be positive, got {self.lr}")
+
+cfg = TrainConfig(csv="train.csv", features=("age", "tenure"))
+print(cfg)
+print(asdict(cfg)["epochs"])
+cfg2 = replace(cfg, lr=0.01)
+print(cfg2.lr, cfg.lr, cfg == cfg2)
+
+try:
+    cfg.lr = 5
+except Exception as exc:
+    print(type(exc).__name__)
+try:
+    TrainConfig(csv="x.csv", lr=-1)
+except ValueError as exc:
+    print(exc)
+try:
+    TrainConfig(csv="x.csv", learning_rate=0.5)
+except TypeError as exc:
+    print("TypeError")
+@@end
+<ol><li><code>frozen=True</code> makes instances immutable (hashable too); <code>kw_only=True</code> forces <code>TrainConfig(csv=...)</code> by name so that argument order never matters.</li>
+<li>Defaults are plain values. <code>field(default_factory=tuple)</code> builds a fresh empty tuple (writing <code>()</code> would also work for a tuple). For a list or dict you must use <code>default_factory</code>: a bare <code>[]</code> default is rejected by dataclasses with a <code>ValueError</code>, so the classic shared-list bug cannot happen.</li>
+<li><code>__post_init__</code> runs right after the generated init and raises on invalid values. The error is raised at the moment of creation, not an hour into training.</li>
+<li>The first output line is the generated <code>repr</code>. <code>asdict</code> gives a plain dict (the epochs value, 20) which you can dump to JSON.</li>
+<li><code>replace</code> returns a new object, so <code>cfg.lr</code> is still 0.1 while <code>cfg2.lr</code> is 0.01 and the two compare unequal (<code>False</code>).</li>
+<li>Assigning to a frozen field raises <code>FrozenInstanceError</code>; the negative learning rate prints our message; the misspelt keyword raises <code>TypeError</code>. Three kinds of mistakes, three immediate, specific errors.</li></ol>
+<h3>typing and mypy</h3>
+<p>Type hints are labels on function signatures and variables. Python does <strong>not</strong> enforce them when the program runs. A separate tool, <strong>mypy</strong> (also pyright), reads the labels and reports inconsistencies without running the code. They catch mistakes such as passing a string where a list is expected, or forgetting that a value may be <code>None</code>.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Hint</th><th>Meaning</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>int</code>, <code>float</code>, <code>str</code>, <code>bool</code></td><td>Basic types (<code>int</code> is accepted where <code>float</code> is expected)</td><td><code>def f(x: float) -> float</code></td></tr>
+<tr><td><code>list[int]</code>, <code>dict[str, float]</code>, <code>tuple[int, str]</code></td><td>Containers with element types (built-in generics, Python 3.9+)</td><td><code>scores: dict[str, float] = {}</code></td></tr>
+<tr><td><code>X | None</code></td><td>Value or <code>None</code> (replaces <code>Optional[X]</code>)</td><td><code>def f(p: Path | None = None)</code></td></tr>
+<tr><td><code>X | Y</code></td><td>Either type (replaces <code>Union</code>)</td><td><code>id: int | str</code></td></tr>
+<tr><td><code>Literal["a", "b"]</code></td><td>Only these exact values</td><td><code>mode: Literal["train", "eval"]</code></td></tr>
+<tr><td><code>TypedDict</code></td><td>Dict with known keys and value types</td><td><code>class Row(TypedDict): id: int</code></td></tr>
+<tr><td><code>NamedTuple</code></td><td>Typed immutable tuple with names</td><td><code>class P(NamedTuple): x: int</code></td></tr>
+<tr><td><code>Callable[[int], str]</code></td><td>A function taking an int returning a str</td><td><code>fn: Callable[[float], float]</code></td></tr>
+<tr><td><code>Protocol</code></td><td>"Anything with these methods" (structural typing)</td><td><code>class Model(Protocol): def predict(self, X): ...</code></td></tr>
+<tr><td>generics (<code>TypeVar</code>, <code>def f[T](x: T) -&gt; T</code>)</td><td>Same type in and out</td><td><code>def first[T](xs: list[T]) -&gt; T</code></td></tr>
+<tr><td><code>Any</code></td><td>Switch checking off for this value</td><td><code>x: Any</code></td></tr>
+<tr><td><code>Final</code></td><td>Constant that must not be reassigned</td><td><code>SEED: Final = 42</code></td></tr>
+<tr><td><code>Annotated[T, meta]</code></td><td>Type plus metadata (used by Typer, FastAPI, pydantic)</td><td><code>Annotated[int, "units: seconds"]</code></td></tr>
+<tr><td><code>cast(T, x)</code></td><td>Tell the checker a type without any runtime effect</td><td><code>cast(list[str], data)</code></td></tr>
+<tr><td><code>TYPE_CHECKING</code></td><td>Imports only for the checker, avoiding circular imports</td><td><code>if TYPE_CHECKING: import pandas as pd</code></td></tr>
+<tr><td><code>reveal_type(x)</code></td><td>mypy prints the inferred type</td><td><code>reveal_type(df)</code></td></tr>
+<tr><td><code># type: ignore[code]</code></td><td>Silence one known error on one line</td><td><code>x = f()  # type: ignore[arg-type]</code></td></tr>
+</tbody></table></div>
+<h3>Example 14: hints are not enforced, but they are readable at run time</h3>
+@@py
+import typing
+
+def mean(values: list[float]) -> float:
+    return sum(values) / len(values)
+
+print(mean([1.0, 2.0, 6.0]))
+print(mean((1, 2, 6)))            # a tuple of ints: works, hints are not enforced
+print(typing.get_type_hints(mean))
+
+def find(name: str, table: dict[str, int]) -> int | None:
+    return table.get(name)
+
+result = find("b", {"a": 1})
+print(result)
+if result is not None:
+    print(result + 1)
+@@end
+<ol><li>The first call passes a list of floats and returns 3.0 (the sum 9.0 divided by 3).</li>
+<li>The second call passes a tuple of ints, which violates the hint <code>list[float]</code>, yet Python happily returns 3.0. This is the key fact: <strong>hints do not change run-time behaviour</strong>. A checker like mypy would flag this call.</li>
+<li><code>get_type_hints</code> shows that the hints are stored on the function and can be read by tools. FastAPI, Typer and pydantic do exactly this: they read the hints and build validation and documentation from them.</li>
+<li><code>find</code> returns <code>int | None</code>. The name <code>"b"</code> is not in the table, so the result is <code>None</code>. The <code>if result is not None</code> guard is what a type checker demands before arithmetic, because <code>None + 1</code> would crash.</li></ol>
+<p>Running mypy (not run here, mypy is not installed). Typical command and the kind of message it prints:</p>
+@@file bash
+python -m pip install mypy
+mypy src/                 # check a folder
+mypy --strict src/        # strictest mode, good for new code
+# example of a report line:
+# src/stats.py:12: error: Argument 1 to "mean" has incompatible type "str"; expected "list[float]"  [arg-type]
+@@end
+@@file toml
+[tool.mypy]
+python_version = "3.12"
+warn_unused_ignores = true
+disallow_untyped_defs = true
+ignore_missing_imports = true      # for libraries without type information
+@@end
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">Do not annotate everything at once. Start with the public functions of the code other people call (parsing, feature building, the predict function), turn on <code>disallow_untyped_defs</code> for new modules only, and let mypy run in the pre-commit hook and in continuous integration. Many teams treat typed function signatures as the cheapest documentation they have.</div></div>
+
+<h3>Environments: venv, pip, uv and pyproject.toml</h3>
+<p>An <strong>environment</strong> is a private folder of installed packages, so project A can use pandas 2 while project B uses pandas 3. <code>pyproject.toml</code> is the single file describing the project, its dependencies and the settings of tools. <strong>uv</strong> is a fast, newer installer and project manager from Astral that reads the same file; it is not installed here, so its commands are shown but not run.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Command / section</th><th>What it does</th></tr></thead><tbody>
+<tr><td><code>python -m venv .venv</code></td><td>Creates an environment in <code>.venv</code></td></tr>
+<tr><td><code>source .venv/bin/activate</code></td><td>Puts that environment's <code>python</code> and <code>pip</code> first on the PATH (Windows: <code>.venv\Scripts\activate</code>)</td></tr>
+<tr><td><code>python -m pip install pkg==1.2.3</code></td><td>Installs an exact version; <code>python -m pip</code> guarantees the pip of that python</td></tr>
+<tr><td><code>pip install -r requirements.txt</code></td><td>Installs a list of pinned requirements</td></tr>
+<tr><td><code>pip freeze &gt; requirements.txt</code></td><td>Records the exact versions installed now</td></tr>
+<tr><td><code>pip install -e .</code></td><td>Editable install of your own package (changes apply immediately)</td></tr>
+<tr><td><code>pip list --outdated</code>, <code>pip check</code></td><td>Show old packages; find broken dependency combinations</td></tr>
+<tr><td><code>uv venv</code>, <code>uv pip install pkg</code></td><td>uv versions of the above</td></tr>
+<tr><td><code>uv init</code>, <code>uv add pkg</code></td><td>Create a project; add a dependency to <code>pyproject.toml</code> and the lock file</td></tr>
+<tr><td><code>uv lock</code>, <code>uv sync</code></td><td>Resolve exact versions into <code>uv.lock</code>; install exactly those</td></tr>
+<tr><td><code>uv run pytest</code></td><td>Run a command inside the project environment</td></tr>
+<tr><td><code>[project]</code></td><td>Name, version, <code>requires-python</code>, <code>dependencies</code></td></tr>
+<tr><td><code>[project.optional-dependencies]</code></td><td>Extras such as <code>dev = ["pytest"]</code>, installed with <code>pip install -e ".[dev]"</code></td></tr>
+<tr><td><code>[project.scripts]</code></td><td>Command names that map to Python functions</td></tr>
+<tr><td><code>[build-system]</code></td><td>Which tool builds the package (setuptools, hatchling, ...)</td></tr>
+<tr><td><code>[tool.xxx]</code></td><td>Settings for pytest, mypy, ruff and others</td></tr>
+</tbody></table></div>
+<h3>Example 15: a pyproject.toml, read back with the standard library</h3>
+<p>Python 3.11+ includes <code>tomllib</code>, which reads TOML. This is useful for checking in a script that the installed versions satisfy what the project file says.</p>
+@@py
+import tomllib
+
+text = """
+[project]
+name = "churn-tools"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = ["pandas>=2.2", "scikit-learn>=1.5", "typer>=0.12"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "mypy"]
+
+[project.scripts]
+churn = "churn_tools.cli:app"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+"""
+data = tomllib.loads(text)
+proj = data["project"]
+print(proj["name"], proj["version"])
+print(proj["dependencies"])
+print(proj["optional-dependencies"]["dev"])
+print(proj["scripts"])
+print(data["tool"]["pytest"]["ini_options"]["testpaths"])
+@@end
+<ol><li>The text is a TOML document: <code>[tables]</code> hold <code>key = value</code> lines; lists use square brackets; strings use quotes.</li>
+<li><code>tomllib.loads</code> parses it to nested dictionaries. Note that tables like <code>[project.scripts]</code> become <code>proj["scripts"]</code>.</li>
+<li><code>dependencies</code> uses <em>ranges</em> (<code>pandas&gt;=2.2</code>), because a library should allow compatible versions. Applications (services, training jobs) additionally keep a lock file of exact versions.</li>
+<li><code>scripts</code> maps the command <code>churn</code> to the function <code>app</code> in the module <code>churn_tools.cli</code>; after <code>pip install -e .</code>, typing <code>churn</code> in a terminal runs that function.</li></ol>
+@@file toml
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+@@end
+<h3>Example 16: create a real environment and use it</h3>
+@@py
+import subprocess
+import sys
+import tempfile
+import venv
+from pathlib import Path
+
+with tempfile.TemporaryDirectory() as tmp:
+    env_dir = Path(tmp) / ".venv"
+    venv.EnvBuilder(with_pip=False).create(env_dir)       # with_pip=False keeps it offline and quick
+    print((env_dir / "pyvenv.cfg").exists())
+    py = env_dir / "bin" / "python"                         # Windows: Scripts\\python.exe
+    code = "import sys; print(sys.prefix != sys.base_prefix)"
+    out = subprocess.run([str(py), "-c", code], capture_output=True, text=True)
+    print(out.stdout.strip())
+    out = subprocess.run([str(py), "-c", "import pandas"], capture_output=True, text=True)
+    print(out.returncode, out.stderr.strip().splitlines()[-1])
+@@end
+<ol><li><code>venv.EnvBuilder(...).create(path)</code> is what <code>python -m venv</code> calls. We skip installing pip (<code>with_pip=False</code>) to stay offline and fast.</li>
+<li>The file <code>pyvenv.cfg</code> marks a folder as an environment; its presence prints <code>True</code>.</li>
+<li>Inside the environment's own interpreter, <code>sys.prefix</code> differs from <code>sys.base_prefix</code>, which is the standard test for "am I in a venv?" (<code>True</code>).</li>
+<li>The new environment is empty: importing <code>pandas</code> fails with return code 1 and <code>ModuleNotFoundError</code>. This is the isolation promise: nothing from your global Python leaks in. It is also why "works on my machine" bugs happen when a package was installed globally and forgotten from <code>requirements.txt</code>.</li></ol>
+<h3>pre-commit</h3>
+<p><strong>pre-commit</strong> runs checks (formatter, linter, type checker, secret scanner) on the files you are about to commit, and blocks the commit if one fails. Install once per clone with <code>pre-commit install</code>; run on everything with <code>pre-commit run --all-files</code>. Not run here (not installed). Pin each <code>rev</code> to a real released tag of the hook repository; the placeholder below must be replaced.</p>
+@@file yaml
+# .pre-commit-config.yaml
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: vX.Y.Z            # replace with a real tag
+    hooks:
+      - id: ruff           # linter
+      - id: ruff-format    # formatter
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: vX.Y.Z            # replace with a real tag
+    hooks:
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+      - id: detect-private-key
+@@end
+<h3>Secrets</h3>
+<p>A secret is a password, token or key. Rules: never in code, never in git (history remembers; if one leaks, <strong>rotate it</strong>, deleting the file is not enough), never in logs, and never in an image layer. Read secrets from environment variables (set by the scheduler, the container platform or a secrets manager) and fail early when one is missing. A local <code>.env</code> file is fine for development if it is listed in <code>.gitignore</code>; the <code>python-dotenv</code> package loads it (not installed here).</p>
+<h3>Example 17: loading secrets safely</h3>
+@@py
+import os
+from dataclasses import dataclass, field
+from unittest import mock
+
+@dataclass(frozen=True)
+class Settings:
+    db_url: str
+    api_token: str = field(repr=False)          # never shown in repr, logs or tracebacks
+
+    @classmethod
+    def from_env(cls):
+        missing = [k for k in ("DB_URL", "API_TOKEN") if not os.environ.get(k)]
+        if missing:
+            raise RuntimeError("missing environment variables: " + ", ".join(missing))
+        return cls(os.environ["DB_URL"], os.environ["API_TOKEN"])
+
+def mask(secret, keep=2):
+    return secret[:keep] + "*" * (len(secret) - keep)
+
+with mock.patch.dict(os.environ, {"DB_URL": "sqlite:///demo.db", "API_TOKEN": "s3cr3t-token"}, clear=True):
+    s = Settings.from_env()
+print(s)
+print(mask(s.api_token))
+
+with mock.patch.dict(os.environ, {"DB_URL": "sqlite:///demo.db"}, clear=True):
+    try:
+        Settings.from_env()
+    except RuntimeError as exc:
+        print(exc)
+@@end
+<ol><li><code>field(repr=False)</code> keeps the token out of <code>print(settings)</code>, which is how secrets usually leak into logs.</li>
+<li><code>from_env</code> checks every required variable and reports <em>all</em> missing names at once. Failing at start-up is better than a cryptic 401 error later.</li>
+<li><code>mock.patch.dict(..., clear=True)</code> gives the block a clean fake environment so the example does not depend on your machine; real code just uses <code>os.environ</code>.</li>
+<li>The first printed line shows the settings object without the token. <code>mask</code> keeps two characters for debugging (<code>s3**********</code>) and hides the rest.</li>
+<li>The second environment has no token, so the code prints <code>missing environment variables: API_TOKEN</code>.</li></ol>
+@@file bash
+# .gitignore (minimum for a data project)
+.venv/
+.env
+__pycache__/
+*.pkl
+mlruns/
+data/raw/
+@@end
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Committing <code>.env</code> or a notebook cell containing a key, then "fixing" it by deleting the line in a later commit. Every earlier commit still holds the secret, and bots scan public repositories within minutes. The fix is: revoke and replace the key first, then clean history if needed, then add a secret scanner (<code>detect-private-key</code> above, or a dedicated scanner) to pre-commit.</div></div>

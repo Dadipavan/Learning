@@ -1,0 +1,148 @@
+<h2>22.6 Dask: pandas in pieces, with a scheduler</h2>
+<h3>Beginner: the idea</h3>
+<p><strong>Dask</strong> splits a big table into many pandas DataFrames called <strong>partitions</strong>, and builds a <strong>task graph</strong> (a diagram of small jobs and what each one needs). Calling a method such as <code>.sum()</code> only adds boxes to the graph, which is lazy execution. Calling <code>.compute()</code> hands the graph to a <strong>scheduler</strong> that runs the small jobs on all cores (threads or processes), or on many machines through <code>dask.distributed</code>, and returns an ordinary pandas object. The API deliberately looks like pandas, so existing code often needs few changes. It does not copy the pandas API completely: operations that need all the data in order (a global sort, a rank within groups, an arbitrary row lookup) are expensive or missing.</p>
+<div class="callout blue"><div class="lab">DEFINITION</div><div class="txt"><strong>Partition</strong>: one pandas DataFrame inside the Dask DataFrame. <strong>Lazy</strong>: building a plan without running it. <strong>Persist</strong>: run the plan now and keep the result in (distributed) memory so later steps reuse it. <strong>Shuffle</strong>: move rows between partitions so that rows with the same key end up together; the expensive step.</div></div>
+
+<h3>Reference table: the 24 most useful Dask names</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example (not run here)</th></tr></thead><tbody>
+<tr><td><code>dd.read_csv(path, blocksize=)</code></td><td>Lazy CSV read; one partition per block; globs allowed</td><td><code>dd.read_csv("logs/*.csv", blocksize="64MB")</code></td></tr>
+<tr><td><code>dd.read_parquet(path)</code></td><td>Lazy Parquet read</td><td><code>dd.read_parquet("sales/", columns=["a"])</code></td></tr>
+<tr><td><code>dd.from_pandas(df, npartitions=)</code></td><td>Turn a pandas frame into a Dask frame</td><td><code>dd.from_pandas(df, npartitions=8)</code></td></tr>
+<tr><td><code>ddf.npartitions</code></td><td>How many pieces</td><td><code>ddf.npartitions</code></td></tr>
+<tr><td><code>ddf.compute()</code></td><td>Run the graph, return pandas</td><td><code>ddf.amount.sum().compute()</code></td></tr>
+<tr><td><code>dask.compute(a, b)</code></td><td>Run several results in one pass (shares work)</td><td><code>dask.compute(x.sum(), x.mean())</code></td></tr>
+<tr><td><code>ddf.persist()</code></td><td>Compute now, keep partitions in memory</td><td><code>ddf = ddf.persist()</code></td></tr>
+<tr><td><code>ddf.head(n)</code></td><td>First rows of the FIRST partition only (cheap, but not a sample)</td><td><code>ddf.head(5)</code></td></tr>
+<tr><td><code>ddf.groupby(k).agg()</code></td><td>Tree-reduced group-by</td><td><code>ddf.groupby("region").amount.sum()</code></td></tr>
+<tr><td><code>ddf.merge(other, on=, how=)</code></td><td>Join; a small pandas side is broadcast, two large sides are shuffled</td><td><code>ddf.merge(tiers, on="customer_id")</code></td></tr>
+<tr><td><code>ddf.map_partitions(func)</code></td><td>Run any pandas function on each partition</td><td><code>ddf.map_partitions(add_rank, meta=m)</code></td></tr>
+<tr><td><code>meta=</code></td><td>Empty frame describing output columns and dtypes</td><td><code>meta=ddf._meta.assign(rank=0)</code></td></tr>
+<tr><td><code>ddf.repartition(npartitions= / partition_size=)</code></td><td>Change the number or size of partitions</td><td><code>ddf.repartition(partition_size="100MB")</code></td></tr>
+<tr><td><code>ddf.shuffle(on=)</code></td><td>Co-locate equal keys in one partition</td><td><code>ddf.shuffle(on="region")</code></td></tr>
+<tr><td><code>ddf.set_index(col)</code></td><td>Sort by a column and record partition boundaries (costly, speeds joins/lookups)</td><td><code>ddf.set_index("ts")</code></td></tr>
+<tr><td><code>ddf.drop_duplicates()</code></td><td>Distinct rows (a shuffle-like reduction)</td><td><code>ddf.drop_duplicates(subset=["order_id"])</code></td></tr>
+<tr><td><code>ddf.astype / ddf.categorize</code></td><td>Change dtypes; make categoricals with known categories</td><td><code>ddf.astype({"qty": "uint8"})</code></td></tr>
+<tr><td><code>ddf.to_parquet(path, partition_on=)</code></td><td>Write output, one file per partition</td><td><code>ddf.to_parquet("out/", partition_on=["year"])</code></td></tr>
+<tr><td><code>ddf.memory_usage(deep=True)</code></td><td>Lazy memory report (compute it)</td><td><code>ddf.memory_usage(deep=True).compute()</code></td></tr>
+<tr><td><code>ddf.visualize()</code></td><td>Draw the task graph (needs graphviz)</td><td><code>ddf.amount.sum().visualize()</code></td></tr>
+<tr><td><code>Client() / LocalCluster()</code></td><td>Start the distributed scheduler with a live dashboard</td><td><code>from dask.distributed import Client; client = Client()</code></td></tr>
+<tr><td><code>client.dashboard_link</code></td><td>URL of the dashboard (task stream, memory, progress)</td><td><code>print(client.dashboard_link)</code></td></tr>
+<tr><td><code>dask.config.set(scheduler=)</code></td><td>Choose "threads", "processes" or "synchronous" (debug)</td><td><code>dask.config.set(scheduler="synchronous")</code></td></tr>
+<tr><td><code>dask.delayed</code></td><td>Make any Python function lazy and parallel</td><td><code>dask.delayed(load)(path)</code></td></tr>
+</tbody></table></div>
+
+<h3>Worked example 1 (trivial, not run): the Dask version of a pandas group-by</h3>
+<np>
+import dask.dataframe as dd
+
+ddf = dd.read_csv("orders.csv")
+print(ddf.npartitions)                       # 1 for a tiny file; many for a big one
+lazy = ddf.groupby("region").amount.sum()    # nothing has been computed yet
+print(lazy.compute().sort_index())           # APAC 75, EU 115, US 85
+</np>
+<ol>
+<li><code>read_csv</code> splits the file into blocks (default tens of MB) and returns immediately; nothing is parsed yet.</li>
+<li><code>ddf.npartitions</code> is 1 for a ten-row file. A 10 GB file at 64 MB blocks gives about 160 partitions.</li>
+<li>The group-by is a plan: sum within each partition, then combine the partial sums. <code>compute()</code> runs it and returns a pandas Series. Expected: APAC 75, EU 115, US 85, the same numbers as the pandas, SQLite and DuckDB blocks.</li>
+</ol>
+
+<h3>Worked example 2 (runnable): what Dask does inside, in plain pandas</h3>
+<p>We can reproduce Dask's strategy with pandas alone: cut the table into partitions, reduce each partition separately, combine the partial results. The block also shows the classic trap: an average of averages is wrong when partitions have different sizes.</p>
+<py>
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(1)
+n = 300_000
+df = pd.DataFrame({"region": rng.choice(["EU", "US", "APAC"], n), "price": rng.normal(50, 15, n)})
+
+cuts = [0, 20_000, 120_000, n]                          # unequal partitions on purpose
+parts = [df.iloc[a:b] for a, b in zip(cuts[:-1], cuts[1:])]
+print("partition sizes:", [len(p) for p in parts])
+
+partials = [p.groupby("region")["price"].agg(["sum", "count"]) for p in parts]
+combined = sum(partials)                                 # element-wise add, aligned on region
+mean_correct = combined["sum"] / combined["count"]
+
+mean_of_means = pd.concat([p.groupby("region")["price"].mean() for p in parts], axis=1).mean(axis=1)
+truth = df.groupby("region")["price"].mean()
+
+print("sum/count equals pandas:", np.allclose(mean_correct.sort_index(), truth.sort_index()))
+print("mean of means equals pandas:", np.allclose(mean_of_means.sort_index(), truth.sort_index()))
+print("worst error of mean-of-means:", float((mean_of_means - truth).abs().max()) > 1e-6)
+</py>
+<ol>
+<li>Three partitions of 20,000, 100,000 and 180,000 rows stand in for Dask partitions.</li>
+<li>Step one (the "map"): every partition computes the sum and the count of price per region. These are small and can be done anywhere, in parallel.</li>
+<li>Step two (the "reduce"): <code>sum(partials)</code> adds the small tables aligned on region. This is what Dask's tree reduction does, in a tree so it works for thousands of partitions.</li>
+<li>The correct mean is total sum divided by total count. Dask's <code>mean()</code> does exactly this internally.</li>
+<li>The wrong way averages the three partition means with equal weight, so the 20,000-row partition counts as much as the 180,000-row one. The result differs from pandas, so the equality check prints <code>False</code>, and the last line prints <code>True</code> because the error is bigger than 1e-6.</li>
+<li>Rule: only combine <em>decomposable</em> partial results (sum, count, min, max, sum of squares). Medians and exact distinct counts need other approaches.</li>
+</ol>
+<p>A rank inside a group needs all of a group's rows in one place. In Dask that means a shuffle first. The running task in Dask (not run here):</p>
+<np>
+import dask.dataframe as dd
+import pandas as pd
+
+orders = dd.read_csv("orders.csv")
+tiers = pd.DataFrame({"customer_id": ["c1", "c2", "c3", "c4", "c5", "c6"],
+                      "tier": ["gold", "silver", "gold", "bronze", "silver", "bronze"]})
+
+rev = (orders.groupby(["region", "customer_id"]).amount.sum()
+             .reset_index().rename(columns={"amount": "revenue"}))
+rev = rev.merge(tiers, on="customer_id", how="left")     # small pandas side: cheap join
+
+def add_rank(part):
+    part = part.copy()
+    part["rank"] = part.groupby("region")["revenue"].rank(method="first", ascending=False).astype(int)
+    return part
+
+ranked = rev.shuffle(on="region").map_partitions(add_rank, meta=rev._meta.assign(rank=0))
+print(ranked.compute().sort_values(["region", "rank"]))
+</np>
+<ol>
+<li>The group-by and <code>reset_index</code> give one row per region and customer; <code>rename</code> gives the honest column name.</li>
+<li>The merge with a small pandas DataFrame is cheap: Dask sends the small table to every partition (a broadcast join) instead of shuffling the big one.</li>
+<li>Dask has no distributed "rank within group". The standard pattern is: <code>shuffle(on="region")</code> so that all rows of a region are in the same partition, then run an ordinary pandas function on each partition with <code>map_partitions</code>.</li>
+<li><code>meta=</code> tells Dask the output columns and dtypes without running the function. Without it, Dask guesses by running your function on fake data, which can be slow or wrong.</li>
+<li>Expected: the same six rows as Problem 22.1.1.</li>
+</ol>
+
+<h3>Worked example 3 (runnable): a shuffle join, step by step</h3>
+<p>Joining two big tables is the hardest distributed operation. Both sides are hash-partitioned by the join key, so matching keys land in the same partition number, then each pair of partitions is joined locally. The block does that with pandas and checks it against a single big merge.</p>
+<py>
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(2)
+orders = pd.DataFrame({"customer_id": rng.integers(0, 5_000, 100_000), "amount": rng.integers(1, 100, 100_000)})
+customers = pd.DataFrame({"customer_id": np.arange(5_000), "tier": rng.choice(["gold", "silver", "bronze"], 5_000)})
+K = 4
+
+def split(frame):
+    bucket = pd.util.hash_pandas_object(frame["customer_id"], index=False) % K
+    return [frame[bucket == i] for i in range(K)]
+
+o_parts, c_parts = split(orders), split(customers)
+print("order rows per partition:", [len(p) for p in o_parts])
+joined = pd.concat([o.merge(c, on="customer_id", how="left") for o, c in zip(o_parts, c_parts)])
+direct = orders.merge(customers, on="customer_id", how="left")
+key = ["customer_id", "amount", "tier"]
+print("rows:", len(joined), len(direct))
+print("same result:", joined.sort_values(key).reset_index(drop=True).equals(direct.sort_values(key).reset_index(drop=True)))
+</py>
+<ol>
+<li>Two tables: 100,000 orders and 5,000 customers, joined on <code>customer_id</code>.</li>
+<li><code>hash_pandas_object</code> gives a stable hash for each key; the remainder modulo K (4) picks a partition. A stable hash is essential: both sides must agree where each key goes. (Python's built-in <code>hash</code> of strings changes between runs, which is a real production bug.)</li>
+<li>The orders table splits into four roughly equal parts, since customer ids are spread evenly.</li>
+<li>Each pair of partitions is merged independently; no pair needs rows from another pair. That independence is the whole trick, and it is what lets different machines do the pairs at the same time.</li>
+<li>The concatenated result equals one big merge (after sorting, because partition order is not row order). Moving rows to their partition is the <strong>shuffle</strong>, the expensive part on a real cluster because it crosses the network.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>ddf.head()</code> to peek at the data, or calling <code>.compute()</code> on a result as large as the input. <strong>Symptom:</strong> <code>head()</code> shows only rows from the first partition and misleads you; <code>compute()</code> of a huge frame crashes the notebook because the result becomes one pandas object. <strong>Fix:</strong> aggregate first and compute small results, write big results with <code>to_parquet</code>, and use <code>ddf.sample(frac=0.01).compute()</code> for a representative peek.</div></div>
+<h3>Going deeper: scheduling and sizing</h3>
+<ul>
+<li>Aim for partitions of roughly 100 MB. Thousands of tiny partitions drown the scheduler in overhead (each task costs about a millisecond of bookkeeping); a few giant ones lose parallelism and risk memory errors.</li>
+<li>The threaded scheduler is good for NumPy/pandas code that releases Python's global interpreter lock. Pure-Python functions need processes (or a distributed cluster).</li>
+<li>With <code>Client()</code> the dashboard shows the task stream, per-worker memory and progress. A worker bar turning orange or red means it is spilling to disk or close to being killed: use smaller partitions or fewer parallel tasks.</li>
+<li>Recent Dask versions plan queries with an optimizer (the dask-expr layer), so column selection and filters are pushed into the read much like Polars; the API you use stays the same.</li>
+</ul>

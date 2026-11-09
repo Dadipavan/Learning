@@ -1,0 +1,248 @@
+<h2>22.7 PySpark: partitions, shuffles, joins, skew, caching and the Spark UI</h2>
+<h3>Beginner: the model</h3>
+<p><strong>Apache Spark</strong> is an engine that runs a query across many machines (or many cores of one). <strong>PySpark</strong> is its Python API. A Spark program has one <strong>driver</strong> (your Python process, which plans the work) and many <strong>executors</strong> (processes that hold data and run tasks). The data is a <strong>DataFrame</strong> cut into <strong>partitions</strong>; each partition is processed by one <strong>task</strong>. Operations come in two kinds. <strong>Transformations</strong> (<code>filter</code>, <code>select</code>, <code>groupBy</code>, <code>join</code>) are lazy: they extend the plan. <strong>Actions</strong> (<code>count</code>, <code>show</code>, <code>collect</code>, <code>write</code>) trigger the run. A <strong>job</strong> is the work for one action; it is cut into <strong>stages</strong> at every shuffle; each stage is a set of parallel tasks.</p>
+<p>The key distinction for performance: a <strong>narrow</strong> transformation (<code>filter</code>, <code>select</code>, <code>withColumn</code>) works on each partition independently and needs no data movement. A <strong>wide</strong> transformation (<code>groupBy</code>, <code>join</code>, <code>distinct</code>, <code>orderBy</code>, <code>repartition</code>) needs rows with the same key to meet, so data is <strong>shuffled</strong>: written to local disk, sent across the network, read by the next stage. Shuffles dominate the cost of most Spark jobs.</p>
+<figure><img src="images/lib22_shuffle.png" alt="Three input partitions each produce local partial sums, which are sent across a shuffle to three reduce partitions holding keys A, B and C." loading="lazy"/><figcaption>Figure 22.6. A shuffle: every map-side partition sends rows to every reduce-side partition (a diagram).</figcaption></figure>
+<p><strong>How to read it:</strong> the left boxes are input partitions holding mixed keys. Each computes partial sums locally (the middle boxes), which is why <code>groupBy().sum()</code> moves only small partial results, not raw rows. The nine arrows are the shuffle: each of three senders sends data to each of three receivers. On a cluster that is network and disk traffic, and the next stage cannot start until all of it has arrived. Fewer, smaller shuffles mean faster jobs.</p>
+
+<h3>Reference table: the 28 most useful PySpark names</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example (not run here)</th></tr></thead><tbody>
+<tr><td><code>SparkSession.builder...getOrCreate()</code></td><td>Start (or reuse) Spark; the entry point</td><td><code>spark = SparkSession.builder.master("local[*]").getOrCreate()</code></td></tr>
+<tr><td><code>spark.read.csv / parquet / json</code></td><td>Read data into a DataFrame (lazy)</td><td><code>spark.read.parquet("sales/")</code></td></tr>
+<tr><td><code>inferSchema=True</code></td><td>Guess types (costs an extra pass; prefer an explicit schema in production)</td><td><code>spark.read.csv(p, header=True, inferSchema=True)</code></td></tr>
+<tr><td><code>spark.createDataFrame(data, cols)</code></td><td>Build from Python data or pandas</td><td><code>spark.createDataFrame([("c1","gold")], ["id","tier"])</code></td></tr>
+<tr><td><code>df.select / withColumn / drop</code></td><td>Choose, add, remove columns</td><td><code>df.withColumn("vat", F.col("a") * 0.2)</code></td></tr>
+<tr><td><code>df.filter / where</code></td><td>Keep rows matching a condition</td><td><code>df.filter(F.col("amount") &gt; 20)</code></td></tr>
+<tr><td><code>df.groupBy(k).agg(...)</code></td><td>Group and aggregate (wide)</td><td><code>df.groupBy("region").agg(F.sum("amount"))</code></td></tr>
+<tr><td><code>pyspark.sql.functions as F</code></td><td>Built-in column functions: sum, count, when, concat, regexp_extract, to_date...</td><td><code>F.when(F.col("a") &gt; 5, 1).otherwise(0)</code></td></tr>
+<tr><td><code>df.join(other, on, how)</code></td><td>Join (inner, left, right, full, left_semi, left_anti, cross)</td><td><code>a.join(b, "customer_id", "left")</code></td></tr>
+<tr><td><code>F.broadcast(df)</code></td><td>Hint: send the small table to all executors, skip the shuffle</td><td><code>big.join(F.broadcast(small), "k")</code></td></tr>
+<tr><td><code>Window.partitionBy().orderBy()</code></td><td>Define a window for ranks, running totals, lag</td><td><code>w = Window.partitionBy("region").orderBy(F.desc("revenue"))</code></td></tr>
+<tr><td><code>F.row_number().over(w)</code></td><td>Window function on that window (also rank, dense_rank, lag, sum)</td><td><code>df.withColumn("rk", F.row_number().over(w))</code></td></tr>
+<tr><td><code>df.dropDuplicates(subset)</code></td><td>Remove duplicate rows (a shuffle)</td><td><code>df.dropDuplicates(["order_id"])</code></td></tr>
+<tr><td><code>df.orderBy / sort</code></td><td>Global sort (wide, expensive; avoid when not needed)</td><td><code>df.orderBy(F.desc("amount"))</code></td></tr>
+<tr><td><code>df.repartition(n, cols)</code></td><td>Reshuffle into n partitions (optionally by key)</td><td><code>df.repartition(200, "customer_id")</code></td></tr>
+<tr><td><code>df.coalesce(n)</code></td><td>Reduce partitions without a full shuffle</td><td><code>df.coalesce(8)</code></td></tr>
+<tr><td><code>df.rdd.getNumPartitions()</code></td><td>How many partitions now</td><td><code>df.rdd.getNumPartitions()</code></td></tr>
+<tr><td><code>df.cache() / persist() / unpersist()</code></td><td>Keep a result in memory (lazy: filled by the first action)</td><td><code>df = df.cache(); df.count()</code></td></tr>
+<tr><td><code>df.explain()</code></td><td>Print the physical plan (look for Exchange and join type)</td><td><code>df.explain("formatted")</code></td></tr>
+<tr><td><code>df.show / count / collect / take</code></td><td>Actions: run the plan</td><td><code>df.show(5)</code></td></tr>
+<tr><td><code>df.toPandas()</code></td><td>Bring the result to the driver as pandas (must be small)</td><td><code>df.limit(1000).toPandas()</code></td></tr>
+<tr><td><code>df.write.partitionBy().parquet()</code></td><td>Write a partitioned folder</td><td><code>df.write.mode("overwrite").partitionBy("year").parquet("out")</code></td></tr>
+<tr><td><code>spark.sql(q) / createOrReplaceTempView</code></td><td>Use SQL on DataFrames</td><td><code>df.createOrReplaceTempView("t"); spark.sql("SELECT ...")</code></td></tr>
+<tr><td><code>F.udf(f, type)</code></td><td>Row-at-a-time Python function (slow; last resort)</td><td><code>F.udf(lambda s: s.lower(), "string")</code></td></tr>
+<tr><td><code>F.pandas_udf</code></td><td>Vectorized Python function over pandas Series (faster than a plain UDF)</td><td><code>@F.pandas_udf("double")</code></td></tr>
+<tr><td><code>spark.conf.set(k, v)</code></td><td>Tune: shuffle partitions, broadcast threshold, AQE</td><td><code>spark.conf.set("spark.sql.shuffle.partitions", "64")</code></td></tr>
+<tr><td><code>F.rand / F.explode / F.array</code></td><td>Building blocks for salting a skewed key</td><td><code>(F.rand() * 8).cast("int")</code></td></tr>
+<tr><td><code>spark.stop()</code></td><td>Release resources at the end of a script</td><td><code>spark.stop()</code></td></tr>
+</tbody></table></div>
+
+<h3>Worked example 1 (realistic, not run): the running task in PySpark</h3>
+<np>
+from pyspark.sql import SparkSession, functions as F, Window
+
+spark = (SparkSession.builder.appName("ch22").master("local[*]")
+         .config("spark.sql.shuffle.partitions", "8")      # the default is 200, too many for tiny data
+         .getOrCreate())
+
+orders = spark.read.csv("orders.csv", header=True, inferSchema=True)
+tiers = spark.createDataFrame(
+    [("c1", "gold"), ("c2", "silver"), ("c3", "gold"),
+     ("c4", "bronze"), ("c5", "silver"), ("c6", "bronze")],
+    ["customer_id", "tier"],
+)
+
+rev = orders.groupBy("region", "customer_id").agg(F.sum("amount").alias("revenue"))
+w = Window.partitionBy("region").orderBy(F.col("revenue").desc())
+result = (rev.join(tiers, "customer_id", "left")
+             .withColumn("rank", F.row_number().over(w))
+             .select("region", "customer_id", "revenue", "tier", "rank")
+             .orderBy("region", "rank"))
+result.show()
+result.explain()
+spark.stop()
+</np>
+<ol>
+<li>The session is the entry point. <code>master("local[*]")</code> runs Spark on all cores of this machine, ideal for learning and tests. On a cluster the platform sets the master for you.</li>
+<li><code>spark.sql.shuffle.partitions</code> is the number of partitions after any shuffle; its default is 200. For ten rows that is 200 mostly empty tasks, so we lower it. On big data you raise it so each partition is a manageable size.</li>
+<li><code>read.csv(..., inferSchema=True)</code> reads the file once extra to guess types. On big files supply a schema instead.</li>
+<li><code>groupBy().agg(F.sum(...))</code> is the wide step: partial sums per partition, shuffle by (region, customer_id), final sums.</li>
+<li>The window is defined once (<code>Window.partitionBy("region").orderBy(...)</code>) and applied with <code>F.row_number().over(w)</code>. This needs all rows of a region together, so Spark shuffles by region.</li>
+<li>With tables this small Spark would pick a broadcast join for <code>tiers</code> automatically. <code>explain()</code> prints the physical plan; read it from the bottom up and look for <code>Exchange</code> (a shuffle) and <code>BroadcastHashJoin</code>.</li>
+<li>Expected output of <code>show()</code>: the same six rows as before, drawn in Spark's ASCII table. Spark does not guarantee row order without <code>orderBy</code>, and that is why we sort.</li>
+</ol>
+<txt>
+region  customer_id  revenue  tier    rank
+APAC    c5                70  silver     1
+APAC    c6                 5  bronze     2
+EU      c2                80  silver     1
+EU      c1                35  gold       2
+US      c3                75  gold       1
+US      c4                10  bronze     2
+</txt>
+
+<h3>Intermediate: partitions, joins and caching</h3>
+<ul>
+<li><strong>Partition count</strong>: when reading files, Spark makes about one partition per 128 MB of input by default. After a shuffle you get <code>spark.sql.shuffle.partitions</code> partitions. Rule of thumb: target partitions of about 100 to 200 MB, at least 2 to 3 times as many partitions as cores. Too few: underused cores and memory errors. Too many: scheduling overhead and tiny output files.</li>
+<li><strong>Join strategies</strong>: if one side is small (default threshold 10 MB, setting <code>spark.sql.autoBroadcastJoinThreshold</code>), Spark broadcasts it and no shuffle of the big side happens. Otherwise it does a <strong>sort-merge join</strong>: shuffle both sides by the key, sort, merge. Use <code>F.broadcast(small)</code> to force the cheap path when you know a table is small.</li>
+<li><strong>Join key quality</strong>: filter and select before the join so less data crosses the network; make sure both key columns have the same type, or Spark casts and may skip optimizations; check nulls (a null key never matches).</li>
+<li><strong>Caching</strong>: <code>df.cache()</code> marks a DataFrame to be kept in memory after its first action. Use it when the same expensive DataFrame feeds several actions (for example, a model's training loop or three reports from one cleaned table). Do not cache something used once, and call <code>unpersist()</code> when done. The Storage tab of the UI shows what is cached and how much space it uses.</li>
+<li><strong>Lazy plan, repeated work</strong>: without cache, every action re-runs the whole plan from the source files. Two <code>count()</code> calls on the same unmaterialized DataFrame read and process the data twice.</li>
+</ul>
+<np>
+from pyspark.sql import SparkSession, functions as F
+
+spark = SparkSession.builder.master("local[*]").getOrCreate()
+events = spark.read.parquet("events_pq")          # big
+users = spark.read.parquet("users_pq")            # small (a few MB)
+
+slim = events.select("user_id", "price").filter(F.col("price") > 0)   # prune early
+joined = slim.join(F.broadcast(users), "user_id", "left")               # no shuffle of events
+joined.explain()                                  # expect BroadcastHashJoin, no Exchange on events
+
+clean = joined.cache()                            # lazy: nothing happens yet
+print(clean.count())                              # first action: computes and fills the cache
+print(clean.groupBy("country").agg(F.sum("price")).count())   # reuses the cache
+clean.unpersist()
+</np>
+<ol>
+<li>Selecting two columns and filtering before the join cuts the rows and the bytes that every later step handles.</li>
+<li><code>F.broadcast(users)</code> promises Spark that <code>users</code> is small enough to ship to every executor. If the promise is false the executors run out of memory, so use it only for genuinely small tables.</li>
+<li>In <code>explain()</code> a <code>BroadcastHashJoin</code> with a <code>BroadcastExchange</code> on the small side only, and no <code>Exchange hashpartitioning</code> on the events side, confirms the shuffle is avoided.</li>
+<li><code>cache()</code> itself does nothing. The first action (<code>count</code>) computes the join and stores the partitions; the second action reads from memory.</li>
+<li><code>unpersist()</code> frees the memory for other work.</li>
+</ol>
+
+<h3>Expert (runnable): data skew and salting</h3>
+<p><strong>Skew</strong> means a few keys have far more rows than the others. After a shuffle by key, one partition gets the hot key's rows and one task runs far longer than its peers while the rest of the cluster sits idle. The block simulates it: 1 million rows, 1,000 keys with a Zipf-like popularity (key 0 gets about 13 percent of all rows), hashed into 8 partitions. <strong>Salting</strong> adds a random suffix 0 to 7 to the key so the hot key is spread over several partitions; an aggregation is done in two stages so the answer stays exact.</p>
+<py>
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(7)
+n, n_keys, n_parts = 1_000_000, 1000, 8
+w = 1 / np.arange(1, n_keys + 1)
+keys = rng.choice(n_keys, n, p=w / w.sum())
+vals = rng.integers(1, 100, n)
+
+def part_sizes(k):
+    h = pd.util.hash_array(k.astype(np.int64))
+    return np.bincount(h % n_parts, minlength=n_parts)
+
+before = part_sizes(keys)
+print("hottest key share:", round((keys == 0).mean(), 3))
+print("before:", before.tolist(), "max/mean =", round(before.max() / before.mean(), 2))
+salt = rng.integers(0, 8, n)
+after = part_sizes(keys * 8 + salt)
+print("after :", after.tolist(), "max/mean =", round(after.max() / after.mean(), 2))
+
+df = pd.DataFrame({"k": keys, "salt": salt, "v": vals})
+stage1 = df.groupby(["k", "salt"])["v"].sum().reset_index()
+stage2 = stage1.groupby("k")["v"].sum()
+direct = df.groupby("k")["v"].sum()
+print("same answer:", stage2.equals(direct))
+</py>
+<ol>
+<li>Key popularity is proportional to 1/rank. This heavy-tailed shape is common: a few customers, bots or null values account for most rows.</li>
+<li><code>part_sizes</code> mimics Spark's hash partitioning: hash the key, take the remainder by the number of partitions, count rows per partition.</li>
+<li>Before salting, the biggest partition holds nearly twice the average (max/mean about 2). That task decides when the whole stage finishes. With 1,000 keys the ratio is mild; with a real hot key holding 50 percent of rows, it is severe.</li>
+<li>After salting, the hot key's rows spread over all 8 partitions and the ratio falls. Not to exactly 1.0: other keys still hash unevenly.</li>
+<li>Stage 1 sums by (key, salt), stage 2 sums the partial sums by key. Because a sum of partial sums is the total, the answer equals the direct group-by (<code>True</code>). Salting works for decomposable aggregations; for joins, the small side must be replicated across all salt values.</li>
+</ol>
+<figure><img src="images/lib22_skew.png" alt="Bar chart of rows per partition for 8 partitions, comparing hashing by key and by key plus salt." loading="lazy"/><figcaption>Figure 22.7. Rows per partition before and after salting, measured in the block above.</figcaption></figure>
+<p><strong>How to read it:</strong> red bars are the partitions when hashing only by key, green bars when hashing key plus salt. The dotted line is the perfect split. Partition 0 in red holds a quarter million rows because the hot key lives there. Green is closer to the line. In Spark you would first try the built-in fix, adaptive query execution, which can split skewed shuffle partitions in sort-merge joins automatically; salt by hand only when the UI still shows one monster task.</p>
+<np>
+from pyspark.sql import functions as F
+
+SALT = 8
+# Two-stage aggregation for a skewed group-by key
+stage1 = (df.withColumn("salt", (F.rand(seed=1) * SALT).cast("int"))
+            .groupBy("k", "salt").agg(F.sum("v").alias("s")))
+total = stage1.groupBy("k").agg(F.sum("s").alias("v"))
+
+# Skewed join: salt the big side, replicate the small side across all salts
+big = big.withColumn("salt", (F.rand(seed=1) * SALT).cast("int"))
+small = small.withColumn("salt", F.explode(F.array([F.lit(i) for i in range(SALT)])))
+joined = big.join(small, ["k", "salt"])
+
+# Often enough: let Spark do it
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
+</np>
+<ol>
+<li>The first part is the Spark version of the pandas two-stage aggregate just run.</li>
+<li><code>F.rand(seed=1)</code> gives a uniform number in [0, 1); times 8 and cast to int gives a salt from 0 to 7.</li>
+<li>For the join, each row of the big side gets one random salt. Each row of the small side is copied 8 times, once per salt, using <code>explode</code> on an array. The join then matches on (key, salt), so a hot key's rows split into 8 smaller joins.</li>
+<li>The cost is 8 times the small side. Salt only the hot keys if the small side is not small.</li>
+<li>Adaptive Query Execution (AQE) has been on by default since Spark 3.2. It coalesces tiny shuffle partitions, switches join strategy using real runtime sizes, and can split skewed partitions. Setting the flags explicitly documents your intent.</li>
+</ol>
+
+<h3>UDFs versus built-in functions</h3>
+<p>A plain Python UDF (user-defined function) is called once per row: Spark must serialize each row from the JVM to a Python process and back, and the optimizer cannot see inside it. Built-in functions (<code>pyspark.sql.functions</code>) run inside the JVM, are optimized and can be pushed down. The same effect shows up in pandas: <code>df.apply(f, axis=1)</code> is a row-by-row Python loop, vectorized column arithmetic is the built-in. The block measures the gap on 200,000 rows (timings are not checked because they vary).</p>
+<py quiet>
+import time
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+n = 200_000
+df = pd.DataFrame({"amount": rng.integers(1, 500, n), "region": rng.choice(["EU", "US", "APAC"], n)})
+rate = {"EU": 0.92, "US": 1.0, "APAC": 0.0065}
+
+def row_udf(row):                      # like a plain Spark UDF: called once per row
+    return row["amount"] * rate[row["region"]]
+
+def best(fn, reps=3):
+    times = []
+    for _ in range(reps):
+        t0 = time.perf_counter(); fn(); times.append(time.perf_counter() - t0)
+    return min(times)
+
+slow = best(lambda: df.apply(row_udf, axis=1))
+fast = best(lambda: df["amount"] * df["region"].map(rate))      # column-at-a-time, like F.when / F.col arithmetic
+print("row-at-a-time:", round(slow, 3), "s; vectorized:", round(fast, 4), "s; ratio:", round(slow / fast))
+print("same values:", np.allclose(df.apply(row_udf, axis=1), df["amount"] * df["region"].map(rate)))
+</py>
+<ol>
+<li><code>row_udf</code> mimics a plain UDF: a Python function receiving one row.</li>
+<li>The vectorized line maps the region to its rate with a dictionary lookup (done once per distinct value internally) and multiplies whole columns.</li>
+<li>On one laptop run: 0.681 s for the row-at-a-time version and 0.0063 s for the vectorized one, about 108 times faster, with identical values. In Spark the penalty is usually larger because of the JVM-to-Python serialization on top.</li>
+<li>Escalation ladder in Spark: (1) a built-in function or <code>F.expr</code> SQL expression; (2) a <code>pandas_udf</code>, which receives whole pandas Series in batches via Arrow; (3) a plain UDF only when nothing else works.</li>
+</ol>
+<np>
+from pyspark.sql import functions as F
+import pandas as pd
+
+rates = {"EU": 0.92, "US": 1.0, "APAC": 0.0065}
+
+# 1. Built-in: a map literal and column arithmetic (best)
+rate_col = F.create_map([F.lit(x) for kv in rates.items() for x in kv])
+df = df.withColumn("eur", F.col("amount") * rate_col[F.col("region")])
+
+# 2. Vectorized pandas UDF: batches of rows as pandas Series
+@F.pandas_udf("double")
+def to_eur(amount: pd.Series, region: pd.Series) -> pd.Series:
+    return amount * region.map(rates)
+df = df.withColumn("eur2", to_eur("amount", "region"))
+
+# 3. Plain UDF: one row at a time (slowest)
+to_eur_slow = F.udf(lambda a, r: float(a * rates[r]), "double")
+df = df.withColumn("eur3", to_eur_slow("amount", "region"))
+</np>
+
+<h3>Reading the Spark UI</h3>
+<p>While a job runs, the driver serves a web page, by default at <code>http://localhost:4040</code>. Learn to read five tabs: <strong>Jobs</strong> (one row per action), <strong>Stages</strong> (the units between shuffles), <strong>Storage</strong> (cached data), <strong>Executors</strong> (memory, GC, failed tasks per executor) and <strong>SQL / DataFrame</strong> (the query plan with row counts). Open the page of a slow stage and read its <em>summary metrics for completed tasks</em>: min, 25th percentile, median, 75th percentile and max of duration, shuffle read size, spill.</p>
+<figure><img src="images/lib22_sparkui.png" alt="Two bar charts of task durations. Left: 40 tasks of similar length. Right: 39 similar tasks and one task much longer." loading="lazy"/><figcaption>Figure 22.8. Simulated task durations in a healthy and in a skewed stage (an illustration, not a real Spark run).</figcaption></figure>
+<p><strong>How to read it:</strong> every bar is one task in the stage. The dashed line is the median. In the healthy stage all bars are about 10 seconds, so the stage ends in about 10 seconds' worth of work on each core. In the skewed stage 39 tasks finish quickly and then one task keeps running for about 55 seconds; the stage cannot end until it does. In the UI that appears as a Max duration far above the Median.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>What you see in the UI</th><th>What it usually means</th><th>First fix to try</th></tr></thead><tbody>
+<tr><td>Max task duration is 5 times or more the median</td><td>Data skew, or one slow node</td><td>Check the key distribution; AQE skew join; salting</td></tr>
+<tr><td>Shuffle spill (memory) and (disk) columns are non-zero</td><td>Partitions too big for execution memory</td><td>More partitions; larger executor memory</td></tr>
+<tr><td>Thousands of tasks, each a few milliseconds</td><td>Too many tiny partitions</td><td><code>coalesce</code>, lower shuffle partitions, compact small files</td></tr>
+<tr><td>A few tasks, each very long, idle cores</td><td>Too few partitions</td><td><code>repartition</code> to 2 to 3 times the core count or more</td></tr>
+<tr><td>High GC time share</td><td>Memory pressure, many objects (often Python UDF data)</td><td>Fewer columns, built-ins, more memory</td></tr>
+<tr><td>Huge shuffle read/write for a simple query</td><td>Unneeded wide operations</td><td>Broadcast small tables; filter earlier; drop <code>distinct</code>/<code>orderBy</code></td></tr>
+<tr><td>SQL tab: scan reads all files and all columns</td><td>No pushdown (filter after a UDF, or wrong partition column)</td><td>Filter on partition columns; select columns early</td></tr>
+<tr><td>Same scan appears in two jobs</td><td>Recomputation without cache</td><td><code>cache()</code> or write an intermediate Parquet</td></tr>
+<tr><td>Executors tab shows lost executors</td><td>Out-of-memory kills</td><td>Smaller partitions; avoid <code>collect()</code>; fix skew</td></tr>
+</tbody></table></div>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Debug Spark in this order: (1) <code>explain()</code> to see the plan; (2) the SQL tab to see where the rows are; (3) the slow stage's task summary for skew and spill; (4) only then change configuration. Most "tuning" is really fixing the data layout or the join order.</div></div>

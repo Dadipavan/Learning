@@ -1,0 +1,1986 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 22: Scaling Up: Polars, DuckDB, Dask and PySpark</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#2b4fd6"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Python &amp; Software Engineering</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 22</div><h1>Scaling Up: Polars, DuckDB, Dask and PySpark</h1><p>Library Handbook: when pandas is not enough and how to choose the next tool.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-22-1-what-these-libraries-are-and-when-to-leave-pandas">22.1 What these libraries are, and when to leave pandas</a></li><li><a href="#s2-22-2-before-you-scale-measure-shrink-and-chunk-in-pandas">22.2 Before you scale: measure, shrink and chunk in pandas</a></li><li><a href="#s3-22-3-parquet-and-columnar-file-formats">22.3 Parquet and columnar file formats</a></li><li><a href="#s4-22-4-polars-fast-dataframes-with-expressions-and-a-lazy-engine">22.4 Polars: fast DataFrames with expressions and a lazy engine</a></li><li><a href="#s5-22-5-duckdb-sql-straight-on-files-and-dataframes">22.5 DuckDB: SQL straight on files and DataFrames</a></li><li><a href="#s6-22-6-dask-pandas-in-pieces-with-a-scheduler">22.6 Dask: pandas in pieces, with a scheduler</a></li><li><a href="#s7-22-7-pyspark-partitions-shuffles-joins-skew-caching-and-the-spark-ui">22.7 PySpark: partitions, shuffles, joins, skew, caching and the Spark UI</a></li><li><a href="#s8-22-8-how-to-choose">22.8 How to choose</a></li><li><a href="#s9-22-9-recipes-how-do-i">22.9 Recipes: How do I ...?</a></li><li><a href="#s10-22-10-performance-and-pitfalls">22.10 Performance and pitfalls</a></li><li><a href="#s11-22-11-cross-library-integration">22.11 Cross-library integration</a></li><li><a href="#s12-22-12-how-to-solve-any-big-data-and-fast-dataframe-problem-the-playboo">22.12 How to solve any big-data and fast-dataframe problem: the playbook</a></li><li><a href="#s13-22-13-going-deeper-what-is-under-the-hood-and-what-interviewers-probe">22.13 Going deeper: what is under the hood, and what interviewers probe</a></li><li><a href="#s14-chapter-recap">Chapter recap</a></li><li><a href="#s15-practice-set">Practice set</a></li><li><a href="#s16-prompt-pack">Prompt pack</a></li></ol></details><p>Priya works at an online shop. On Monday the data team drops a file called <code>events.csv</code> into a shared folder: every click, cart and purchase from the last year. It is 10 GB. Her laptop has 16 GB of memory. She types <code>pd.read_csv("events.csv")</code>, the fan spins up, the notebook freezes for four minutes, and then the kernel dies with no message. She did nothing wrong. Pandas is a superb tool, but it was designed to hold a table in memory, and a table can be bigger than memory.</p>
+<p>This chapter is the map of what to do next. You will learn to measure how big a problem really is, shrink it with cheap pandas tricks, read it in chunks, and then move to the right bigger tool: <strong>Parquet</strong> files (a compact column-based file format), <strong>Polars</strong> (a very fast DataFrame library), <strong>DuckDB</strong> (a database that runs SQL directly on files), <strong>Dask</strong> (pandas split across many pieces) and <strong>PySpark</strong> (the cluster engine used in many companies). By the end you will be able to choose between them on purpose, write the same task in each, read a Spark UI, and fix the usual disasters: out-of-memory kills, skewed joins and slow Python functions.</p>
+<p><em>How the code in this chapter is labelled.</em> Polars, DuckDB, Dask, PySpark and PyArrow are <strong>not installed</strong> on the study machine, so their code is marked <strong>NOT RUN HERE</strong>. It is written to be correct and current, and every such example solves the same small task as a block that <strong>was run</strong> with pandas and with <code>sqlite3</code> (which ships with Python), so you can verify the expected result by eye. Everything else was run with Python 3.14, pandas 3.0 and NumPy 2.x, and the output shown is the real output. Timings are measured on one laptop and will vary on yours; trust the ratios and the shapes, not the exact seconds.</p>
+
+<h2 id="s1-22-1-what-these-libraries-are-and-when-to-leave-pandas">22.1 What these libraries are, and when to leave pandas</h2>
+<h3>Beginner: the problem in one picture</h3>
+<p>A <strong>DataFrame</strong> is a table: rows are records, columns are fields. Pandas keeps the whole table in RAM (the fast working memory of your computer) and works on one CPU core for most operations. That gives two limits. <strong>Memory</strong>: if the table needs more RAM than you have, the program crashes or starts swapping to disk and crawls. <strong>Speed</strong>: if a job takes an hour on one core while your laptop has eight, seven cores sit idle.</p>
+<p>The tools in this chapter attack those two limits with three ideas. Learn the ideas once and every library becomes easier.</p>
+<ul>
+<li><strong>Columnar storage.</strong> Store each column together, not each row. A question about one column reads only that column (figure below).</li>
+<li><strong>Lazy execution.</strong> Do not run each line immediately. Collect the whole plan, let an optimizer clean it up, then run once.</li>
+<li><strong>Partitioning.</strong> Cut the data into pieces that can be processed independently (in parallel, or one at a time), then combine the partial answers.</li>
+</ul>
+<figure><img src="images/lib22_rowcol.png" alt="Left: a row store where a sum of one column must read every cell. Right: a column store where the sum reads one column." loading="lazy"/><figcaption>Figure 22.1. Row storage versus column storage. The highlighted column is the only one the query needs.</figcaption></figure>
+<p><strong>How to read it:</strong> each small square is one cell. In the row store (a CSV file or a <code>sqlite3</code> table) the cells of a row sit next to each other on disk, so adding up <code>amount</code> forces the reader to walk past every other cell. In the column store the cells of a column sit together, so only the orange column is read. With 4 columns that saves about three quarters of the reading; with 100 columns it saves 99 percent. This is the main reason Parquet, Polars and DuckDB are fast on analytics.</p>
+
+<h3>The five libraries at a glance</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Library</th><th>What it is</th><th>Use it when</th><th>Do NOT use it when</th></tr></thead><tbody>
+<tr><td>pandas</td><td>In-memory DataFrame, one core mostly</td><td>Data fits in RAM comfortably (a good rule: the in-memory size is under a third of your RAM)</td><td>The file will not load, or one step takes hours</td></tr>
+<tr><td>Polars</td><td>Rust DataFrame library, multi-core, eager and lazy modes</td><td>One machine, data from a few GB to larger than RAM (lazy/streaming), you like method chains</td><td>You need the exact pandas API, or a cluster</td></tr>
+<tr><td>DuckDB</td><td>In-process analytical SQL database</td><td>You think in SQL, you query Parquet/CSV files directly, you want window functions and joins on big files</td><td>Many small writes per second (that is OLTP, use PostgreSQL or SQLite)</td></tr>
+<tr><td>Dask</td><td>Parallel pandas: many pandas pieces plus a scheduler</td><td>You have pandas code and need more cores or more than RAM, maybe a small cluster</td><td>Data is small (the overhead is larger than the gain), or you can use Polars/DuckDB on one machine</td></tr>
+<tr><td>PySpark</td><td>Python API for Apache Spark, a distributed engine</td><td>Data is many hundreds of GB or TB, or your company already runs Spark (Databricks, EMR, Dataproc, Synapse)</td><td>Data fits on one machine: Spark startup and shuffle costs will make it slower</td></tr>
+</tbody></table></div>
+
+<h3>Install, version check and import conventions</h3>
+<p>Install with pip into a virtual environment (see Chapter 9 for environments). PySpark also needs a Java runtime installed on the machine, because Spark itself runs on the JVM.</p>
+<pre class="code lang-bash"><code>pip install pyarrow polars duckdb "dask[dataframe]" pyspark
+java -version        # PySpark needs a Java runtime; install a JDK if this fails</code></pre>
+<p>This block checks which of the libraries exist on the current machine and prints the version of each one that does. It is the first thing to run when someone says "it works on my laptop".</p>
+<pre class="code lang-python"><code>import importlib.util
+from importlib.metadata import version, PackageNotFoundError
+
+for name in ["pandas", "numpy", "pyarrow", "polars", "duckdb", "dask", "pyspark"]:
+    if importlib.util.find_spec(name) is None:
+        print(f"{name:8s} not installed")
+    else:
+        try:
+            print(f"{name:8s} {version(name)}")
+        except PackageNotFoundError:
+            print(f"{name:8s} present")
+import sqlite3
+print("sqlite3  ", sqlite3.sqlite_version)</code></pre>
+<pre class="code lang-text"><code>pandas   3.0.6
+numpy    2.5.3
+pyarrow  not installed
+polars   not installed
+duckdb   not installed
+dask     not installed
+pyspark  not installed
+sqlite3   3.50.4</code></pre>
+<ol>
+<li><code>find_spec</code> asks Python whether an import would succeed, without importing (a slow import of Spark is avoided).</li>
+<li>For installed packages, <code>importlib.metadata.version</code> returns the version string from the package metadata.</li>
+<li>The last two lines show the version of the SQLite engine inside Python. It matters: window functions need SQLite 3.25 or newer.</li>
+<li>On the study machine the output above shows pandas and NumPy present, and PyArrow, Polars, DuckDB, Dask and PySpark missing. That is why their code is labelled NOT RUN HERE.</li>
+</ol>
+<p>The import conventions you will see everywhere:</p>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (libraries not installed)
+import pandas as pd
+import polars as pl
+import duckdb
+import dask.dataframe as dd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from pyspark.sql import SparkSession, functions as F, Window</code></pre>
+
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">There is no best library, only the smallest tool that finishes in time. Each step up (pandas, Polars/DuckDB, Dask, Spark) buys capacity and costs simplicity: more setup, less debugging comfort, more concepts (partitions, shuffles). Cheap fixes first: read fewer columns, use smaller dtypes, read in chunks.</div></div>
+
+<h3>The running task used in this chapter</h3>
+<p>To compare libraries fairly, we solve one small task in all of them. Ten orders, six customers. <strong>For each region, rank customers by their total revenue (rank 1 is the biggest), and attach each customer's loyalty tier.</strong> That needs a group-by, a join and a window function (rank within a group), which are the three operations that decide whether a tool is any good. First in pandas.</p>
+<p class="problem"><span class="pl">Problem 22.1.1</span> Using the ten orders and the customer tiers below, produce one row per (region, customer) with the customer's revenue, tier and rank within the region. Compute it with pandas.</p>
+<pre class="code lang-python"><code>import io
+import pandas as pd
+
+orders = pd.read_csv(io.StringIO("""order_id,customer_id,region,category,amount
+1,c1,EU,book,20
+2,c2,EU,toy,35
+3,c1,EU,toy,15
+4,c3,US,book,50
+5,c4,US,toy,10
+6,c3,US,toy,25
+7,c5,APAC,book,40
+8,c5,APAC,book,30
+9,c6,APAC,toy,5
+10,c2,EU,book,45"""))
+tiers = pd.DataFrame({"customer_id": ["c1", "c2", "c3", "c4", "c5", "c6"],
+                      "tier": ["gold", "silver", "gold", "bronze", "silver", "bronze"]})
+
+rev = orders.groupby(["region", "customer_id"], as_index=False)["amount"].sum()
+rev = rev.rename(columns={"amount": "revenue"})
+rev = rev.merge(tiers, on="customer_id", how="left")
+rev["rank"] = rev.groupby("region")["revenue"].rank(method="first", ascending=False).astype(int)
+print(rev.sort_values(["region", "rank"]).to_string(index=False))</code></pre>
+<pre class="code lang-text"><code>region customer_id  revenue   tier  rank
+  APAC          c5       70 silver     1
+  APAC          c6        5 bronze     2
+    EU          c2       80 silver     1
+    EU          c1       35   gold     2
+    US          c3       75   gold     1
+    US          c4       10 bronze     2</code></pre>
+<ol>
+<li><code>read_csv(io.StringIO(...))</code> reads CSV text from a string as if it were a file. This keeps the block standalone.</li>
+<li><code>groupby([...], as_index=False)["amount"].sum()</code> adds up the amount per (region, customer) pair. <code>as_index=False</code> keeps the keys as normal columns.</li>
+<li><code>rename</code> gives the new column an honest name, <code>revenue</code>.</li>
+<li><code>merge(tiers, on="customer_id", how="left")</code> is a left join: every revenue row is kept and the tier is attached.</li>
+<li><code>groupby("region")["revenue"].rank(...)</code> is the window function: it ranks within each region. <code>method="first"</code> breaks ties by order of appearance and <code>ascending=False</code> makes the largest revenue rank 1.</li>
+<li>The last line sorts for a stable, readable print. Check by hand: EU c2 = 35 + 45 = 80, c1 = 20 + 15 = 35. US c3 = 75, c4 = 10. APAC c5 = 70, c6 = 5.</li>
+</ol>
+<p>Keep these six rows in mind. Every other library in the chapter must give the same six rows, and the next block proves the SQL version does.</p>
+<pre class="code lang-python"><code>import io, sqlite3
+import pandas as pd
+
+csv = """order_id,customer_id,region,category,amount
+1,c1,EU,book,20
+2,c2,EU,toy,35
+3,c1,EU,toy,15
+4,c3,US,book,50
+5,c4,US,toy,10
+6,c3,US,toy,25
+7,c5,APAC,book,40
+8,c5,APAC,book,30
+9,c6,APAC,toy,5
+10,c2,EU,book,45"""
+con = sqlite3.connect(":memory:")
+pd.read_csv(io.StringIO(csv)).to_sql("orders", con, index=False)
+con.execute("CREATE TABLE tiers(customer_id TEXT, tier TEXT)")
+con.executemany("INSERT INTO tiers VALUES (?, ?)", [("c1","gold"),("c2","silver"),("c3","gold"),("c4","bronze"),("c5","silver"),("c6","bronze")])
+
+sql = """
+WITH rev AS (
+    SELECT region, customer_id, SUM(amount) AS revenue
+    FROM orders GROUP BY region, customer_id
+)
+SELECT r.region, r.customer_id, r.revenue, t.tier,
+       ROW_NUMBER() OVER (PARTITION BY r.region ORDER BY r.revenue DESC) AS rnk
+FROM rev r LEFT JOIN tiers t ON t.customer_id = r.customer_id
+ORDER BY r.region, rnk
+"""
+for row in con.execute(sql):
+    print(row)</code></pre>
+<pre class="code lang-text"><code>('APAC', 'c5', 70, 'silver', 1)
+('APAC', 'c6', 5, 'bronze', 2)
+('EU', 'c2', 80, 'silver', 1)
+('EU', 'c1', 35, 'gold', 2)
+('US', 'c3', 75, 'gold', 1)
+('US', 'c4', 10, 'bronze', 2)</code></pre>
+<ol>
+<li>An in-memory SQLite database is created; the orders table is loaded from the same ten rows with <code>to_sql</code>.</li>
+<li>A small <code>tiers</code> table is created and filled with <code>executemany</code> (placeholders <code>?</code> keep values out of the SQL text).</li>
+<li>The CTE (<code>WITH rev AS (...)</code>) is the group-by step: one row per region and customer.</li>
+<li><code>LEFT JOIN tiers</code> attaches the tier, same as <code>merge(..., how="left")</code>.</li>
+<li><code>ROW_NUMBER() OVER (PARTITION BY region ORDER BY revenue DESC)</code> is the window function: number the rows inside each region, biggest revenue first.</li>
+<li>The tuples printed match the pandas table cell for cell (pandas prints a table, SQLite prints tuples; the values are the same). <strong>DuckDB accepts this exact SQL text</strong>, which is why the DuckDB section can reuse it.</li>
+</ol>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">When you move a pipeline to a bigger tool, never trust it on faith. Keep a tiny sample dataset with a known answer (like these ten rows) and a test that compares the new output with the old output. Most migration bugs (different tie-breaking, null handling, integer overflow) show up on ten rows.</div></div>
+
+<h2 id="s2-22-2-before-you-scale-measure-shrink-and-chunk-in-pandas">22.2 Before you scale: measure, shrink and chunk in pandas</h2>
+<p>The cheapest speed-up is the one that needs no new library. Most "big data" problems at the 1 to 20 GB scale are really "wasteful data" problems: columns you never use, 64-bit numbers holding values below 100, and the word <code>"EU"</code> stored a million times. This section gives you the measuring tools and the three fixes: read less, store smaller, read in pieces.</p>
+<h3>Reference table: the 24 most useful pandas scaling tools</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>df.info(memory_usage="deep")</code></td><td>Prints dtypes and the true memory including string contents</td><td><code>df.info(memory_usage="deep")</code></td></tr>
+<tr><td><code>df.memory_usage(deep=True)</code></td><td>Bytes used per column</td><td><code>df.memory_usage(deep=True).sum()</code></td></tr>
+<tr><td><code>pd.read_csv(usecols=)</code></td><td>Read only the columns you need</td><td><code>pd.read_csv(p, usecols=["a","b"])</code></td></tr>
+<tr><td><code>pd.read_csv(dtype=)</code></td><td>Choose dtypes at read time, skip the guessing</td><td><code>dtype={"qty": "uint8"}</code></td></tr>
+<tr><td><code>pd.read_csv(chunksize=)</code></td><td>Iterator of DataFrames of N rows each</td><td><code>for ch in pd.read_csv(p, chunksize=10**5):</code></td></tr>
+<tr><td><code>pd.read_csv(nrows=)</code></td><td>Read only the first N rows (peek at a huge file)</td><td><code>pd.read_csv(p, nrows=1000)</code></td></tr>
+<tr><td><code>pd.read_csv(skiprows=)</code></td><td>Skip rows (also a callable to sample at random)</td><td><code>skiprows=lambda i: i &gt; 0 and random() &gt; .01</code></td></tr>
+<tr><td><code>pd.read_csv(parse_dates=)</code></td><td>Turn text dates into real datetimes while reading</td><td><code>parse_dates=["ts"]</code></td></tr>
+<tr><td><code>pd.to_numeric(downcast=)</code></td><td>Shrink a number column to the smallest dtype that fits</td><td><code>pd.to_numeric(s, downcast="unsigned")</code></td></tr>
+<tr><td><code>astype("category")</code></td><td>Store repeated strings once, plus small integer codes</td><td><code>df["region"].astype("category")</code></td></tr>
+<tr><td><code>astype("float32")</code></td><td>Halve a float column (loses precision)</td><td><code>df["x"].astype("float32")</code></td></tr>
+<tr><td><code>astype("uint8")</code> etc.</td><td>Integer dtypes: int8/16/32/64, uint8/16/32/64</td><td><code>df["qty"].astype("uint8")</code></td></tr>
+<tr><td><code>pd.Series.nunique()</code></td><td>Counts distinct values; low counts suggest category</td><td><code>df["region"].nunique()</code></td></tr>
+<tr><td><code>df.select_dtypes()</code></td><td>Pick columns by dtype, for bulk conversion</td><td><code>df.select_dtypes("int64").columns</code></td></tr>
+<tr><td><code>df.convert_dtypes()</code></td><td>Switch to nullable dtypes (Int64, boolean)</td><td><code>df.convert_dtypes()</code></td></tr>
+<tr><td><code>groupby(observed=True)</code></td><td>Group on a category without empty combinations (the default since pandas 3.0; older versions needed it)</td><td><code>df.groupby("region", observed=True)</code></td></tr>
+<tr><td><code>Series.add(other, fill_value=0)</code></td><td>Add two partial results, treating a missing key as 0</td><td><code>total.add(part, fill_value=0)</code></td></tr>
+<tr><td><code>pd.concat(list)</code></td><td>Glue many small frames once (not in a loop)</td><td><code>pd.concat(parts, ignore_index=True)</code></td></tr>
+<tr><td><code>df.to_csv(mode="a", header=False)</code></td><td>Append a chunk to a file</td><td><code>ch.to_csv(out, mode="a", header=first)</code></td></tr>
+<tr><td><code>pd.read_sql(chunksize=)</code></td><td>Stream a database query in chunks</td><td><code>pd.read_sql(q, con, chunksize=50_000)</code></td></tr>
+<tr><td><code>df.sample(frac=)</code></td><td>Random sample to develop on a small slice</td><td><code>df.sample(frac=0.01, random_state=0)</code></td></tr>
+<tr><td><code>np.load(mmap_mode="r")</code></td><td>Memory-map a .npy file: arrays on disk behave like arrays in RAM</td><td><code>np.load("a.npy", mmap_mode="r")</code></td></tr>
+<tr><td><code>tracemalloc</code></td><td>Standard-library tool to measure peak Python memory</td><td><code>tracemalloc.start(); ...; tracemalloc.get_traced_memory()</code></td></tr>
+<tr><td><code>time.perf_counter()</code></td><td>Precise clock for timing code</td><td><code>t0 = time.perf_counter()</code></td></tr>
+<tr><td><code>del df; gc.collect()</code></td><td>Drop big objects you no longer need</td><td><code>del raw</code></td></tr>
+</tbody></table></div>
+
+<h3>Beginner: how big is a column really?</h3>
+<p>An integer in pandas defaults to 64 bits, which is 8 bytes, even if the value is 7. A column of 1 million integers therefore takes 8 MB. A string column is worse: each Python string object costs dozens of bytes beyond its characters. A <strong>category</strong> column keeps each distinct value once and stores a tiny integer code per row. The next block builds a synthetic table of 1 million orders and measures every column before and after shrinking. This synthetic table is reused in the next blocks.</p>
+<p class="problem"><span class="pl">Problem 22.2.1</span> Build a 1-million-row orders table (order_id, customer_id, region, qty, price). Measure the memory of each column, then shrink it with downcasting, <code>category</code> and <code>float32</code>, and compare.</p>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(42)
+n = 1_000_000
+df = pd.DataFrame({
+    "order_id": np.arange(n),
+    "customer_id": rng.integers(0, 50_000, n),
+    "region": rng.choice(["EU", "US", "APAC", "LATAM", "MEA"], n),
+    "qty": rng.integers(1, 20, n),
+    "price": rng.normal(50, 15, n).round(2),
+})
+mb = lambda s: round(s.memory_usage(deep=True, index=False) / 1e6, 1)
+print("BEFORE")
+for c in df:
+    print(f"  {c:12s} {str(df[c].dtype):6s} {mb(df[c]):6.1f} MB")
+print("  total", round(df.memory_usage(deep=True).sum() / 1e6, 1), "MB")
+
+small = df.assign(
+    order_id=pd.to_numeric(df.order_id, downcast="unsigned"),
+    customer_id=pd.to_numeric(df.customer_id, downcast="unsigned"),
+    region=df.region.astype("category"),
+    qty=pd.to_numeric(df.qty, downcast="unsigned"),
+    price=df.price.astype("float32"),
+)
+print("AFTER")
+for c in small:
+    print(f"  {c:12s} {str(small[c].dtype):8s} {mb(small[c]):5.1f} MB")
+print("  total", round(small.memory_usage(deep=True).sum() / 1e6, 1), "MB")</code></pre>
+<pre class="code lang-text"><code>BEFORE
+  order_id     int64     8.0 MB
+  customer_id  int64     8.0 MB
+  region       str      52.2 MB
+  qty          int64     8.0 MB
+  price        float64    8.0 MB
+  total 84.2 MB
+AFTER
+  order_id     uint32     4.0 MB
+  customer_id  uint16     2.0 MB
+  region       category   1.0 MB
+  qty          uint8      1.0 MB
+  price        float32    4.0 MB
+  total 12.0 MB</code></pre>
+<ol>
+<li>Lines 4 to 12 build the table with a seeded random generator, so every run gives the same numbers.</li>
+<li><code>mb</code> is a one-line helper: <code>deep=True</code> counts the real size of string contents, not just pointers.</li>
+<li>BEFORE: the four numeric columns cost 8 MB each (1 million values times 8 bytes). The region column (the text <code>EU</code>, <code>US</code> and so on) costs over 50 MB, more than the other four together. In pandas 3.0 text columns default to the <code>str</code> dtype; without PyArrow installed it is still backed by Python string objects, which is why it is large. With PyArrow installed the text is stored more compactly, but a category is smaller still for few distinct values.</li>
+<li><code>pd.to_numeric(..., downcast="unsigned")</code> picks the smallest unsigned integer dtype that holds every value: 1,000,000 ids need 32 bits, customers below 50,000 need 16, quantities below 20 need 8.</li>
+<li><code>astype("category")</code> stores 5 labels and one 8-bit code per row: 1 MB.</li>
+<li><code>float32</code> halves the price column. It keeps about 7 significant digits, fine for a price of 49.99 in analytics, wrong for money you must add up exactly (see pitfalls).</li>
+<li>Result: about 84 MB becomes about 12 MB, seven times smaller, with the same information. Check the range before you force a type: <code>to_numeric(downcast=)</code> picks a dtype from the actual min and max, but a blind <code>astype("uint8")</code> on a value of 300 silently wraps it to 44, and writing 300 into an existing <code>uint8</code> column raises an error.</li>
+</ol>
+<figure><img src="images/lib22_memory.png" alt="Bar chart of memory per column for default dtypes versus downcast dtypes. The region column dominates the default total." loading="lazy"/><figcaption>Figure 22.2. Memory per column for the 1-million-row table, measured with <code>memory_usage(deep=True)</code>.</figcaption></figure>
+<p><strong>How to read it:</strong> each pair of bars is one column. The orange bar is the default dtype, the green bar the shrunk version. The tall orange bar is the text column; the other columns shrink by half or more. The lesson: look at the biggest bar first. Shrinking an already small column barely helps.</p>
+
+<h3>Intermediate: chunking, the way to beat the memory wall</h3>
+<p>If you cannot fit the file, do not load the file. A <strong>chunk</strong> is a block of rows. You read one chunk, reduce it to a small partial answer (a sum, a count, a filtered set of rows), throw the chunk away, and move to the next. At the end you combine the partial answers. This works for any <strong>decomposable</strong> statistic: sums, counts, min, max, and the mean (as sum divided by count). It does not work directly for the median or the exact distinct count, which need other tricks (Section 22.9).</p>
+<p class="problem"><span class="pl">Problem 22.2.2</span> Write the 1-million-row table to a CSV file. Compute the revenue (qty times price) per region two ways: reading the whole file, and in chunks of 100,000 and 10,000 rows. Compare the peak memory and check that the answers agree.</p>
+<pre class="code lang-python"><code>import os, tempfile, tracemalloc
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(42)
+n = 1_000_000
+df = pd.DataFrame({
+    "order_id": np.arange(n),
+    "customer_id": rng.integers(0, 50_000, n),
+    "region": rng.choice(["EU", "US", "APAC", "LATAM", "MEA"], n),
+    "qty": rng.integers(1, 20, n),
+    "price": rng.normal(50, 15, n).round(2),
+})
+path = os.path.join(tempfile.mkdtemp(), "orders.csv")
+df.to_csv(path, index=False)
+del df
+print("file size over 20 MB:", os.path.getsize(path) &gt; 20e6)
+
+def revenue_full():
+    d = pd.read_csv(path)
+    return (d.qty * d.price).groupby(d.region).sum()
+
+def revenue_chunked(size):
+    total = None
+    for ch in pd.read_csv(path, chunksize=size):
+        part = (ch.qty * ch.price).groupby(ch.region).sum()
+        total = part if total is None else total.add(part, fill_value=0)
+    return total
+
+peaks, answers = {}, {}
+for label, fn in [("full", revenue_full),
+                  ("chunk 100k", lambda: revenue_chunked(100_000)),
+                  ("chunk 10k", lambda: revenue_chunked(10_000))]:
+    tracemalloc.start()
+    answers[label] = fn().sort_index()
+    peaks[label] = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+
+print("full peak above 60 MB:", peaks["full"] &gt; 60e6)
+print("chunk 100k peak below 30 MB:", peaks["chunk 100k"] &lt; 30e6)
+print("chunk 10k peak below 10 MB:", peaks["chunk 10k"] &lt; 10e6)
+print("same answer:", np.allclose(answers["full"], answers["chunk 10k"]))
+print(answers["chunk 10k"].round(0).astype("int64").to_string())</code></pre>
+<pre class="code lang-text"><code>file size over 20 MB: True
+full peak above 60 MB: True
+chunk 100k peak below 30 MB: True
+chunk 10k peak below 10 MB: True
+same answer: True
+region
+APAC     100744849
+EU        99851750
+LATAM     99823225
+MEA       99991196
+US        99891792</code></pre>
+<ol>
+<li>The first half is the same data generator, written to a temporary CSV. <code>del df</code> frees the in-memory copy, so only the file remains, like Priya's situation.</li>
+<li><code>revenue_full</code> loads everything, multiplies <code>qty * price</code> row by row, and groups the products by the region column.</li>
+<li><code>revenue_chunked</code> asks for an iterator: <code>read_csv(chunksize=size)</code> yields DataFrames of at most <code>size</code> rows. Each one is reduced to a 5-row <code>Series</code> of partial sums.</li>
+<li><code>total.add(part, fill_value=0)</code> adds two Series aligned on the region label. <code>fill_value=0</code> treats a region missing from one chunk as zero instead of producing NaN.</li>
+<li><code>tracemalloc</code> measures the peak Python-level memory while the function runs. The prints use thresholds, not exact bytes, because exact numbers differ a little between machines.</li>
+<li>The peak shrinks roughly in proportion to the chunk size, while the answer is identical (up to floating-point rounding, hence <code>allclose</code>). The last line prints the revenue per region as whole numbers.</li>
+</ol>
+<figure><img src="images/lib22_chunks.png" alt="Line chart of peak memory against rows per chunk on a log axis, rising with chunk size, with a dashed line for reading everything." loading="lazy"/><figcaption>Figure 22.3. Peak memory against chunk size for the same file, measured with <code>tracemalloc</code>.</figcaption></figure>
+<p><strong>How to read it:</strong> the x-axis is the number of rows per chunk (log scale), the y-axis the peak memory. The blue line climbs with chunk size and the red dashed line is the cost of loading everything. If the file were 100 times larger, the blue points would not move at all, because the chunk size sets the memory, not the file size. That is what lets a laptop process a 10 GB file.</p>
+
+<h3>Expert: speed numbers, honestly measured</h3>
+<p>Smaller data is also faster data, but not every trick helps every time. The next block measures reading and group-by variants on the same million rows. Timings are not pasted as checked output because they change on every run; the table after it shows what one run on one laptop gave.</p>
+<pre class="code lang-python"><code>import os, tempfile, time
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(42)
+n = 1_000_000
+df = pd.DataFrame({
+    "order_id": np.arange(n),
+    "customer_id": rng.integers(0, 50_000, n),
+    "region": rng.choice(["EU", "US", "APAC", "LATAM", "MEA"], n),
+    "qty": rng.integers(1, 20, n),
+    "price": rng.normal(50, 15, n).round(2),
+})
+path = os.path.join(tempfile.mkdtemp(), "orders.csv")
+df.to_csv(path, index=False)
+
+def best(fn, reps=5):
+    times = []
+    for _ in range(reps):
+        t0 = time.perf_counter(); fn(); times.append(time.perf_counter() - t0)
+    return min(times)
+
+print("--- reading the CSV (best of 5, seconds) ---")
+print("read everything       ", round(best(lambda: pd.read_csv(path)), 3))
+print("usecols 2 of 5        ", round(best(lambda: pd.read_csv(path, usecols=["region", "price"])), 3))
+print("usecols + dtype       ", round(best(lambda: pd.read_csv(path, usecols=["region", "price"], dtype={"region": "category", "price": "float32"})), 3))
+print("chunks of 100k, sum   ", round(best(lambda: sum(c.price.sum() for c in pd.read_csv(path, chunksize=100_000))), 3))
+
+df_cat = df.assign(region=df.region.astype("category"))
+codes = df_cat.region.cat.codes.to_numpy()
+price = df.price.to_numpy()
+region = df.region.tolist()
+def py_loop():
+    tot = {}
+    for r, p in zip(region, price):
+        tot[r] = tot.get(r, 0.0) + p
+    return tot
+print("--- mean price per region (best of 5, seconds) ---")
+print("python dict loop      ", round(best(py_loop), 3))
+print("groupby str column    ", round(best(lambda: df.groupby("region")["price"].mean()), 3))
+print("groupby category      ", round(best(lambda: df_cat.groupby("region", observed=True)["price"].mean()), 3))
+print("numpy bincount codes  ", round(best(lambda: np.bincount(codes, weights=price) / np.bincount(codes)), 3))</code></pre>
+<div class="tablewrap"><table class="data"><thead><tr><th>Operation (1M rows)</th><th>Best of 5 (s), one laptop</th><th>Reading</th></tr></thead><tbody>
+<tr><td>read_csv, everything</td><td>0.164</td><td>baseline</td></tr>
+<tr><td>read_csv, usecols (2 of 5 columns)</td><td>0.105</td><td>fewer columns, less parsing</td></tr>
+<tr><td>usecols + category/float32 dtypes</td><td>0.095</td><td>a bit faster still, and far smaller in memory</td></tr>
+<tr><td>chunks of 100k, summing price</td><td>0.181</td><td>slightly slower than one read: chunking buys memory, not speed</td></tr>
+<tr><td>mean price per region, Python dict loop</td><td>0.087</td><td>interpreted loop, one row at a time</td></tr>
+<tr><td>groupby on a str column</td><td>0.036</td><td>vectorized, about 2.4 times faster than the loop</td></tr>
+<tr><td>groupby on a category column</td><td>0.007</td><td>integer codes, about 5 times faster than the str groupby</td></tr>
+<tr><td>NumPy bincount on the codes</td><td>0.004</td><td>the floor: pure integer arithmetic</td></tr>
+</tbody></table></div>
+<ol>
+<li>The timing helper runs each variant five times and keeps the minimum, which is the least noisy estimate of the cost of the code itself.</li>
+<li>Reading fewer columns saved about a third here. On a 100-column file the saving is far larger because parsing cost is per column.</li>
+<li>Chunking is not free: the same work done in 10 pieces carries a little overhead. You chunk because you must, not to go faster.</li>
+<li>Group-by on a category is much faster than on strings because comparing small integers is cheaper than comparing text. This is the same reason databases dictionary-encode strings.</li>
+<li>Your numbers will differ, and the ordering is what you should expect to reproduce. The ratios shown are computed from this single run.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>df["price"] = df["price"].astype("float32")</code> on money columns, then summing a billion of them. <strong>Symptom:</strong> totals differ from the finance system by a few units, and differ again if you change the row order. <strong>Fix:</strong> store money as integer cents (<code>int64</code>, or <code>int32</code> if the range allows) and divide by 100 only for display. Use float32 only for measurements where 7 digits are plenty.</div></div>
+
+<h2 id="s3-22-3-parquet-and-columnar-file-formats">22.3 Parquet and columnar file formats</h2>
+<h3>Beginner: why CSV is the wrong format for big data</h3>
+<p>A CSV file is plain text. That is friendly (you can open it anywhere) and wasteful. The number 49.99 is stored as five characters, not one 8-byte float. Nothing says whether a column is an integer or a date, so the reader must guess. You cannot read one column without scanning every line. And a CSV cannot be split safely in the middle of a quoted multi-line field. <strong>Parquet</strong> is an open file format built for analytics. It stores data by column, with a schema (names and types), compression, and small statistics (minimum and maximum) for each block. The same data is typically many times smaller than the CSV, and a query that needs two columns reads two columns.</p>
+<div class="callout blue"><div class="lab">DEFINITION</div><div class="txt"><strong>Row group</strong>: a block of rows (for example 100,000 to 1,000,000) inside a Parquet file. <strong>Column chunk</strong>: the data of one column inside one row group. <strong>Footer</strong>: metadata at the end of the file with the schema and, for each column chunk, its location, row count and minimum/maximum. A reader jumps to the footer first, decides which chunks it needs, and reads only those. <strong>Apache Arrow</strong> is the matching in-memory columnar format that Polars, DuckDB, PyArrow, and (optionally) pandas use, so data moves between them with little copying.</div></div>
+<figure><img src="images/lib22_layout.png" alt="Directory tree sales/year=2025/region=EU/part-0.parquet with grey skipped branches and green selected branch." loading="lazy"/><figcaption>Figure 22.4. A Hive-style partitioned dataset. The folder names carry the values of the partition columns, so a filter on them skips whole folders.</figcaption></figure>
+<p><strong>How to read it:</strong> the dataset is a folder, not a file. Each level of sub-folders is named <code>column=value</code>. The query asks for year 2025 and region EU, so the engine lists the folders, discards every branch whose name fails the filter (grey) and opens one file (green). Nothing was read from the other three files. This is called <strong>partition pruning</strong>. Inside the one file we additionally get <strong>row-group skipping</strong> from the footer statistics.</p>
+
+<h3>Reference table: the 24 most useful Parquet-related calls</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example (not run here)</th></tr></thead><tbody>
+<tr><td><code>df.to_parquet(path)</code></td><td>pandas: write a DataFrame (needs pyarrow or fastparquet)</td><td><code>df.to_parquet("o.parquet", index=False)</code></td></tr>
+<tr><td><code>pd.read_parquet(path, columns=)</code></td><td>pandas: read, optionally only some columns</td><td><code>pd.read_parquet("o.parquet", columns=["region"])</code></td></tr>
+<tr><td><code>pd.read_parquet(filters=)</code></td><td>pandas: push a filter down to the reader</td><td><code>filters=[("year", "==", 2025)]</code></td></tr>
+<tr><td><code>df.to_parquet(partition_cols=)</code></td><td>pandas: write a partitioned folder</td><td><code>df.to_parquet("sales/", partition_cols=["year"])</code></td></tr>
+<tr><td><code>df.to_parquet(compression=)</code></td><td>Choose snappy (fast), zstd (small and fast) or gzip (small, slow)</td><td><code>compression="zstd"</code></td></tr>
+<tr><td><code>pa.Table.from_pandas(df)</code></td><td>pyarrow: convert pandas to an Arrow table</td><td><code>t = pa.Table.from_pandas(df)</code></td></tr>
+<tr><td><code>pq.write_table(t, path)</code></td><td>pyarrow: write an Arrow table</td><td><code>pq.write_table(t, "o.parquet", row_group_size=500_000)</code></td></tr>
+<tr><td><code>pq.read_table(path, columns=)</code></td><td>pyarrow: read to an Arrow table</td><td><code>pq.read_table("o.parquet", columns=["qty"])</code></td></tr>
+<tr><td><code>pq.ParquetFile(path).metadata</code></td><td>Inspect rows, row groups and column statistics without reading data</td><td><code>pq.ParquetFile("o.parquet").metadata.num_row_groups</code></td></tr>
+<tr><td><code>pq.ParquetFile(path).schema_arrow</code></td><td>Show column names and types</td><td><code>print(pf.schema_arrow)</code></td></tr>
+<tr><td><code>pq.ParquetFile(path).iter_batches()</code></td><td>Stream a big file in batches (chunking for Parquet)</td><td><code>for b in pf.iter_batches(batch_size=100_000):</code></td></tr>
+<tr><td><code>pyarrow.dataset.dataset(path)</code></td><td>Open a folder of files as one lazy dataset</td><td><code>ds.dataset("sales/", format="parquet", partitioning="hive")</code></td></tr>
+<tr><td><code>dataset.to_table(filter=, columns=)</code></td><td>Read only what the filter and columns need</td><td><code>d.to_table(filter=ds.field("year") == 2025)</code></td></tr>
+<tr><td><code>pl.read_parquet(path)</code></td><td>Polars: read eagerly</td><td><code>pl.read_parquet("o.parquet")</code></td></tr>
+<tr><td><code>pl.scan_parquet(path)</code></td><td>Polars: lazy scan with pushdown; globs allowed</td><td><code>pl.scan_parquet("sales/**/*.parquet")</code></td></tr>
+<tr><td><code>df.write_parquet(path)</code></td><td>Polars: write a DataFrame</td><td><code>df.write_parquet("o.parquet")</code></td></tr>
+<tr><td><code>lf.sink_parquet(path)</code></td><td>Polars: run a lazy query and stream the result to disk without holding it</td><td><code>lf.sink_parquet("out.parquet")</code></td></tr>
+<tr><td><code>read_parquet('glob')</code> (DuckDB SQL)</td><td>Query files as a table</td><td><code>SELECT * FROM read_parquet('sales/*/*.parquet')</code></td></tr>
+<tr><td><code>COPY ... TO ... (FORMAT PARQUET)</code></td><td>DuckDB: write a query result as Parquet</td><td><code>COPY (SELECT ...) TO 'out.parquet' (FORMAT PARQUET)</code></td></tr>
+<tr><td><code>PARTITION_BY</code> (DuckDB)</td><td>DuckDB: write a Hive-partitioned folder</td><td><code>COPY t TO 'sales' (FORMAT PARQUET, PARTITION_BY (year))</code></td></tr>
+<tr><td><code>hive_partitioning = true</code></td><td>DuckDB: turn folder names into columns on read</td><td><code>read_parquet('sales/*/*.parquet', hive_partitioning = true)</code></td></tr>
+<tr><td><code>dd.read_parquet(path)</code></td><td>Dask: lazy read, one partition per file or row-group chunk</td><td><code>dd.read_parquet("sales/")</code></td></tr>
+<tr><td><code>ddf.to_parquet(path, partition_on=)</code></td><td>Dask: write partitioned output</td><td><code>ddf.to_parquet("out/", partition_on=["year"])</code></td></tr>
+<tr><td><code>spark.read.parquet(path)</code></td><td>Spark: read a file or folder (schema comes from the files)</td><td><code>spark.read.parquet("sales/")</code></td></tr>
+<tr><td><code>df.write.partitionBy().parquet()</code></td><td>Spark: write a partitioned folder</td><td><code>df.write.partitionBy("year").mode("overwrite").parquet("out/")</code></td></tr>
+</tbody></table></div>
+
+<h3>Intermediate: see the columnar idea with tools you have</h3>
+<p>We cannot write Parquet here (no PyArrow), but we can show the principle with NumPy. Store each numeric column as its own binary <code>.npy</code> file (typed, no parsing, one file per column), and compare with the CSV.</p>
+<p class="problem"><span class="pl">Problem 22.3.1</span> Write the 1-million-row table as one CSV and as one binary file per column. Then compute the total of the price column from each, and report how many bytes each approach had to touch.</p>
+<pre class="code lang-python"><code>import os, tempfile
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(42)
+n = 1_000_000
+df = pd.DataFrame({
+    "order_id": np.arange(n, dtype="uint32"),
+    "customer_id": rng.integers(0, 50_000, n).astype("uint16"),
+    "region": pd.Categorical(rng.choice(["EU", "US", "APAC", "LATAM", "MEA"], n)),
+    "qty": rng.integers(1, 20, n).astype("uint8"),
+    "price": rng.normal(50, 15, n).round(2),
+})
+d = tempfile.mkdtemp()
+csv_path = os.path.join(d, "orders.csv")
+df.to_csv(csv_path, index=False)
+for c in ["order_id", "customer_id", "qty", "price"]:
+    np.save(os.path.join(d, c + ".npy"), df[c].to_numpy())
+np.save(os.path.join(d, "region_codes.npy"), df["region"].cat.codes.to_numpy())
+
+size = lambda p: os.path.getsize(p)
+col_files = [f for f in os.listdir(d) if f.endswith(".npy")]
+print("csv MB          :", round(size(csv_path) / 1e6, 1))
+print("all columns MB  :", round(sum(size(os.path.join(d, f)) for f in col_files) / 1e6, 1))
+print("price.npy MB    :", round(size(os.path.join(d, "price.npy")) / 1e6, 1))
+
+total_csv = pd.read_csv(csv_path)["price"].sum()
+price = np.load(os.path.join(d, "price.npy"), mmap_mode="r")
+total_npy = float(price.sum())
+print("same total      :", np.isclose(total_csv, total_npy))
+print("bytes touched, binary vs csv:", f"{size(os.path.join(d, 'price.npy')) / size(csv_path):.0%}")</code></pre>
+<pre class="code lang-text"><code>csv MB          : 25.3
+all columns MB  : 16.0
+price.npy MB    : 8.0
+same total      : True
+bytes touched, binary vs csv: 32%</code></pre>
+<ol>
+<li>The table uses already-small dtypes, built with the knowledge from Section 22.2.</li>
+<li>The CSV is the row-oriented, text version. Each numeric column is saved by <code>np.save</code> into its own file; the region column is saved as 8-bit category codes.</li>
+<li>The CSV is about 25 MB. All column files together are about 16 MB, because 8-bit and 16-bit numbers need fewer bytes than their decimal text.</li>
+<li>For the total price, the CSV approach must parse the entire file. The column approach opens only <code>price.npy</code>.</li>
+<li><code>mmap_mode="r"</code> memory-maps the file: the operating system pages bytes in on demand and the array behaves like a normal NumPy array.</li>
+<li>The last line reports that the binary price column is about a third of the size of the CSV that held all five columns. Real Parquet adds compression on top (dictionary encoding, run-length encoding, a general compressor), so it usually does better still, and it adds a schema and statistics that this toy lacks.</li>
+</ol>
+<p>Now the folder idea. Here we write a small dataset in the Hive layout (as CSV files, since Parquet is unavailable), then answer a filtered query by opening only the matching folder.</p>
+<p class="problem"><span class="pl">Problem 22.3.2</span> Write 100,000 orders into <code>year=.../region=.../part-0.csv</code> folders. Answer "total amount for year 2025 and region EU" by reading only one file, and prove the answer equals the full scan.</p>
+<pre class="code lang-python"><code>import os, tempfile
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(5)
+n = 100_000
+df = pd.DataFrame({
+    "year": rng.choice([2024, 2025], n),
+    "region": rng.choice(["EU", "US", "APAC"], n),
+    "amount": rng.integers(1, 500, n),
+})
+root = Path(tempfile.mkdtemp()) / "sales"
+for (year, region), part in df.groupby(["year", "region"]):
+    folder = root / f"year={year}" / f"region={region}"
+    folder.mkdir(parents=True)
+    part[["amount"]].to_csv(folder / "part-0.csv", index=False)
+
+for p in sorted(root.rglob("*.csv")):
+    print(p.relative_to(root))
+
+wanted = root / "year=2025" / "region=EU" / "part-0.csv"
+fast = pd.read_csv(wanted)
+print("rows read with pruning:", len(fast), "of", n)
+full = df[(df.year == 2025) &amp; (df.region == "EU")]["amount"].sum()
+print("same total:", fast["amount"].sum() == full)</code></pre>
+<pre class="code lang-text"><code>year=2024/region=APAC/part-0.csv
+year=2024/region=EU/part-0.csv
+year=2024/region=US/part-0.csv
+year=2025/region=APAC/part-0.csv
+year=2025/region=EU/part-0.csv
+year=2025/region=US/part-0.csv
+rows read with pruning: 16521 of 100000
+same total: True</code></pre>
+<ol>
+<li>The generator makes three columns; <code>year</code> and <code>region</code> will become folder names.</li>
+<li><code>groupby(["year", "region"])</code> yields one group per combination. For each, we build the path <code>year=2025/region=EU</code> and write only the <code>amount</code> column, because the other two are encoded in the folder names (that is how Hive layout saves space).</li>
+<li><code>rglob("*.csv")</code> walks the tree; printing the relative paths shows the six files.</li>
+<li>A reader that knows the layout builds the path for the wanted year and region and opens that single file: about one sixth of the rows.</li>
+<li>The check compares with a brute-force filter over the full table. Equal totals prove that pruning changes how much you read, never the answer.</li>
+</ol>
+<p>Real engines do this automatically. The same task in real libraries (not run here):</p>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (library not installed)
+import pandas as pd
+import duckdb
+import polars as pl
+import pyarrow.dataset as ds
+
+# df is the 100,000-row DataFrame (year, region, amount) from the block above
+# 1. pandas + pyarrow: write a partitioned folder, then read with a filter
+df.to_parquet("sales", partition_cols=["year", "region"], index=False)
+eu_2025 = pd.read_parquet("sales", filters=[("year", "==", 2025), ("region", "==", "EU")])
+
+# 2. DuckDB: the folder names become columns; the WHERE clause prunes folders
+total = duckdb.sql("""
+    SELECT SUM(amount) FROM read_parquet('sales/*/*/*.parquet', hive_partitioning = true)
+    WHERE year = 2025 AND region = 'EU'
+""").fetchone()[0]
+
+# 3. Polars lazy: scan, filter, aggregate, collect
+total = (pl.scan_parquet("sales/**/*.parquet", hive_partitioning=True)
+           .filter((pl.col("year") == 2025) &amp; (pl.col("region") == "EU"))
+           .select(pl.col("amount").sum())
+           .collect()
+           .item())
+
+# 4. pyarrow dataset
+dataset = ds.dataset("sales", format="parquet", partitioning="hive")
+table = dataset.to_table(filter=(ds.field("year") == 2025) &amp; (ds.field("region") == "EU"), columns=["amount"])</code></pre>
+<ol>
+<li>All four read only the matching folder and only the <code>amount</code> column. The answer is the same number as the runnable block above prints (<code>fast["amount"].sum()</code>).</li>
+<li><code>partition_cols</code> in pandas and <code>PARTITION_BY</code> in DuckDB create the <code>column=value</code> folders for you.</li>
+<li>In DuckDB, <code>hive_partitioning = true</code> turns the folder names back into columns, so the <code>WHERE</code> can use them.</li>
+<li>Polars <code>scan_parquet</code> is lazy: nothing is read until <code>collect()</code>, and the optimizer pushes the filter and the column choice into the scan.</li>
+<li>The PyArrow dataset API is the lower-level building block that several of the others sit on.</li>
+</ol>
+<h3>Expert: choosing a layout</h3>
+<ul>
+<li><strong>Partition by a column that queries filter on and that has few values</strong> (date, country, tenant). Do not partition by a high-cardinality column such as <code>customer_id</code>: you will create millions of tiny files, and listing them costs more than reading them.</li>
+<li><strong>Aim for files of roughly 100 MB to 1 GB</strong> in a distributed setting. Thousands of tiny files (the "small files problem") slow every engine, since each file costs an open, a footer read and a task.</li>
+<li><strong>Sort within files by the column you filter on.</strong> Row-group statistics then become tight (a small min-max range per group), so more groups can be skipped.</li>
+<li><strong>Compression</strong>: snappy is quick and moderate; zstd gives smaller files at a similar speed; gzip is small but slow. Measure on your data.</li>
+<li><strong>Schema is part of the file.</strong> Write dates as dates and money as decimals or integers, not strings. Changing a column type later means rewriting files.</li>
+</ul>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Convert once, query many times. Reading a 10 GB CSV costs minutes every time you do it. Convert it to partitioned Parquet once (the recipe in Section 22.9), and every later query reads only the columns and folders it needs.</div></div>
+
+<h2 id="s4-22-4-polars-fast-dataframes-with-expressions-and-a-lazy-engine">22.4 Polars: fast DataFrames with expressions and a lazy engine</h2>
+<h3>Beginner: what Polars is and the mental model</h3>
+<p><strong>Polars</strong> is a DataFrame library written in Rust. Three things make it different from pandas. It uses all your CPU cores by default. It stores data in the Arrow columnar format. And it has a <strong>lazy mode</strong> that builds a query plan and optimizes it before running. It also has no row index: rows are just rows, which removes a whole class of alignment surprises.</p>
+<p>There are four objects to know. A <strong>Series</strong> is one column. A <strong>DataFrame</strong> is an eager table: every operation runs at once. A <strong>LazyFrame</strong> is a plan: operations are recorded and nothing runs until you call <code>.collect()</code>. An <strong>Expression</strong> (written <code>pl.col("amount") * 2</code>) is a recipe for computing a column; it does nothing until placed in a <em>context</em> such as <code>select</code>, <code>with_columns</code>, <code>filter</code> or <code>group_by().agg</code>.</p>
+<figure><img src="images/lib22_lazy.png" alt="Two plans. Left: scan all 12 columns, filter, select, group. Right: optimized, a scan of 3 columns that skips row groups, then group." loading="lazy"/><figcaption>Figure 22.5. A lazy plan before and after optimization (a diagram, not a measurement).</figcaption></figure>
+<p><strong>How to read it:</strong> the left stack is the order in which you wrote the steps. The right stack is what the optimizer runs. It notices that only 3 columns are ever used (<strong>projection pushdown</strong>) and that the year filter can be applied inside the scan so whole row groups are skipped (<strong>predicate pushdown</strong>). You wrote four steps; the engine ran two cheaper ones.</p>
+
+<h3>Reference table: the 26 most important Polars names</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>pl.read_csv</code></td><td>Read a CSV eagerly into a DataFrame</td><td><code>pl.read_csv("o.csv")</code></td></tr>
+<tr><td><code>pl.scan_csv</code></td><td>Lazy CSV scan: returns a LazyFrame, reads nothing yet</td><td><code>pl.scan_csv("o.csv")</code></td></tr>
+<tr><td><code>pl.read_parquet / scan_parquet</code></td><td>Eager / lazy Parquet reading</td><td><code>pl.scan_parquet("sales/**/*.parquet")</code></td></tr>
+<tr><td><code>pl.col(name)</code></td><td>Refer to a column inside an expression</td><td><code>pl.col("amount")</code></td></tr>
+<tr><td><code>pl.lit(value)</code></td><td>A constant inside an expression</td><td><code>pl.lit(1)</code></td></tr>
+<tr><td><code>df.select(exprs)</code></td><td>Pick or compute columns (output has only these)</td><td><code>df.select("region", pl.col("amount") * 2)</code></td></tr>
+<tr><td><code>df.with_columns(exprs)</code></td><td>Add or replace columns, keep the rest</td><td><code>df.with_columns(vat=pl.col("amount") * 0.2)</code></td></tr>
+<tr><td><code>df.filter(expr)</code></td><td>Keep rows where the expression is true</td><td><code>df.filter(pl.col("amount") &gt; 20)</code></td></tr>
+<tr><td><code>df.group_by(keys).agg(exprs)</code></td><td>Group, then aggregate (note the underscore)</td><td><code>df.group_by("region").agg(pl.col("amount").sum())</code></td></tr>
+<tr><td><code>expr.over(keys)</code></td><td>Window function: compute within groups, keep every row</td><td><code>pl.col("amount").sum().over("region")</code></td></tr>
+<tr><td><code>expr.rank(method=, descending=)</code></td><td>Rank values (methods: average, min, max, dense, ordinal)</td><td><code>pl.col("r").rank("dense", descending=True)</code></td></tr>
+<tr><td><code>df.join(other, on=, how=)</code></td><td>Join two frames (inner, left, full, semi, anti, cross)</td><td><code>df.join(t, on="customer_id", how="left")</code></td></tr>
+<tr><td><code>df.sort(by, descending=)</code></td><td>Sort rows</td><td><code>df.sort("amount", descending=True)</code></td></tr>
+<tr><td><code>pl.when().then().otherwise()</code></td><td>If-else as an expression</td><td><code>pl.when(pl.col("a") &gt; 5).then(1).otherwise(0)</code></td></tr>
+<tr><td><code>expr.cast(dtype)</code></td><td>Change type (pl.Int32, pl.Float32, pl.Categorical...)</td><td><code>pl.col("qty").cast(pl.UInt8)</code></td></tr>
+<tr><td><code>expr.str.*</code> / <code>expr.dt.*</code></td><td>String and date/time methods</td><td><code>pl.col("ts").dt.year()</code></td></tr>
+<tr><td><code>expr.is_in(list)</code></td><td>Membership test</td><td><code>pl.col("region").is_in(["EU", "US"])</code></td></tr>
+<tr><td><code>expr.fill_null / df.drop_nulls</code></td><td>Handle missing values (null, not NaN)</td><td><code>pl.col("x").fill_null(0)</code></td></tr>
+<tr><td><code>df.unique(subset=, keep=)</code></td><td>Drop duplicate rows</td><td><code>df.unique(subset=["order_id"], keep="first")</code></td></tr>
+<tr><td><code>expr.n_unique()</code> / <code>pl.len()</code></td><td>Distinct count / row count in an aggregation</td><td><code>.agg(pl.len(), pl.col("c").n_unique())</code></td></tr>
+<tr><td><code>df.pivot / df.unpivot</code></td><td>Long to wide / wide to long</td><td><code>df.pivot(on="region", index="year", values="amount")</code></td></tr>
+<tr><td><code>pl.concat([a, b])</code></td><td>Stack frames vertically (or horizontally)</td><td><code>pl.concat([jan, feb])</code></td></tr>
+<tr><td><code>lf.collect()</code></td><td>Run a lazy plan and return a DataFrame</td><td><code>lf.collect()</code></td></tr>
+<tr><td><code>lf.explain()</code></td><td>Print the optimized plan (use it to confirm pushdown)</td><td><code>print(lf.explain())</code></td></tr>
+<tr><td><code>lf.sink_parquet(path)</code></td><td>Stream the result to a file with low memory</td><td><code>lf.sink_parquet("out.parquet")</code></td></tr>
+<tr><td><code>df.to_pandas() / pl.from_pandas()</code></td><td>Convert to and from pandas (needs pyarrow)</td><td><code>df.to_pandas()</code></td></tr>
+<tr><td><code>df.schema / df.estimated_size("mb")</code></td><td>Inspect types and memory</td><td><code>print(df.schema)</code></td></tr>
+</tbody></table></div>
+
+<h3>Intermediate: how pandas habits translate</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Task</th><th>pandas</th><th>Polars</th></tr></thead><tbody>
+<tr><td>Filter rows</td><td><code>df[df.amount &gt; 20]</code></td><td><code>df.filter(pl.col("amount") &gt; 20)</code></td></tr>
+<tr><td>New column</td><td><code>df["v"] = df.amount * 2</code></td><td><code>df.with_columns(v=pl.col("amount") * 2)</code></td></tr>
+<tr><td>Group and sum</td><td><code>df.groupby("r")["a"].sum()</code></td><td><code>df.group_by("r").agg(pl.col("a").sum())</code></td></tr>
+<tr><td>Group transform</td><td><code>df.groupby("r")["a"].transform("sum")</code></td><td><code>pl.col("a").sum().over("r")</code></td></tr>
+<tr><td>Rank in group</td><td><code>g["a"].rank(method="first")</code></td><td><code>pl.col("a").rank("ordinal").over("r")</code></td></tr>
+<tr><td>Merge</td><td><code>a.merge(b, on="k", how="left")</code></td><td><code>a.join(b, on="k", how="left")</code></td></tr>
+<tr><td>Row-wise Python function</td><td><code>df.apply(f, axis=1)</code></td><td>Avoid. Use expressions; last resort <code>map_elements</code></td></tr>
+<tr><td>Missing value</td><td><code>NaN</code> / <code>isna()</code></td><td><code>null</code> / <code>is_null()</code></td></tr>
+<tr><td>Index</td><td><code>df.loc[...]</code>, index alignment</td><td>None: use <code>filter</code>, <code>join</code></td></tr>
+</tbody></table></div>
+<p>The big change in thinking: in pandas you modify columns step by step. In Polars you describe columns as expressions, and several expressions inside one <code>with_columns</code> run in parallel and all see the <em>original</em> frame. They cannot see each other's new columns; chain a second <code>with_columns</code> if you need that.</p>
+
+<h3>Worked example 1 (trivial): create, inspect, compute</h3>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (library not installed)
+import polars as pl
+
+df = pl.DataFrame({
+    "region": ["EU", "EU", "US", "APAC"],
+    "amount": [20, 35, 50, 40],
+})
+print(df.shape)                                   # (4, 2)
+print(df.schema)                                  # region: String, amount: Int64
+out = df.with_columns(
+    amount_with_vat=pl.col("amount") * 1.2,
+    big=pl.col("amount") &gt; 30,
+)
+print(out)
+print(df.select(pl.col("amount").sum()).item())   # 145</code></pre>
+<ol>
+<li><code>pl.DataFrame({...})</code> builds a table from a dict of columns, like pandas. Polars infers <code>String</code> and <code>Int64</code>.</li>
+<li><code>df.shape</code> is rows and columns: (4, 2). <code>df.schema</code> maps column names to dtypes. It is cheap and worth printing at every step.</li>
+<li><code>with_columns</code> adds two new columns from two expressions in a single pass: the amount times 1.2 and a True/False flag.</li>
+<li><code>select(pl.col("amount").sum())</code> returns a one-cell DataFrame; <code>.item()</code> pulls out the number, 145 (20 + 35 + 50 + 40).</li>
+</ol>
+<p>Expected result: <code>(4, 2)</code>, the schema, a four-row table with the two new columns (24.0, 42.0, 60.0 and 48.0 for the VAT column), and the final number 145. The same in pandas runs everywhere: <code>df["amount"].sum()</code> gives 145.</p>
+
+<h3>Worked example 2 (realistic): the running task in Polars</h3>
+<p>The task from Problem 22.1.1: revenue per (region, customer), tier by left join, rank within region. Here <code>orders.csv</code> holds the same ten rows.</p>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (library not installed)
+import polars as pl
+
+orders = pl.read_csv("orders.csv")
+tiers = pl.DataFrame({
+    "customer_id": ["c1", "c2", "c3", "c4", "c5", "c6"],
+    "tier": ["gold", "silver", "gold", "bronze", "silver", "bronze"],
+})
+
+result = (
+    orders
+    .group_by(["region", "customer_id"], maintain_order=True)
+    .agg(pl.col("amount").sum().alias("revenue"))
+    .join(tiers, on="customer_id", how="left")
+    .with_columns(
+        pl.col("revenue").rank("ordinal", descending=True).over("region").alias("rank")
+    )
+    .sort(["region", "rank"])
+)
+print(result)</code></pre>
+<ol>
+<li><code>read_csv</code> loads the ten rows eagerly.</li>
+<li><code>group_by([...], maintain_order=True).agg(...)</code> sums the amount per pair. Without <code>maintain_order=True</code> Polars may return groups in any order, which matters only for tie-breaking later.</li>
+<li><code>.alias("revenue")</code> names the aggregate. Without it the column would keep the name <code>amount</code>.</li>
+<li><code>join(..., how="left")</code> keeps every revenue row and attaches the tier.</li>
+<li><code>rank("ordinal", descending=True).over("region")</code> is the window function. <code>over("region")</code> means "do this separately inside each region but keep all rows". <code>"ordinal"</code> is pandas <code>method="first"</code>: ties get distinct ranks in order of appearance.</li>
+<li><code>sort</code> makes the output order reproducible.</li>
+</ol>
+<p>Expected result (verified by the pandas and SQLite blocks in Section 22.1; Polars draws it in its own bordered table with dtype labels):</p>
+<pre class="code lang-text"><code>region  customer_id  revenue  tier    rank
+APAC    c5                70  silver     1
+APAC    c6                 5  bronze     2
+EU      c2                80  silver     1
+EU      c1                35  gold       2
+US      c3                75  gold       1
+US      c4                10  bronze     2</code></pre>
+
+<h3>Worked example 3 (realistic): lazy scanning of a file bigger than memory</h3>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (library not installed)
+import polars as pl
+
+lf = (
+    pl.scan_csv("events.csv", try_parse_dates=True)
+    .filter(pl.col("country") == "DE")
+    .group_by("user_id")
+    .agg(
+        pl.len().alias("events"),
+        pl.col("price").sum().alias("spend"),
+    )
+    .filter(pl.col("events") &gt;= 5)
+    .sort("spend", descending=True)
+)
+
+print(lf.explain())                               # read the optimized plan first
+top = lf.head(1000).collect()                     # run it, keep the top 1000 only
+lf.sink_parquet("german_users.parquet")           # or stream the whole result to disk</code></pre>
+<ol>
+<li><code>scan_csv</code> returns a LazyFrame. No data is read yet, so this line is instant even for 10 GB.</li>
+<li>The next four calls only add steps to the plan. <code>pl.len()</code> counts rows per group.</li>
+<li><code>lf.explain()</code> prints the optimized plan as text. Look for the scan line listing only the needed columns (<code>user_id</code>, <code>country</code>, <code>price</code>) and a filter pushed into the scan. If you see every column, something blocked the pushdown.</li>
+<li><code>collect()</code> executes the plan and returns a DataFrame. Because only the top 1000 rows are needed, ask for them in the plan (<code>head</code>) instead of collecting everything and cutting later.</li>
+<li><code>sink_parquet</code> streams the result to disk in batches, so the final result need not fit in memory either. In recent Polars versions you can also request the streaming engine with <code>lf.collect(engine="streaming")</code> (older versions used <code>collect(streaming=True)</code>; check the documentation for your version).</li>
+</ol>
+<p>The output cannot be shown because there is no 10 GB file here; the structure to expect is a 1000-row table with columns <code>user_id</code>, <code>events</code>, <code>spend</code> sorted by spend. The idea of the plan is demonstrated by the runnable toy below.</p>
+
+<h3>Worked example 4 (expert, runnable): build a tiny lazy engine to see why it is faster</h3>
+<p>The toy below records filter and select steps without running them. At <code>collect</code> time, it works out which columns are really needed and reads only those from the CSV. It is a few lines, and it is the same trick as projection pushdown.</p>
+<pre class="code lang-python"><code>import io, os, tempfile
+import pandas as pd
+
+csv = """order_id,customer_id,region,category,amount
+1,c1,EU,book,20
+2,c2,EU,toy,35
+3,c1,EU,toy,15
+4,c3,US,book,50
+5,c4,US,toy,10
+6,c3,US,toy,25
+7,c5,APAC,book,40
+8,c5,APAC,book,30
+9,c6,APAC,toy,5
+10,c2,EU,book,45
+"""
+path = os.path.join(tempfile.mkdtemp(), "orders.csv")
+open(path, "w").write(csv)
+
+class Lazy:
+    def __init__(self, path):
+        self.path, self.steps = path, []
+    def filter(self, col, test):
+        self.steps.append(("filter", col, test)); return self
+    def select(self, *cols):
+        self.steps.append(("select", cols)); return self
+    def collect(self, optimize=True):
+        needed = set()
+        for s in self.steps:
+            needed.update([s[1]] if s[0] == "filter" else s[1])
+        usecols = sorted(needed) if optimize else None
+        df = pd.read_csv(self.path, usecols=usecols)
+        print("columns parsed:", list(df.columns))
+        out = list(df.columns)
+        for s in self.steps:
+            if s[0] == "filter":
+                df = df[s[2](df[s[1]])]
+            else:
+                out = list(s[1])
+        return df[out]
+
+def plan():
+    return Lazy(path).filter("region", lambda s: s == "EU").select("customer_id", "amount")
+
+print("naive:")
+a = plan().collect(optimize=False)
+print("optimized:")
+b = plan().collect()
+print("same result:", a.equals(b))
+print(b.to_string(index=False))</code></pre>
+<pre class="code lang-text"><code>naive:
+columns parsed: ['order_id', 'customer_id', 'region', 'category', 'amount']
+optimized:
+columns parsed: ['customer_id', 'region', 'amount']
+same result: True
+customer_id  amount
+         c1      20
+         c2      35
+         c1      15
+         c2      45</code></pre>
+<ol>
+<li>The ten-row file is written to a temporary folder, so the block is standalone.</li>
+<li>The class <code>Lazy</code> stores steps in a list. <code>filter</code> and <code>select</code> run nothing, and they return <code>self</code> so calls can be chained like Polars methods.</li>
+<li>In <code>collect</code>, the optimizer step is the set of columns mentioned anywhere in the plan: <code>region</code> (filter), <code>customer_id</code> and <code>amount</code> (select).</li>
+<li>With <code>optimize=False</code> all five columns are parsed. With <code>optimize=True</code> only the three needed columns are parsed, the saving you saw in Figure 22.5.</li>
+<li>Both plans give the same rows. Optimization changes the cost, never the answer; that is the contract of every query optimizer, in Polars, DuckDB and Spark.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>pl.read_csv("events.csv").filter(...).group_by(...)</code> on a huge file. <strong>Symptom:</strong> memory spike or kill at the first line; the optimizer never gets a chance to skip columns. <strong>Fix:</strong> <code>pl.scan_csv("events.csv")</code> and a final <code>.collect()</code> (or <code>sink_parquet</code>). Use eager <code>read_*</code> only when the file is small or you need to look at the data interactively.</div></div>
+<h3>Going deeper: Polars internals worth knowing</h3>
+<ul>
+<li>Expressions are compiled into a plan and executed with parallelism across columns and within large columns. This is why <code>pl.col(...).str.to_uppercase()</code> beats a Python loop by a huge factor: the loop (via <code>map_elements</code>) hands one value at a time to the interpreter.</li>
+<li>Strings repeated often are best stored as <code>pl.Categorical</code> or <code>pl.Enum</code> (a fixed set of allowed values). It is the same idea as pandas <code>category</code>.</li>
+<li>Missing values are <code>null</code> everywhere, including integers, so an integer column with a missing value stays an integer column (in pandas classic dtypes it becomes float).</li>
+<li>Interview question: "Why can Polars be faster than pandas on the same machine?" Good answer: columnar Arrow memory, multi-threaded Rust kernels, lazy plans with pushdown, and no row index. Always add: for small data the difference is small, and the pandas ecosystem is broader.</li>
+</ul>
+
+<h2 id="s5-22-5-duckdb-sql-straight-on-files-and-dataframes">22.5 DuckDB: SQL straight on files and DataFrames</h2>
+<h3>Beginner: what DuckDB is</h3>
+<p><strong>DuckDB</strong> is a database that lives inside your Python process, like SQLite, but built for analytics instead of transactions. There is no server to install or start. You point SQL at a CSV or Parquet file, or at a pandas DataFrame sitting in a variable, and it answers using a columnar, multi-threaded engine that can spill to disk when a query is larger than memory. If you already know SQL (and the SQL document in this library teaches it), DuckDB lets you use that knowledge on files that do not fit in pandas.</p>
+<p>The mental model: <em>files are tables</em>. <code>SELECT ... FROM 'orders.csv'</code> or <code>FROM read_parquet('sales/*/*.parquet')</code> works with no loading step. Results come back as a DataFrame with <code>.df()</code> (pandas) or <code>.pl()</code> (Polars). The comparison with SQLite is useful: SQLite stores rows and is excellent for many small reads and writes; DuckDB stores columns and is excellent for scanning, grouping and joining many rows.</p>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of DuckDB as "SQLite for analysis". Same lightweight feel (one import, no server), opposite design (columns, vectors, parallel scans). It is a poor fit for an app that writes one row at a time from many users; for that, use PostgreSQL or SQLite.</div></div>
+
+<h3>Reference table: the 28 most useful DuckDB names</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example (not run here)</th></tr></thead><tbody>
+<tr><td><code>duckdb.sql(q)</code></td><td>Run SQL on the default in-memory database; returns a lazy relation</td><td><code>duckdb.sql("SELECT 42 AS x")</code></td></tr>
+<tr><td><code>duckdb.connect(path)</code></td><td>Open a connection; give a file name for a persistent database</td><td><code>con = duckdb.connect("shop.duckdb")</code></td></tr>
+<tr><td><code>con.execute(q, params)</code></td><td>Run SQL with <code>?</code> placeholders</td><td><code>con.execute("SELECT * FROM t WHERE a = ?", [5])</code></td></tr>
+<tr><td><code>.fetchall() / .fetchone()</code></td><td>Get Python tuples</td><td><code>rel.fetchall()</code></td></tr>
+<tr><td><code>.df() / .pl() / .arrow()</code></td><td>Get a pandas / Polars / Arrow result (Arrow accessor name varies by version)</td><td><code>duckdb.sql(q).df()</code></td></tr>
+<tr><td><code>FROM 'file.csv'</code></td><td>Query a CSV or Parquet by file name</td><td><code>SELECT * FROM 'orders.csv' LIMIT 5</code></td></tr>
+<tr><td><code>read_csv(path, ...)</code></td><td>CSV reader with options (header, delim, types, sample size)</td><td><code>read_csv('e.csv', header = true, types = {'amount': 'DOUBLE'})</code></td></tr>
+<tr><td><code>read_parquet(glob)</code></td><td>Read one or many Parquet files</td><td><code>read_parquet('sales/**/*.parquet')</code></td></tr>
+<tr><td><code>hive_partitioning = true</code></td><td>Folder names <code>k=v</code> become columns (enables pruning)</td><td><code>read_parquet('s/*/*.parquet', hive_partitioning = true)</code></td></tr>
+<tr><td>Replacement scan</td><td>A pandas/Polars/Arrow variable can be used as a table by its name</td><td><code>duckdb.sql("SELECT region, SUM(amount) FROM df GROUP BY region")</code></td></tr>
+<tr><td><code>con.register(name, df)</code></td><td>Explicitly expose a DataFrame as a view</td><td><code>con.register("orders", df)</code></td></tr>
+<tr><td><code>CREATE TABLE t AS SELECT</code></td><td>Materialize a result inside the database</td><td><code>CREATE TABLE rev AS SELECT ...</code></td></tr>
+<tr><td><code>COPY (q) TO file</code></td><td>Write a result as Parquet, CSV or JSON</td><td><code>COPY (SELECT ...) TO 'o.parquet' (FORMAT PARQUET)</code></td></tr>
+<tr><td><code>PARTITION_BY</code></td><td>Write Hive-partitioned folders</td><td><code>COPY t TO 'out' (FORMAT PARQUET, PARTITION_BY (year))</code></td></tr>
+<tr><td><code>GROUP BY ALL</code></td><td>Group by every non-aggregated select column</td><td><code>SELECT region, SUM(a) FROM t GROUP BY ALL</code></td></tr>
+<tr><td><code>SELECT * EXCLUDE (c)</code></td><td>All columns except some</td><td><code>SELECT * EXCLUDE (note) FROM t</code></td></tr>
+<tr><td><code>COLUMNS('regex')</code></td><td>Apply an expression to all matching columns</td><td><code>SELECT MAX(COLUMNS('amt_.*')) FROM t</code></td></tr>
+<tr><td><code>QUALIFY</code></td><td>Filter on a window function result without a subquery</td><td><code>... QUALIFY ROW_NUMBER() OVER (...) = 1</code></td></tr>
+<tr><td><code>OVER (PARTITION BY .. ORDER BY ..)</code></td><td>Window functions: rank, running total, lag, lead</td><td><code>SUM(a) OVER (PARTITION BY r ORDER BY d)</code></td></tr>
+<tr><td><code>arg_max(x, y)</code></td><td>The value of x on the row where y is largest (latest-row-per-key)</td><td><code>arg_max(status, ts)</code></td></tr>
+<tr><td><code>approx_count_distinct(c)</code></td><td>Fast, memory-light distinct count (small error)</td><td><code>SELECT approx_count_distinct(user_id)</code></td></tr>
+<tr><td><code>quantile_cont(c, p)</code></td><td>Percentile / median</td><td><code>quantile_cont(amount, 0.5)</code></td></tr>
+<tr><td><code>USING SAMPLE</code></td><td>Random sample of a table or query</td><td><code>SELECT * FROM t USING SAMPLE 1%</code></td></tr>
+<tr><td><code>ASOF JOIN</code></td><td>Join each row to the nearest earlier row (prices, sessions)</td><td><code>a ASOF JOIN b ON a.k = b.k AND a.ts &gt;= b.ts</code></td></tr>
+<tr><td><code>PIVOT / UNPIVOT</code></td><td>Reshape in SQL</td><td><code>PIVOT t ON region USING SUM(amount)</code></td></tr>
+<tr><td><code>DESCRIBE / SUMMARIZE</code></td><td>Schema / per-column statistics for a table or query</td><td><code>SUMMARIZE SELECT * FROM 'e.csv'</code></td></tr>
+<tr><td><code>EXPLAIN / EXPLAIN ANALYZE</code></td><td>Show the plan / the plan with measured times</td><td><code>EXPLAIN ANALYZE SELECT ...</code></td></tr>
+<tr><td><code>SET memory_limit / threads</code></td><td>Resource limits; larger queries spill to <code>temp_directory</code></td><td><code>SET memory_limit = '8GB'</code></td></tr>
+<tr><td><code>duckdb.__version__</code></td><td>Version check</td><td><code>print(duckdb.__version__)</code></td></tr>
+</tbody></table></div>
+
+<h3>Worked example 1 (trivial): SQL on a file and on a DataFrame</h3>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (library not installed)
+import duckdb
+import pandas as pd
+
+print(duckdb.__version__)
+
+# 1. Query a CSV file by name. No loading step.
+print(duckdb.sql("SELECT region, SUM(amount) AS revenue FROM 'orders.csv' GROUP BY region ORDER BY region").fetchall())
+
+# 2. Query a pandas DataFrame by its variable name (a "replacement scan").
+df = pd.read_csv("orders.csv")
+print(duckdb.sql("SELECT region, SUM(amount) AS revenue FROM df GROUP BY region ORDER BY region").df())</code></pre>
+<ol>
+<li><code>duckdb.sql(...)</code> parses and plans the query. The data is not read until you ask for results with <code>fetchall()</code> or <code>.df()</code>.</li>
+<li><code>FROM 'orders.csv'</code>: DuckDB sees a file name in the table position, detects the delimiter, header and column types by sampling, and scans the file.</li>
+<li>In the second query <code>df</code> is not a table in any database. DuckDB looks up the Python variable named <code>df</code> in the calling code and scans it directly in memory with no copy of the data into a database.</li>
+<li><code>ORDER BY region</code> makes the order reproducible; without it SQL gives no order guarantee.</li>
+<li>Expected values: APAC 75, EU 115, US 85 (hand check: APAC 40 + 30 + 5, EU 20 + 35 + 15 + 45, US 50 + 10 + 25). The runnable SQLite twin below returns exactly these.</li>
+</ol>
+<p>The SQL text is standard enough to run in SQLite. This runnable block is the twin of both DuckDB queries: we load the same ten rows into SQLite from a DataFrame (the manual version of a replacement scan) and run the same SQL.</p>
+<pre class="code lang-python"><code>import io, sqlite3
+import pandas as pd
+
+csv = """order_id,customer_id,region,category,amount
+1,c1,EU,book,20
+2,c2,EU,toy,35
+3,c1,EU,toy,15
+4,c3,US,book,50
+5,c4,US,toy,10
+6,c3,US,toy,25
+7,c5,APAC,book,40
+8,c5,APAC,book,30
+9,c6,APAC,toy,5
+10,c2,EU,book,45"""
+df = pd.read_csv(io.StringIO(csv))
+con = sqlite3.connect(":memory:")
+df.to_sql("df", con, index=False)
+rows = con.execute("SELECT region, SUM(amount) AS revenue FROM df GROUP BY region ORDER BY region").fetchall()
+print(rows)
+print(pd.read_sql("SELECT category, COUNT(*) AS n, AVG(amount) AS avg_amount FROM df GROUP BY category ORDER BY category", con))</code></pre>
+<pre class="code lang-text"><code>[('APAC', 75), ('EU', 115), ('US', 85)]
+  category  n  avg_amount
+0     book  5        37.0
+1      toy  5        18.0</code></pre>
+<ol>
+<li>The CSV text becomes a DataFrame; <code>to_sql("df", con)</code> copies it into an SQLite table named <code>df</code>, the table name the DuckDB version found by variable name.</li>
+<li>The first query is character-for-character the DuckDB query. The three revenues match the hand check.</li>
+<li><code>pd.read_sql</code> runs a query and returns a DataFrame: pandas and SQL together, which DuckDB makes much faster for large inputs.</li>
+<li>Category stats: books are orders 1, 4, 7, 8, 10 (20 + 50 + 40 + 30 + 45 = 185 over 5 = 37.0), toys are orders 2, 3, 5, 6, 9 (35 + 15 + 10 + 25 + 5 = 90 over 5 = 18.0).</li>
+</ol>
+
+<h3>Worked example 2 (intermediate): window functions, the part SQL does best</h3>
+<p>A <strong>window function</strong> computes a value for each row using a "window" of related rows, without collapsing the rows the way <code>GROUP BY</code> does. The three clauses: <code>PARTITION BY</code> (which rows belong together), <code>ORDER BY</code> (their order inside the window) and optionally a frame such as <code>ROWS BETWEEN 1 PRECEDING AND CURRENT ROW</code> (which neighbours to include). SQLite 3.25 and later, and DuckDB, share this syntax.</p>
+<p class="problem"><span class="pl">Problem 22.5.1</span> Daily sales per region: compute the running total, the change from the previous day, a 2-day moving average, and the rank of each day by sales inside its region (with ties). Run it in SQLite; the same SQL runs in DuckDB.</p>
+<pre class="code lang-python"><code>import sqlite3
+
+con = sqlite3.connect(":memory:")
+con.execute("CREATE TABLE sales(day INTEGER, region TEXT, amount INTEGER)")
+con.executemany("INSERT INTO sales VALUES (?, ?, ?)", [
+    (1, "EU", 10), (2, "EU", 30), (3, "EU", 30), (4, "EU", 20),
+    (1, "US", 5), (2, "US", 15), (3, "US", 10),
+])
+q = """
+SELECT region, day, amount,
+  SUM(amount) OVER (PARTITION BY region ORDER BY day)                  AS running,
+  amount - LAG(amount) OVER (PARTITION BY region ORDER BY day)         AS change,
+  AVG(amount) OVER (PARTITION BY region ORDER BY day
+                    ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)          AS avg2,
+  RANK()       OVER (PARTITION BY region ORDER BY amount DESC)         AS rnk,
+  DENSE_RANK() OVER (PARTITION BY region ORDER BY amount DESC)         AS drnk
+FROM sales ORDER BY region, day
+"""
+print("region day amount running change avg2 rnk drnk")
+for r in con.execute(q):
+    print(*r)</code></pre>
+<pre class="code lang-text"><code>region day amount running change avg2 rnk drnk
+EU 1 10 10 None 10.0 4 3
+EU 2 30 40 20 20.0 1 1
+EU 3 30 70 0 30.0 1 1
+EU 4 20 90 -10 25.0 3 2
+US 1 5 5 None 5.0 3 3
+US 2 15 20 10 10.0 1 1
+US 3 10 30 -5 12.5 2 2</code></pre>
+<ol>
+<li>The table holds four EU days (with a tie: days 2 and 3 both sold 30) and three US days.</li>
+<li><code>SUM(amount) OVER (PARTITION BY region ORDER BY day)</code> is a running total: with an <code>ORDER BY</code> and no frame, the default frame runs from the first row to the current one. EU runs 10, 40, 70, 90.</li>
+<li><code>LAG(amount)</code> reads the previous row's amount inside the partition; the first day has no previous row, so the subtraction gives <code>None</code> (SQL NULL).</li>
+<li>The frame <code>ROWS BETWEEN 1 PRECEDING AND CURRENT ROW</code> averages the current and previous row: EU day 2 is (10 + 30) / 2 = 20.0. The first row has only itself, so its average is 10.0.</li>
+<li><code>RANK</code> gives tied rows the same rank and then skips: EU amounts 30, 30, 20, 10 get ranks 1, 1, 3, 4. <code>DENSE_RANK</code> does not skip: 1, 1, 2, 3.</li>
+<li>Remember this about ties for the Practice set: <code>ROW_NUMBER</code> never ties, <code>RANK</code> skips after a tie, <code>DENSE_RANK</code> does not.</li>
+</ol>
+
+<h3>Worked example 3 (realistic): the running task in DuckDB, with QUALIFY</h3>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (library not installed)
+import duckdb
+
+duckdb.sql("""
+    CREATE OR REPLACE TABLE rev AS
+    SELECT o.region, o.customer_id, SUM(o.amount) AS revenue
+    FROM 'orders.csv' o
+    GROUP BY o.region, o.customer_id
+""")
+
+tiers = duckdb.sql("""
+    SELECT * FROM (VALUES ('c1','gold'),('c2','silver'),('c3','gold'),
+                          ('c4','bronze'),('c5','silver'),('c6','bronze')) AS t(customer_id, tier)
+""")
+duckdb.register("tiers", tiers)
+
+# All ranks, same SQL text as the SQLite block in Section 22.1:
+print(duckdb.sql("""
+    SELECT r.region, r.customer_id, r.revenue, t.tier,
+           ROW_NUMBER() OVER (PARTITION BY r.region ORDER BY r.revenue DESC) AS rnk
+    FROM rev r LEFT JOIN tiers t USING (customer_id)
+    ORDER BY r.region, rnk
+""").fetchall())
+
+# Only the top customer per region, using QUALIFY (DuckDB; SQLite does not have it):
+print(duckdb.sql("""
+    SELECT r.region, r.customer_id, r.revenue
+    FROM rev r
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY r.region ORDER BY r.revenue DESC) = 1
+    ORDER BY r.region
+""").fetchall())</code></pre>
+<ol>
+<li>The first statement reads the CSV and groups. <code>CREATE OR REPLACE TABLE ... AS</code> stores the small result inside DuckDB for reuse.</li>
+<li>The tiers are a literal <code>VALUES</code> list; <code>AS t(customer_id, tier)</code> names the columns.</li>
+<li>The first query is the same logic as the SQLite window query: six rows, ranks 1 and 2 in each region. <code>USING (customer_id)</code> is shorthand for <code>ON r.customer_id = t.customer_id</code> that also merges the key column.</li>
+<li><code>QUALIFY</code> filters on a window function directly. Without it you need a subquery: <code>SELECT * FROM (SELECT ..., ROW_NUMBER() OVER (...) AS rn FROM rev) WHERE rn = 1</code>. The runnable block below uses that portable form.</li>
+<li>Expected: the first query returns the six rows already shown in Section 22.1; the second returns <code>('APAC', 'c5', 70)</code>, <code>('EU', 'c2', 80)</code>, <code>('US', 'c3', 75)</code>.</li>
+</ol>
+<pre class="code lang-python"><code>import io, sqlite3
+import pandas as pd
+
+csv = """order_id,customer_id,region,category,amount
+1,c1,EU,book,20
+2,c2,EU,toy,35
+3,c1,EU,toy,15
+4,c3,US,book,50
+5,c4,US,toy,10
+6,c3,US,toy,25
+7,c5,APAC,book,40
+8,c5,APAC,book,30
+9,c6,APAC,toy,5
+10,c2,EU,book,45"""
+con = sqlite3.connect(":memory:")
+pd.read_csv(io.StringIO(csv)).to_sql("orders", con, index=False)
+q = """
+SELECT region, customer_id, revenue FROM (
+    SELECT region, customer_id, SUM(amount) AS revenue,
+           ROW_NUMBER() OVER (PARTITION BY region ORDER BY SUM(amount) DESC) AS rn
+    FROM orders GROUP BY region, customer_id
+) WHERE rn = 1 ORDER BY region
+"""
+print(con.execute(q).fetchall())</code></pre>
+<pre class="code lang-text"><code>[('APAC', 'c5', 70), ('EU', 'c2', 80), ('US', 'c3', 75)]</code></pre>
+<ol>
+<li>This is the portable equivalent of QUALIFY: compute the window function in an inner query, filter it in the outer one.</li>
+<li>A window function can wrap an aggregate: <code>ROW_NUMBER() OVER (... ORDER BY SUM(amount) DESC)</code> works because windows are evaluated after <code>GROUP BY</code>.</li>
+<li>The result matches the DuckDB expectation above: APAC c5 70, EU c2 80, US c3 75.</li>
+</ol>
+
+<h3>Worked example 4 (expert): bigger than memory and Parquet output</h3>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (library not installed)
+import duckdb
+
+con = duckdb.connect("analytics.duckdb")          # a persistent database file
+con.execute("SET memory_limit = '6GB'")           # cap RAM; bigger operators spill to disk
+con.execute("SET temp_directory = '/tmp/duck_spill'")
+con.execute("SET threads = 4")
+
+# Convert a huge CSV into partitioned Parquet in one streaming query.
+con.execute("""
+    COPY (
+        SELECT *, year(CAST(ts AS TIMESTAMP)) AS year
+        FROM read_csv('events.csv', header = true)
+    ) TO 'events_pq' (FORMAT PARQUET, PARTITION_BY (year), COMPRESSION zstd)
+""")
+
+# Query it back; the WHERE prunes the year folders.
+top = con.execute("""
+    SELECT user_id, COUNT(*) AS n
+    FROM read_parquet('events_pq/*/*.parquet', hive_partitioning = true)
+    WHERE year = 2025
+    GROUP BY user_id
+    ORDER BY n DESC
+    LIMIT 10
+""").df()
+print(top)
+con.execute("EXPLAIN ANALYZE SELECT COUNT(*) FROM read_parquet('events_pq/*/*.parquet')").fetchall()</code></pre>
+<ol>
+<li><code>connect("analytics.duckdb")</code> stores the database in a file you can reopen later. Only one process may write to it at a time.</li>
+<li><code>SET memory_limit</code> and <code>temp_directory</code> tell DuckDB how much RAM it may use and where to spill. Sorts, big joins and large aggregates then continue from disk instead of failing.</li>
+<li>The <code>COPY (SELECT ...) TO ... (FORMAT PARQUET, PARTITION_BY (year))</code> statement reads the CSV in a streaming fashion and writes one folder per year. This is the "convert once" step. The output folder must not already exist.</li>
+<li>The second query reads only the <code>year=2025</code> folder; only the <code>user_id</code> column is touched.</li>
+<li><code>EXPLAIN ANALYZE</code> runs the query and prints the plan with row counts and timings per operator; use it to see where time goes.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>SELECT * FROM 'events.csv'</code> followed by <code>.df()</code> on a 10 GB file. <strong>Symptom:</strong> DuckDB streams happily, then pandas runs out of memory building the result. <strong>Fix:</strong> do the filtering and aggregation in SQL and convert only the small result to pandas; or <code>COPY ... TO</code> a file. The engine can handle data larger than memory, but your Python variable cannot.</div></div>
+<h3>Going deeper: why DuckDB is fast</h3>
+<ul>
+<li><strong>Vectorized execution</strong>: operators process batches of values (around 2,000) at a time instead of one row, keeping data in CPU caches and avoiding per-row interpretation costs.</li>
+<li><strong>Morsel-driven parallelism</strong>: the input is cut into small work units that threads pick up, so all cores stay busy.</li>
+<li><strong>Pushdown into Parquet</strong>: projection and filters are applied while reading, using the footer statistics to skip row groups.</li>
+<li>Interview question: "When DuckDB and when Spark?" Answer with the data size, the number of machines, the existing platform, and the fact that one big machine with DuckDB beats a small cluster surprisingly often for datasets up to hundreds of GB, while data that must be written by many jobs concurrently belongs in a warehouse or lakehouse.</li>
+</ul>
+
+<h2 id="s6-22-6-dask-pandas-in-pieces-with-a-scheduler">22.6 Dask: pandas in pieces, with a scheduler</h2>
+<h3>Beginner: the idea</h3>
+<p><strong>Dask</strong> splits a big table into many pandas DataFrames called <strong>partitions</strong>, and builds a <strong>task graph</strong> (a diagram of small jobs and what each one needs). Calling a method such as <code>.sum()</code> only adds boxes to the graph, which is lazy execution. Calling <code>.compute()</code> hands the graph to a <strong>scheduler</strong> that runs the small jobs on all cores (threads or processes), or on many machines through <code>dask.distributed</code>, and returns an ordinary pandas object. The API deliberately looks like pandas, so existing code often needs few changes. It does not copy the pandas API completely: operations that need all the data in order (a global sort, a rank within groups, an arbitrary row lookup) are expensive or missing.</p>
+<div class="callout blue"><div class="lab">DEFINITION</div><div class="txt"><strong>Partition</strong>: one pandas DataFrame inside the Dask DataFrame. <strong>Lazy</strong>: building a plan without running it. <strong>Persist</strong>: run the plan now and keep the result in (distributed) memory so later steps reuse it. <strong>Shuffle</strong>: move rows between partitions so that rows with the same key end up together; the expensive step.</div></div>
+
+<h3>Reference table: the 24 most useful Dask names</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example (not run here)</th></tr></thead><tbody>
+<tr><td><code>dd.read_csv(path, blocksize=)</code></td><td>Lazy CSV read; one partition per block; globs allowed</td><td><code>dd.read_csv("logs/*.csv", blocksize="64MB")</code></td></tr>
+<tr><td><code>dd.read_parquet(path)</code></td><td>Lazy Parquet read</td><td><code>dd.read_parquet("sales/", columns=["a"])</code></td></tr>
+<tr><td><code>dd.from_pandas(df, npartitions=)</code></td><td>Turn a pandas frame into a Dask frame</td><td><code>dd.from_pandas(df, npartitions=8)</code></td></tr>
+<tr><td><code>ddf.npartitions</code></td><td>How many pieces</td><td><code>ddf.npartitions</code></td></tr>
+<tr><td><code>ddf.compute()</code></td><td>Run the graph, return pandas</td><td><code>ddf.amount.sum().compute()</code></td></tr>
+<tr><td><code>dask.compute(a, b)</code></td><td>Run several results in one pass (shares work)</td><td><code>dask.compute(x.sum(), x.mean())</code></td></tr>
+<tr><td><code>ddf.persist()</code></td><td>Compute now, keep partitions in memory</td><td><code>ddf = ddf.persist()</code></td></tr>
+<tr><td><code>ddf.head(n)</code></td><td>First rows of the FIRST partition only (cheap, but not a sample)</td><td><code>ddf.head(5)</code></td></tr>
+<tr><td><code>ddf.groupby(k).agg()</code></td><td>Tree-reduced group-by</td><td><code>ddf.groupby("region").amount.sum()</code></td></tr>
+<tr><td><code>ddf.merge(other, on=, how=)</code></td><td>Join; a small pandas side is broadcast, two large sides are shuffled</td><td><code>ddf.merge(tiers, on="customer_id")</code></td></tr>
+<tr><td><code>ddf.map_partitions(func)</code></td><td>Run any pandas function on each partition</td><td><code>ddf.map_partitions(add_rank, meta=m)</code></td></tr>
+<tr><td><code>meta=</code></td><td>Empty frame describing output columns and dtypes</td><td><code>meta=ddf._meta.assign(rank=0)</code></td></tr>
+<tr><td><code>ddf.repartition(npartitions= / partition_size=)</code></td><td>Change the number or size of partitions</td><td><code>ddf.repartition(partition_size="100MB")</code></td></tr>
+<tr><td><code>ddf.shuffle(on=)</code></td><td>Co-locate equal keys in one partition</td><td><code>ddf.shuffle(on="region")</code></td></tr>
+<tr><td><code>ddf.set_index(col)</code></td><td>Sort by a column and record partition boundaries (costly, speeds joins/lookups)</td><td><code>ddf.set_index("ts")</code></td></tr>
+<tr><td><code>ddf.drop_duplicates()</code></td><td>Distinct rows (a shuffle-like reduction)</td><td><code>ddf.drop_duplicates(subset=["order_id"])</code></td></tr>
+<tr><td><code>ddf.astype / ddf.categorize</code></td><td>Change dtypes; make categoricals with known categories</td><td><code>ddf.astype({"qty": "uint8"})</code></td></tr>
+<tr><td><code>ddf.to_parquet(path, partition_on=)</code></td><td>Write output, one file per partition</td><td><code>ddf.to_parquet("out/", partition_on=["year"])</code></td></tr>
+<tr><td><code>ddf.memory_usage(deep=True)</code></td><td>Lazy memory report (compute it)</td><td><code>ddf.memory_usage(deep=True).compute()</code></td></tr>
+<tr><td><code>ddf.visualize()</code></td><td>Draw the task graph (needs graphviz)</td><td><code>ddf.amount.sum().visualize()</code></td></tr>
+<tr><td><code>Client() / LocalCluster()</code></td><td>Start the distributed scheduler with a live dashboard</td><td><code>from dask.distributed import Client; client = Client()</code></td></tr>
+<tr><td><code>client.dashboard_link</code></td><td>URL of the dashboard (task stream, memory, progress)</td><td><code>print(client.dashboard_link)</code></td></tr>
+<tr><td><code>dask.config.set(scheduler=)</code></td><td>Choose "threads", "processes" or "synchronous" (debug)</td><td><code>dask.config.set(scheduler="synchronous")</code></td></tr>
+<tr><td><code>dask.delayed</code></td><td>Make any Python function lazy and parallel</td><td><code>dask.delayed(load)(path)</code></td></tr>
+</tbody></table></div>
+
+<h3>Worked example 1 (trivial, not run): the Dask version of a pandas group-by</h3>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (library not installed)
+import dask.dataframe as dd
+
+ddf = dd.read_csv("orders.csv")
+print(ddf.npartitions)                       # 1 for a tiny file; many for a big one
+lazy = ddf.groupby("region").amount.sum()    # nothing has been computed yet
+print(lazy.compute().sort_index())           # APAC 75, EU 115, US 85</code></pre>
+<ol>
+<li><code>read_csv</code> splits the file into blocks (default tens of MB) and returns immediately; nothing is parsed yet.</li>
+<li><code>ddf.npartitions</code> is 1 for a ten-row file. A 10 GB file at 64 MB blocks gives about 160 partitions.</li>
+<li>The group-by is a plan: sum within each partition, then combine the partial sums. <code>compute()</code> runs it and returns a pandas Series. Expected: APAC 75, EU 115, US 85, the same numbers as the pandas, SQLite and DuckDB blocks.</li>
+</ol>
+
+<h3>Worked example 2 (runnable): what Dask does inside, in plain pandas</h3>
+<p>We can reproduce Dask's strategy with pandas alone: cut the table into partitions, reduce each partition separately, combine the partial results. The block also shows the classic trap: an average of averages is wrong when partitions have different sizes.</p>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(1)
+n = 300_000
+df = pd.DataFrame({"region": rng.choice(["EU", "US", "APAC"], n), "price": rng.normal(50, 15, n)})
+
+cuts = [0, 20_000, 120_000, n]                          # unequal partitions on purpose
+parts = [df.iloc[a:b] for a, b in zip(cuts[:-1], cuts[1:])]
+print("partition sizes:", [len(p) for p in parts])
+
+partials = [p.groupby("region")["price"].agg(["sum", "count"]) for p in parts]
+combined = sum(partials)                                 # element-wise add, aligned on region
+mean_correct = combined["sum"] / combined["count"]
+
+mean_of_means = pd.concat([p.groupby("region")["price"].mean() for p in parts], axis=1).mean(axis=1)
+truth = df.groupby("region")["price"].mean()
+
+print("sum/count equals pandas:", np.allclose(mean_correct.sort_index(), truth.sort_index()))
+print("mean of means equals pandas:", np.allclose(mean_of_means.sort_index(), truth.sort_index()))
+print("worst error of mean-of-means:", float((mean_of_means - truth).abs().max()) &gt; 1e-6)</code></pre>
+<pre class="code lang-text"><code>partition sizes: [20000, 100000, 180000]
+sum/count equals pandas: True
+mean of means equals pandas: False
+worst error of mean-of-means: True</code></pre>
+<ol>
+<li>Three partitions of 20,000, 100,000 and 180,000 rows stand in for Dask partitions.</li>
+<li>Step one (the "map"): every partition computes the sum and the count of price per region. These are small and can be done anywhere, in parallel.</li>
+<li>Step two (the "reduce"): <code>sum(partials)</code> adds the small tables aligned on region. This is what Dask's tree reduction does, in a tree so it works for thousands of partitions.</li>
+<li>The correct mean is total sum divided by total count. Dask's <code>mean()</code> does exactly this internally.</li>
+<li>The wrong way averages the three partition means with equal weight, so the 20,000-row partition counts as much as the 180,000-row one. The result differs from pandas, so the equality check prints <code>False</code>, and the last line prints <code>True</code> because the error is bigger than 1e-6.</li>
+<li>Rule: only combine <em>decomposable</em> partial results (sum, count, min, max, sum of squares). Medians and exact distinct counts need other approaches.</li>
+</ol>
+<p>A rank inside a group needs all of a group's rows in one place. In Dask that means a shuffle first. The running task in Dask (not run here):</p>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (library not installed)
+import dask.dataframe as dd
+import pandas as pd
+
+orders = dd.read_csv("orders.csv")
+tiers = pd.DataFrame({"customer_id": ["c1", "c2", "c3", "c4", "c5", "c6"],
+                      "tier": ["gold", "silver", "gold", "bronze", "silver", "bronze"]})
+
+rev = (orders.groupby(["region", "customer_id"]).amount.sum()
+             .reset_index().rename(columns={"amount": "revenue"}))
+rev = rev.merge(tiers, on="customer_id", how="left")     # small pandas side: cheap join
+
+def add_rank(part):
+    part = part.copy()
+    part["rank"] = part.groupby("region")["revenue"].rank(method="first", ascending=False).astype(int)
+    return part
+
+ranked = rev.shuffle(on="region").map_partitions(add_rank, meta=rev._meta.assign(rank=0))
+print(ranked.compute().sort_values(["region", "rank"]))</code></pre>
+<ol>
+<li>The group-by and <code>reset_index</code> give one row per region and customer; <code>rename</code> gives the honest column name.</li>
+<li>The merge with a small pandas DataFrame is cheap: Dask sends the small table to every partition (a broadcast join) instead of shuffling the big one.</li>
+<li>Dask has no distributed "rank within group". The standard pattern is: <code>shuffle(on="region")</code> so that all rows of a region are in the same partition, then run an ordinary pandas function on each partition with <code>map_partitions</code>.</li>
+<li><code>meta=</code> tells Dask the output columns and dtypes without running the function. Without it, Dask guesses by running your function on fake data, which can be slow or wrong.</li>
+<li>Expected: the same six rows as Problem 22.1.1.</li>
+</ol>
+
+<h3>Worked example 3 (runnable): a shuffle join, step by step</h3>
+<p>Joining two big tables is the hardest distributed operation. Both sides are hash-partitioned by the join key, so matching keys land in the same partition number, then each pair of partitions is joined locally. The block does that with pandas and checks it against a single big merge.</p>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(2)
+orders = pd.DataFrame({"customer_id": rng.integers(0, 5_000, 100_000), "amount": rng.integers(1, 100, 100_000)})
+customers = pd.DataFrame({"customer_id": np.arange(5_000), "tier": rng.choice(["gold", "silver", "bronze"], 5_000)})
+K = 4
+
+def split(frame):
+    bucket = pd.util.hash_pandas_object(frame["customer_id"], index=False) % K
+    return [frame[bucket == i] for i in range(K)]
+
+o_parts, c_parts = split(orders), split(customers)
+print("order rows per partition:", [len(p) for p in o_parts])
+joined = pd.concat([o.merge(c, on="customer_id", how="left") for o, c in zip(o_parts, c_parts)])
+direct = orders.merge(customers, on="customer_id", how="left")
+key = ["customer_id", "amount", "tier"]
+print("rows:", len(joined), len(direct))
+print("same result:", joined.sort_values(key).reset_index(drop=True).equals(direct.sort_values(key).reset_index(drop=True)))</code></pre>
+<pre class="code lang-text"><code>order rows per partition: [23741, 26181, 24196, 25882]
+rows: 100000 100000
+same result: True</code></pre>
+<ol>
+<li>Two tables: 100,000 orders and 5,000 customers, joined on <code>customer_id</code>.</li>
+<li><code>hash_pandas_object</code> gives a stable hash for each key; the remainder modulo K (4) picks a partition. A stable hash is essential: both sides must agree where each key goes. (Python's built-in <code>hash</code> of strings changes between runs, which is a real production bug.)</li>
+<li>The orders table splits into four roughly equal parts, since customer ids are spread evenly.</li>
+<li>Each pair of partitions is merged independently; no pair needs rows from another pair. That independence is the whole trick, and it is what lets different machines do the pairs at the same time.</li>
+<li>The concatenated result equals one big merge (after sorting, because partition order is not row order). Moving rows to their partition is the <strong>shuffle</strong>, the expensive part on a real cluster because it crosses the network.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>ddf.head()</code> to peek at the data, or calling <code>.compute()</code> on a result as large as the input. <strong>Symptom:</strong> <code>head()</code> shows only rows from the first partition and misleads you; <code>compute()</code> of a huge frame crashes the notebook because the result becomes one pandas object. <strong>Fix:</strong> aggregate first and compute small results, write big results with <code>to_parquet</code>, and use <code>ddf.sample(frac=0.01).compute()</code> for a representative peek.</div></div>
+<h3>Going deeper: scheduling and sizing</h3>
+<ul>
+<li>Aim for partitions of roughly 100 MB. Thousands of tiny partitions drown the scheduler in overhead (each task costs about a millisecond of bookkeeping); a few giant ones lose parallelism and risk memory errors.</li>
+<li>The threaded scheduler is good for NumPy/pandas code that releases Python's global interpreter lock. Pure-Python functions need processes (or a distributed cluster).</li>
+<li>With <code>Client()</code> the dashboard shows the task stream, per-worker memory and progress. A worker bar turning orange or red means it is spilling to disk or close to being killed: use smaller partitions or fewer parallel tasks.</li>
+<li>Recent Dask versions plan queries with an optimizer (the dask-expr layer), so column selection and filters are pushed into the read much like Polars; the API you use stays the same.</li>
+</ul>
+
+<h2 id="s7-22-7-pyspark-partitions-shuffles-joins-skew-caching-and-the-spark-ui">22.7 PySpark: partitions, shuffles, joins, skew, caching and the Spark UI</h2>
+<h3>Beginner: the model</h3>
+<p><strong>Apache Spark</strong> is an engine that runs a query across many machines (or many cores of one). <strong>PySpark</strong> is its Python API. A Spark program has one <strong>driver</strong> (your Python process, which plans the work) and many <strong>executors</strong> (processes that hold data and run tasks). The data is a <strong>DataFrame</strong> cut into <strong>partitions</strong>; each partition is processed by one <strong>task</strong>. Operations come in two kinds. <strong>Transformations</strong> (<code>filter</code>, <code>select</code>, <code>groupBy</code>, <code>join</code>) are lazy: they extend the plan. <strong>Actions</strong> (<code>count</code>, <code>show</code>, <code>collect</code>, <code>write</code>) trigger the run. A <strong>job</strong> is the work for one action; it is cut into <strong>stages</strong> at every shuffle; each stage is a set of parallel tasks.</p>
+<p>The key distinction for performance: a <strong>narrow</strong> transformation (<code>filter</code>, <code>select</code>, <code>withColumn</code>) works on each partition independently and needs no data movement. A <strong>wide</strong> transformation (<code>groupBy</code>, <code>join</code>, <code>distinct</code>, <code>orderBy</code>, <code>repartition</code>) needs rows with the same key to meet, so data is <strong>shuffled</strong>: written to local disk, sent across the network, read by the next stage. Shuffles dominate the cost of most Spark jobs.</p>
+<figure><img src="images/lib22_shuffle.png" alt="Three input partitions each produce local partial sums, which are sent across a shuffle to three reduce partitions holding keys A, B and C." loading="lazy"/><figcaption>Figure 22.6. A shuffle: every map-side partition sends rows to every reduce-side partition (a diagram).</figcaption></figure>
+<p><strong>How to read it:</strong> the left boxes are input partitions holding mixed keys. Each computes partial sums locally (the middle boxes), which is why <code>groupBy().sum()</code> moves only small partial results, not raw rows. The nine arrows are the shuffle: each of three senders sends data to each of three receivers. On a cluster that is network and disk traffic, and the next stage cannot start until all of it has arrived. Fewer, smaller shuffles mean faster jobs.</p>
+
+<h3>Reference table: the 28 most useful PySpark names</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example (not run here)</th></tr></thead><tbody>
+<tr><td><code>SparkSession.builder...getOrCreate()</code></td><td>Start (or reuse) Spark; the entry point</td><td><code>spark = SparkSession.builder.master("local[*]").getOrCreate()</code></td></tr>
+<tr><td><code>spark.read.csv / parquet / json</code></td><td>Read data into a DataFrame (lazy)</td><td><code>spark.read.parquet("sales/")</code></td></tr>
+<tr><td><code>inferSchema=True</code></td><td>Guess types (costs an extra pass; prefer an explicit schema in production)</td><td><code>spark.read.csv(p, header=True, inferSchema=True)</code></td></tr>
+<tr><td><code>spark.createDataFrame(data, cols)</code></td><td>Build from Python data or pandas</td><td><code>spark.createDataFrame([("c1","gold")], ["id","tier"])</code></td></tr>
+<tr><td><code>df.select / withColumn / drop</code></td><td>Choose, add, remove columns</td><td><code>df.withColumn("vat", F.col("a") * 0.2)</code></td></tr>
+<tr><td><code>df.filter / where</code></td><td>Keep rows matching a condition</td><td><code>df.filter(F.col("amount") &gt; 20)</code></td></tr>
+<tr><td><code>df.groupBy(k).agg(...)</code></td><td>Group and aggregate (wide)</td><td><code>df.groupBy("region").agg(F.sum("amount"))</code></td></tr>
+<tr><td><code>pyspark.sql.functions as F</code></td><td>Built-in column functions: sum, count, when, concat, regexp_extract, to_date...</td><td><code>F.when(F.col("a") &gt; 5, 1).otherwise(0)</code></td></tr>
+<tr><td><code>df.join(other, on, how)</code></td><td>Join (inner, left, right, full, left_semi, left_anti, cross)</td><td><code>a.join(b, "customer_id", "left")</code></td></tr>
+<tr><td><code>F.broadcast(df)</code></td><td>Hint: send the small table to all executors, skip the shuffle</td><td><code>big.join(F.broadcast(small), "k")</code></td></tr>
+<tr><td><code>Window.partitionBy().orderBy()</code></td><td>Define a window for ranks, running totals, lag</td><td><code>w = Window.partitionBy("region").orderBy(F.desc("revenue"))</code></td></tr>
+<tr><td><code>F.row_number().over(w)</code></td><td>Window function on that window (also rank, dense_rank, lag, sum)</td><td><code>df.withColumn("rk", F.row_number().over(w))</code></td></tr>
+<tr><td><code>df.dropDuplicates(subset)</code></td><td>Remove duplicate rows (a shuffle)</td><td><code>df.dropDuplicates(["order_id"])</code></td></tr>
+<tr><td><code>df.orderBy / sort</code></td><td>Global sort (wide, expensive; avoid when not needed)</td><td><code>df.orderBy(F.desc("amount"))</code></td></tr>
+<tr><td><code>df.repartition(n, cols)</code></td><td>Reshuffle into n partitions (optionally by key)</td><td><code>df.repartition(200, "customer_id")</code></td></tr>
+<tr><td><code>df.coalesce(n)</code></td><td>Reduce partitions without a full shuffle</td><td><code>df.coalesce(8)</code></td></tr>
+<tr><td><code>df.rdd.getNumPartitions()</code></td><td>How many partitions now</td><td><code>df.rdd.getNumPartitions()</code></td></tr>
+<tr><td><code>df.cache() / persist() / unpersist()</code></td><td>Keep a result in memory (lazy: filled by the first action)</td><td><code>df = df.cache(); df.count()</code></td></tr>
+<tr><td><code>df.explain()</code></td><td>Print the physical plan (look for Exchange and join type)</td><td><code>df.explain("formatted")</code></td></tr>
+<tr><td><code>df.show / count / collect / take</code></td><td>Actions: run the plan</td><td><code>df.show(5)</code></td></tr>
+<tr><td><code>df.toPandas()</code></td><td>Bring the result to the driver as pandas (must be small)</td><td><code>df.limit(1000).toPandas()</code></td></tr>
+<tr><td><code>df.write.partitionBy().parquet()</code></td><td>Write a partitioned folder</td><td><code>df.write.mode("overwrite").partitionBy("year").parquet("out")</code></td></tr>
+<tr><td><code>spark.sql(q) / createOrReplaceTempView</code></td><td>Use SQL on DataFrames</td><td><code>df.createOrReplaceTempView("t"); spark.sql("SELECT ...")</code></td></tr>
+<tr><td><code>F.udf(f, type)</code></td><td>Row-at-a-time Python function (slow; last resort)</td><td><code>F.udf(lambda s: s.lower(), "string")</code></td></tr>
+<tr><td><code>F.pandas_udf</code></td><td>Vectorized Python function over pandas Series (faster than a plain UDF)</td><td><code>@F.pandas_udf("double")</code></td></tr>
+<tr><td><code>spark.conf.set(k, v)</code></td><td>Tune: shuffle partitions, broadcast threshold, AQE</td><td><code>spark.conf.set("spark.sql.shuffle.partitions", "64")</code></td></tr>
+<tr><td><code>F.rand / F.explode / F.array</code></td><td>Building blocks for salting a skewed key</td><td><code>(F.rand() * 8).cast("int")</code></td></tr>
+<tr><td><code>spark.stop()</code></td><td>Release resources at the end of a script</td><td><code>spark.stop()</code></td></tr>
+</tbody></table></div>
+
+<h3>Worked example 1 (realistic, not run): the running task in PySpark</h3>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (library not installed)
+from pyspark.sql import SparkSession, functions as F, Window
+
+spark = (SparkSession.builder.appName("ch22").master("local[*]")
+         .config("spark.sql.shuffle.partitions", "8")      # the default is 200, too many for tiny data
+         .getOrCreate())
+
+orders = spark.read.csv("orders.csv", header=True, inferSchema=True)
+tiers = spark.createDataFrame(
+    [("c1", "gold"), ("c2", "silver"), ("c3", "gold"),
+     ("c4", "bronze"), ("c5", "silver"), ("c6", "bronze")],
+    ["customer_id", "tier"],
+)
+
+rev = orders.groupBy("region", "customer_id").agg(F.sum("amount").alias("revenue"))
+w = Window.partitionBy("region").orderBy(F.col("revenue").desc())
+result = (rev.join(tiers, "customer_id", "left")
+             .withColumn("rank", F.row_number().over(w))
+             .select("region", "customer_id", "revenue", "tier", "rank")
+             .orderBy("region", "rank"))
+result.show()
+result.explain()
+spark.stop()</code></pre>
+<ol>
+<li>The session is the entry point. <code>master("local[*]")</code> runs Spark on all cores of this machine, ideal for learning and tests. On a cluster the platform sets the master for you.</li>
+<li><code>spark.sql.shuffle.partitions</code> is the number of partitions after any shuffle; its default is 200. For ten rows that is 200 mostly empty tasks, so we lower it. On big data you raise it so each partition is a manageable size.</li>
+<li><code>read.csv(..., inferSchema=True)</code> reads the file once extra to guess types. On big files supply a schema instead.</li>
+<li><code>groupBy().agg(F.sum(...))</code> is the wide step: partial sums per partition, shuffle by (region, customer_id), final sums.</li>
+<li>The window is defined once (<code>Window.partitionBy("region").orderBy(...)</code>) and applied with <code>F.row_number().over(w)</code>. This needs all rows of a region together, so Spark shuffles by region.</li>
+<li>With tables this small Spark would pick a broadcast join for <code>tiers</code> automatically. <code>explain()</code> prints the physical plan; read it from the bottom up and look for <code>Exchange</code> (a shuffle) and <code>BroadcastHashJoin</code>.</li>
+<li>Expected output of <code>show()</code>: the same six rows as before, drawn in Spark's ASCII table. Spark does not guarantee row order without <code>orderBy</code>, and that is why we sort.</li>
+</ol>
+<pre class="code lang-text"><code>region  customer_id  revenue  tier    rank
+APAC    c5                70  silver     1
+APAC    c6                 5  bronze     2
+EU      c2                80  silver     1
+EU      c1                35  gold       2
+US      c3                75  gold       1
+US      c4                10  bronze     2</code></pre>
+
+<h3>Intermediate: partitions, joins and caching</h3>
+<ul>
+<li><strong>Partition count</strong>: when reading files, Spark makes about one partition per 128 MB of input by default. After a shuffle you get <code>spark.sql.shuffle.partitions</code> partitions. Rule of thumb: target partitions of about 100 to 200 MB, at least 2 to 3 times as many partitions as cores. Too few: underused cores and memory errors. Too many: scheduling overhead and tiny output files.</li>
+<li><strong>Join strategies</strong>: if one side is small (default threshold 10 MB, setting <code>spark.sql.autoBroadcastJoinThreshold</code>), Spark broadcasts it and no shuffle of the big side happens. Otherwise it does a <strong>sort-merge join</strong>: shuffle both sides by the key, sort, merge. Use <code>F.broadcast(small)</code> to force the cheap path when you know a table is small.</li>
+<li><strong>Join key quality</strong>: filter and select before the join so less data crosses the network; make sure both key columns have the same type, or Spark casts and may skip optimizations; check nulls (a null key never matches).</li>
+<li><strong>Caching</strong>: <code>df.cache()</code> marks a DataFrame to be kept in memory after its first action. Use it when the same expensive DataFrame feeds several actions (for example, a model's training loop or three reports from one cleaned table). Do not cache something used once, and call <code>unpersist()</code> when done. The Storage tab of the UI shows what is cached and how much space it uses.</li>
+<li><strong>Lazy plan, repeated work</strong>: without cache, every action re-runs the whole plan from the source files. Two <code>count()</code> calls on the same unmaterialized DataFrame read and process the data twice.</li>
+</ul>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (library not installed)
+from pyspark.sql import SparkSession, functions as F
+
+spark = SparkSession.builder.master("local[*]").getOrCreate()
+events = spark.read.parquet("events_pq")          # big
+users = spark.read.parquet("users_pq")            # small (a few MB)
+
+slim = events.select("user_id", "price").filter(F.col("price") &gt; 0)   # prune early
+joined = slim.join(F.broadcast(users), "user_id", "left")               # no shuffle of events
+joined.explain()                                  # expect BroadcastHashJoin, no Exchange on events
+
+clean = joined.cache()                            # lazy: nothing happens yet
+print(clean.count())                              # first action: computes and fills the cache
+print(clean.groupBy("country").agg(F.sum("price")).count())   # reuses the cache
+clean.unpersist()</code></pre>
+<ol>
+<li>Selecting two columns and filtering before the join cuts the rows and the bytes that every later step handles.</li>
+<li><code>F.broadcast(users)</code> promises Spark that <code>users</code> is small enough to ship to every executor. If the promise is false the executors run out of memory, so use it only for genuinely small tables.</li>
+<li>In <code>explain()</code> a <code>BroadcastHashJoin</code> with a <code>BroadcastExchange</code> on the small side only, and no <code>Exchange hashpartitioning</code> on the events side, confirms the shuffle is avoided.</li>
+<li><code>cache()</code> itself does nothing. The first action (<code>count</code>) computes the join and stores the partitions; the second action reads from memory.</li>
+<li><code>unpersist()</code> frees the memory for other work.</li>
+</ol>
+
+<h3>Expert (runnable): data skew and salting</h3>
+<p><strong>Skew</strong> means a few keys have far more rows than the others. After a shuffle by key, one partition gets the hot key's rows and one task runs far longer than its peers while the rest of the cluster sits idle. The block simulates it: 1 million rows, 1,000 keys with a Zipf-like popularity (key 0 gets about 13 percent of all rows), hashed into 8 partitions. <strong>Salting</strong> adds a random suffix 0 to 7 to the key so the hot key is spread over several partitions; an aggregation is done in two stages so the answer stays exact.</p>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(7)
+n, n_keys, n_parts = 1_000_000, 1000, 8
+w = 1 / np.arange(1, n_keys + 1)
+keys = rng.choice(n_keys, n, p=w / w.sum())
+vals = rng.integers(1, 100, n)
+
+def part_sizes(k):
+    h = pd.util.hash_array(k.astype(np.int64))
+    return np.bincount(h % n_parts, minlength=n_parts)
+
+before = part_sizes(keys)
+print("hottest key share:", round((keys == 0).mean(), 3))
+print("before:", before.tolist(), "max/mean =", round(before.max() / before.mean(), 2))
+salt = rng.integers(0, 8, n)
+after = part_sizes(keys * 8 + salt)
+print("after :", after.tolist(), "max/mean =", round(after.max() / after.mean(), 2))
+
+df = pd.DataFrame({"k": keys, "salt": salt, "v": vals})
+stage1 = df.groupby(["k", "salt"])["v"].sum().reset_index()
+stage2 = stage1.groupby("k")["v"].sum()
+direct = df.groupby("k")["v"].sum()
+print("same answer:", stage2.equals(direct))</code></pre>
+<pre class="code lang-text"><code>hottest key share: 0.134
+before: [247565, 101396, 117133, 71796, 152006, 160663, 60940, 88501] max/mean = 1.98
+after : [138513, 128210, 121237, 106290, 161283, 138354, 91594, 114519] max/mean = 1.29
+same answer: True</code></pre>
+<ol>
+<li>Key popularity is proportional to 1/rank. This heavy-tailed shape is common: a few customers, bots or null values account for most rows.</li>
+<li><code>part_sizes</code> mimics Spark's hash partitioning: hash the key, take the remainder by the number of partitions, count rows per partition.</li>
+<li>Before salting, the biggest partition holds nearly twice the average (max/mean about 2). That task decides when the whole stage finishes. With 1,000 keys the ratio is mild; with a real hot key holding 50 percent of rows, it is severe.</li>
+<li>After salting, the hot key's rows spread over all 8 partitions and the ratio falls. Not to exactly 1.0: other keys still hash unevenly.</li>
+<li>Stage 1 sums by (key, salt), stage 2 sums the partial sums by key. Because a sum of partial sums is the total, the answer equals the direct group-by (<code>True</code>). Salting works for decomposable aggregations; for joins, the small side must be replicated across all salt values.</li>
+</ol>
+<figure><img src="images/lib22_skew.png" alt="Bar chart of rows per partition for 8 partitions, comparing hashing by key and by key plus salt." loading="lazy"/><figcaption>Figure 22.7. Rows per partition before and after salting, measured in the block above.</figcaption></figure>
+<p><strong>How to read it:</strong> red bars are the partitions when hashing only by key, green bars when hashing key plus salt. The dotted line is the perfect split. Partition 0 in red holds a quarter million rows because the hot key lives there. Green is closer to the line. In Spark you would first try the built-in fix, adaptive query execution, which can split skewed shuffle partitions in sort-merge joins automatically; salt by hand only when the UI still shows one monster task.</p>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (library not installed)
+from pyspark.sql import functions as F
+
+SALT = 8
+# Two-stage aggregation for a skewed group-by key
+stage1 = (df.withColumn("salt", (F.rand(seed=1) * SALT).cast("int"))
+            .groupBy("k", "salt").agg(F.sum("v").alias("s")))
+total = stage1.groupBy("k").agg(F.sum("s").alias("v"))
+
+# Skewed join: salt the big side, replicate the small side across all salts
+big = big.withColumn("salt", (F.rand(seed=1) * SALT).cast("int"))
+small = small.withColumn("salt", F.explode(F.array([F.lit(i) for i in range(SALT)])))
+joined = big.join(small, ["k", "salt"])
+
+# Often enough: let Spark do it
+spark.conf.set("spark.sql.adaptive.enabled", "true")
+spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")</code></pre>
+<ol>
+<li>The first part is the Spark version of the pandas two-stage aggregate just run.</li>
+<li><code>F.rand(seed=1)</code> gives a uniform number in [0, 1); times 8 and cast to int gives a salt from 0 to 7.</li>
+<li>For the join, each row of the big side gets one random salt. Each row of the small side is copied 8 times, once per salt, using <code>explode</code> on an array. The join then matches on (key, salt), so a hot key's rows split into 8 smaller joins.</li>
+<li>The cost is 8 times the small side. Salt only the hot keys if the small side is not small.</li>
+<li>Adaptive Query Execution (AQE) has been on by default since Spark 3.2. It coalesces tiny shuffle partitions, switches join strategy using real runtime sizes, and can split skewed partitions. Setting the flags explicitly documents your intent.</li>
+</ol>
+
+<h3>UDFs versus built-in functions</h3>
+<p>A plain Python UDF (user-defined function) is called once per row: Spark must serialize each row from the JVM to a Python process and back, and the optimizer cannot see inside it. Built-in functions (<code>pyspark.sql.functions</code>) run inside the JVM, are optimized and can be pushed down. The same effect shows up in pandas: <code>df.apply(f, axis=1)</code> is a row-by-row Python loop, vectorized column arithmetic is the built-in. The block measures the gap on 200,000 rows (timings are not checked because they vary).</p>
+<pre class="code lang-python"><code>import time
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+n = 200_000
+df = pd.DataFrame({"amount": rng.integers(1, 500, n), "region": rng.choice(["EU", "US", "APAC"], n)})
+rate = {"EU": 0.92, "US": 1.0, "APAC": 0.0065}
+
+def row_udf(row):                      # like a plain Spark UDF: called once per row
+    return row["amount"] * rate[row["region"]]
+
+def best(fn, reps=3):
+    times = []
+    for _ in range(reps):
+        t0 = time.perf_counter(); fn(); times.append(time.perf_counter() - t0)
+    return min(times)
+
+slow = best(lambda: df.apply(row_udf, axis=1))
+fast = best(lambda: df["amount"] * df["region"].map(rate))      # column-at-a-time, like F.when / F.col arithmetic
+print("row-at-a-time:", round(slow, 3), "s; vectorized:", round(fast, 4), "s; ratio:", round(slow / fast))
+print("same values:", np.allclose(df.apply(row_udf, axis=1), df["amount"] * df["region"].map(rate)))</code></pre>
+<ol>
+<li><code>row_udf</code> mimics a plain UDF: a Python function receiving one row.</li>
+<li>The vectorized line maps the region to its rate with a dictionary lookup (done once per distinct value internally) and multiplies whole columns.</li>
+<li>On one laptop run: 0.681 s for the row-at-a-time version and 0.0063 s for the vectorized one, about 108 times faster, with identical values. In Spark the penalty is usually larger because of the JVM-to-Python serialization on top.</li>
+<li>Escalation ladder in Spark: (1) a built-in function or <code>F.expr</code> SQL expression; (2) a <code>pandas_udf</code>, which receives whole pandas Series in batches via Arrow; (3) a plain UDF only when nothing else works.</li>
+</ol>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (library not installed)
+from pyspark.sql import functions as F
+import pandas as pd
+
+rates = {"EU": 0.92, "US": 1.0, "APAC": 0.0065}
+
+# 1. Built-in: a map literal and column arithmetic (best)
+rate_col = F.create_map([F.lit(x) for kv in rates.items() for x in kv])
+df = df.withColumn("eur", F.col("amount") * rate_col[F.col("region")])
+
+# 2. Vectorized pandas UDF: batches of rows as pandas Series
+@F.pandas_udf("double")
+def to_eur(amount: pd.Series, region: pd.Series) -&gt; pd.Series:
+    return amount * region.map(rates)
+df = df.withColumn("eur2", to_eur("amount", "region"))
+
+# 3. Plain UDF: one row at a time (slowest)
+to_eur_slow = F.udf(lambda a, r: float(a * rates[r]), "double")
+df = df.withColumn("eur3", to_eur_slow("amount", "region"))</code></pre>
+
+<h3>Reading the Spark UI</h3>
+<p>While a job runs, the driver serves a web page, by default at <code>http://localhost:4040</code>. Learn to read five tabs: <strong>Jobs</strong> (one row per action), <strong>Stages</strong> (the units between shuffles), <strong>Storage</strong> (cached data), <strong>Executors</strong> (memory, GC, failed tasks per executor) and <strong>SQL / DataFrame</strong> (the query plan with row counts). Open the page of a slow stage and read its <em>summary metrics for completed tasks</em>: min, 25th percentile, median, 75th percentile and max of duration, shuffle read size, spill.</p>
+<figure><img src="images/lib22_sparkui.png" alt="Two bar charts of task durations. Left: 40 tasks of similar length. Right: 39 similar tasks and one task much longer." loading="lazy"/><figcaption>Figure 22.8. Simulated task durations in a healthy and in a skewed stage (an illustration, not a real Spark run).</figcaption></figure>
+<p><strong>How to read it:</strong> every bar is one task in the stage. The dashed line is the median. In the healthy stage all bars are about 10 seconds, so the stage ends in about 10 seconds' worth of work on each core. In the skewed stage 39 tasks finish quickly and then one task keeps running for about 55 seconds; the stage cannot end until it does. In the UI that appears as a Max duration far above the Median.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>What you see in the UI</th><th>What it usually means</th><th>First fix to try</th></tr></thead><tbody>
+<tr><td>Max task duration is 5 times or more the median</td><td>Data skew, or one slow node</td><td>Check the key distribution; AQE skew join; salting</td></tr>
+<tr><td>Shuffle spill (memory) and (disk) columns are non-zero</td><td>Partitions too big for execution memory</td><td>More partitions; larger executor memory</td></tr>
+<tr><td>Thousands of tasks, each a few milliseconds</td><td>Too many tiny partitions</td><td><code>coalesce</code>, lower shuffle partitions, compact small files</td></tr>
+<tr><td>A few tasks, each very long, idle cores</td><td>Too few partitions</td><td><code>repartition</code> to 2 to 3 times the core count or more</td></tr>
+<tr><td>High GC time share</td><td>Memory pressure, many objects (often Python UDF data)</td><td>Fewer columns, built-ins, more memory</td></tr>
+<tr><td>Huge shuffle read/write for a simple query</td><td>Unneeded wide operations</td><td>Broadcast small tables; filter earlier; drop <code>distinct</code>/<code>orderBy</code></td></tr>
+<tr><td>SQL tab: scan reads all files and all columns</td><td>No pushdown (filter after a UDF, or wrong partition column)</td><td>Filter on partition columns; select columns early</td></tr>
+<tr><td>Same scan appears in two jobs</td><td>Recomputation without cache</td><td><code>cache()</code> or write an intermediate Parquet</td></tr>
+<tr><td>Executors tab shows lost executors</td><td>Out-of-memory kills</td><td>Smaller partitions; avoid <code>collect()</code>; fix skew</td></tr>
+</tbody></table></div>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Debug Spark in this order: (1) <code>explain()</code> to see the plan; (2) the SQL tab to see where the rows are; (3) the slow stage's task summary for skew and spill; (4) only then change configuration. Most "tuning" is really fixing the data layout or the join order.</div></div>
+
+<h2 id="s8-22-8-how-to-choose">22.8 How to choose</h2>
+<p>Start with the size of the data and the size of your machine, then ask what you already know. The flow chart below encodes the order of questions. Follow it from the top; stop at the first tool that answers yes.</p>
+<figure><img src="images/lib22_flow.png" alt="Flow chart: fits in RAM leads to pandas; otherwise fits on one disk leads to DuckDB for SQL or Polars lazy for code; otherwise Spark if a platform exists, else Dask." loading="lazy"/><figcaption>Figure 22.9. Decision flow for choosing a data library.</figcaption></figure>
+<p><strong>How to read it:</strong> blue boxes are questions, green boxes are single-machine answers, orange boxes are multi-machine answers. Notice how many paths end on one machine: a modern laptop or a single big cloud machine with DuckDB or Polars handles data far beyond what people expect, and avoids the cost of a cluster. Go right and down only when the data truly cannot be handled by one machine, or when the platform (data lake, scheduler, security) is already built on Spark.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Situation</th><th>Pick</th><th>Why</th></tr></thead><tbody>
+<tr><td>2 GB CSV, analysis in a notebook, 16 GB laptop</td><td>pandas with <code>usecols</code>, dtypes</td><td>No new tool needed</td></tr>
+<tr><td>30 GB of Parquet, SQL-literate team, one workstation</td><td>DuckDB</td><td>Reads Parquet directly, spills to disk</td></tr>
+<tr><td>30 GB, Python method chains, repeated transformations</td><td>Polars lazy</td><td>Optimizer, expressions, streaming</td></tr>
+<tr><td>Existing 5,000 lines of pandas that must scale somewhat</td><td>Dask DataFrame</td><td>Same API, partitions</td></tr>
+<tr><td>2 TB of logs in a data lake, nightly jobs, shared cluster</td><td>PySpark</td><td>Distributed shuffle, ecosystem, schedulers</td></tr>
+<tr><td>Streaming ingestion with exactly-once guarantees</td><td>Spark Structured Streaming or a stream processor</td><td>Beyond this chapter</td></tr>
+</tbody></table></div>
+<p>A quick way to know which row you are in: estimate the in-memory size from a sample before you load anything. The block builds a 200,000-row CSV, reads only the first 20,000 rows, and extrapolates.</p>
+<pre class="code lang-python"><code>import os, tempfile
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(3)
+n = 200_000
+df = pd.DataFrame({
+    "order_id": np.arange(n),
+    "region": rng.choice(["EU", "US", "APAC", "LATAM", "MEA"], n),
+    "qty": rng.integers(1, 20, n),
+    "price": rng.normal(50, 15, n).round(2),
+})
+path = os.path.join(tempfile.mkdtemp(), "o.csv")
+df.to_csv(path, index=False)
+
+total_rows = sum(1 for _ in open(path)) - 1
+sample = pd.read_csv(path, nrows=20_000)
+per_row = sample.memory_usage(deep=True, index=False).sum() / len(sample)
+estimate = per_row * total_rows
+actual = pd.read_csv(path).memory_usage(deep=True, index=False).sum()
+print("rows:", total_rows)
+print("estimate within 5% of actual:", abs(estimate - actual) / actual &lt; 0.05)
+print("in-memory is larger than the file:", actual &gt; os.path.getsize(path))</code></pre>
+<pre class="code lang-text"><code>rows: 200000
+estimate within 5% of actual: True
+in-memory is larger than the file: True</code></pre>
+<ol>
+<li>Counting lines is a cheap streaming pass over the file (no parsing), giving the row count.</li>
+<li>Reading the first 20,000 rows and measuring <code>memory_usage(deep=True)</code> gives bytes per row at the dtypes pandas would choose.</li>
+<li>Multiplying by the row count estimates the full size. The estimate is good when the sample is representative: if the file is sorted so that long strings appear only at the end, the sample under-estimates.</li>
+<li>For this table the in-memory size exceeds the CSV file size, mostly because strings are bulky as Python objects. A common surprise: a 10 GB CSV can need 20 GB or more of RAM in pandas, plus working memory for every operation.</li>
+</ol>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">In interviews and design reviews, defend the choice with numbers: data size, growth rate, how many people run the job, how often, and the cost of the platform. "We used Spark because it is big data" is a weak answer. "Our largest table is 40 GB, DuckDB on one 64 GB machine finished in 3 minutes, so we skipped the cluster" is a strong one.</div></div>
+
+<h2 id="s9-22-9-recipes-how-do-i">22.9 Recipes: How do I ...?</h2>
+<p>Every recipe below follows the same shape: the task, a runnable pandas or standard-library solution with a check, and the equivalent in the big libraries where it differs. All files are generated in temporary folders.</p>
+
+<h3>How do I process a 10 GB CSV in chunks?</h3>
+<p>Stream the file, clean each chunk, update small running totals, and never hold more than one chunk. This block makes a dirty 300,000-row file (lowercase region names, missing prices, negative quantities) and aggregates it in 50,000-row chunks.</p>
+<pre class="code lang-python"><code>import os, tempfile
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(11)
+n = 300_000
+raw = pd.DataFrame({
+    "region": rng.choice(["eu", "US", " apac", "EU"], n),
+    "qty": rng.integers(-2, 10, n),
+    "price": np.where(rng.random(n) &lt; 0.05, np.nan, rng.normal(40, 10, n).round(2)),
+})
+path = os.path.join(tempfile.mkdtemp(), "dirty.csv")
+raw.to_csv(path, index=False)
+
+revenue, kept, dropped = {}, 0, 0
+for chunk in pd.read_csv(path, chunksize=50_000):
+    chunk["region"] = chunk["region"].str.strip().str.upper()
+    ok = chunk["qty"].gt(0) &amp; chunk["price"].notna()
+    dropped += int((~ok).sum())
+    good = chunk[ok]
+    kept += len(good)
+    for region, value in (good["qty"] * good["price"]).groupby(good["region"]).sum().items():
+        revenue[region] = revenue.get(region, 0.0) + value
+
+print("kept", kept, "dropped", dropped, "total", kept + dropped)
+print({k: round(v) for k, v in sorted(revenue.items())})
+
+whole = raw.assign(region=raw.region.str.strip().str.upper())
+whole = whole[whole.qty.gt(0) &amp; whole.price.notna()]
+check = (whole.qty * whole.price).groupby(whole.region).sum()
+print("matches one-shot pandas:", all(abs(check[k] - revenue[k]) &lt; 1e-6 * check[k] for k in check.index))</code></pre>
+<pre class="code lang-text"><code>kept 213790 dropped 86210 total 300000
+{'APAC': 10740859, 'EU': 21399204, 'US': 10654963}
+matches one-shot pandas: True</code></pre>
+<ol>
+<li>The generator plants three kinds of dirt: inconsistent region spellings, missing prices (about 5 percent) and non-positive quantities.</li>
+<li>For each chunk, <code>str.strip().str.upper()</code> normalizes the region, then a boolean mask keeps only valid rows. Counting the dropped rows is part of any honest pipeline: you must report how many rows you discarded.</li>
+<li>The running totals live in a plain dictionary: small, and independent of file size.</li>
+<li>The last block recomputes everything in one shot on the in-memory frame and compares. Chunked and one-shot agree to floating-point accuracy.</li>
+<li>In Polars the equivalent is a lazy scan with the same filters and a <code>group_by</code>, and the engine does the chunking for you: <code>pl.scan_csv(p).filter((pl.col("qty") &gt; 0) &amp; pl.col("price").is_not_null()).group_by(pl.col("region").str.strip_chars().str.to_uppercase()).agg((pl.col("qty") * pl.col("price")).sum()).collect(engine="streaming")</code> (not run here).</li>
+</ol>
+
+<h3>How do I dedupe at scale?</h3>
+<p>A hash set of all keys may not fit in memory. Use the shuffle idea: write rows into B bucket files by hash of the key, so every copy of the same key lands in the same bucket; then dedupe each bucket on its own, which fits in memory.</p>
+<pre class="code lang-python"><code>import os, tempfile
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(21)
+n = 200_000
+df = pd.DataFrame({
+    "order_id": rng.integers(0, 120_000, n),          # many repeated ids
+    "ts": np.arange(n),                                # later row = newer version
+    "status": rng.choice(["new", "paid", "shipped"], n),
+})
+d = tempfile.mkdtemp()
+src = os.path.join(d, "orders.csv")
+df.to_csv(src, index=False)
+
+B = 8
+for chunk in pd.read_csv(src, chunksize=40_000):                       # pass 1: scatter
+    bucket = pd.util.hash_pandas_object(chunk["order_id"], index=False) % B
+    for b, part in chunk.groupby(bucket):
+        part.to_csv(os.path.join(d, f"bucket{b}.csv"), mode="a", header=not os.path.exists(os.path.join(d, f"bucket{b}.csv")), index=False)
+
+kept = []
+for b in range(B):                                                      # pass 2: dedupe each bucket
+    part = pd.read_csv(os.path.join(d, f"bucket{b}.csv"))
+    kept.append(part.sort_values("ts").drop_duplicates("order_id", keep="last"))
+result = pd.concat(kept)
+
+truth = df.sort_values("ts").drop_duplicates("order_id", keep="last")
+print("rows in:", n, "unique ids:", len(result), "expected:", len(truth))
+print("same rows:", result.sort_values("order_id").reset_index(drop=True).equals(truth.sort_values("order_id").reset_index(drop=True)))
+print("largest bucket rows:", max(len(k) for k in kept) &lt; n / 2)</code></pre>
+<pre class="code lang-text"><code>rows in: 200000 unique ids: 97410 expected: 97410
+same rows: True
+largest bucket rows: True</code></pre>
+<ol>
+<li>The data has 200,000 rows but only about 97,000 distinct ids, each possibly repeated with different timestamps. We keep the newest row per id.</li>
+<li>Pass 1 reads chunks and appends each row to <code>bucketK.csv</code>, where K is the stable hash of the id modulo 8. The header is written only when the bucket file is first created.</li>
+<li>Pass 2 loads one bucket at a time. All copies of an id are in the same bucket, so sorting by <code>ts</code> and <code>drop_duplicates(keep="last")</code> gives the right answer locally.</li>
+<li>The result equals a global dedupe on the in-memory table. Memory use is one bucket, which you control by raising B.</li>
+<li>This is exactly what Spark's <code>dropDuplicates</code> does (shuffle by key, dedupe within partitions). For "keep the latest", use a window: <code>row_number() over (partition by order_id order by ts desc)</code> and keep 1, in Spark, DuckDB (<code>QUALIFY</code>) or Polars (<code>df.sort("ts").unique(subset="order_id", keep="last")</code>).</li>
+</ol>
+
+<h3>How do I aggregate incrementally as new files arrive?</h3>
+<p>Keep a small state (sums and counts, never means) and a list of processed files. Each run adds only the new files, and a rerun does nothing.</p>
+<pre class="code lang-python"><code>import json, os, tempfile
+import numpy as np
+import pandas as pd
+
+d = tempfile.mkdtemp()
+state_path = os.path.join(d, "state.json")
+rng = np.random.default_rng(8)
+for day in (1, 2):
+    pd.DataFrame({"region": rng.choice(["EU", "US"], 1000), "amount": rng.integers(1, 100, 1000)}).to_csv(os.path.join(d, f"day{day}.csv"), index=False)
+
+def update(folder):
+    state = json.load(open(state_path)) if os.path.exists(state_path) else {"files": [], "sum": {}, "count": {}}
+    for name in sorted(f for f in os.listdir(folder) if f.startswith("day")):
+        if name in state["files"]:
+            continue                                          # already processed: idempotent
+        part = pd.read_csv(os.path.join(folder, name)).groupby("region")["amount"].agg(["sum", "count"])
+        for region, row in part.iterrows():
+            state["sum"][region] = state["sum"].get(region, 0) + int(row["sum"])
+            state["count"][region] = state["count"].get(region, 0) + int(row["count"])
+        state["files"].append(name)
+    json.dump(state, open(state_path, "w"))
+    return state
+
+s1 = update(d)
+print("after run 1:", s1["files"], s1["count"])
+s2 = update(d)
+print("after rerun:", s2["files"], s2["count"] == s1["count"])
+pd.DataFrame({"region": rng.choice(["EU", "US"], 500), "amount": rng.integers(1, 100, 500)}).to_csv(os.path.join(d, "day3.csv"), index=False)
+s3 = update(d)
+print("after day 3:", s3["files"], sum(s3["count"].values()))
+print("mean EU:", round(s3["sum"]["EU"] / s3["count"]["EU"], 2))</code></pre>
+<pre class="code lang-text"><code>after run 1: ['day1.csv', 'day2.csv'] {'EU': 1010, 'US': 990}
+after rerun: ['day1.csv', 'day2.csv'] True
+after day 3: ['day1.csv', 'day2.csv', 'day3.csv'] 2500
+mean EU: 49.49</code></pre>
+<ol>
+<li>The state holds, per region, the running sum and count, so the mean can be computed at any time without the raw data.</li>
+<li>Processed file names are stored in the state. Each run skips any file already in the list, which makes the job <strong>idempotent</strong>: running it twice changes nothing. This matters when a scheduler retries a failed night.</li>
+<li>Run 1 processes two files with 1,000 rows each. The rerun reads nothing new and the counts are identical (<code>True</code>).</li>
+<li>When day 3 arrives, only that file is read, and the total count becomes 2,500.</li>
+<li>In Spark or Delta-style systems the same pattern is called an incremental load, with a checkpoint or watermark in place of the JSON file. Write the state and the outputs atomically (write a temporary file and rename) so a crash cannot leave half an update.</li>
+</ol>
+
+<h3>How do I join a big table with a small one?</h3>
+<p>Load the small table into memory and look up values chunk by chunk. This is a <strong>broadcast join</strong>: the small side is copied to wherever the big side is processed, so the big side never moves. The block checks the answer with a real SQL join in <code>sqlite3</code>.</p>
+<pre class="code lang-python"><code>import io, os, sqlite3, tempfile
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(4)
+n = 200_000
+big = pd.DataFrame({"customer_id": rng.integers(0, 1_000, n), "amount": rng.integers(1, 100, n)})
+small = pd.DataFrame({"customer_id": np.arange(0, 900), "tier": rng.choice(["gold", "silver", "bronze"], 900)})   # 100 customers unknown
+path = os.path.join(tempfile.mkdtemp(), "big.csv")
+big.to_csv(path, index=False)
+
+lookup = small.set_index("customer_id")["tier"]
+totals, unmatched = {}, 0
+for chunk in pd.read_csv(path, chunksize=50_000):
+    tier = chunk["customer_id"].map(lookup)                    # hash lookup, no shuffle
+    unmatched += int(tier.isna().sum())
+    for t, v in chunk["amount"].groupby(tier.fillna("unknown")).sum().items():
+        totals[t] = totals.get(t, 0) + int(v)
+print(dict(sorted(totals.items())), "unmatched rows:", unmatched)
+
+con = sqlite3.connect(":memory:")
+big.to_sql("big", con, index=False); small.to_sql("small", con, index=False)
+rows = con.execute("""SELECT COALESCE(s.tier, 'unknown') AS tier, SUM(b.amount)
+                      FROM big b LEFT JOIN small s ON s.customer_id = b.customer_id
+                      GROUP BY 1 ORDER BY 1""").fetchall()
+print("sqlite3 agrees:", dict(rows) == totals)</code></pre>
+<pre class="code lang-text"><code>{'bronze': 2996573, 'gold': 3034570, 'silver': 2974233, 'unknown': 1011012} unmatched rows: 20123
+sqlite3 agrees: True</code></pre>
+<ol>
+<li>The big table has customers 0 to 999 but the small table knows only 0 to 899, so about a tenth of the rows will not match. This is deliberate: real joins always have unmatched keys.</li>
+<li><code>small.set_index(...)["tier"]</code> is a Series that acts as a dictionary. <code>chunk["customer_id"].map(lookup)</code> gives the tier for each row, NaN where unknown.</li>
+<li>The unmatched rows are counted and grouped as <code>unknown</code>. A left join keeps them; an inner join would silently drop about 10 percent of the data. Always check the unmatched count after a join.</li>
+<li>The SQL <code>LEFT JOIN</code> in sqlite3 gives identical totals per tier.</li>
+<li>Spark: <code>big.join(F.broadcast(small), "customer_id", "left")</code>. Polars: <code>big_lf.join(small_lf, on="customer_id", how="left")</code> (the small side is held in memory). DuckDB: the same SQL, and its hash join builds the table on the smaller side.</li>
+</ol>
+
+<h3>How do I write a partitioned dataset from a stream of chunks?</h3>
+<p>Append each chunk's rows into the right partition folder as you go, so the whole dataset never sits in memory. The block uses CSV files because Parquet is unavailable; the layout logic is identical to Parquet.</p>
+<pre class="code lang-python"><code>import os, tempfile
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(6)
+n = 120_000
+src = os.path.join(tempfile.mkdtemp(), "events.csv")
+pd.DataFrame({
+    "ts": pd.to_datetime("2025-01-01") + pd.to_timedelta(rng.integers(0, 90, n), unit="D"),
+    "country": rng.choice(["DE", "FR", "US"], n),
+    "value": rng.integers(1, 1000, n),
+}).to_csv(src, index=False)
+
+root = Path(tempfile.mkdtemp()) / "events"
+rows_written = 0
+for chunk in pd.read_csv(src, chunksize=30_000, parse_dates=["ts"]):
+    chunk["month"] = chunk["ts"].dt.strftime("%Y-%m")
+    for (month, country), part in chunk.groupby(["month", "country"]):
+        folder = root / f"month={month}" / f"country={country}"
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / "part-0.csv"
+        part[["ts", "value"]].to_csv(target, mode="a", header=not target.exists(), index=False)
+        rows_written += len(part)
+
+files = sorted(root.rglob("*.csv"))
+print("folders:", len({p.parent for p in files}), "rows written:", rows_written == n)
+print(files[0].relative_to(root))
+only = pd.read_csv(root / "month=2025-02" / "country=DE" / "part-0.csv")
+print("one partition rows:", len(only), "of", n)</code></pre>
+<pre class="code lang-text"><code>folders: 9 rows written: True
+month=2025-01/country=DE/part-0.csv
+one partition rows: 12355 of 120000</code></pre>
+<ol>
+<li>Dates are spread over 90 days from 1 January, so months 2025-01, 2025-02 and 2025-03 appear; there are 3 countries, so 9 folders.</li>
+<li>Each chunk is split by (month, country). The target file is opened in append mode and the header is written only when the file does not exist yet.</li>
+<li>Only <code>ts</code> and <code>value</code> are written inside the files, since month and country are in the folder names.</li>
+<li>The counters prove that no row was lost. Reading a single partition touches about a tenth of the rows.</li>
+<li>Parquet equivalent (not run): in PyArrow use <code>pq.write_to_dataset(table, root, partition_cols=["month", "country"])</code> for each chunk, or in one statement in DuckDB: <code>COPY (SELECT *, strftime(ts, '%Y-%m') AS month FROM 'events.csv') TO 'events' (FORMAT PARQUET, PARTITION_BY (month, country))</code>. Spark: <code>df.write.partitionBy("month", "country").parquet("events")</code>.</li>
+<li>Watch out for the small-files problem: appending every chunk as a new Parquet file makes thousands of files. Prefer one big conversion job, or compact files afterwards.</li>
+</ol>
+
+<h3>More "How do I ...?" one-liners (not run here)</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>How do I ...?</th><th>Polars</th><th>DuckDB SQL</th><th>PySpark</th></tr></thead><tbody>
+<tr><td>Convert CSV to Parquet</td><td><code>pl.scan_csv(p).sink_parquet(q)</code></td><td><code>COPY (SELECT * FROM 'p.csv') TO 'q.parquet' (FORMAT PARQUET)</code></td><td><code>spark.read.csv(p, header=True).write.parquet(q)</code></td></tr>
+<tr><td>Read many files at once</td><td><code>pl.scan_parquet("d/*.parquet")</code></td><td><code>FROM read_parquet('d/*.parquet')</code></td><td><code>spark.read.parquet("d/")</code></td></tr>
+<tr><td>Top 3 per group</td><td><code>df.sort("v", descending=True).group_by("g").head(3)</code></td><td><code>QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v DESC) &lt;= 3</code></td><td><code>filter(F.row_number().over(w) &lt;= 3)</code> on a withColumn</td></tr>
+<tr><td>Latest record per key</td><td><code>df.sort("ts").unique("k", keep="last")</code></td><td><code>SELECT k, arg_max(status, ts) FROM t GROUP BY k</code></td><td>window <code>row_number</code> ordered by <code>ts</code> desc, keep 1</td></tr>
+<tr><td>Count distinct, approximately</td><td><code>pl.col("u").approx_n_unique()</code></td><td><code>approx_count_distinct(u)</code></td><td><code>F.approx_count_distinct("u")</code></td></tr>
+<tr><td>Take a 1 percent sample</td><td><code>df.sample(fraction=0.01, seed=0)</code></td><td><code>SELECT * FROM t USING SAMPLE 1%</code></td><td><code>df.sample(fraction=0.01, seed=0)</code></td></tr>
+<tr><td>Median per group</td><td><code>pl.col("v").median()</code> in <code>agg</code></td><td><code>quantile_cont(v, 0.5)</code></td><td><code>F.percentile_approx("v", 0.5)</code></td></tr>
+<tr><td>Rolling 7-day sum</td><td><code>pl.col("v").rolling_sum_by("ts", window_size="7d")</code></td><td><code>SUM(v) OVER (ORDER BY ts RANGE BETWEEN INTERVAL 6 DAYS PRECEDING AND CURRENT ROW)</code></td><td>window with <code>rangeBetween</code> on a numeric time column</td></tr>
+<tr><td>Find rows with no match</td><td><code>a.join(b, on="k", how="anti")</code></td><td><code>a ANTI JOIN b USING (k)</code></td><td><code>a.join(b, "k", "left_anti")</code></td></tr>
+<tr><td>Peek at the schema cheaply</td><td><code>pl.scan_csv(p).collect_schema()</code></td><td><code>DESCRIBE SELECT * FROM 'p.csv'</code></td><td><code>spark.read.csv(p, header=True).printSchema()</code></td></tr>
+</tbody></table></div>
+<p>Count so far: five fully worked runnable recipes and ten more one-liners, fifteen "How do I" tasks in total.</p>
+
+<h2 id="s10-22-10-performance-and-pitfalls">22.10 Performance and pitfalls</h2>
+<p>These are the mistakes that cost the most hours. Each box gives the wrong code, the symptom you will see, and the fix.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE 1: loading everything first</div><div class="txt"><strong>Wrong:</strong> <code>df = pd.read_csv("events.csv")</code> for a file larger than a third of RAM. <strong>Symptom:</strong> frozen notebook, swapping, or a killed kernel with no traceback. <strong>Fix:</strong> measure first (Section 22.8), then <code>usecols</code> and <code>dtype</code>, or <code>chunksize</code>, or <code>pl.scan_csv</code> / DuckDB on the file.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 2: row-by-row Python</div><div class="txt"><strong>Wrong:</strong> <code>df.apply(f, axis=1)</code>, <code>df.iterrows()</code>, or a Spark <code>F.udf</code> for arithmetic. <strong>Symptom:</strong> a step that takes minutes on 200,000 rows (we measured about 100 times slower than the vectorized form). <strong>Fix:</strong> column expressions, <code>map</code> with a dictionary, <code>np.where</code>, Polars expressions, Spark built-ins, then <code>pandas_udf</code>.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 3: pulling big results to the driver</div><div class="txt"><strong>Wrong:</strong> <code>sdf.toPandas()</code>, <code>sdf.collect()</code> or <code>ddf.compute()</code> on a result as big as the input. <strong>Symptom:</strong> driver out-of-memory error after the cluster finished all the work. <strong>Fix:</strong> aggregate or <code>limit</code> first, or write to Parquet and read the part you need.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 4: averaging averages</div><div class="txt"><strong>Wrong:</strong> combining per-partition means with an unweighted mean. <strong>Symptom:</strong> totals do not match the single-machine answer (we showed it in Section 22.6). <strong>Fix:</strong> keep sum and count per partition and divide at the end; for medians use an approximate quantile and say so.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 5: a million tiny files</div><div class="txt"><strong>Wrong:</strong> <code>df.write.partitionBy("customer_id").parquet(...)</code>, or writing a file per chunk or per minute. <strong>Symptom:</strong> a listing that takes minutes, thousands of 5 ms tasks, slow reads. <strong>Fix:</strong> partition by low-cardinality columns (date, country), then compact to files of about 100 MB to 1 GB.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 6: default shuffle partitions</div><div class="txt"><strong>Wrong:</strong> leaving <code>spark.sql.shuffle.partitions</code> at 200 for a 50 MB job or for a 5 TB job. <strong>Symptom:</strong> 200 near-empty tasks, or 200 giant tasks that spill to disk. <strong>Fix:</strong> aim for partitions of 100 to 200 MB after the shuffle; check the Stages page; let AQE coalesce small ones.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 7: ignoring skew</div><div class="txt"><strong>Wrong:</strong> joining on a key where 20 percent of rows are <code>NULL</code> or one bot id. <strong>Symptom:</strong> 199 tasks finish in seconds, one runs for an hour, executors idle. <strong>Fix:</strong> filter or isolate the hot keys, enable AQE skew join, or salt (Section 22.7).</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 8: caching blindly, or never</div><div class="txt"><strong>Wrong:</strong> <code>df.cache()</code> on everything, or calling three actions on an expensive plan with no cache. <strong>Symptom:</strong> executors fill with cached data and evict useful blocks; or the same scan appears three times in the Jobs tab. <strong>Fix:</strong> cache only DataFrames reused by several actions, trigger them with one action, <code>unpersist()</code> after; or write a checkpoint Parquet file.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 9: unstable hashing</div><div class="txt"><strong>Wrong:</strong> routing rows to buckets with Python's built-in <code>hash(key)</code> for strings. <strong>Symptom:</strong> the same key lands in different buckets in different processes or runs; duplicates survive dedupe, joins miss matches. <strong>Fix:</strong> a stable hash such as <code>pd.util.hash_pandas_object</code>, <code>hashlib</code> or the engine's own partitioner.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 10: schema drift and guessed types</div><div class="txt"><strong>Wrong:</strong> <code>inferSchema=True</code> on a huge CSV, or appending a file where <code>id</code> is a string to a folder where it is an integer. <strong>Symptom:</strong> an extra full pass, ids turning into floats like <code>1.0e7</code>, or "cannot merge incompatible data types" at read time. <strong>Fix:</strong> an explicit schema, ids as strings, types written into Parquet, and a schema check at ingestion.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 11: null keys and silent row loss</div><div class="txt"><strong>Wrong:</strong> an inner join where one side has missing keys, or <code>NaN</code> treated like <code>null</code>. <strong>Symptom:</strong> row counts drop without an error, or <code>NULL = NULL</code> never matches. <strong>Fix:</strong> count rows before and after every join, use <code>left</code> joins when you must keep all rows, report unmatched keys, and learn your library's null rules (in Polars <code>NaN</code> and <code>null</code> are different).</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 12: a global sort you did not need</div><div class="txt"><strong>Wrong:</strong> <code>df.orderBy("ts")</code> or <code>ddf.set_index("ts")</code> in the middle of a pipeline. <strong>Symptom:</strong> an extra full shuffle and a stage that dominates the run. <strong>Fix:</strong> sort only for final output or for window functions that need it; use <code>sortWithinPartitions</code>, or sort when writing.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 13: trusting float sums across engines</div><div class="txt"><strong>Wrong:</strong> asserting <code>spark_total == pandas_total</code> on floats. <strong>Symptom:</strong> the check fails by 1e-9, or flips between runs, because partitions add in a different order. <strong>Fix:</strong> compare with a tolerance (<code>np.isclose</code>) or sum integer cents.</div></div>
+<h3>Quick performance checklist</h3>
+<ol>
+<li>Read only needed columns; filter as early as possible; prefer Parquet over CSV.</li>
+<li>Use the smallest dtypes that are safe; categories for repeated strings.</li>
+<li>Prefer built-in column operations to Python functions.</li>
+<li>Reduce data before a join (filter, select, pre-aggregate); broadcast small tables.</li>
+<li>Count shuffles in the plan; remove the ones you can.</li>
+<li>Check for skew and for tiny or giant partitions before touching configuration.</li>
+<li>Time one stage at a time on a sample, then scale up and measure again; trust measurements over folklore.</li>
+</ol>
+
+<h2 id="s11-22-11-cross-library-integration">22.11 Cross-library integration</h2>
+<p>You will often mix tools: aggregate in DuckDB or Spark, then finish in pandas, then plot or model. The rule is to move <em>small</em> things between libraries and leave big things on disk as Parquet.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>From to</th><th>How (not run here)</th><th>Cost</th></tr></thead><tbody>
+<tr><td>pandas to Polars</td><td><code>pl.from_pandas(df)</code></td><td>Needs pyarrow; copies unless dtypes map directly</td></tr>
+<tr><td>Polars to pandas</td><td><code>lf.collect().to_pandas()</code></td><td>Needs pyarrow; the whole result must fit in RAM</td></tr>
+<tr><td>pandas to DuckDB</td><td><code>duckdb.sql("SELECT ... FROM df")</code></td><td>Reads the DataFrame in place, no copy of the data into a database</td></tr>
+<tr><td>DuckDB to pandas / Polars / Arrow</td><td><code>.df()</code>, <code>.pl()</code>, <code>.arrow()</code> (accessor name varies by version)</td><td>Cost proportional to the result size</td></tr>
+<tr><td>Dask to pandas</td><td><code>ddf.compute()</code></td><td>The result becomes one pandas object</td></tr>
+<tr><td>pandas to Dask</td><td><code>dd.from_pandas(df, npartitions=8)</code></td><td>Splits in memory</td></tr>
+<tr><td>Spark to pandas</td><td><code>sdf.toPandas()</code> after <code>spark.conf.set("spark.sql.execution.arrow.pyspark.enabled", "true")</code></td><td>Collects to the driver; faster with Arrow</td></tr>
+<tr><td>pandas to Spark</td><td><code>spark.createDataFrame(df)</code></td><td>Serializes through the driver: for small data</td></tr>
+<tr><td>Anything to anything, big data</td><td>Write Parquet, read Parquet</td><td>Zero shared memory, no size limit, fully reproducible</td></tr>
+<tr><td>Spark with the pandas API</td><td><code>sdf.pandas_api()</code> (module <code>pyspark.pandas</code>)</td><td>Familiar syntax; some operations are shuffles in disguise</td></tr>
+</tbody></table></div>
+<p>The scikit-learn side matters too. Most models need all training rows in memory, so you either aggregate or sample before training, or use an estimator with <code>partial_fit</code> that learns from one chunk at a time. The block trains a linear model on 200,000 rows in 20,000-row chunks and compares it with a full fit.</p>
+<pre class="code lang-python"><code>import numpy as np
+from sklearn.linear_model import LinearRegression, SGDRegressor
+from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(0)
+n = 200_000
+X = rng.normal(size=(n, 3))
+y = X @ np.array([3.0, -2.0, 0.5]) + 10 + rng.normal(0, 1, n)
+
+full = LinearRegression().fit(X, y)
+
+scaler = StandardScaler().fit(X[:20_000])                 # in practice: fit the scaler on one chunk or a sample
+model = SGDRegressor(learning_rate="constant", eta0=0.001, random_state=0)
+for epoch in range(3):
+    for start in range(0, n, 20_000):
+        sl = slice(start, start + 20_000)
+        model.partial_fit(scaler.transform(X[sl]), y[sl])
+
+pred_full = full.predict(X[:2000])
+pred_sgd = model.predict(scaler.transform(X[:2000]))
+print("full coefficients:", np.round(full.coef_, 2))
+print("streamed predictions close to full fit:", bool(np.abs(pred_full - pred_sgd).max() &lt; 0.3))</code></pre>
+<pre class="code lang-text"><code>full coefficients: [ 3.  -2.   0.5]
+streamed predictions close to full fit: True</code></pre>
+<ol>
+<li>The synthetic data has known coefficients 3, -2 and 0.5 and intercept 10, plus noise.</li>
+<li><code>LinearRegression().fit(X, y)</code> needs the whole matrix at once; this is the reference answer. It recovers the true coefficients to two decimals.</li>
+<li>The scaler is fitted on the first chunk only, which is what you do when the whole data cannot be scanned twice. Scaling matters because SGD is sensitive to feature scale.</li>
+<li><code>partial_fit</code> updates the model with one chunk and remembers its state. Three passes (epochs) over the chunks let it converge.</li>
+<li>The streamed model's predictions agree with the exact fit to within 0.3 on the first 2,000 rows, close but not identical: SGD is approximate. Other estimators with <code>partial_fit</code> include <code>MiniBatchKMeans</code>, <code>SGDClassifier</code>, <code>MultinomialNB</code> and <code>IncrementalPCA</code>.</li>
+</ol>
+<ul>
+<li><strong>Plotting:</strong> never send 100 million points to matplotlib. Aggregate to bins or a few thousand points (a group-by or a histogram in the engine), then plot.</li>
+<li><strong>SQL and pandas:</strong> <code>pd.read_sql(q, con, chunksize=50_000)</code> streams a database result; for real warehouses push the aggregation into SQL.</li>
+<li><strong>joblib and multiprocessing:</strong> for embarrassingly parallel work on a few big files (one file per worker), a <code>joblib.Parallel</code> over files is often enough before you need Dask.</li>
+</ul>
+
+<h2 id="s12-22-12-how-to-solve-any-big-data-and-fast-dataframe-problem-the-playboo">22.12 How to solve any big-data and fast-dataframe problem: the playbook</h2>
+<h3>Step 0: the questions to ask in order</h3>
+<ol>
+<li><strong>How big, really?</strong> Rows, columns, bytes on disk, estimated bytes in memory (Section 22.8).</li>
+<li><strong>What is the answer's size?</strong> A report with 50 rows from 5 billion rows is an aggregation problem; a full-size output is a transformation problem and needs a writable sink.</li>
+<li><strong>Which operation is expensive?</strong> Narrow steps are cheap. Joins, group-bys, distincts and sorts are the costs.</li>
+<li><strong>Who else uses it, and how often?</strong> A one-off analysis tolerates minutes; a nightly job needs idempotence and monitoring.</li>
+<li><strong>How will I know it is right?</strong> Decide the check before you scale up.</li>
+</ol>
+<h3>Eight recurring problem patterns</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>#</th><th>Pattern and symptom</th><th>Fix</th><th>Solved example</th></tr></thead><tbody>
+<tr><td>1</td><td>Does not fit in RAM; kernel dies on load</td><td>Read less, smaller dtypes, chunks, or a lazy engine</td><td>Problem 22.2.1 and 22.2.2: 84 MB to 12 MB; peak memory set by the chunk size</td></tr>
+<tr><td>2</td><td>Big group-by or counts</td><td>Partial aggregates (sum, count), then combine</td><td>Section 22.6, sum/count versus mean of means; recipe "incremental aggregation"</td></tr>
+<tr><td>3</td><td>Big table joined to a small one</td><td>Broadcast: look up in memory, no shuffle</td><td>Recipe "join a big table with a small one": <code>map</code> + SQL check</td></tr>
+<tr><td>4</td><td>Big table joined to a big table, or dedupe at scale</td><td>Hash-partition both sides on the key, join or dedupe each bucket</td><td>Section 22.6 shuffle join; recipe "dedupe at scale"</td></tr>
+<tr><td>5</td><td>One task or one partition far slower than the rest</td><td>Isolate or filter hot keys; AQE; salting</td><td>Section 22.7: max/mean 1.98 to 1.29, same sums</td></tr>
+<tr><td>6</td><td>The same expensive result is recomputed</td><td><code>cache</code>/<code>persist</code>, or write an intermediate Parquet checkpoint</td><td>Section 22.7 broadcast + cache example</td></tr>
+<tr><td>7</td><td>A step is slow although the cluster is idle</td><td>Replace Python UDFs and row loops with column expressions</td><td>Section 22.7: about 100 times in the pandas analogue</td></tr>
+<tr><td>8</td><td>Slow listing, thousands of tiny tasks, slow reads</td><td>Partition by low-cardinality columns; compact files; Parquet instead of CSV</td><td>Problems 22.3.1 and 22.3.2; recipe "partitioned dataset from chunks"</td></tr>
+</tbody></table></div>
+<h3>How to verify a result</h3>
+<p>Never ship a scaled-up pipeline without comparing it with a trusted slow version on a sample. Check row counts, key uniqueness, null counts, and totals (with a tolerance for floats). The helper below does that, and the demo shows it catching a planted bug (an inner join that silently drops rows).</p>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+def compare(trusted, candidate, keys, value_cols):
+    """Return a list of human-readable differences (empty list means they agree)."""
+    problems = []
+    if len(trusted) != len(candidate):
+        problems.append(f"row count {len(trusted)} vs {len(candidate)}")
+    if candidate.duplicated(keys).any():
+        problems.append("duplicate keys in candidate")
+    merged = trusted.merge(candidate, on=keys, how="outer", suffixes=("_t", "_c"), indicator=True)
+    only = merged["_merge"].value_counts()
+    if only.get("left_only", 0) or only.get("right_only", 0):
+        problems.append(f"keys only in trusted: {only.get('left_only', 0)}, only in candidate: {only.get('right_only', 0)}")
+    both = merged[merged["_merge"] == "both"]
+    for c in value_cols:
+        if not np.allclose(both[c + "_t"], both[c + "_c"]):
+            problems.append(f"values differ in {c}")
+    return problems
+
+orders = pd.DataFrame({"cid": [1, 2, 3, 4], "amount": [10.0, 20.0, 30.0, 40.0]})
+tiers = pd.DataFrame({"cid": [1, 2, 3], "tier": ["g", "s", "g"]})           # customer 4 unknown
+trusted = orders.merge(tiers, on="cid", how="left").groupby("cid", as_index=False)["amount"].sum()
+buggy = orders.merge(tiers, on="cid", how="inner").groupby("cid", as_index=False)["amount"].sum()
+print("good:", compare(trusted, trusted.copy(), ["cid"], ["amount"]))
+print("bug :", compare(trusted, buggy, ["cid"], ["amount"]))</code></pre>
+<pre class="code lang-text"><code>good: []
+bug : ['row count 4 vs 3', 'keys only in trusted: 1, only in candidate: 0']</code></pre>
+<ol>
+<li><code>compare</code> checks four things in turn: row counts, duplicate keys, keys present on only one side, and values on the shared keys using <code>np.allclose</code>.</li>
+<li>The outer merge with <code>indicator=True</code> adds a <code>_merge</code> column saying whether each key is left-only, right-only or in both. It is the quickest way to see which keys went missing.</li>
+<li>The trusted version uses a left join and keeps customer 4. The buggy version uses an inner join and drops the unknown customer, so the totals lose 40 and a row.</li>
+<li>The good comparison prints an empty list. The buggy one reports the row-count mismatch and the key that exists only in the trusted result, which tells you where to look.</li>
+</ol>
+<h3>How to debug when it is slow or crashing</h3>
+<ol>
+<li><strong>Shrink the input</strong> (a sample, one partition, the first million rows) until the problem reproduces in seconds.</li>
+<li><strong>Look at the plan</strong> before the clock: Polars <code>explain()</code>, DuckDB <code>EXPLAIN ANALYZE</code>, Spark <code>explain("formatted")</code>, Dask <code>visualize()</code>.</li>
+<li><strong>Bisect the pipeline</strong>: run it step by step, forcing each with <code>collect()</code> or <code>count()</code>, and time each. The slowest step is usually obvious.</li>
+<li><strong>Check data shape</strong>: key distribution (<code>value_counts().head()</code>), null share, partition sizes.</li>
+<li><strong>Read the right monitor</strong>: Spark UI stage task summary, Dask dashboard memory bars, <code>htop</code> or Activity Monitor for a local engine (one busy core means no parallelism, all cores with high memory means spill risk).</li>
+<li><strong>Change one thing at a time</strong> and keep the measurement next to the change.</li>
+</ol>
+
+<h2 id="s13-22-13-going-deeper-what-is-under-the-hood-and-what-interviewers-probe">22.13 Going deeper: what is under the hood, and what interviewers probe</h2>
+<h3>Memory formats</h3>
+<ul>
+<li><strong>Apache Arrow</strong> lays a column out as contiguous buffers: a values buffer, an optional validity bitmap (one bit per row saying null or not), and for strings an offsets buffer plus a bytes buffer. Contiguous, typed memory is what makes vectorized CPU code and zero-copy sharing between libraries possible.</li>
+<li><strong>Parquet encodings</strong>: dictionary encoding (store distinct values once, codes per row), run-length and bit-packing for the codes, delta encoding for sorted numbers; then a general compressor per page. Low-cardinality and sorted columns compress extremely well, which is why sorting before writing helps.</li>
+<li><strong>pandas 3.0</strong>: copy-on-write is the default, so derived objects share memory until one is modified, which removes many hidden copies and makes chained assignment safe by construction; text columns default to the <code>str</code> dtype (backed by PyArrow when it is installed). Even so, a typical pandas operation needs more than one copy of the data in the worst case, which is why you size RAM generously relative to the file.</li>
+</ul>
+<h3>Execution models</h3>
+<ul>
+<li><strong>DuckDB</strong> processes vectors of values per operator and parallelizes with small work units shared by threads; large hash tables and sorts can spill to disk.</li>
+<li><strong>Polars</strong> turns lazy plans into optimized physical plans (projection and predicate pushdown, common subexpression elimination) and has a streaming engine for larger-than-memory work, though not every operation is streamable; unsupported ones fall back to in-memory execution.</li>
+<li><strong>Dask</strong> builds a graph of small tasks and a scheduler runs them; overhead is per task, so partition size is the main tuning knob.</li>
+<li><strong>Spark</strong> converts your DataFrame code into a logical plan, optimizes it (the Catalyst optimizer), chooses physical operators (broadcast or sort-merge join), and generates JVM code for pipelines of narrow operations (whole-stage code generation). Adaptive query execution revises the plan at stage boundaries using real statistics.</li>
+</ul>
+<h3>Questions interviewers like</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Question</th><th>Strong answer, in one breath</th></tr></thead><tbody>
+<tr><td>Why is Parquet faster than CSV?</td><td>Columnar (read only needed columns), typed with a schema (no parsing guesses), compressed with encodings, with min/max statistics that let readers skip row groups.</td></tr>
+<tr><td>What is a shuffle and why is it expensive?</td><td>Redistributing rows by key across partitions; it writes to disk, crosses the network and creates a stage barrier. Avoid with broadcast joins, pre-aggregation and fewer wide operations.</td></tr>
+<tr><td>Narrow versus wide transformation?</td><td>Narrow: each output partition depends on one input partition. Wide: depends on many, so a shuffle.</td></tr>
+<tr><td>How do you handle skew?</td><td>Detect it (max task time versus median), isolate or filter hot keys, AQE, salting with a two-stage aggregation or a replicated small side.</td></tr>
+<tr><td>Lazy versus eager evaluation?</td><td>Lazy builds a plan the optimizer can rewrite (pushdown, reordering) and runs on demand; eager runs each step immediately and is easier to debug.</td></tr>
+<tr><td>UDF versus built-in?</td><td>Built-ins are optimized and run in the engine; plain UDFs cross a process boundary per row. Use built-ins, then pandas UDFs, then plain UDFs.</td></tr>
+<tr><td>When not to use Spark?</td><td>When the data fits one machine: DuckDB or Polars is simpler and often faster; Spark startup and shuffles are overhead.</td></tr>
+<tr><td>How would you dedupe 5 billion rows?</td><td>Hash-partition by key, dedupe within partitions with a window or <code>dropDuplicates</code>; if exactness is not needed, a Bloom filter or approximate counts.</td></tr>
+</tbody></table></div>
+
+<h2 id="s14-chapter-recap">Chapter recap</h2>
+<ul>
+<li>Pandas is limited by memory (the whole table in RAM, often several times the file size) and by mostly one core. Measure before you change tools.</li>
+<li>Cheap fixes first: read fewer columns, downcast integers, use <code>category</code> for repeated strings, and read in chunks. Our 1-million-row table went from 84 MB to 12 MB.</li>
+<li>Chunking sets memory by chunk size, not file size, but only works for decomposable statistics: sums, counts, min, max, and means as sum over count.</li>
+<li>Parquet is columnar, typed and compressed, with statistics. Partitioned folders (<code>year=2025/region=EU</code>) allow partition pruning.</li>
+<li>Polars: expressions, <code>group_by().agg()</code>, <code>over()</code> windows, and lazy <code>scan_*</code> + <code>collect()</code> with pushdown. Use <code>explain()</code>.</li>
+<li>DuckDB: SQL on files and DataFrames, window functions, <code>QUALIFY</code>, <code>COPY ... TO</code> Parquet, memory limits with disk spill.</li>
+<li>Dask: partitions plus a task graph; <code>compute()</code> is the action; combine partial results correctly; rank-in-group needs a shuffle.</li>
+<li>Spark: transformations are lazy, actions run jobs, wide operations shuffle. Broadcast small tables, fix skew, cache only reused data, prefer built-ins to UDFs, read the Stages page.</li>
+<li>Choose the smallest tool that finishes in time: pandas, then DuckDB or Polars, then Dask or Spark.</li>
+<li>Verify every migration against a trusted slow version on a sample, with tolerance for floats and counts for rows.</li>
+</ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / pattern</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>mean = (sum of partial sums) / (sum of partial counts)</td><td>The only correct way to combine partition means</td></tr>
+<tr><td>partition = stable_hash(key) % B</td><td>Co-locates equal keys; basis of shuffle joins, dedupe and group-by</td></tr>
+<tr><td>peak memory is about the chunk size, not the file size</td><td>Why chunking works</td></tr>
+<tr><td>number of partitions is about data size / 128 MB (reads), then 100 to 200 MB after shuffles</td><td>Sizing rule of thumb</td></tr>
+<tr><td>skew ratio = max partition size / mean partition size</td><td>Near 1 is healthy; large values mean stragglers</td></tr>
+<tr><td>salt s in 0..S-1, key becomes (key, s), then re-aggregate</td><td>Spreads a hot key over S partitions</td></tr>
+<tr><td>scan(columns, filters) before join before group-by</td><td>Reduce data before the expensive steps</td></tr>
+<tr><td>lazy plan, then one <code>collect()</code>, <code>compute()</code> or action</td><td>Let the optimizer see the whole query</td></tr>
+<tr><td>built-in, then vectorized UDF, then plain UDF</td><td>Order of preference for custom logic</td></tr>
+<tr><td>compare(trusted, candidate): counts, keys, values with tolerance</td><td>Safe migration test</td></tr>
+</tbody></table></div>
+
+<h2 id="s15-practice-set">Practice set</h2>
+<p>Twenty-three problems, easy first. Try each before reading the answer. Code in the problems that is marked as a block was run, and the printed results quoted in the answers are real.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.1</span> (Easy) Name the three ideas behind Parquet, Polars, DuckDB, Dask and Spark, and give one sentence on what each buys you.</p>
+<p><strong>Answer:</strong> Columnar storage (a query reads only the columns it needs), lazy execution (the whole plan is optimized before it runs: pushdown, reordering) and partitioning (independent pieces are processed in parallel or one at a time, then combined).</p>
+
+<p class="problem"><span class="pl">Problem 22.P.2</span> (Easy) A column holds 10 million integers between 0 and 200. How many MB does it take as <code>int64</code>, and as the smallest safe unsigned type?</p>
+<p><strong>Answer:</strong> <code>int64</code> is 8 bytes: 10,000,000 times 8 = 80,000,000 bytes = 80 MB. Values up to 200 fit in <code>uint8</code> (0 to 255): 10,000,000 bytes = 10 MB. Eight times smaller.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.3</span> (Easy) Classify as narrow or wide in Spark: <code>filter</code>, <code>groupBy().sum()</code>, <code>select</code>, a sort-merge <code>join</code>, <code>distinct</code>, <code>withColumn</code>.</p>
+<p><strong>Answer:</strong> Narrow: <code>filter</code>, <code>select</code>, <code>withColumn</code> (each partition is processed alone). Wide (shuffle): <code>groupBy().sum()</code>, the sort-merge <code>join</code> (a broadcast join of a small side avoids shuffling the big side), and <code>distinct</code>.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.4</span> (Easy) A 10 GB CSV is read by Spark with the default of 128 MB per input partition. Roughly how many partitions, and why does the number matter?</p>
+<p><strong>Answer:</strong> 10 GB is about 10,240 MB, divided by 128 MB gives about 80 partitions (80 tasks that can run in parallel). Too few partitions waste cores and risk memory errors, too many cost scheduling overhead.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.5</span> (Easy) What does this print?</p>
+<pre class="code lang-python"><code>import io
+import pandas as pd
+
+csv = "k,v\na,1\nb,2\na,3\nb,4\na,5"
+tot = None
+for ch in pd.read_csv(io.StringIO(csv), chunksize=2):
+    s = ch.groupby("k")["v"].sum()
+    tot = s if tot is None else tot.add(s, fill_value=0)
+print(tot.to_dict())</code></pre>
+<p><strong>Answer:</strong> <code>{'a': 9.0, 'b': 6.0}</code>. The chunks are rows 1 to 2, 3 to 4 and row 5. Partial sums: a=1, b=2, then a=3, b=4, then a=5. Totals: a = 1 + 3 + 5 = 9 and b = 2 + 4 = 6. They print as floats because <code>add(..., fill_value=0)</code> aligns on labels and returns floating-point values.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.6</span> (Easy) Values 30, 30, 20 sorted descending. Give <code>ROW_NUMBER</code>, <code>RANK</code> and <code>DENSE_RANK</code> for each.</p>
+<p><strong>Answer:</strong> ROW_NUMBER: 1, 2, 3 (never ties; which 30 gets 1 is arbitrary unless you add a tie-breaker). RANK: 1, 1, 3 (a gap after the tie). DENSE_RANK: 1, 1, 2 (no gap). Running it in SQLite gives <code>(30, 1, 1, 1)</code>, <code>(30, 2, 1, 1)</code>, <code>(20, 3, 3, 2)</code> in that column order.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.7</span> (Medium) Which lines of this PySpark script are actions, and which only build a plan?
+<br/><code>df = spark.read.parquet("e")</code> / <code>f = df.filter("price &gt; 0")</code> / <code>g = f.groupBy("k").count()</code> / <code>g.show()</code> / <code>n = f.count()</code></p>
+<p><strong>Answer:</strong> <code>g.show()</code> and <code>f.count()</code> are actions and each runs a job (the second re-reads and re-filters the data unless <code>f</code> was cached). The filter and the group-by are lazy transformations. The read normally touches only file metadata (to find the schema) until an action runs.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.8</span> (Medium) What does this print?</p>
+<pre class="code lang-python"><code>import numpy as np
+
+keys = np.array([0, 0, 0, 0, 1, 2, 3, 4, 8])
+sizes = np.bincount(keys % 4, minlength=4)
+print(sizes.tolist(), round(sizes.max() / sizes.mean(), 2))</code></pre>
+<p><strong>Answer:</strong> <code>[6, 1, 1, 1] 2.67</code>. Remainders modulo 4: key 0 gives 0 (four rows), key 4 gives 0, key 8 gives 0, so partition 0 has 4 + 1 + 1 = 6 rows; keys 1, 2, 3 give one row each. The mean is 9/4 = 2.25 and 6 / 2.25 = 2.67. That is a skew ratio well above 1.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.9</span> (Medium, find the bug) A Dask user computes the average order value like this and finds it differs from the pandas answer. Partition A has one order of 10; partition B has three orders of 20 each. Their code averages the two partition means. What do they get, what is correct, and what is the fix?</p>
+<p><strong>Answer:</strong> They compute (10 + 20) / 2 = 15. Correct: total = 10 + 60 = 70 over 4 orders = 17.5. The unweighted average gives partition A (one order) the same weight as B (three orders). Fix: keep (sum, count) per partition, add them (70 and 4) and divide at the end, which is what <code>ddf.amount.mean()</code> does for you.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.10</span> (Medium, find the bug) A teammate downcasts with <code>s.astype("uint8")</code> on a column that sometimes holds 300. What does <code>pd.Series([100, 300]).astype("uint8").tolist()</code> print and what is the lesson?</p>
+<p><strong>Answer:</strong> <code>[100, 44]</code>. 300 does not fit in 8 bits and wraps around (300 - 256 = 44), silently. Lesson: choose dtypes from the real minimum and maximum (<code>pd.to_numeric(downcast="unsigned")</code> does) and assert the range yourself (<code>s.max() &lt;= 255</code>) before a forced <code>astype</code>.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.11</span> (Medium, find the bug) After enriching 3 orders with a customer table, the result has 4 rows and the revenue total is too high. The code is <code>orders.merge(tiers, on="k", how="left")</code>, with <code>orders.k = [1, 2, 3]</code> and <code>tiers.k = [1, 1, 2]</code>. Explain and fix.</p>
+<p><strong>Answer:</strong> The key 1 appears twice in <code>tiers</code>, so the order with k = 1 matches two rows and is duplicated: the merge returns 4 rows (this is a many-to-one join that turned into many-to-many). Orders with k = 3 get a missing tier. Fix: deduplicate the dimension first (<code>tiers.drop_duplicates("k")</code> with a rule for which row to keep), and validate with <code>merge(..., validate="many_to_one")</code>, which raises an error if the right side has duplicate keys. Also assert that the row count is unchanged after a left join.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.12</span> (Medium) Choose pandas, DuckDB, Polars, Dask or Spark, with a one-line reason: (a) an 800 MB CSV on a 16 GB laptop; (b) 200 GB of Parquet on one 128 GB server, with SQL-fluent analysts; (c) 5 TB in object storage, and the company already runs Databricks.</p>
+<p><strong>Answer:</strong> (a) pandas with <code>usecols</code> and dtypes: the data fits, no new tool needed. (b) DuckDB: SQL straight on Parquet, spills to disk, no cluster; Polars lazy is a good second choice for a code-first team. (c) PySpark: the data is beyond one machine and the platform and skills exist.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.13</span> (Medium) Write portable SQL (it should run in SQLite and DuckDB) for "the single highest order per region" on the orders table of this chapter, and give the answer.</p>
+<p><strong>Answer:</strong> Rank in an inner query and filter in the outer query (QUALIFY is DuckDB-only):<br/><code>SELECT region, order_id, amount FROM (SELECT region, order_id, amount, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn FROM orders) WHERE rn = 1 ORDER BY region</code><br/>Largest orders: APAC order 7 (40), EU order 10 (45), US order 4 (50). So the rows are (APAC, 7, 40), (EU, 10, 45), (US, 4, 50).</p>
+
+<p class="problem"><span class="pl">Problem 22.P.14</span> (Medium) Write a function that keeps an exact running mean over a stream of chunks using constant memory, and test it on the chunks [1, 2, 3] and [4, 5].</p>
+<pre class="code lang-python"><code>def update(state, chunk):
+    total, count = state
+    return total + sum(chunk), count + len(chunk)
+
+state = (0, 0)
+for chunk in ([1, 2, 3], [4, 5]):
+    state = update(state, chunk)
+print(state, state[0] / state[1])</code></pre>
+<p><strong>Answer:</strong> It prints <code>(15, 5) 3.0</code>. The state is two numbers however long the stream is. Do not store the mean itself: a mean cannot be merged without the count behind it. The same state design extends to variance (keep the count, the sum and the sum of squares, or use Welford's update for numerical stability).</p>
+
+<p class="problem"><span class="pl">Problem 22.P.15</span> (Hard) The Spark UI shows, for one stage: median task duration 8 s, max 190 s, shuffle spill 0, 200 tasks. Diagnose it and list three things to try in order.</p>
+<p><strong>Answer:</strong> 190 / 8 is about 24 times the median, with no spill: one partition is far larger than the others, so this is data skew (or one bad node, but a node problem would not be tied to a stage's data). Try: (1) look at the key distribution of the shuffle key (<code>groupBy(key).count().orderBy(desc)</code>) and filter or isolate null or bot keys; (2) make sure AQE skew handling is on (<code>spark.sql.adaptive.skewJoin.enabled</code>); (3) salt the hot keys with a two-stage aggregation or a replicated small side. Re-check the task summary after each change.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.16</span> (Hard) Translate to Polars: for each row add the region total and the row's share of it, then the rank of the row within its region (largest first). Pandas: <code>t = df.groupby("region")["amount"].transform("sum"); share = df["amount"] / t; rk = df.groupby("region")["amount"].rank(method="first", ascending=False)</code>.</p>
+<p><strong>Answer (not run here):</strong><br/><code>df.with_columns(region_total=pl.col("amount").sum().over("region")).with_columns(share=pl.col("amount") / pl.col("region_total"), rk=pl.col("amount").rank("ordinal", descending=True).over("region"))</code><br/>The first <code>with_columns</code> creates the total; a second one is needed for the share because expressions in one call cannot see each other's new columns. <code>over("region")</code> is the transform: compute within groups, keep all rows.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.17</span> (Hard) Design the storage layout for 2 TB of web logs per month (columns: ts, user_id, country, url, status, bytes), queried mostly by date range and country.</p>
+<p><strong>Answer:</strong> Parquet, compressed with zstd or snappy. Partition by date (<code>date=2025-06-01</code>), and country only if its cardinality is small and queries filter on it. Do not partition by <code>user_id</code> (millions of folders). Target files of 128 MB to 1 GB (so about 20 to 100 files per day, not 100,000). Sort within files by <code>country</code> then <code>ts</code> so row-group statistics skip well. Write dates as timestamps and ids as strings or 64-bit integers, consistently. Add a compaction job for late data.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.18</span> (Hard) Hash-bucket dedupe of 2 billion order ids (8 bytes each) with 1 GB of memory available per bucket. How many buckets at least, and why add a safety margin?</p>
+<p><strong>Answer:</strong> 2,000,000,000 times 8 bytes = 16 GB of raw keys, so at least 16 buckets of 1 GB each; in practice more (32 or 64) because hashing is only roughly even, Python or pandas structures need several times the raw key bytes, and rows carry other columns too. Choose the bucket count so one bucket comfortably fits, and test the largest bucket size.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.19</span> (Hard) A join key has one value holding 40 percent of all rows, the shuffle uses 100 partitions, and you want no partition above twice the mean. What is the least number of salts S for that key (ignore other keys)?</p>
+<p><strong>Answer:</strong> The mean share per partition is 1 percent. After salting, the hot key's 40 percent is divided into S pieces of 40/S percent. We need 40 / S &lt;= 2, so S &gt;= 20. The small side of the join is then replicated 20 times for that key (or only for hot keys, if you salt selectively).</p>
+
+<p class="problem"><span class="pl">Problem 22.P.20</span> (Hard) Why can a Spark filter written as <code>df.filter(my_udf(F.col("name")) == "x")</code> be much slower than <code>df.filter(F.col("name") == "x")</code> on Parquet, even when the UDF is trivial?</p>
+<p><strong>Answer:</strong> The built-in comparison on a raw column can be pushed into the Parquet scan, so row groups whose statistics rule out "x" are skipped and the rows never leave the JVM. The optimizer cannot see inside the UDF: the filter cannot be pushed down, every row of the column is read, serialized to a Python process, evaluated and sent back. Fix: express it with built-ins (<code>F.lower</code>, <code>F.regexp_extract</code>), or filter on the raw column first.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.21</span> (Hard) A Spark job does <code>df.repartition(200, "customer_id").write.partitionBy("date").parquet(out)</code> and produces a huge number of small files for a 30-day dataset. Why, and what is the fix?</p>
+<p><strong>Answer:</strong> Each of the 200 tasks holds customers from all 30 days, so each task writes one file per date it contains: up to 200 x 30 = 6,000 files, each small. Fix: repartition by the same column you partition by, so each date is written by few tasks: <code>df.repartition("date").write.partitionBy("date")...</code>, or <code>repartition(n, "date", salt)</code> to control files per date, or coalesce before writing; compaction afterwards is the fallback.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.22</span> (Expert) The same dataset summed in two orders gives different float totals. Show it with three numbers, then say how to design checks between a pandas and a Spark pipeline.</p>
+<pre class="code lang-python"><code>a = (1e16 + 1.0) - 1e16
+b = (1e16 - 1e16) + 1.0
+print(a, b)</code></pre>
+<p><strong>Answer:</strong> It prints <code>0.0 1.0</code>. In 64-bit floating point, 1e16 + 1.0 rounds back to 1e16, so the first order loses the 1.0. Floating-point addition is not associative, and a distributed engine adds partial sums in a data-dependent order. Therefore: compare floats with a relative tolerance (<code>np.isclose</code>), compare counts and integer columns exactly, store money as integer cents so sums are exact, and compare many cheap invariants (row counts, distinct keys, null counts, min and max, a checksum of an integer column) instead of just one total.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.23</span> (Expert, interview) "Count distinct users per day over 3 billion rows is slow in Spark. Why, and what are your options?" Give an answer you would defend.</p>
+<p><strong>Answer:</strong> An exact distinct count needs every distinct (day, user) pair to be brought together: it shuffles by the pair or by the day, deduplicates, then counts, which is memory- and network-heavy, and a few busy days create skew. Options: (1) <code>F.approx_count_distinct</code> (HyperLogLog sketch, mergeable across partitions so it needs a tiny partial state; the default relative standard deviation is about 5 percent and can be tightened at higher memory cost) when a small error is acceptable; (2) first deduplicate (day, user) with a narrower row (select only those two columns) and then count, to reduce shuffle bytes; (3) pre-aggregate hourly to daily distinct sets in a table, or sketches stored in a table and merged; (4) fix skew with salting if one day dominates. State the accuracy trade-off explicitly.</p>
+
+<h2 id="s16-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language, so use simple English. Teach me when pandas stops being enough and how to choose between Parquet, Polars, DuckDB, Dask and PySpark. Use small Python examples that I can run with only pandas, numpy and sqlite3, show real output, and relate each idea to a story about a 10 GB CSV on a laptop. Cover: dtype downcasting, categories, chunked reading, partial aggregates (sum and count, never mean of means), columnar storage, lazy execution, partitions, shuffles and skew. After each part, ask me one check question and wait for my answer before continuing.</pre></div>
+<div class="prompt"><div class="ph"><span>AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning big-data tools. Below I will paste a pandas, Polars, DuckDB SQL, Dask or PySpark script that I wrote for a large dataset. Review it like a senior data engineer: find memory and speed risks (reading everything, row-by-row functions, UDFs, collect or toPandas on big results, unneeded sorts, tiny files, skewed keys, null join keys, float sums), explain each problem in simple English with the symptom I would see, and show the fixed code. Tell me which library you would choose for my data size and why, and how I can verify the fixed pipeline gives the same result as the old one on a small sample.</pre></div>
+<div class="prompt"><div class="ph"><span>AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are a hiring manager for a data engineering or data science role. Run a 30-minute mock interview on scaling data processing: pandas memory limits, Parquet versus CSV, lazy versus eager evaluation, Polars expressions, DuckDB window functions, Dask partitions, Spark shuffles, broadcast joins, data skew and salting, caching, UDFs versus built-ins, and reading the Spark UI. Ask one question at a time, starting easy and getting harder, and include two find-the-bug code questions and one design question (storage layout for 2 TB of logs per month). After each of my answers, score it out of 10, say what a strong answer would include, then continue. At the end give me a summary of my weak spots and a three-day study plan.</pre></div>
+<div class="readbtn"><button class="btn" data-read="study:python:ch22">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch21.html">← Chapter 21: Deep Learning and GenAI Libraries: PyTorch, Hugging Face and the LLM Toolchain</a><a class="btn" href="ch23.html">Chapter 23: Engineering Toolkit: pytest, CLI Tools, FastAPI, Packaging and ML Tracking →</a></div></div><script src="../../assets/study.js"></script></body></html>

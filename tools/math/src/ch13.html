@@ -1,0 +1,887 @@
+<p>You have trained a model that predicts whether a customer will cancel a subscription. The training loop is three lines: compute the loss, call <code>loss.backward()</code>, call <code>optimizer.step()</code>. It works. Then one Tuesday the loss turns into <code>nan</code> after 40 steps. Or the loss does not move at all, no matter what learning rate you try. Or a colleague asks, in a design review, "why does the gradient of the first layer vanish in this architecture?" If <code>backward()</code> is a magic button, you can only guess. If you know what it does, you can look at the network, see where the signal is dying, and fix it.</p>
+<p>That magic button is the chain rule from Chapter 10, applied again and again, in a clever order, with bookkeeping. It is called backpropagation, and it is the single algorithm that makes every deep network trainable, from a two-neuron toy to a model with billions of weights. In this chapter you will do it three ways: by hand with real numbers (so no step is hidden), as vectorised matrix formulas (so you can read any framework's source), and as code you write yourself (a NumPy network and a 40-line automatic differentiation engine). You will check every result against numerical derivatives.</p>
+<p>By the end you will be able to: draw the computational graph of any formula and run its forward and backward passes; explain the rule "upstream gradient times local gradient" and why gradients add up at fan-out nodes; derive <code>dW = δ xᵀ</code>, <code>db = δ</code>, <code>dx = Wᵀ δ</code> and the softmax plus cross-entropy gradient <code>p − y</code>; train a neural network on XOR and on a spiral dataset using nothing but NumPy; check gradients numerically; explain why reverse mode wins for deep learning; diagnose vanishing and exploding gradients and choose a sound initialisation; and answer the expert questions about Jacobian-vector products, memory, checkpointing, Hessian-vector products and backpropagation through time. You need Chapter 10 (derivatives, the chain rule) and Chapter 12 (partial derivatives, gradients, the shape of Jacobians) for this one. Optimisation algorithms that <em>use</em> the gradient are the subject of Chapter 14.</p>
+
+<h2>13.1 The Chain Rule and Why Deep Learning Is Repeated Chain Rule</h2>
+<h3>Beginner: a chain of gears</h3>
+<p>Picture three gears connected in a row. Turn the first one once and the second turns 3 times. Turn the second once and the third turns 2 times. How many turns does the third make for one turn of the first? You multiply: 3 × 2 = 6. That is the chain rule in one sentence: <strong>when effects are chained, their rates multiply</strong>.</p>
+<p>In symbols, if <code>y</code> depends on <code>u</code> and <code>u</code> depends on <code>x</code>, then</p>
+<div class="eq">dy/dx = (dy/du) · (du/dx)</div>
+<p>Read <code>dy/du</code> as "how many units y moves per unit of u", exactly the gear ratio. Here <code>u</code> is the <em>inner</em> quantity and <code>y</code> the <em>outer</em> one.</p>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A derivative is a rate of change. If a salary rises 2 euros per hour worked, and hours rise 5 per day, then salary rises 2 × 5 = 10 euros per day. You never needed a formula for the whole path; you multiplied the local rates. Backpropagation does exactly this, for millions of paths at once.</div></div>
+
+<h3>Intermediate: three worked examples</h3>
+<p class="problem"><span class="pl">Problem 13.1.1</span> Differentiate y = (3x + 1)⁴ at x = 1.</p>
+<table class="steps"><tr><th>Split</th><td>Inner u = 3x + 1. Outer y = u⁴.</td></tr><tr><th>Local rates</th><td>dy/du = 4u³. du/dx = 3.</td></tr><tr><th>Multiply</th><td>dy/dx = 4u³ · 3 = 12u³.</td></tr><tr><th>Plug in</th><td>At x = 1: u = 3·1 + 1 = 4, so dy/dx = 12 · 4³ = 12 · 64 = 768.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting the inner derivative. Wrong: d/dx (3x+1)⁴ = 4(3x+1)³ = 4 · 64 = 256 at x = 1. Right: 4(3x+1)³ · <strong>3</strong> = 768. Whenever the inside of a function is not just "x", there is a second factor.</div></div>
+<p class="problem"><span class="pl">Problem 13.1.2</span> A chain of three links: y = ln(1 + e<sup>2x</sup>). Find dy/dx at x = 0.</p>
+<table class="steps"><tr><th>Name the links</th><td>u = 2x, v = e<sup>u</sup>, w = 1 + v, y = ln w.</td></tr><tr><th>Forward at x = 0</th><td>u = 0, v = e⁰ = 1, w = 2, y = ln 2 ≈ 0.6931.</td></tr><tr><th>Local rates</th><td>dy/dw = 1/w = 1/2. dw/dv = 1. dv/du = e<sup>u</sup> = 1. du/dx = 2.</td></tr><tr><th>Multiply</th><td>dy/dx = (1/2) · 1 · 1 · 2 = 1.</td></tr><tr><th>Check by formula</th><td>dy/dx = 2e<sup>2x</sup>/(1 + e<sup>2x</sup>) = 2/2 = 1. ✓</td></tr></table>
+<p>Notice the pattern: first go <em>forward</em> to get the values at every link, then multiply the local rates. The local rates are evaluated at the values found on the forward pass. This two-phase habit is the whole of backpropagation.</p>
+<p class="problem"><span class="pl">Problem 13.1.3</span> (ML story) A single neuron has weight w, input x = 2 and target t = 1. Its prediction is p = w·x and the loss is L = (p − t)². With w = 0.3, how does L change when w changes?</p>
+<table class="steps"><tr><th>Forward</th><td>p = 0.3 · 2 = 0.6. L = (0.6 − 1)² = 0.16.</td></tr><tr><th>Local rates</th><td>dL/dp = 2(p − t) = 2(−0.4) = −0.8. dp/dw = x = 2.</td></tr><tr><th>Multiply</th><td>dL/dw = −0.8 · 2 = −1.6.</td></tr><tr><th>Meaning</th><td>Raising w by a small 0.01 lowers the loss by about 0.016. Gradient descent would therefore <em>increase</em> w.</td></tr></table>
+<p>Let us confirm all three numerically. A central difference <code>(f(x+h) − f(x−h)) / 2h</code> approximates the derivative without any calculus.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+def num_deriv(f, x, h=1e-6):
+    return (f(x + h) - f(x - h)) / (2 * h)
+
+print(round(num_deriv(lambda x: (3 * x + 1) ** 4, 1.0), 3))
+print(round(num_deriv(lambda x: np.log(1 + np.exp(2 * x)), 0.0), 6))
+print(round(num_deriv(lambda w: (w * 2 - 1) ** 2, 0.3), 4))</code></pre>
+<pre class="code lang-text"><code>768.0
+1.0
+-1.6</code></pre>
+
+<h3>From one variable to a deep network</h3>
+<p>A neural network is a long composition of simple functions. With layers f₁, f₂, ..., f<sub>K</sub> and a loss at the end:</p>
+<div class="eq">a₁ = f₁(x; θ₁), a₂ = f₂(a₁; θ₂), ..., a<sub>K</sub> = f<sub>K</sub>(a<sub>K−1</sub>; θ<sub>K</sub>), L = loss(a<sub>K</sub>, y)</div>
+<p>Here θ<sub>k</sub> are the parameters (weights and biases) of layer k. To train, you need ∂L/∂θ<sub>k</sub> for every k. The chain rule says the gradient for layer k is the product of all the local rates between the loss and that layer:</p>
+<div class="eq">∂L/∂θ<sub>k</sub> = (∂L/∂a<sub>K</sub>) · (∂a<sub>K</sub>/∂a<sub>K−1</sub>) ··· (∂a<sub>k+1</sub>/∂a<sub>k</sub>) · (∂a<sub>k</sub>/∂θ<sub>k</sub>)</div>
+<p>When the a's are vectors, each "rate" is a Jacobian matrix (Chapter 12) and the product is a product of matrices. The key observation: the prefix <code>(∂L/∂a<sub>K</sub>) ··· (∂a<sub>k+1</sub>/∂a<sub>k</sub>)</code> for layer k is <em>reused</em> by layer k − 1, which only multiplies one more factor. Computing from the loss backwards, you compute each factor once and share it. That sharing is the reason backpropagation costs about the same as one forward pass instead of K separate gradient computations.</p>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Deep learning is the chain rule applied to a long composition, organised so that the shared part of the product is computed once, starting at the loss and walking backwards. Everything else in this chapter (graphs, shapes, autograd, vanishing gradients) is a consequence.</div></div>
+<h3>Going deeper</h3>
+<p>The product above also tells you what can go wrong. If most factors are smaller than 1, the product shrinks exponentially with depth (vanishing gradients). If most are larger than 1, it grows exponentially (exploding gradients). A 20-layer product of factors 0.25 is 0.25²⁰ ≈ 9 × 10⁻¹³. We will return to this in Section 13.7. Also note the order of multiplication matters for cost: for a scalar loss, multiplying left to right (loss first) is a chain of vector-matrix products, cheap; multiplying right to left (parameter first) is a chain of matrix-matrix products, expensive. That asymmetry is the heart of Section 13.6.</p>
+
+<h2>13.2 Computational Graphs: Forward Pass, Backward Pass, Fan-Out</h2>
+<h3>Beginner: a recipe drawn as boxes</h3>
+<p>A computational graph draws a calculation as a diagram. Each <strong>node</strong> is one small operation (add, multiply, sigmoid) or an input. Each <strong>arrow</strong> carries a number from one node to the next. To compute f = (x + y) · z you need two operations, so the graph has two operation nodes and three input nodes.</p>
+<div class="callout blue"><div class="lab">DEFINITION</div><div class="txt"><strong>Forward pass</strong>: evaluate nodes from inputs to output, storing every node's value. <strong>Backward pass</strong>: visit nodes from output to inputs, computing for each node the gradient of the final output with respect to that node's value. We write that gradient as <code>grad</code> or ∂f/∂node.</div></div>
+<figure><img src="images/ch13_graph.png" alt="Two computational graphs with forward values in blue above each node and gradients in red below" loading="lazy"/><figcaption>Left: f = (x + y)·z at x = −2, y = 5, z = −4. Right: c = (x·y)(x + y), where x and y each feed two nodes.</figcaption></figure>
+<p>How to read it: blue numbers are the forward pass values, red numbers are the backward pass gradients. Start at the right node, whose gradient is always 1 (the output changes by 1 when itself changes by 1) and move left, filling in the red numbers using the rules below.</p>
+
+<h3>Intermediate: the rule of upstream times local</h3>
+<p>Every node follows the same rule. Suppose a node computes <code>out = g(inputs)</code>. During the backward pass it receives the <strong>upstream gradient</strong> ∂f/∂out (how much the final output cares about this node). It knows its own <strong>local gradient</strong> ∂out/∂input for each input. It passes to each input:</p>
+<div class="eq">∂f/∂input = (∂f/∂out) · (∂out/∂input)  =  upstream × local</div>
+<p>That is just the chain rule written node by node. A node never needs to know the rest of the graph. This locality is why you can build any network from a library of small pieces, each with a hand-written forward and backward.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Node</th><th>Forward</th><th>Local gradients</th><th>Backward rule (upstream = g)</th></tr></thead><tbody>
+<tr><td>add</td><td>out = a + b</td><td>1 and 1</td><td>a gets g, b gets g ("a distributor")</td></tr>
+<tr><td>multiply</td><td>out = a · b</td><td>b and a</td><td>a gets g·b, b gets g·a ("a swapper")</td></tr>
+<tr><td>square</td><td>out = a²</td><td>2a</td><td>a gets 2a·g</td></tr>
+<tr><td>ReLU</td><td>out = max(0, a)</td><td>1 if a &gt; 0 else 0</td><td>g passes if a &gt; 0, else 0 ("a gate")</td></tr>
+<tr><td>sigmoid</td><td>out = σ(a)</td><td>out(1 − out)</td><td>a gets g · out(1 − out)</td></tr>
+<tr><td>max(a, b)</td><td>larger of the two</td><td>1 for the winner, 0 for the loser</td><td>g routes to the winner only</td></tr>
+</tbody></table></div>
+<p class="problem"><span class="pl">Problem 13.2.1</span> Run both passes on f = (x + y) · z with x = −2, y = 5, z = −4.</p>
+<table class="steps"><tr><th>Forward</th><td>q = x + y = −2 + 5 = 3. f = q · z = 3 · (−4) = −12.</td></tr><tr><th>Start</th><td>∂f/∂f = 1.</td></tr><tr><th>Multiply node</th><td>∂f/∂q = 1 · z = −4. ∂f/∂z = 1 · q = 3.</td></tr><tr><th>Add node</th><td>∂f/∂x = ∂f/∂q · 1 = −4. ∂f/∂y = ∂f/∂q · 1 = −4.</td></tr><tr><th>Meaning</th><td>Nudging z up by 0.01 moves f by about +0.03; nudging x up by 0.01 moves f by about −0.04.</td></tr></table>
+<h3>Fan-out: gradients add</h3>
+<p>What if one value is used by two different nodes? In the right graph of the figure, x feeds both the product x·y and the sum x + y. Changing x changes the output through <em>two separate routes</em>. The total effect is the sum of the effects along each route. This is the multivariable chain rule from Chapter 12: ∂f/∂x = Σ over routes.</p>
+<p class="problem"><span class="pl">Problem 13.2.2</span> Run both passes on c = (x·y)(x + y) with x = 2, y = 3.</p>
+<table class="steps"><tr><th>Forward</th><td>a = x·y = 6. b = x + y = 5. c = a·b = 30.</td></tr><tr><th>Multiply node</th><td>∂c/∂a = b = 5. ∂c/∂b = a = 6.</td></tr><tr><th>Node a = x·y</th><td>sends 5 · y = 5 · 3 = 15 to x, and 5 · x = 5 · 2 = 10 to y.</td></tr><tr><th>Node b = x + y</th><td>sends 6 · 1 = 6 to x, and 6 · 1 = 6 to y.</td></tr><tr><th>Accumulate</th><td>∂c/∂x = 15 + 6 = 21. ∂c/∂y = 10 + 6 = 16.</td></tr><tr><th>Check</th><td>c = x²y + xy², so ∂c/∂x = 2xy + y² = 12 + 9 = 21 ✓ and ∂c/∂y = x² + 2xy = 4 + 12 = 16 ✓.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Overwriting instead of accumulating at a fan-out node. If you keep only the last route you get ∂c/∂x = 6 (or 15), not 21. In code this is the difference between <code>x.grad = ...</code> and <code>x.grad += ...</code>. It is the most common bug when writing backprop by hand, and the reason PyTorch also needs <code>optimizer.zero_grad()</code> between steps: gradients <em>accumulate</em> by design.</div></div>
+<pre class="code lang-python"><code># Forward and backward by hand for both graphs
+x, y, z = -2.0, 5.0, -4.0
+q = x + y
+f = q * z
+df = 1.0
+dq = df * z            # multiply node: gradient to q is upstream * z
+dz = df * q            # gradient to z is upstream * q
+dx = dq * 1.0          # add node distributes
+dy = dq * 1.0
+print("graph 1:", q, f, dq, dz, dx, dy)
+
+x, y = 2.0, 3.0
+a = x * y
+b = x + y
+c = a * b
+da, db = b, a                       # upstream is 1
+dx = da * y + db * 1.0              # two routes into x: ACCUMULATE
+dy = da * x + db * 1.0
+print("graph 2:", a, b, c, da, db, dx, dy)
+print("wrong (overwrite):", db * 1.0)</code></pre>
+<pre class="code lang-text"><code>graph 1: 3.0 -12.0 -4.0 3.0 -4.0 -4.0
+graph 2: 6.0 5.0 30.0 5.0 6.0 21.0 16.0
+wrong (overwrite): 6.0</code></pre>
+<h3>Going deeper</h3>
+<p>Why must the backward pass go in <em>reverse topological order</em>? A node can only push its gradient to its inputs once its own gradient is complete, meaning every node that consumes it has already contributed. Reverse order guarantees that: all consumers of a node come after it in the forward order, so they come before it in the reverse order. Frameworks record the forward operations on a "tape" (a list) as they happen, then replay the tape backwards. This is called dynamic graph construction and is why PyTorch lets you use ordinary Python <code>if</code> and <code>for</code>: the graph is whatever happened on this run.</p>
+<p>Another consequence: every intermediate value needed by a local gradient (the <code>q</code> and <code>z</code> above) must be remembered from the forward pass. That is the memory cost of backpropagation, which we quantify in Section 13.8.</p>
+<div class="callout green"><div class="lab">REMEMBER</div><div class="txt">Add distributes, multiply swaps, ReLU gates, fan-out sums. Four sentences cover almost all hand backpropagation.</div></div>
+
+<h2>13.3 Backpropagation by Hand: One Neuron, Then a Two-Layer Network</h2>
+<h3>A single sigmoid neuron</h3>
+<p>Take one neuron with input x = 1.5, weight w = 0.8, bias b = −0.5, a sigmoid activation, target y = 1 and squared-error loss. The graph is a chain of five nodes:</p>
+<div class="eq">z = w·x + b,  a = σ(z) = 1/(1 + e<sup>−z</sup>),  L = (a − y)²</div>
+<p><strong>The derivative of the sigmoid</strong> deserves a derivation because it is used everywhere. Write σ(z) = (1 + e<sup>−z</sup>)⁻¹. By the chain rule, with u = 1 + e<sup>−z</sup>:</p>
+<div class="eq">dσ/dz = −u⁻² · (−e<sup>−z</sup>) = e<sup>−z</sup>/(1 + e<sup>−z</sup>)²</div>
+<div class="eq">= <span class="frac"><span>1</span><span>1 + e<sup>−z</sup></span></span> · <span class="frac"><span>e<sup>−z</sup></span><span>1 + e<sup>−z</sup></span></span> = σ(z) · (1 − σ(z))</div>
+<p>(because 1 − σ = e<sup>−z</sup>/(1 + e<sup>−z</sup>)). The derivative is computed from the output alone, so the forward pass already stored everything the backward pass needs.</p>
+<p class="problem"><span class="pl">Problem 13.3.1</span> Do the full forward and backward pass, then one gradient descent step with learning rate 0.5. (Values shown to 4 decimals; the code below keeps full precision.)</p>
+<table class="steps"><tr><th>Forward</th><td>z = 0.8 · 1.5 + (−0.5) = 1.2 − 0.5 = 0.7. a = σ(0.7) = 1/(1 + e<sup>−0.7</sup>) = 1/(1 + 0.4966) = 0.6682. L = (0.6682 − 1)² = 0.1101.</td></tr><tr><th>Local 1</th><td>∂L/∂a = 2(a − y) = 2(0.6682 − 1) = −0.6636.</td></tr><tr><th>Local 2</th><td>∂a/∂z = a(1 − a) = 0.6682 · 0.3318 = 0.2217.</td></tr><tr><th>Upstream × local</th><td>∂L/∂z = −0.6636 · 0.2217 = −0.1471.</td></tr><tr><th>Local 3 (weights)</th><td>∂z/∂w = x = 1.5. ∂z/∂b = 1. ∂z/∂x = w = 0.8.</td></tr><tr><th>Gradients</th><td>∂L/∂w = −0.1471 · 1.5 = −0.2207. ∂L/∂b = −0.1471 · 1 = −0.1471. ∂L/∂x = −0.1471 · 0.8 = −0.1177.</td></tr><tr><th>Update (lr 0.5)</th><td>w ← 0.8 − 0.5 · (−0.2207) = 0.9104. b ← −0.5 − 0.5 · (−0.1471) = −0.4264.</td></tr><tr><th>Check</th><td>New z = 0.9104 · 1.5 − 0.4264 = 0.9392. New a = 0.7189. New L = 0.0790, down from 0.1101 ✓.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+sig = lambda z: 1 / (1 + np.exp(-z))
+
+def loss(w, b, x=1.5, y=1.0):
+    return (sig(w * x + b) - y) ** 2
+
+x, w, b, y = 1.5, 0.8, -0.5, 1.0
+z = w * x + b; a = sig(z); L = (a - y) ** 2
+dL_da = 2 * (a - y); da_dz = a * (1 - a)
+dL_dz = dL_da * da_dz
+dL_dw, dL_db, dL_dx = dL_dz * x, dL_dz * 1.0, dL_dz * w
+print("z a L      :", round(z, 4), round(a, 4), round(L, 4))
+print("dL/da da/dz:", round(dL_da, 4), round(da_dz, 4))
+print("dL/dz      :", round(dL_dz, 4))
+print("dL/dw dL/db dL/dx:", round(dL_dw, 4), round(dL_db, 4), round(dL_dx, 4))
+
+# numerical check of dL/dw and dL/db
+h = 1e-6
+print("numeric w,b:", round((loss(w + h, b) - loss(w - h, b)) / (2 * h), 4),
+      round((loss(w, b + h) - loss(w, b - h)) / (2 * h), 4))
+
+w2, b2 = w - 0.5 * dL_dw, b - 0.5 * dL_db
+print("after step :", round(w2, 4), round(b2, 4), round(loss(w2, b2), 4))</code></pre>
+<pre class="code lang-text"><code>z a L      : 0.7 0.6682 0.1101
+dL/da da/dz: -0.6636 0.2217
+dL/dz      : -0.1471
+dL/dw dL/db dL/dx: -0.2207 -0.1471 -0.1177
+numeric w,b: -0.2207 -0.1471
+after step : 0.9104 -0.4264 0.079</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using the wrong value for the sigmoid slope. The local gradient is a(1 − a) with a = σ(z) = 0.6682, giving 0.2217. Plugging z into it, 0.7 · (1 − 0.7) = 0.21, is wrong: the formula takes the <em>output</em> of the sigmoid, not its input. Likewise, the local gradient of a product uses the <em>forward values</em>, so you must have run the forward pass first.</div></div>
+<p><strong>A saturated neuron.</strong> The same neuron with z = 8 gives a = 0.99966 and slope a(1 − a) = 0.000335. Any upstream gradient is multiplied by 0.000335 and almost nothing reaches w. That is a "saturated" sigmoid, and a first glimpse of vanishing gradients.</p>
+
+<h3>A full two-layer network, every weight</h3>
+<p>Now a network with two inputs, two hidden ReLU units and one sigmoid output. Loss is L = ½(a − y)² (the ½ cancels the 2 when differentiating). One training example: x = (1, 2), target y = 0. All nine parameters:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Parameter</th><th>Value</th><th>Role</th></tr></thead><tbody>
+<tr><td>W₁ row 1: w₁₁, w₁₂</td><td>0.5, 0.25</td><td>weights into hidden unit 1</td></tr>
+<tr><td>W₁ row 2: w₂₁, w₂₂</td><td>−0.6, 0.1</td><td>weights into hidden unit 2</td></tr>
+<tr><td>b₁ = (b₁₁, b₁₂)</td><td>0.1, 0.05</td><td>hidden biases</td></tr>
+<tr><td>v = (v₁, v₂)</td><td>0.7, −0.4</td><td>output weights</td></tr>
+<tr><td>c</td><td>0.2</td><td>output bias</td></tr>
+</tbody></table></div>
+<p class="problem"><span class="pl">Problem 13.3.2</span> Forward pass.</p>
+<table class="steps"><tr><th>Hidden pre-activations</th><td>z₁ = 0.5·1 + 0.25·2 + 0.1 = 0.5 + 0.5 + 0.1 = 1.1. z₂ = −0.6·1 + 0.1·2 + 0.05 = −0.6 + 0.2 + 0.05 = −0.35.</td></tr><tr><th>ReLU</th><td>h₁ = max(0, 1.1) = 1.1. h₂ = max(0, −0.35) = 0.</td></tr><tr><th>Output pre-activation</th><td>s = 0.7·1.1 + (−0.4)·0 + 0.2 = 0.77 + 0 + 0.2 = 0.97.</td></tr><tr><th>Sigmoid</th><td>a = σ(0.97) = 0.7251.</td></tr><tr><th>Loss</th><td>L = ½(0.7251 − 0)² = ½ · 0.5258 = 0.2629.</td></tr></table>
+<p class="problem"><span class="pl">Problem 13.3.3</span> Backward pass, one line per node, walking from the loss to the inputs.</p>
+<table class="steps"><tr><th>Loss node</th><td>∂L/∂a = a − y = 0.7251.</td></tr><tr><th>Sigmoid node</th><td>∂a/∂s = a(1 − a) = 0.7251 · 0.2749 = 0.1993. So δ<sub>s</sub> = ∂L/∂s = 0.7251 · 0.1993 = 0.1445.</td></tr><tr><th>Output layer weights</th><td>∂L/∂v₁ = δ<sub>s</sub> · h₁ = 0.1445 · 1.1 = 0.1590. ∂L/∂v₂ = δ<sub>s</sub> · h₂ = 0.1445 · 0 = 0. ∂L/∂c = δ<sub>s</sub> · 1 = 0.1445.</td></tr><tr><th>Into the hidden layer</th><td>∂L/∂h₁ = δ<sub>s</sub> · v₁ = 0.1445 · 0.7 = 0.1012. ∂L/∂h₂ = δ<sub>s</sub> · v₂ = 0.1445 · (−0.4) = −0.0578.</td></tr><tr><th>ReLU gates</th><td>z₁ = 1.1 &gt; 0, gate open: δ₁ = 0.1012. z₂ = −0.35 &lt; 0, gate closed: δ₂ = 0 (the −0.0578 is blocked).</td></tr><tr><th>Hidden layer weights</th><td>∂L/∂w₁₁ = δ₁ · x₁ = 0.1012 · 1 = 0.1012. ∂L/∂w₁₂ = δ₁ · x₂ = 0.1012 · 2 = 0.2023. ∂L/∂w₂₁ = 0, ∂L/∂w₂₂ = 0. ∂L/∂b₁₁ = 0.1012, ∂L/∂b₁₂ = 0.</td></tr><tr><th>Into the input</th><td>∂L/∂x₁ = w₁₁δ₁ + w₂₁δ₂ = 0.5 · 0.1012 + 0 = 0.0506. ∂L/∂x₂ = 0.25 · 0.1012 = 0.0253.</td></tr></table>
+<p>Look at what happened. Hidden unit 2 was off for this example, so every weight feeding it received exactly zero gradient. A ReLU unit that is off for <em>all</em> examples never learns: a "dead ReLU". Also notice the multiplication by v₁ in step four: the weight of the next layer is the "local gradient" of the hidden activation, which is how information about the later layer flows back to the earlier one.</p>
+<p class="problem"><span class="pl">Problem 13.3.4</span> One gradient descent step with learning rate 1.0, then recompute the loss.</p>
+<table class="steps"><tr><th>New weights</th><td>w₁₁ = 0.5 − 0.1012 = 0.3988. w₁₂ = 0.25 − 0.2023 = 0.0477. w₂₁, w₂₂ unchanged (−0.6, 0.1). b₁₁ = 0.1 − 0.1012 = ��0.0012. b₁₂ = 0.05. v₁ = 0.7 − 0.1590 = 0.5410. v₂ = −0.4. c = 0.2 − 0.1445 = 0.0555.</td></tr><tr><th>New forward</th><td>z₁ = 0.3988 + 2 · 0.0477 − 0.0012 = 0.4930. h₁ = 0.4930. s = 0.5410 · 0.4930 + 0.0555 = 0.3222. a = σ(0.3222) = 0.5799.</td></tr><tr><th>New loss</th><td>L = ½ · 0.5799² = 0.1681, down from 0.2629 ✓.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+sig = lambda z: 1 / (1 + np.exp(-z))
+
+x = np.array([1.0, 2.0]); y = 0.0
+W1 = np.array([[0.5, 0.25], [-0.6, 0.1]]); b1 = np.array([0.1, 0.05])
+v = np.array([0.7, -0.4]); c = 0.2
+
+def forward(W1, b1, v, c):
+    z = W1 @ x + b1; h = np.maximum(z, 0); s = v @ h + c; a = sig(s)
+    return z, h, s, a, 0.5 * (a - y) ** 2
+
+z, h, s, a, L = forward(W1, b1, v, c)
+print("z", z, "h", h, "s", round(s, 4), "a", round(a, 4), "L", round(L, 4))
+
+ds = (a - y) * a * (1 - a)              # delta at the output node
+dv, dc = ds * h, ds
+dh = ds * v
+dz = dh * (z > 0)                       # ReLU gate
+dW1 = np.outer(dz, x); db1 = dz
+dx = W1.T @ dz
+print("ds", round(ds, 4), "dv", np.round(dv, 4), "dc", round(dc, 4))
+print("dz", np.round(dz, 4) + 0.0)
+print("dW1", (np.round(dW1, 4) + 0.0).tolist(), "db1", np.round(db1, 4) + 0.0)
+print("dx", np.round(dx, 4))
+
+z, h, s, a, L = forward(W1 - dW1, b1 - db1, v - dv, c - dc)
+print("after step: a", round(a, 4), "L", round(L, 4))</code></pre>
+<pre class="code lang-text"><code>z [ 1.1  -0.35] h [1.1 0. ] s 0.97 a 0.7251 L 0.2629
+ds 0.1445 dv [0.159 0.   ] dc 0.1445
+dz [0.1012 0.    ]
+dW1 [[0.1012, 0.2023], [0.0, 0.0]] db1 [0.1012 0.    ]
+dx [0.0506 0.0253]
+after step: a 0.5799 L 0.1681</code></pre>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">When a teammate says "the first layer is not learning", the first thing to look at is exactly this table of deltas, per layer, for one batch. A layer whose deltas are all zero is dead or blocked; a layer whose deltas are 10⁶ times larger than the others is exploding. You can print them with a few lines of code, as in Section 13.7.</div></div>
+<h2>13.4 Vectorised Backpropagation: Shapes, Softmax and Activations</h2>
+<h3>Beginner: the same rule, with arrays</h3>
+<p>Real networks have thousands of units per layer, so nobody writes one line per weight. We stack numbers into vectors and matrices (Chapter 6) and the same three steps happen to whole arrays at once. Think of a layer as a machine with three jobs on the way back: (1) hand its weights a gradient, (2) hand its bias a gradient, (3) hand the layer below a gradient. The only new skill is keeping track of shapes. A good habit: <strong>the gradient of anything always has the same shape as the thing itself</strong>.</p>
+<h3>Intermediate: deriving the three layer formulas</h3>
+<p>Take one layer with input x (a column of n<sub>in</sub> numbers), weight matrix W (n<sub>out</sub> × n<sub>in</sub>), bias b (n<sub>out</sub>) and output z = W x + b. Suppose the backward pass delivers δ = ∂L/∂z, a column of n<sub>out</sub> numbers. Write out one entry: z<sub>i</sub> = Σ<sub>j</sub> W<sub>ij</sub> x<sub>j</sub> + b<sub>i</sub>.</p>
+<div class="eq">∂z<sub>i</sub>/∂W<sub>ij</sub> = x<sub>j</sub>  (and ∂z<sub>k</sub>/∂W<sub>ij</sub> = 0 for k ≠ i)</div>
+<div class="eq">∂L/∂W<sub>ij</sub> = Σ<sub>k</sub> (∂L/∂z<sub>k</sub>)(∂z<sub>k</sub>/∂W<sub>ij</sub>) = δ<sub>i</sub> · x<sub>j</sub></div>
+<p>The entry (i, j) of the answer is δ<sub>i</sub> x<sub>j</sub>, which is exactly the outer product of the column δ with the row xᵀ:</p>
+<div class="eq">dW = δ xᵀ    shape (n<sub>out</sub> × 1)(1 × n<sub>in</sub>) = n<sub>out</sub> × n<sub>in</sub> ✓ same as W</div>
+<p>For the bias, ∂z<sub>k</sub>/∂b<sub>i</sub> is 1 when k = i and 0 otherwise, so <strong>db = δ</strong>. For the input, each x<sub>j</sub> affects every z<sub>i</sub> with rate W<sub>ij</sub>, a fan-out. Summing over the routes:</p>
+<div class="eq">∂L/∂x<sub>j</sub> = Σ<sub>i</sub> δ<sub>i</sub> W<sub>ij</sub>  ⇒  dx = Wᵀ δ    shape (n<sub>in</sub> × n<sub>out</sub>)(n<sub>out</sub> × 1) = n<sub>in</sub> × 1 ✓</div>
+<p>In the previous section we computed dx = W₁ᵀ δ and dW₁ = δ xᵀ for the hidden layer, entry by entry. Same formulas. After the layer, the elementwise activation a = f(z) has a diagonal Jacobian, so its backward step is an elementwise product: δ<sub>z</sub> = δ<sub>a</sub> ⊙ f′(z), where ⊙ means multiply entry by entry.</p>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">For a linear layer z = Wx + b with upstream δ: <strong>dW = δ xᵀ</strong>, <strong>db = δ</strong>, <strong>dx = Wᵀ δ</strong>. The backward pass of a matrix multiply is another matrix multiply, with the transposed matrix. That is why GPUs, which are fast at matrix multiplication, accelerate training both ways.</div></div>
+<h3>The batch version</h3>
+<p>Training uses a batch of N examples. Frameworks store the batch as a matrix X with <strong>one example per row</strong>, shape N × n<sub>in</sub>. The layer becomes Z = X Wᵀ + b (b is added to every row), shape N × n<sub>out</sub>. The gradient of the average loss over the batch is the average (or sum) of the per-example gradients, so the per-example outer products add up into a matrix product:</p>
+<div class="eq">dW = Δᵀ X    (n<sub>out</sub> × N)(N × n<sub>in</sub> = n<sub>out</sub> × n<sub>in</sub>)</div>
+<div class="eq">db = Σ over rows of Δ    shape n<sub>out</sub></div>
+<div class="eq">dX = Δ W    (N × n<sub>out</sub>)(n<sub>out</sub> × n<sub>in</sub>) = N × n<sub>in</sub></div>
+<p>where Δ (N × n<sub>out</sub>) holds one δ per row. Why does Δᵀ X equal the sum of outer products? Entry (i, j) of Δᵀ X is Σ<sub>n</sub> Δ<sub>ni</sub> X<sub>nj</sub>, the sum over examples of δ<sub>i</sub> x<sub>j</sub>. The bias gradient is a sum over examples because the same bias is "fanned out" to every example: fan-out sums again.</p>
+<p class="problem"><span class="pl">Problem 13.4.1</span> A layer maps 3 inputs to 2 outputs on a batch of N = 2. W = [[1, 0, −1], [2, 1, 0]], b = (0, 1). X rows: (1, 2, 3) and (0, 1, −1). The upstream gradient Δ has rows (1, −1) and (0.5, 2). Find dW, db, dX.</p>
+<table class="steps"><tr><th>Shapes</th><td>X is 2×3, W is 2×3, Δ is 2×2. Expect dW 2×3, db length 2, dX 2×3.</td></tr><tr><th>dW = Δᵀ X</th><td>Δᵀ = [[1, 0.5], [−1, 2]]. Row 1 of dW = 1·(1,2,3) + 0.5·(0,1,−1) = (1, 2.5, 2.5). Row 2 = −1·(1,2,3) + 2·(0,1,−1) = (−1, 0, −5).</td></tr><tr><th>db</th><td>Column sums of Δ: (1 + 0.5, −1 + 2) = (1.5, 1).</td></tr><tr><th>dX = Δ W</th><td>Row 1 = 1·(1,0,−1) + (−1)·(2,1,0) = (−1, −1, −1). Row 2 = 0.5·(1,0,−1) + 2·(2,1,0) = (4.5, 2, −0.5).</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+W = np.array([[1., 0., -1.], [2., 1., 0.]])
+X = np.array([[1., 2., 3.], [0., 1., -1.]])
+D = np.array([[1., -1.], [0.5, 2.]])
+print("dW", (D.T @ X).tolist())
+print("db", D.sum(axis=0).tolist())
+print("dX", (D @ W).tolist())</code></pre>
+<pre class="code lang-text"><code>dW [[1.0, 2.5, 2.5], [-1.0, 0.0, -5.0]]
+db [1.5, 1.0]
+dX [[-1.0, -1.0, -1.0], [4.5, 2.0, -0.5]]</code></pre>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Shape mismatches hidden by square matrices. Writing <code>dW = D @ X</code> instead of <code>D.T @ X</code> raises an error when N ≠ n<sub>out</sub> (here 2×2 times 2×3 actually works but gives the wrong answer, because the sum is over the wrong index!). Always check: the inner dimension of the product must be the one you are summing over, and the result must have the shape of the parameter. Test your code with a batch size that differs from every layer width.</div></div>
+<h3>Softmax plus cross-entropy: the gradient is p − y</h3>
+<p>For classification the last layer produces logits z = (z₁, ..., z<sub>K</sub>), softmax turns them into probabilities p<sub>i</sub> = e<sup>z<sub>i</sub></sup>/S with S = Σ<sub>k</sub> e<sup>z<sub>k</sub></sup>, and the cross-entropy loss with a one-hot target y (y<sub>c</sub> = 1 for the true class c) is L = −Σ y<sub>i</sub> ln p<sub>i</sub> = −ln p<sub>c</sub> (see Chapter 15 for why this loss). Because L = −z<sub>c</sub> + ln S:</p>
+<div class="eq">∂L/∂z<sub>j</sub> = −[j = c] + (1/S) · ∂S/∂z<sub>j</sub> = −y<sub>j</sub> + e<sup>z<sub>j</sub></sup>/S = p<sub>j</sub> − y<sub>j</sub></div>
+<p>where [j = c] is 1 if j = c and 0 otherwise, which is just y<sub>j</sub>. No messy softmax Jacobian is needed: the two nodes fused together have a beautifully simple backward rule. The gradient is "what the model said minus what was true".</p>
+<p class="problem"><span class="pl">Problem 13.4.2</span> Logits z = (2, 1, 0.1), true class 0. Find p, the loss and the gradient.</p>
+<table class="steps"><tr><th>Exponentials</th><td>e² = 7.3891, e¹ = 2.7183, e<sup>0.1</sup> = 1.1052. Sum S = 11.2126.</td></tr><tr><th>Probabilities</th><td>p = (7.3891, 2.7183, 1.1052)/11.2126 = (0.6590, 0.2424, 0.0986).</td></tr><tr><th>Loss</th><td>L = −ln 0.6590 = 0.4170.</td></tr><tr><th>Gradient p − y</th><td>y = (1, 0, 0), so ∂L/∂z = (0.6590 − 1, 0.2424, 0.0986) = (−0.3410, 0.2424, 0.0986).</td></tr><tr><th>Sanity</th><td>The entries sum to zero: −0.3410 + 0.2424 + 0.0986 = 0 ✓ (shifting all logits equally cannot change the probabilities).</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+z = np.array([2.0, 1.0, 0.1]); y = np.array([1.0, 0.0, 0.0])
+
+def ce(z):
+    e = np.exp(z - z.max()); p = e / e.sum()
+    return -np.log(p[0])
+
+e = np.exp(z - z.max()); p = e / e.sum()
+print("p     ", np.round(p, 4), " loss", round(ce(z), 4))
+print("p - y ", np.round(p - y, 4), " sum", round((p - y).sum(), 12))
+h = 1e-6
+num = [(ce(z + h * np.eye(3)[i]) - ce(z - h * np.eye(3)[i])) / (2 * h) for i in range(3)]
+print("numeric", np.round(num, 4))</code></pre>
+<pre class="code lang-text"><code>p      [0.659  0.2424 0.0986]  loss 0.417
+p - y  [-0.341   0.2424  0.0986]  sum 0.0
+numeric [-0.341   0.2424  0.0986]</code></pre>
+<h3>Activations: the elementwise backward rules</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Activation</th><th>a = f(z)</th><th>f′(z)</th><th>Backward: δ<sub>z</sub> = δ<sub>a</sub> ⊙ ...</th><th>Behaviour</th></tr></thead><tbody>
+<tr><td>ReLU</td><td>max(0, z)</td><td>1 if z &gt; 0 else 0</td><td>(z &gt; 0)</td><td>gate; never shrinks the gradient where active; dead when z ≤ 0</td></tr>
+<tr><td>sigmoid</td><td>1/(1 + e<sup>−z</sup>)</td><td>a(1 − a)</td><td>a(1 − a)</td><td>max slope 0.25; saturates at both ends</td></tr>
+<tr><td>tanh</td><td>(e<sup>z</sup> − e<sup>−z</sup>)/(e<sup>z</sup> + e<sup>−z</sup>)</td><td>1 − a²</td><td>(1 − a²)</td><td>max slope 1 at 0; saturates at ±1</td></tr>
+</tbody></table></div>
+<p>The tanh derivative follows from tanh = sinh/cosh and the quotient rule: (cosh² − sinh²)/cosh² = 1 − tanh². Notice that ReLU's local gradient is exactly 1 in its active region, while sigmoid's is at most 0.25. That single fact is a large part of why ReLU networks train deeper stacks (Section 13.7). At z = 0 exactly, ReLU has no derivative; frameworks pick 0 and it does not matter in practice.</p>
+<p class="problem"><span class="pl">Problem 13.4.3</span> Backprop through a bias-carrying layer followed by tanh. A layer has z = w·x + b with w = 2, x = 0.5, b = −0.5, then a = tanh(z). The upstream gradient on a is ∂L/∂a = 3. Find ∂L/∂w, ∂L/∂b, ∂L/∂x.</p>
+<table class="steps"><tr><th>Forward</th><td>z = 2 · 0.5 − 0.5 = 0.5. a = tanh(0.5) = 0.4621.</td></tr><tr><th>tanh node</th><td>f′ = 1 − a² = 1 − 0.2135 = 0.7864 (0.78645 unrounded). δ<sub>z</sub> = 3 · 0.78645 = 2.3593.</td></tr><tr><th>Linear node</th><td>∂L/∂w = δ<sub>z</sub> · x = 2.3593 · 0.5 = 1.1797. ∂L/∂b = δ<sub>z</sub> = 2.3593. ∂L/∂x = δ<sub>z</sub> · w = 4.7187.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+w, x, b, up = 2.0, 0.5, -0.5, 3.0
+a = np.tanh(w * x + b)
+dz = up * (1 - a ** 2)
+print(round(a, 4), round(dz, 4), round(dz * x, 4), round(dz, 4), round(dz * w, 4))
+
+f = lambda w, b, x: 3.0 * np.tanh(w * x + b)      # a loss whose dL/da is exactly 3
+h = 1e-6
+print(round((f(w + h, b, x) - f(w - h, b, x)) / (2 * h), 4))</code></pre>
+<pre class="code lang-text"><code>0.4621 2.3593 1.1797 2.3593 4.7187
+1.1797</code></pre>
+<h3>Going deeper</h3>
+<p>The complete backward pass of an L-layer MLP is a loop, and every line has been derived above. With a₀ = x, z<sub>l</sub> = W<sub>l</sub> a<sub>l−1</sub> + b<sub>l</sub>, a<sub>l</sub> = f(z<sub>l</sub>):</p>
+<div class="eq">δ<sub>L</sub> = ∂L/∂z<sub>L</sub> (for softmax and cross-entropy this is p − y)</div>
+<div class="eq">dW<sub>l</sub> = δ<sub>l</sub> a<sub>l−1</sub>ᵀ,  db<sub>l</sub> = δ<sub>l</sub>,  δ<sub>l−1</sub> = (W<sub>l</sub>ᵀ δ<sub>l</sub>) ⊙ f′(z<sub>l−1</sub>)</div>
+<p>These four lines are "the backpropagation equations". The Jacobian view of the same loop: δ<sub>l−1</sub>ᵀ = δ<sub>l</sub>ᵀ · W<sub>l</sub> · diag(f′(z<sub>l−1</sub>)), a row vector times a matrix times a diagonal matrix. A scalar loss means δ is always a vector, never a matrix: the whole algorithm is a chain of vector-matrix products. The interview question "why is backprop cheap?" has exactly this answer: you never form a Jacobian, only multiply a row vector by one.</p>
+<div class="callout cream"><div class="lab">INTERVIEW</div><div class="txt">"Derive the gradient of softmax cross-entropy with respect to the logits." Write L = −z<sub>c</sub> + ln Σ e<sup>z<sub>k</sub></sup>, differentiate each term, and finish with p − y in three lines. Mention the numerical trick: subtract max(z) before exponentiating, because softmax is shift-invariant and e¹⁰⁰⁰ overflows.</div></div>
+
+<h2>13.5 A Neural Network from Scratch in NumPy, and Gradient Checking</h2>
+<h3>Beginner: what we are building</h3>
+<p>You now know every ingredient. We assemble them into a class with three methods: <code>forward</code> (compute predictions and remember intermediates), <code>backward</code> (the four backpropagation equations) and <code>train</code> (repeat: forward, backward, step). The convention: a batch X has one example per row, W<sub>l</sub> has shape (n<sub>out</sub>, n<sub>in</sub>), so Z = A Wᵀ + b, exactly as in the batch formulas above. The loss is the <em>mean</em> cross-entropy, so the starting delta is (p − y)/N.</p>
+<p>Read <code>backward</code> against the equations: <code>dZ.T @ self.As[i]</code> is dW = Δᵀ A<sub>prev</sub>; <code>dZ.sum(axis=0)</code> is db; <code>dZ @ self.W[i]</code> is dX = Δ W; multiplying by <code>df(...)</code> is the activation gate. That is the whole of backpropagation in a dozen lines. The block below holds the class plus three experiments: a gradient check, XOR and a spiral. (Python blocks in this chapter are standalone, so the class is pasted once, here.)</p>
+<pre class="code lang-python"><code>import numpy as np
+
+def softmax(Z):
+    E = np.exp(Z - Z.max(axis=1, keepdims=True))   # subtract max for stability
+    return E / E.sum(axis=1, keepdims=True)
+
+class MLP:
+    def __init__(self, sizes, act="relu", seed=0):
+        rng = np.random.default_rng(seed)
+        self.act = act
+        self.W, self.b = [], []
+        for n_in, n_out in zip(sizes[:-1], sizes[1:]):
+            gain = 2.0 if act == "relu" else 1.0          # He for relu, Xavier-like for tanh
+            self.W.append(rng.normal(0, np.sqrt(gain / n_in), (n_out, n_in)))
+            self.b.append(np.zeros(n_out))
+
+    def f(self, Z):
+        return np.maximum(Z, 0) if self.act == "relu" else np.tanh(Z)
+
+    def df(self, Z, A):
+        return (Z &gt; 0).astype(float) if self.act == "relu" else 1 - A**2
+
+    def forward(self, X):
+        self.As, self.Zs = [X], []
+        A = X
+        for i, (W, b) in enumerate(zip(self.W, self.b)):
+            Z = A @ W.T + b                      # (N, n_out)
+            self.Zs.append(Z)
+            A = self.f(Z) if i &lt; len(self.W) - 1 else Z
+            self.As.append(A)
+        return softmax(self.As[-1])              # class probabilities
+
+    def loss(self, P, y):
+        return -np.log(P[np.arange(len(y)), y]).mean()
+
+    def backward(self, P, y):
+        N = len(y)
+        dZ = P.copy()
+        dZ[np.arange(N), y] -= 1                 # p - y (one-hot)
+        dZ /= N                                  # mean over the batch
+        gW, gb = [None] * len(self.W), [None] * len(self.W)
+        for i in reversed(range(len(self.W))):
+            gW[i] = dZ.T @ self.As[i]            # (n_out, n_in)
+            gb[i] = dZ.sum(axis=0)
+            if i &gt; 0:
+                dA = dZ @ self.W[i]              # (N, n_in)
+                dZ = dA * self.df(self.Zs[i-1], self.As[i])
+        return gW, gb
+
+    def train(self, X, y, lr=0.5, epochs=1000, every=250):
+        hist = []
+        for ep in range(epochs + 1):
+            P = self.forward(X)
+            L = self.loss(P, y)
+            hist.append(L)
+            if every and ep % every == 0:
+                acc = (P.argmax(axis=1) == y).mean()
+                print(f"epoch {ep:5d}  loss {L:.4f}  acc {acc:.3f}")
+            gW, gb = self.backward(P, y)
+            for i in range(len(self.W)):
+                self.W[i] -= lr * gW[i]
+                self.b[i] -= lr * gb[i]
+        return hist
+
+# ---------- 1. gradient check on a tiny tanh network ----------
+def numeric_grad(net, X, y, h=1e-5):
+    grads = []
+    for arr in net.W + net.b:
+        g = np.zeros_like(arr)
+        for idx in np.ndindex(*arr.shape):
+            old = arr[idx]
+            arr[idx] = old + h; Lp = net.loss(net.forward(X), y)
+            arr[idx] = old - h; Lm = net.loss(net.forward(X), y)
+            arr[idx] = old
+            g[idx] = (Lp - Lm) / (2 * h)
+        grads.append(g)
+    return grads
+
+def rel_error(ga, gn):
+    a = np.concatenate([g.ravel() for g in ga]); n = np.concatenate([g.ravel() for g in gn])
+    return np.linalg.norm(a - n) / (np.linalg.norm(a) + np.linalg.norm(n))
+
+rng = np.random.default_rng(5)
+Xs = rng.normal(size=(5, 3)); ys = np.array([0, 2, 1, 1, 0])
+net = MLP([3, 4, 3], act="tanh", seed=1)
+P = net.forward(Xs); gW, gb = net.backward(P, ys)
+gn = numeric_grad(net, Xs, ys)
+print("relative error, correct backward:", f"{rel_error(gW + gb, gn):.1e}")
+bad = [g * len(ys) for g in gW + gb]             # bug: forgot the 1/N
+print("relative error, buggy backward  :", f"{rel_error(bad, gn):.2f}")
+
+# ---------- 2. XOR ----------
+X = np.array([[0, 0], [0, 1], [1, 0], [1, 1.0]]); y = np.array([0, 1, 1, 0])
+net = MLP([2, 4, 2], act="tanh", seed=1)
+net.train(X, y, lr=0.5, epochs=1000, every=250)
+print("P(class 1) for the four XOR inputs:", np.round(net.forward(X)[:, 1], 3))
+
+# ---------- 3. three-arm spiral ----------
+def spiral(n=100, k=3, seed=0):
+    rng = np.random.default_rng(seed)
+    X = np.zeros((n * k, 2)); y = np.zeros(n * k, dtype=int)
+    for j in range(k):
+        r = np.linspace(0.05, 1, n)
+        t = np.linspace(j * 4, (j + 1) * 4, n) + rng.normal(0, 0.2, n)
+        X[j*n:(j+1)*n] = np.c_[r * np.sin(t), r * np.cos(t)]
+        y[j*n:(j+1)*n] = j
+    return X, y
+
+Xtr, ytr = spiral(seed=0); Xte, yte = spiral(seed=1)
+net = MLP([2, 64, 3], act="relu", seed=0)
+net.train(Xtr, ytr, lr=1.0, epochs=1000, every=250)
+test_acc = (net.forward(Xte).argmax(axis=1) == yte).mean()
+print("test accuracy on fresh spiral noise:", round(test_acc, 3))</code></pre>
+<pre class="code lang-text"><code>relative error, correct backward: 4.5e-11
+relative error, buggy backward  : 0.67
+epoch     0  loss 0.7162  acc 0.500
+epoch   250  loss 0.0218  acc 1.000
+epoch   500  loss 0.0065  acc 1.000
+epoch   750  loss 0.0036  acc 1.000
+epoch  1000  loss 0.0024  acc 1.000
+P(class 1) for the four XOR inputs: [0.001 0.998 0.997 0.004]
+epoch     0  loss 1.1686  acc 0.227
+epoch   250  loss 0.0818  acc 1.000
+epoch   500  loss 0.0411  acc 1.000
+epoch   750  loss 0.0266  acc 1.000
+epoch  1000  loss 0.0193  acc 1.000
+test accuracy on fresh spiral noise: 0.997</code></pre>
+<figure><img src="images/ch13_spiral.png" alt="Decision regions of a trained network on three spiral arms and the training loss curve" loading="lazy"/><figcaption>Left: decision regions of the 2-64-3 ReLU network after 1500 epochs, with the 300 training points. Right: the cross-entropy loss falling on a log scale.</figcaption></figure>
+<p>How to read it: each coloured region is where the network predicts one class. The boundaries curl around the spiral arms, something no straight line (no linear model, Chapter 7) could do. The loss curve falls quickly then slowly: early steps fix big mistakes, later steps polish the boundary.</p>
+<h3>Intermediate: reading the output, and gradient checking</h3>
+<p>The first two printed lines are the most important lines of the whole experiment. <strong>Gradient checking</strong> compares the analytical gradient from <code>backward</code> with a numerical gradient made by nudging each parameter: g<sub>num</sub> = (L(θ + h) − L(θ − h))/(2h). The comparison uses the relative error</p>
+<div class="eq">relative error = ‖g<sub>analytic</sub> − g<sub>numeric</sub>‖ / (‖g<sub>analytic</sub>‖ + ‖g<sub>numeric</sub>‖)</div>
+<p>It is relative because absolute differences mean nothing if the gradients themselves are tiny. As a rule of thumb with float64 and h = 10⁻⁵: below 10⁻⁷ is excellent, around 10⁻⁵ deserves a look, above 10⁻³ is a bug. The correct code lands around 10⁻¹⁰. The deliberately buggy version, which forgot the 1/N from the mean, scores 0.67 (exactly (N − 1)/(N + 1) = 4/6 for N = 5, because it is N times too large). A bug that large is unmistakable; subtler bugs (a wrong transpose, a missing bias gradient) land between 10⁻¹ and 10⁻³.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Checking gradients in float32, or with a ReLU network at a kink. Wrong: h = 10⁻⁵ in float32 gives numerator differences of the size of rounding noise, so a correct gradient shows a relative error of 10⁻². Right: switch to float64 for the check. Also a ReLU exactly at 0 (or within h of it) makes the numerical slope the average of 0 and 1, which is a false alarm; use tanh for the check, or accept a handful of kink mismatches. Never leave the numerical check inside the training loop: it needs two forward passes <em>per parameter</em>.</div></div>
+<p>The XOR run shows the classic lesson: no single straight line separates the points (0,0), (1,1) from (0,1), (1,0), but four tanh hidden units do it, and the loss falls from about 0.7 (a coin flip, ln 2) to nearly 0 with accuracy 1.000. On the spiral the loss starts at 1.17 (close to ln 3 = 1.0986, the loss of guessing all three classes equally) and ends near 0.02 after 1000 epochs. Because the test set was generated with different noise, the test accuracy tells you the network learned the spiral shape and not just the 300 training points.</p>
+
+<h3>Learning rate and the loss curve</h3>
+<p>The gradient tells you the direction; the learning rate α decides the step: θ ← θ − α ∇L. Chapter 14 studies this in depth, but you need the intuition now to read loss curves. On the simplest bowl, L(w) = w², the gradient is 2w and one step gives w ← w − α·2w = (1 − 2α) w. Each step multiplies w by the factor (1 − 2α). If |1 − 2α| &lt; 1 the iterates shrink to 0; if it is larger, they blow up.</p>
+<pre class="code lang-python"><code>w0 = 1.0
+for lr in [0.01, 0.1, 0.5, 1.0, 1.1]:
+    w = w0
+    for step in range(10):
+        w = w - lr * 2 * w          # gradient of w**2 is 2w
+    print(f"lr {lr:5.2f}  factor {1 - 2*lr:6.2f}  w after 10 steps {w:9.4f}")</code></pre>
+<pre class="code lang-text"><code>lr  0.01  factor   0.98  w after 10 steps    0.8171
+lr  0.10  factor   0.80  w after 10 steps    0.1074
+lr  0.50  factor   0.00  w after 10 steps    0.0000
+lr  1.00  factor  -1.00  w after 10 steps    1.0000
+lr  1.10  factor  -1.20  w after 10 steps    6.1917</code></pre>
+<figure><img src="images/ch13_lr.png" alt="Loss versus epoch for four learning rates on the spiral problem, on a log scale" loading="lazy"/><figcaption>The same 2-64-3 network on the spiral data with learning rates 0.01, 0.1, 1 and 10. Log scale on the vertical axis.</figcaption></figure>
+<p>How to read it: a very small rate (blue) is safe but slow, still above 0.6 after 600 epochs. A moderate rate (teal) learns steadily. The best rate here (orange, 1.0) reaches about 0.03. A rate that is too large (purple, 10) never settles: the loss bounces around 1 to 10 with spikes, because each step overshoots the valley, exactly like the factor 1 − 2α = −1.2 above. Rules of thumb when you read a curve: loss rising or <code>nan</code> means the rate is too high (or a gradient exploded); a very flat curve means it is too low (or gradients are vanishing); a noisy curve that plateaus above a good value means lower the rate later in training.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Blaming backpropagation for a loss that will not go down. Wrong diagnosis: "my gradients must be wrong". Right order of checks: (1) is the learning rate sane (try 10× smaller)? (2) can the model overfit 10 examples (if not, there is a bug)? (3) only then run the gradient check. A gradient check passing while the loss still fails points at the data, the loss definition or the learning rate.</div></div>
+
+<h2>13.6 Reverse-Mode vs Forward-Mode Autodiff, and a Micro Autograd Engine</h2>
+<h3>Beginner: two ways to walk the same graph</h3>
+<p>We have been walking the graph backwards. You could also walk it forwards, carrying along, with each value, a second number: "how fast is this value changing if I wiggle one chosen input?" That is <strong>forward-mode</strong> differentiation. It answers one question per sweep: the derivative of <em>everything</em> with respect to <em>one</em> input. Backward (<strong>reverse-mode</strong>) answers the opposite question per sweep: the derivative of <em>one</em> output with respect to <em>everything</em>. Neural networks have one output (the loss) and millions of inputs (the weights). That settles it.</p>
+<p>Neither is "numerical differentiation" (finite differences) and neither is "symbolic differentiation" (expanding a formula like a CAS). Automatic differentiation computes exact derivatives, up to floating-point rounding, by applying the chain rule to the actual sequence of operations executed.</p>
+<h3>Intermediate: forward mode with dual numbers</h3>
+<p>Forward mode is easy to build. A <strong>dual number</strong> carries a pair (value, derivative). Each operation updates both using its local rule: (a, a′) + (b, b′) = (a + b, a′ + b′) and (a, a′) · (b, b′) = (ab, a′b + ab′), the product rule. Seed the input you care about with derivative 1 and the others with 0.</p>
+<p class="problem"><span class="pl">Problem 13.6.1</span> f(x₁, x₂, x₃, x₄) = x₁x₂ + x₂x₃ + x₃x₄ + x₄x₁ at x = (1, 2, 3, 4). Find the gradient with forward mode and count the sweeps.</p>
+<table class="steps"><tr><th>By hand</th><td>∂f/∂x₁ = x₂ + x₄ = 6. ∂f/∂x₂ = x₁ + x₃ = 4. ∂f/∂x₃ = x₂ + x₄ = 6. ∂f/∂x₄ = x₃ + x₁ = 4.</td></tr><tr><th>Forward mode</th><td>Sweep 1 seeds x₁ with derivative 1 and gets f′ = 6. Sweep 2 seeds x₂, and so on: <strong>4 sweeps</strong> for 4 inputs.</td></tr><tr><th>Reverse mode</th><td>One forward pass plus one backward pass gives all four derivatives: 1 sweep (costing about 2 to 3 forward passes).</td></tr></table>
+<pre class="code lang-python"><code>class Dual:
+    """A number that carries (value, derivative)."""
+    def __init__(self, v, d=0.0):
+        self.v, self.d = v, d
+    def __add__(self, o):
+        o = o if isinstance(o, Dual) else Dual(o)
+        return Dual(self.v + o.v, self.d + o.d)
+    def __mul__(self, o):
+        o = o if isinstance(o, Dual) else Dual(o)
+        return Dual(self.v * o.v, self.d * o.v + self.v * o.d)   # product rule
+
+def f(x):
+    return x[0]*x[1] + x[1]*x[2] + x[2]*x[3] + x[3]*x[0]
+
+point = [1.0, 2.0, 3.0, 4.0]
+grad, sweeps = [], 0
+for i in range(4):                                    # one sweep per input
+    xs = [Dual(p, 1.0 if j == i else 0.0) for j, p in enumerate(point)]
+    grad.append(f(xs).d)
+    sweeps += 1
+print("forward-mode gradient:", grad, " sweeps:", sweeps)
+
+n = 1e8                                              # parameters in a modest network
+seconds = n * 1.0                                    # one second per forward sweep
+print("forward mode for 1e8 weights:", round(seconds / (3600 * 24 * 365), 2), "years")</code></pre>
+<pre class="code lang-text"><code>forward-mode gradient: [6.0, 4.0, 6.0, 4.0]  sweeps: 4
+forward mode for 1e8 weights: 3.17 years</code></pre>
+<div class="tablewrap"><table class="data"><thead><tr><th>Function f: R<sup>n</sup> → R<sup>m</sup></th><th>Forward mode</th><th>Reverse mode</th></tr></thead><tbody>
+<tr><td>One sweep computes</td><td>a column of the Jacobian, J·v (a JVP)</td><td>a row of the Jacobian, uᵀ·J (a VJP)</td></tr>
+<tr><td>Sweeps for the full Jacobian</td><td>n</td><td>m</td></tr>
+<tr><td>Memory</td><td>small (no need to store the forward pass)</td><td>stores intermediate values for the backward pass</td></tr>
+<tr><td>Best when</td><td>few inputs, many outputs (n ≪ m)</td><td>many inputs, few outputs (m ≪ n), such as loss with millions of weights</td></tr>
+<tr><td>Cost of the gradient of a scalar loss</td><td>n × (forward cost)</td><td>about 2 to 3 × (forward cost), independent of n</td></tr>
+</tbody></table></div>
+<p>That last cell is the economic miracle of deep learning, sometimes called the "cheap gradient principle": the gradient of a scalar function costs only a small constant times the function itself, no matter how many parameters it has. Forward mode for 10⁸ weights would take 3 years of forward passes; reverse mode takes a few seconds. Forward mode still has niches: sensitivity of a simulation to a handful of physical parameters, and computing Hessian-vector products (Section 13.8).</p>
+
+<h3>A micro autograd engine</h3>
+<p>Now we build the reverse-mode machine: a <code>Value</code> class that wraps a number, remembers which values it was computed from, and knows how to push gradient back to them. This is the idea behind micrograd, PyTorch and JAX, in 50 lines. Each operation defines its own small <code>_backward</code> closure using the rule <strong>upstream × local</strong> and <strong>accumulates with +=</strong>. The <code>backward()</code> method sorts the graph topologically (parents before children), sets the output's gradient to 1, and calls the closures in reverse order.</p>
+<pre class="code lang-python"><code>import math
+
+class Value:
+    def __init__(self, data, parents=()):
+        self.data = float(data)
+        self.grad = 0.0
+        self._parents = parents
+        self._backward = lambda: None
+
+    def __add__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data + other.data, (self, other))
+        def _backward():
+            self.grad += out.grad                       # add: distribute
+            other.grad += out.grad
+        out._backward = _backward
+        return out
+
+    def __mul__(self, other):
+        other = other if isinstance(other, Value) else Value(other)
+        out = Value(self.data * other.data, (self, other))
+        def _backward():
+            self.grad += other.data * out.grad          # multiply: swap
+            other.grad += self.data * out.grad
+        out._backward = _backward
+        return out
+
+    def __pow__(self, k):                               # k is a plain number
+        out = Value(self.data ** k, (self,))
+        def _backward():
+            self.grad += k * self.data ** (k - 1) * out.grad
+        out._backward = _backward
+        return out
+
+    def exp(self):
+        out = Value(math.exp(self.data), (self,))
+        def _backward():
+            self.grad += out.data * out.grad            # d exp(z) = exp(z)
+        out._backward = _backward
+        return out
+
+    def tanh(self):
+        t = math.tanh(self.data)
+        out = Value(t, (self,))
+        def _backward():
+            self.grad += (1 - t ** 2) * out.grad
+        out._backward = _backward
+        return out
+
+    def relu(self):
+        out = Value(max(0.0, self.data), (self,))
+        def _backward():
+            self.grad += (self.data &gt; 0) * out.grad     # the gate
+        out._backward = _backward
+        return out
+
+    def __neg__(self): return self * -1
+    def __sub__(self, other): return self + (-other)
+    def __radd__(self, other): return self + other
+    def __rmul__(self, other): return self * other
+    def __truediv__(self, other): return self * (other ** -1)
+    def __rtruediv__(self, other): return other * (self ** -1)
+
+    def backward(self):
+        topo, seen = [], set()
+        def build(v):                                   # depth-first topological sort
+            if v not in seen:
+                seen.add(v)
+                for p in v._parents:
+                    build(p)
+                topo.append(v)                          # appended AFTER its parents
+        build(self)
+        self.grad = 1.0                                 # d output / d output
+        for v in reversed(topo):                        # consumers before producers
+            v._backward()
+
+def sigmoid(z):
+    return 1 / (1 + (-z).exp())
+
+# 1. a tanh neuron: n = x1*w1 + x2*w2 + b, o = tanh(n)
+x1, x2, w1, w2 = Value(2.0), Value(0.0), Value(-3.0), Value(1.0)
+b = Value(6.8813735870195432)
+o = (x1 * w1 + x2 * w2 + b).tanh()
+o.backward()
+print("tanh neuron o:", round(o.data, 4), " grads x1 w1 x2 w2:", round(x1.grad, 4), round(w1.grad, 4), round(x2.grad, 4), round(w2.grad, 4))
+
+# 2. fan-out graph c = (x*y)(x+y) at x=2, y=3
+x, y = Value(2.0), Value(3.0)
+c = (x * y) * (x + y)
+c.backward()
+print("fan-out c:", c.data, " dx dy:", x.grad, y.grad)
+
+# 3. the sigmoid neuron of Section 13.3
+w, b, xin = Value(0.8), Value(-0.5), Value(1.5)
+L = (sigmoid(w * xin + b) - 1) ** 2
+L.backward()
+print("sigmoid neuron L:", round(L.data, 4), " dw db dx:", round(w.grad, 4), round(b.grad, 4), round(xin.grad, 4))
+
+# 4. the two-layer network of Section 13.3
+xs = [Value(1.0), Value(2.0)]
+W1 = [[Value(0.5), Value(0.25)], [Value(-0.6), Value(0.1)]]
+b1 = [Value(0.1), Value(0.05)]
+v = [Value(0.7), Value(-0.4)]; c0 = Value(0.2)
+h = [(W1[i][0] * xs[0] + W1[i][1] * xs[1] + b1[i]).relu() for i in range(2)]
+a = sigmoid(v[0] * h[0] + v[1] * h[1] + c0)
+L = 0.5 * (a - 0) ** 2
+L.backward()
+print("MLP L:", round(L.data, 4))
+print("dW1 row1:", round(W1[0][0].grad, 4), round(W1[0][1].grad, 4), " row2:", W1[1][0].grad, W1[1][1].grad)
+print("dv:", round(v[0].grad, 4), v[1].grad, " dc:", round(c0.grad, 4), " dx:", round(xs[0].grad, 4), round(xs[1].grad, 4))
+
+# 5. forward-mode example from above, reverse mode, ONE backward call
+p = [Value(t) for t in (1.0, 2.0, 3.0, 4.0)]
+f = p[0]*p[1] + p[1]*p[2] + p[2]*p[3] + p[3]*p[0]
+f.backward()
+print("reverse-mode gradient:", [q.grad for q in p], " backward calls: 1")</code></pre>
+<pre class="code lang-text"><code>tanh neuron o: 0.7071  grads x1 w1 x2 w2: -1.5 1.0 0.5 0.0
+fan-out c: 30.0  dx dy: 21.0 16.0
+sigmoid neuron L: 0.1101  dw db dx: -0.2207 -0.1471 -0.1177
+MLP L: 0.2629
+dW1 row1: 0.1012 0.2023  row2: 0.0 0.0
+dv: 0.159 0.0  dc: 0.1445  dx: 0.0506 0.0253
+reverse-mode gradient: [6.0, 4.0, 6.0, 4.0]  backward calls: 1</code></pre>
+<p>Every number matches the hand results: ∂o/∂x₁ = −1.5, ∂o/∂w₁ = 1.0 (the tanh neuron, where n = 0.8814 and 1 − tanh² = 0.5, so x₁'s gradient is w₁ · 0.5 = −1.5), the 21 and 16 of the fan-out graph, the −0.2207, −0.1471, −0.1177 of the sigmoid neuron, and the 0.1012, 0.2023, 0.1590, 0.1445, 0.0506, 0.0253 of the two-layer network, including the exact zeros for the dead ReLU row. The engine reuses nothing but the rule upstream × local.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Writing <code>self.grad = other.data * out.grad</code> instead of <code>+=</code> in the engine. For y = x·x with x = 3 the multiply node sends gradient to the same node twice: with <code>=</code> the second overwrites the first and you get 3; with <code>+=</code> you get 3 + 3 = 6 = 2x ✓. Two more traps: forgetting to reset <code>.grad</code> to zero before a second backward call on the same graph (gradients stack up, which PyTorch also does), and calling the closures in forward order, which pushes incomplete gradients.</div></div>
+<h3>Going deeper</h3>
+<p>Three details separate this toy from a production engine. (1) <strong>Tensors</strong>: PyTorch's nodes hold whole arrays, and each op's <code>_backward</code> uses the matrix formulas of Section 13.4 (a matmul node stores W and x, and its backward is two matmuls). (2) <strong>Memory</strong>: closures keep the forward values alive; a framework frees the graph after <code>backward()</code> unless you pass <code>retain_graph=True</code>. (3) <strong>Higher order</strong>: because the backward closures are themselves built from differentiable operations, a framework can record <em>them</em> too (<code>create_graph=True</code>) and differentiate the gradient, which gives second derivatives (Section 13.8).</p>
+<h3>How PyTorch autograd does it</h3>
+<p>PyTorch tensors with <code>requires_grad=True</code> record every operation in a graph of <code>grad_fn</code> objects, like our <code>_parents</code> and <code>_backward</code>. Calling <code>.backward()</code> on the scalar loss runs the reverse topological sweep and <em>accumulates</em> into each leaf's <code>.grad</code>. The equivalent of Section 13.3's sigmoid neuron and of our tanh neuron is shown in comments below. <strong>Torch is not installed in this environment, so the PyTorch lines are not run here.</strong> The Python that does run just prints the values you should see.</p>
+<pre class="code lang-python"><code># ---- PyTorch equivalent (NOT RUN HERE: torch is not installed in this environment) ----
+# import torch
+# x1 = torch.tensor(2.0, requires_grad=True);  w1 = torch.tensor(-3.0, requires_grad=True)
+# x2 = torch.tensor(0.0, requires_grad=True);  w2 = torch.tensor(1.0, requires_grad=True)
+# b  = torch.tensor(6.8813735870195432, requires_grad=True)
+# o = torch.tanh(x1 * w1 + x2 * w2 + b)
+# o.backward()                                    # fills .grad of every leaf
+# print(x1.grad.item(), w1.grad.item(), x2.grad.item(), w2.grad.item())
+#
+# Typical training step in PyTorch (also not run here):
+# model = torch.nn.Sequential(torch.nn.Linear(2, 64), torch.nn.ReLU(), torch.nn.Linear(64, 3))
+# opt = torch.optim.SGD(model.parameters(), lr=1.0)
+# loss_fn = torch.nn.CrossEntropyLoss()           # softmax + cross-entropy fused (p - y backward)
+# for epoch in range(1000):
+#     opt.zero_grad()                             # gradients ACCUMULATE, so reset them
+#     loss = loss_fn(model(X), y)                 # forward builds the graph
+#     loss.backward()                             # backward sweeps it
+#     opt.step()                                  # theta -= lr * grad
+# with torch.no_grad(): ...                       # evaluation: no graph, less memory
+print("expected from the hand calculation: -1.5 1.0 0.5 0.0   (x1, w1, x2, w2)")</code></pre>
+<pre class="code lang-text"><code>expected from the hand calculation: -1.5 1.0 0.5 0.0   (x1, w1, x2, w2)</code></pre>
+<div class="callout cream"><div class="lab">INTERVIEW</div><div class="txt">"Why does PyTorch need <code>zero_grad()</code>?" Because <code>backward()</code> accumulates (<code>+=</code>) into <code>.grad</code>; that is the fan-out rule applied across calls, and it is useful for gradient accumulation over several micro-batches. "Why is reverse mode used for training?" One scalar output, millions of inputs: one backward sweep costs a small multiple of the forward pass, forward mode would need one sweep per parameter.</div></div>
+<h2>13.7 Vanishing and Exploding Gradients, Initialisation, Residuals and Batch Norm</h2>
+<h3>Beginner: the game of telephone</h3>
+<p>In the children's game of telephone, a message passes through twenty people. If each person whispers a bit quieter, the last person hears nothing. If each person shouts a bit louder, the last person is deafened. Backpropagation sends a gradient message through every layer, and each layer multiplies it by its local factors (Section 13.1). Twenty factors of 0.25 make the message almost silent; twenty factors of 3 make it enormous. In the first case the early layers barely learn (<strong>vanishing gradients</strong>); in the second the weights jump wildly or become <code>nan</code> (<strong>exploding gradients</strong>).</p>
+<p class="problem"><span class="pl">Problem 13.7.1</span> Why is a deep sigmoid network in trouble even in the best case?</p>
+<table class="steps"><tr><th>Max slope</th><td>σ′(z) = σ(1 − σ) is largest at z = 0, where it is 0.5 · 0.5 = 0.25.</td></tr><tr><th>One layer</th><td>Passing a gradient through one sigmoid multiplies it by at most 0.25 (times the weights).</td></tr><tr><th>Ten layers</th><td>0.25¹⁰ = 1/1,048,576 ≈ 9.5 × 10⁻⁷.</td></tr><tr><th>Twenty layers</th><td>0.25²⁰ ≈ 9.1 × 10⁻¹³. Unless the weights are large, the first layers see essentially zero gradient.</td></tr></table>
+<h3>Intermediate: measure it, then fix it with initialisation</h3>
+<p>The experiment: build a 20-layer network of width 100, send a random batch forward, then push a gradient of ones back from the last layer and record the norm of the delta (the quantity δ of Section 13.4) at every layer. The code covers five settings, then checks how the <em>forward</em> signal behaves under two weight scales.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+def delta_norms(act, std, L=20, n=100, N=64, seed=0):
+    rng = np.random.default_rng(seed)
+    Ws = [rng.normal(0, std, (n, n)) for _ in range(L)]
+    a = rng.normal(size=(N, n)); As = [a]; Zs = []
+    for W in Ws:
+        z = a @ W.T; Zs.append(z)
+        a = 1/(1+np.exp(-z)) if act == "sigmoid" else np.maximum(z, 0) if act == "relu" else np.tanh(z)
+        As.append(a)
+    d = np.ones((N, n)); out = []
+    for i in reversed(range(L)):
+        if act == "sigmoid": d = d * As[i+1] * (1 - As[i+1])
+        elif act == "relu": d = d * (Zs[i] &gt; 0)
+        else: d = d * (1 - As[i+1]**2)
+        out.append(np.linalg.norm(d)); d = d @ Ws[i]
+    return out[::-1]                                  # index 0 = layer closest to the input
+
+n = 100
+cases = [("sigmoid, Xavier", "sigmoid", np.sqrt(1/n)), ("relu, std 0.05", "relu", 0.05),
+         ("relu, std 0.3", "relu", 0.3), ("relu, He", "relu", np.sqrt(2/n)), ("tanh, Xavier", "tanh", np.sqrt(1/n))]
+print(f"{'setting':18s} {'layer 1':>10s} {'layer 10':>10s} {'layer 20':>10s}")
+for name, act, std in cases:
+    g = delta_norms(act, std)
+    print(f"{name:18s} {g[0]:10.1e} {g[9]:10.1e} {g[19]:10.1e}")
+
+rng = np.random.default_rng(0)
+for name, var in [("Var(w) = 1/n", 1.0), ("Var(w) = 2/n (He)", 2.0)]:
+    a = rng.normal(size=(1000, 500))
+    for _ in range(20):
+        a = np.maximum(a @ rng.normal(0, np.sqrt(var / 500), (500, 500)).T, 0)
+    print(name, "RMS of layer-20 activations:", f"{np.sqrt((a**2).mean()):.4f}")</code></pre>
+<pre class="code lang-text"><code>setting               layer 1   layer 10   layer 20
+sigmoid, Xavier       1.7e-11    9.6e-06    1.9e+01
+relu, std 0.05        4.0e-07    4.1e-03    5.9e+01
+relu, std 0.3         2.4e+08    2.5e+05    5.9e+01
+relu, He              1.5e+02    1.3e+02    5.9e+01
+tanh, Xavier          1.4e+01    5.4e+01    7.8e+01
+Var(w) = 1/n RMS of layer-20 activations: 0.0008
+Var(w) = 2/n (He) RMS of layer-20 activations: 0.7336</code></pre>
+<figure><img src="images/ch13_gradflow.png" alt="Norm of the backpropagated delta at each of 20 layers for five activation and initialisation choices, log scale" loading="lazy"/><figcaption>Gradient signal per layer. Layer 20 is next to the loss and layer 1 next to the input. Each straight line on this log plot means the signal changes by a constant factor per layer.</figcaption></figure>
+<p>How to read it: moving from right (loss) to left (input) the sigmoid line (blue) falls by about twelve orders of magnitude, so the first layer receives a signal roughly a trillion times weaker than the last. ReLU with a too-small scale (orange) vanishes too, ReLU with a too-large scale (dark red) explodes by more than six orders of magnitude, while He initialisation (teal) is almost flat. Tanh with Xavier (purple) is nearly flat, with mild decay. The straight lines are the signature of a per-layer multiplicative factor.</p>
+<h3>Deriving Xavier and He initialisation</h3>
+<p>We want each layer to <em>preserve the scale</em> of the signal. Consider one unit z = Σ<sub>j=1</sub><sup>n</sup> w<sub>j</sub> a<sub>j</sub>, with n inputs. Assume the weights are independent, have mean 0 and variance Var(w), and are independent of the inputs a<sub>j</sub>. Then the terms are independent with mean 0 and</p>
+<div class="eq">Var(z) = Σ<sub>j</sub> Var(w<sub>j</sub> a<sub>j</sub>) = Σ<sub>j</sub> Var(w) · E[a<sub>j</sub>²] = n · Var(w) · E[a²]</div>
+<p><strong>Linear or tanh units (near zero):</strong> a ≈ z of the previous layer, so E[a²] ≈ Var(z<sub>prev</sub>). To keep Var(z) = Var(z<sub>prev</sub>) we need n · Var(w) = 1, that is <strong>Var(w) = 1/n<sub>in</sub></strong>. The same argument for the backward pass (δ<sub>prev</sub> = Wᵀ δ sums over n<sub>out</sub> terms) asks for 1/n<sub>out</sub>. Xavier (Glorot) initialisation compromises: <strong>Var(w) = 2/(n<sub>in</sub> + n<sub>out</sub>)</strong>.</p>
+<p><strong>ReLU units:</strong> a = max(0, z) with z symmetric around 0, so half the mass is zeroed and E[a²] = ½ Var(z<sub>prev</sub>). Now Var(z) = n · Var(w) · ½ · Var(z<sub>prev</sub>), and we need n · Var(w)/2 = 1, that is <strong>Var(w) = 2/n<sub>in</sub></strong> (He initialisation). The factor 2 compensates the half that ReLU kills.</p>
+<p class="problem"><span class="pl">Problem 13.7.2</span> A layer has 512 inputs and uses ReLU. What standard deviation should its weights have, and what happens with 1/n instead?</p>
+<table class="steps"><tr><th>He</th><td>Var(w) = 2/512 = 0.00390625, so std = √0.00390625 = 0.0625.</td></tr><tr><th>Xavier-style 1/n</th><td>Var(w) = 1/512, std = 0.0442.</td></tr><tr><th>Effect with 1/n</th><td>Each ReLU layer shrinks E[a²] by a factor 1/2, so after 20 layers the RMS has dropped by (1/2)¹⁰ ≈ 0.001. The code above measured 0.0008, while He measured 0.73 (order one, with sampling noise).</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Initialising all weights to the same value (for example zero). Wrong: with W = 0 every hidden unit computes the same thing and receives the same gradient (δ = Wᵀδ = 0 too), so they stay identical forever: "symmetry is never broken". Right: small <em>random</em> weights with the variances above. Biases may start at zero: they do not suffer from symmetry because the weights already differ.</div></div>
+<h3>Residual connections</h3>
+<p>A residual block computes y = x + F(x) instead of y = F(x). The derivative is ∂y/∂x = I + ∂F/∂x. Over L blocks the backward signal is multiplied by (I + J<sub>L</sub>)···(I + J₁). Expand the product: one term is I·I···I = I, a path where the gradient goes straight through with factor exactly 1, plus terms involving the J's. The identity "highway" cannot vanish, however small the J's are. Residual networks (ResNets, and every transformer) rely on it to train hundreds of layers.</p>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(1)
+n, L = 50, 30
+Js = [rng.normal(0, 0.05, (n, n)) for _ in range(L)]      # small layer Jacobians
+u = np.ones(n) / np.sqrt(n)                                # gradient arriving at the top, norm 1
+plain, res = u.copy(), u.copy()
+for J in Js:
+    plain = J.T @ plain                    # plain network: multiply by J
+    res = (np.eye(n) + J).T @ res          # residual network: multiply by (I + J)
+print("plain 30 layers   :", f"{np.linalg.norm(plain):.1e}")
+print("residual 30 layers:", f"{np.linalg.norm(res):.2f}")</code></pre>
+<pre class="code lang-text"><code>plain 30 layers   : 3.5e-14
+residual 30 layers: 5.22</code></pre>
+<p>The same gradient shrinks to 3 × 10⁻¹⁴ in the plain stack and stays of order 5 (not vanishing) with skip connections. Residual blocks can still explode if the J's are large, which is why transformers add normalisation and scale the residual branch at initialisation.</p>
+<h3>Batch normalisation: gradient awareness</h3>
+<p>Batch normalisation rescales a feature to zero mean and unit variance over the batch: x̂<sub>i</sub> = (x<sub>i</sub> − μ)/σ̂, with μ the batch mean and σ̂ = √(var + ε). For backpropagation the catch is that μ and σ̂ depend on <em>every</em> example in the batch. Example i influences output j through three routes: directly (only when i = j), through the mean, and through the variance. These routes fan out and must be <strong>summed</strong>. Collecting them gives, for a single feature over a batch of N,</p>
+<div class="eq">∂L/∂x<sub>i</sub> = <span class="frac"><span>1</span><span>N σ̂</span></span> · ( N · dx̂<sub>i</sub> − Σ<sub>k</sub> dx̂<sub>k</sub> − x̂<sub>i</sub> · Σ<sub>k</sub> dx̂<sub>k</sub> x̂<sub>k</sub> )</div>
+<p>Two sanity facts: the gradient sums to zero over the batch (adding a constant to every x changes nothing, because the mean is subtracted), and it is orthogonal to x̂ (scaling every x changes nothing). Treating μ and σ̂ as constants would give the naive dx̂<sub>i</sub>/σ̂, which is wrong. The code verifies the formula numerically and shows how far off the naive version is. It also shows gradient clipping, the standard guard against explosions: if the total gradient norm exceeds a limit, scale every gradient down so the norm equals the limit.</p>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(0)
+x = rng.normal(size=6) * 2 + 1
+g = rng.normal(size=6)                    # upstream gradient dL/d xhat, with L = sum(g * xhat)
+eps = 1e-5
+
+def bn(x):
+    return (x - x.mean()) / np.sqrt(x.var() + eps)
+
+xhat = bn(x); sd = np.sqrt(x.var() + eps); N = len(x)
+dx = (N * g - g.sum() - xhat * (g * xhat).sum()) / (N * sd)      # full batchnorm backward
+naive = g / sd                                                    # pretends mean and variance are constants
+
+L = lambda x: (g * bn(x)).sum()
+h = 1e-6
+num = np.array([(L(x + h*np.eye(N)[i]) - L(x - h*np.eye(N)[i])) / (2*h) for i in range(N)])
+print("full formula :", np.round(dx, 4))
+print("numeric      :", np.round(num, 4))
+print("naive (wrong):", np.round(naive, 4))
+print("max error full vs numeric:", f"{np.abs(dx - num).max():.1e}", " |sum of dx|:", abs(round(dx.sum(), 10)))
+
+# gradient clipping by global norm
+grads = [np.array([30.0, -40.0]), np.array([0.0, 120.0])]
+total = np.sqrt(sum((q**2).sum() for q in grads))
+scale = min(1.0, 5.0 / total)
+print("global norm", round(total, 2), " scale", round(scale, 5), " clipped:", [np.round(q * scale, 4).tolist() for q in grads])</code></pre>
+<pre class="code lang-text"><code>full formula : [ 1.8412  1.2868 -0.7335 -1.642  -0.9502  0.1977]
+numeric      : [ 1.8412  1.2868 -0.7335 -1.642  -0.9502  0.1977]
+naive (wrong): [ 1.7648  1.2818 -0.9524 -1.7126 -0.8435  0.0559]
+max error full vs numeric: 2.5e-10  |sum of dx|: 0.0
+global norm 130.0  scale 0.03846  clipped: [[1.1538, -1.5385], [0.0, 4.6154]]</code></pre>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Four tools keep gradients healthy: (1) activations with slope near 1 (ReLU family, not saturated sigmoids), (2) variance-preserving initialisation (Xavier for tanh, He for ReLU), (3) skip connections that give gradients an identity path, (4) normalisation layers plus gradient clipping as a safety net. Modern architectures use all four.</div></div>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">A practical monitoring habit: log the global gradient norm and the per-layer update-to-weight ratio (learning rate times gradient norm divided by weight norm; a healthy value is around 10⁻³). A loss that suddenly spikes together with a gradient-norm spike is an exploding step; a norm sliding to zero in the early layers is vanishing.</div></div>
+
+<h2>13.8 The Expert Layer: JVPs and VJPs, Memory, Checkpointing, Second Order, BPTT</h2>
+<h3>Jacobian-vector products and vector-Jacobian products</h3>
+<p>For a function with Jacobian J (Chapter 12), two products matter. A <strong>JVP</strong>, J v, pushes a direction v from the input side to the output side: it is what forward mode computes and answers "if I move the inputs along v, how do the outputs move?" A <strong>VJP</strong>, uᵀ J, pulls a weighting u from the output side to the input side: it is what reverse mode computes and answers "how sensitive is the weighted sum uᵀ(output) to each input?". Backpropagation is a chain of VJPs, one per layer, where u is the current δ. Frameworks never build J. For z = W x the VJP with respect to x is Wᵀu; for an elementwise activation, J is diagonal, so the VJP is an elementwise product; for a softmax over a vocabulary of 50,000 words, J would have 2.5 × 10⁹ entries (10 GB in float32) <em>per token</em>, but its VJP needs only O(n) work.</p>
+<p>Each primitive therefore ships with exactly one function: "given u, return uᵀJ". For softmax, J = diag(p) − ppᵀ, so uᵀJ = p ⊙ u − p (p·u) = p ⊙ (u − p·u): no matrix needed.</p>
+<h3>Memory cost of backprop and gradient checkpointing</h3>
+<p>The backward pass needs the forward values (the local gradients use them). A network with L layers, batch N and width n stores about L · N · n numbers for activations (more, if each layer keeps both pre-activation and activation). Compute is cheap but memory is the usual limit.</p>
+<p class="problem"><span class="pl">Problem 13.8.1</span> 50 layers, batch 512, width 4096, float32 (4 bytes), storing both z and a per layer.</p>
+<table class="steps"><tr><th>Per layer</th><td>512 · 4096 · 4 bytes = 8,388,608 bytes = 8 MiB per tensor, so 16 MiB for z and a together.</td></tr><tr><th>All layers</th><td>50 · 16 MiB = 800 MiB ≈ 0.78 GiB, for activations only (weights, gradients and optimiser state come on top).</td></tr></table>
+<p><strong>Gradient checkpointing</strong> trades compute for memory: store only every s-th layer's activation (a "checkpoint"). During the backward pass, when you reach a segment, recompute its forward pass from the nearest checkpoint, keeping that one segment's activations in memory. Memory is about L/s checkpoints plus s live activations; the extra compute is roughly one more forward pass (since backward costs about twice a forward pass, training becomes about 33% slower). The minimum of L/s + s is at s = √L.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+# VJP of softmax without the Jacobian
+z = np.array([2.0, 1.0, 0.1]); u = np.array([1.0, -2.0, 0.5])
+p = np.exp(z) / np.exp(z).sum()
+J = np.diag(p) - np.outer(p, p)
+print("u^T J (explicit Jacobian)  :", np.round(u @ J, 4))
+print("p * (u - p.u) (no Jacobian):", np.round(p * (u - p @ u), 4))
+
+# memory of stored activations
+layers, batch, width, nbytes = 50, 512, 4096, 4
+per_layer = batch * width * nbytes * 2
+print("MiB per layer:", per_layer / 2**20, " all layers GiB:", round(layers * per_layer / 2**30, 3))
+
+# checkpointing: stored tensors = L/s checkpoints + s live activations
+L = 100
+for s in [1, 5, 10, 20, 50, 100]:
+    print(f"segment {s:3d}: stored activations {L // s + s}")</code></pre>
+<pre class="code lang-text"><code>u^T J (explicit Jacobian)  : [ 0.5118 -0.539   0.0273]
+p * (u - p.u) (no Jacobian): [ 0.5118 -0.539   0.0273]
+MiB per layer: 16.0  all layers GiB: 0.781
+segment   1: stored activations 101
+segment   5: stored activations 25
+segment  10: stored activations 20
+segment  20: stored activations 25
+segment  50: stored activations 52
+segment 100: stored activations 101</code></pre>
+<p>With L = 100, plain storage keeps 100 activations; segments of 10 keep 10 + 10 = 20, a 5× memory saving for about one extra forward pass. (The rows s = 1 and s = 100 are the degenerate ends: both cost 101 here.) Large language models train with exactly this trick, usually combined with mixed precision.</p>
+<h3>Second order: Hessian-vector products</h3>
+<p>The Hessian H (all second derivatives, Chapter 12) of a model with 10⁸ parameters has 10¹⁶ entries, about 40 petabytes in float32: impossible to store. But the <strong>Hessian-vector product</strong> H v is cheap. Since H v = ∇<sub>θ</sub>(∇L(θ) · v), you can get it by differentiating the dot product of the gradient with a fixed vector: one more backward sweep through the graph of the backward pass (this is what <code>create_graph=True</code> allows), costing a small multiple of one gradient. A cruder alternative uses a finite difference of gradients: H v ≈ (∇L(θ + εv) − ∇L(θ − εv))/(2ε), two gradient evaluations. HVPs power conjugate-gradient Newton methods, Lanczos estimates of the largest Hessian eigenvalue (a "sharpness" measure) and influence functions. Check with logistic regression, where the Hessian of the mean log loss is Xᵀ diag(s(1 − s)) X / N, with s the sigmoid of the scores:</p>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(0)
+X = rng.normal(size=(50, 3))
+y = (X @ np.array([1., -2., 0.5]) + rng.normal(size=50) &gt; 0) * 2.0 - 1     # labels in {-1, +1}
+sig = lambda t: 1 / (1 + np.exp(-t))
+
+def grad(w):                                          # gradient of mean log(1 + exp(-y x.w))
+    return X.T @ (-y * sig(-y * (X @ w))) / len(y)
+
+w = np.array([0.3, -0.1, 0.2]); v = np.array([1.0, 2.0, -1.0])
+s = sig(X @ w)
+H = X.T @ (X * (s * (1 - s))[:, None]) / len(y)       # exact Hessian
+eps = 1e-5
+hv_fd = (grad(w + eps * v) - grad(w - eps * v)) / (2 * eps)   # no Hessian needed
+print("exact H v     :", np.round(H @ v, 6))
+print("gradient diff :", np.round(hv_fd, 6))</code></pre>
+<pre class="code lang-text"><code>exact H v     : [ 0.317444  0.358911 -0.173782]
+gradient diff : [ 0.317444  0.358911 -0.173782]</code></pre>
+<h3>Backpropagation through time</h3>
+<p>A recurrent network applies the same weights at every time step: h<sub>t</sub> = f(w h<sub>t−1</sub> + x<sub>t</sub>). Unroll it over T steps and you get a very deep graph whose layers <em>share</em> a parameter. Two consequences. First, the shared weight fans out to T places, so its gradient is the <strong>sum</strong> over time steps of the per-step contributions (fan-out accumulation again). Second, the gradient reaching the start is a product of T identical Jacobian factors:</p>
+<div class="eq">∂h<sub>T</sub>/∂h₀ = Π<sub>t=1</sub><sup>T</sup> w · f′(·)</div>
+<p>so the vanishing or exploding behaviour of Section 13.7 appears with depth T, and with the same weight at every step it is as sharp as it gets: a factor 0.9 gives 0.9³⁰ = 0.042, a factor 1.1 gives 1.1³⁰ = 17.4. Remedies: gradient clipping against explosion, gated cells (LSTM, GRU) whose near-identity paths act like residual connections against vanishing, and <strong>truncated BPTT</strong>, which backpropagates only the last k steps to bound memory and the product length. Transformers sidestep the long product with attention paths that connect distant positions directly.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+def chain_grad(w, T=30, tanh_act=True):
+    """d h_T / d h_0 for h_t = f(w * h_{t-1} + 0.1), as a product of local factors."""
+    h, jac = 0.5, 1.0
+    for _ in range(T):
+        h = np.tanh(w * h + 0.1) if tanh_act else w * h + 0.1
+        jac *= w * (1 - h**2) if tanh_act else w
+    return jac
+
+def numeric(w, T=30, e=1e-6):
+    def run(h0):
+        h = h0
+        for _ in range(T): h = np.tanh(w * h + 0.1)
+        return h
+    return (run(0.5 + e) - run(0.5 - e)) / (2 * e)
+
+print(f"{'w':>5s} {'linear w^30':>12s} {'tanh chain':>12s} {'tanh numeric':>13s}")
+for w in [0.9, 1.1, 1.5]:
+    print(f"{w:5.1f} {chain_grad(w, tanh_act=False):12.3e} {chain_grad(w):12.3e} {numeric(w):13.3e}")</code></pre>
+<pre class="code lang-text"><code>w  linear w^30   tanh chain  tanh numeric
+  0.9    4.239e-02    7.132e-06     7.132e-06
+  1.1    1.745e+01    4.907e-08     4.907e-08
+  1.5    1.918e+05    1.443e-15     0.000e+00</code></pre>
+<p>With a linear recurrence, w = 1.1 explodes (17.4) and w = 0.9 fades (0.042). With tanh the saturating slope 1 − h² adds a second shrinking factor, so even w = 1.1 and w = 1.5 vanish: tanh turns a would-be explosion into silence, which is one reason plain RNNs forget long-range information. The chain-rule product matches the numerical derivative in the first two rows; at w = 1.5 both are zero to machine precision.</p>
+<div class="callout cream"><div class="lab">INTERVIEW</div><div class="txt">"How would you train a model whose activations do not fit in memory?" Gradient checkpointing (recompute segments), smaller micro-batches with gradient accumulation (use <code>+=</code> across micro-batches, then one step), mixed precision (halve activation bytes), and offloading. Quote the trade: about 1.33× compute for √L memory. "What is the cost of a Hessian-vector product?" A small constant times a gradient, without ever forming the Hessian.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Assuming gradient checkpointing changes the gradient. Wrong: "recomputation makes the result approximate". Right: recomputation reproduces the same forward values, so the gradient is bit-for-bit the same in exact arithmetic. Pitfall: layers with randomness (dropout) must reuse the same random mask when recomputed, or the recomputed forward differs from the original and the gradient is wrong; frameworks save the random-number-generator state for this.</div></div>
+
+<h2>Chapter recap</h2>
+<ul>
+<li>The chain rule says rates multiply along a chain: dy/dx = dy/du · du/dx. A deep network is a long chain, so training is repeated chain rule.</li>
+<li>A computational graph has a forward pass (store every value) and a backward pass (reverse topological order, upstream × local at every node).</li>
+<li>At fan-out nodes, gradients from the different routes are <strong>added</strong> (<code>+=</code>), never overwritten.</li>
+<li>Add distributes the gradient, multiply swaps the inputs, ReLU gates, sigmoid uses a(1 − a), tanh uses 1 − a².</li>
+<li>For a linear layer z = Wx + b with upstream δ: dW = δxᵀ, db = δ, dx = Wᵀδ; in batch form dW = ΔᵀX, db = column sums of Δ, dX = ΔW. A gradient always has the shape of the thing it differentiates.</li>
+<li>Softmax with cross-entropy has the clean logit gradient p − y (divide by N for a mean loss).</li>
+<li>Always gradient-check a new layer: relative error below 10⁻⁷ in float64, above 10⁻³ means a bug.</li>
+<li>Reverse mode costs a few forward passes for the gradient of a scalar, regardless of the number of parameters; forward mode needs one sweep per input.</li>
+<li>A micro autograd engine is a <code>Value</code> with parents, a local backward closure, a topological sort and <code>+=</code>; PyTorch is the same idea on tensors.</li>
+<li>Vanishing and exploding gradients are products of many factors below or above 1: use ReLU-family activations, He (Var = 2/n) or Xavier (Var = 1/n) initialisation, skip connections, normalisation and clipping.</li>
+<li>Expert layer: backprop is a chain of VJPs that never forms Jacobians; checkpointing trades one extra forward pass for √L memory; Hessian-vector products cost about one gradient; BPTT is backprop on an unrolled graph with shared weights.</li>
+</ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / pattern</th><th>Meaning</th></tr></thead><tbody>
+<tr><td>dy/dx = dy/du · du/dx</td><td>chain rule: multiply local rates</td></tr>
+<tr><td>∂f/∂in = (∂f/∂out)(∂out/∂in)</td><td>upstream × local, the rule of every node</td></tr>
+<tr><td>∂f/∂x = Σ over routes</td><td>fan-out accumulation</td></tr>
+<tr><td>σ′ = σ(1 − σ), tanh′ = 1 − tanh²</td><td>derivatives computed from the stored output</td></tr>
+<tr><td>dW = δxᵀ, db = δ, dx = Wᵀδ</td><td>linear layer backward (single example)</td></tr>
+<tr><td>dW = ΔᵀX, dX = ΔW</td><td>batch version, one example per row</td></tr>
+<tr><td>∂L/∂z = p − y</td><td>softmax plus cross-entropy</td></tr>
+<tr><td>Var(w) = 2/n<sub>in</sub> (ReLU), 2/(n<sub>in</sub> + n<sub>out</sub>) (Xavier)</td><td>keep activation and gradient scale constant</td></tr>
+<tr><td>y = x + F(x) ⇒ ∂y/∂x = I + ∂F/∂x</td><td>identity highway for gradients</td></tr>
+<tr><td>(L(θ+h) − L(θ−h))/2h</td><td>numerical gradient for checking</td></tr>
+<tr><td>Hv ≈ (∇L(θ+εv) − ∇L(θ−εv))/2ε</td><td>Hessian-vector product without the Hessian</td></tr>
+</tbody></table></div>
+
+<h2>Practice set</h2>
+<p class="problem"><span class="pl">Problem 13.1</span> Differentiate y = (2x + 1)³ at x = 1 with the chain rule.</p>
+<p><strong>Answer:</strong> Inner u = 2x + 1 = 3 at x = 1. dy/du = 3u² = 27, du/dx = 2, so dy/dx = 27 · 2 = 54. (Forgetting the inner factor gives 27, wrong.)</p>
+<p class="problem"><span class="pl">Problem 13.2</span> For f = a·b + c with a = 2, b = −3, c = 4, run the forward and backward pass and give ∂f/∂a, ∂f/∂b, ∂f/∂c.</p>
+<p><strong>Answer:</strong> Forward: p = a·b = −6, f = p + c = −2. Backward: ∂f/∂p = 1, ∂f/∂c = 1. Multiply node swaps: ∂f/∂a = 1 · b = −3, ∂f/∂b = 1 · a = 2. So (−3, 2, 1).</p>
+<p class="problem"><span class="pl">Problem 13.3</span> Draw the graph of f = x · (x + 2) and compute df/dx at x = 3 using the fan-out rule. Check with calculus.</p>
+<p><strong>Answer:</strong> Forward: a = x + 2 = 5, f = x · a = 15. Backward: the multiply node sends ∂f/∂x (route 1) = a = 5 and ∂f/∂a = x = 3. The add node sends 3 · 1 = 3 to x (route 2). Total ∂f/∂x = 5 + 3 = 8. Calculus: f = x² + 2x, f′ = 2x + 2 = 8 ✓.</p>
+<p class="problem"><span class="pl">Problem 13.4</span> A sigmoid neuron has x = 2, w = 0.5, b = 0 and target y = 0, loss L = (a − y)². Find ∂L/∂w.</p>
+<p><strong>Answer:</strong> z = 0.5 · 2 + 0 = 1. a = σ(1) = 0.7311. ∂L/∂a = 2(a − 0) = 1.4621. ∂a/∂z = a(1 − a) = 0.7311 · 0.2689 = 0.1966. ∂L/∂z = 1.4621 · 0.1966 = 0.2875. ∂L/∂w = 0.2875 · x = 0.5750 (0.5749 with unrounded intermediates). (A positive gradient: decreasing w lowers the loss.)</p>
+<p class="problem"><span class="pl">Problem 13.5</span> Logits (1, 2, 3), true class 1 (the second one, counting from 0). Give the softmax probabilities and the gradient of the cross-entropy with respect to the logits.</p>
+<p><strong>Answer:</strong> Exponentials 2.7183, 7.3891, 20.0855, sum 30.1929. p = (0.0900, 0.2447, 0.6652). With y = (0, 1, 0), p − y = (0.0900, −0.7553, 0.6652). The entries sum to 0 ✓.</p>
+<p class="problem"><span class="pl">Problem 13.6</span> A layer maps 5 inputs to 3 outputs, batch size 8. Give the shapes of W, b, X, Z, Δ, dW, db, dX.</p>
+<p><strong>Answer:</strong> W: 3×5, b: 3, X: 8×5, Z = XWᵀ + b: 8×3, Δ: 8×3, dW = ΔᵀX: (3×8)(8×5) = 3×5, db = column sums of Δ: 3, dX = ΔW: (8×3)(3×5) = 8×5. Every gradient has the shape of its variable.</p>
+<p class="problem"><span class="pl">Problem 13.7</span> Find the bug. A student's engine multiplies with <code>self.grad = other.data * out.grad; other.grad = self.data * out.grad</code> and tests y = x · x at x = 3. What does it return, and what is correct?</p>
+<p><strong>Answer:</strong> Here self and other are the same object x. The first line sets x.grad = 3 · 1 = 3, the second overwrites it with 3 · 1 = 3. Result 3. Correct is dy/dx = 2x = 6. Fix: use <code>+=</code> in both lines, giving 3 + 3 = 6.</p>
+<p class="problem"><span class="pl">Problem 13.8</span> Ten sigmoid layers each pass the gradient through the maximum possible slope. What is the largest the gradient factor can be, ignoring the weights? Why does this make deep sigmoid networks hard to train?</p>
+<p><strong>Answer:</strong> σ′ ≤ 0.25, so the factor is at most 0.25¹⁰ = 1/1,048,576 ≈ 9.5 × 10⁻⁷. Weights of size around 1 do not rescue it: the first layers get about a millionth of the learning signal of the last layer, so they barely move.</p>
+<p class="problem"><span class="pl">Problem 13.9</span> A gradient check returns analytic 0.75 and numeric 0.70 for one parameter. Compute the relative error and decide whether to trust the backward code.</p>
+<p><strong>Answer:</strong> |0.75 − 0.70|/max(0.75, 0.70) = 0.05/0.75 = 0.067 (using the other form, 0.05/(0.75 + 0.70) = 0.034). Either way it is far above 10⁻³: do not trust the code. Look for a missing term, a wrong transpose or a missing 1/N. A correct float64 implementation gives about 10⁻⁹.</p>
+<p class="problem"><span class="pl">Problem 13.10</span> A 20-block residual network has F(x) = 0.1x in every block, and a plain network has the same layers without the skip. Compare the gradient factors from output to input.</p>
+<p><strong>Answer:</strong> Plain: each layer has derivative 0.1, so 0.1²⁰ = 10⁻²⁰. Residual: each block has derivative 1 + 0.1 = 1.1, so 1.1²⁰ = 6.7275. The identity path turns total vanishing into mild growth; with a larger F′ the product could explode, which is why residual branches are scaled and normalised.</p>
+<p class="problem"><span class="pl">Problem 13.11</span> Gradient checkpointing: a network of 36 layers stores one 1 MiB activation per layer. How much memory do the activations need without checkpointing and with checkpoints every 6 layers?</p>
+<p><strong>Answer:</strong> Without: 36 MiB. With segments of s = 6: 36/6 = 6 checkpoints plus 6 live activations = 12 MiB, a 3× saving. Cost: about one extra forward pass (around 33% more compute), same gradient.</p>
+<p class="problem"><span class="pl">Problem 13.12</span> (Expert, derive) Show that the gradient of softmax cross-entropy sums to zero, and explain what this says about the logits.</p>
+<p><strong>Answer:</strong> ∂L/∂z<sub>j</sub> = p<sub>j</sub> − y<sub>j</sub>. Sum over j: Σp<sub>j</sub> − Σy<sub>j</sub> = 1 − 1 = 0. So moving the logits along (1, 1, ..., 1) never changes the loss: softmax is shift-invariant, and its gradient has no component along that direction. This also explains why subtracting max(z) before exponentiating is safe.</p>
+<p class="problem"><span class="pl">Problem 13.13</span> (Interview) You must train a network with 10⁸ parameters and one scalar loss. Why use reverse mode rather than forward mode, and what does it cost?</p>
+<p><strong>Answer:</strong> Forward mode yields one column of the Jacobian per sweep, so the gradient needs 10⁸ sweeps. Reverse mode yields the whole gradient of a scalar in one backward sweep, costing about 2 to 3 forward passes regardless of the parameter count. The price is memory: reverse mode must store intermediate activations, which checkpointing can reduce.</p>
+<p class="problem"><span class="pl">Problem 13.14</span> (Interview, BPTT) An RNN is trained on sequences of length 200 and the loss does not improve for early time steps. Give two likely reasons and two fixes.</p>
+<p><strong>Answer:</strong> Reasons: vanishing gradients (a product of 200 factors below 1, for example tanh slopes and recurrent weights with spectral norm below 1) and exploding gradients (factors above 1, seen as loss spikes or nan). Fixes: gradient clipping by global norm for explosion; gated cells (LSTM or GRU) or orthogonal initialisation of the recurrent matrix for vanishing; truncated BPTT to bound the product; or switch to attention-based models.</p>
+
+<h2>Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me the chain rule and backpropagation step by step: computational graphs, forward and backward passes, upstream times local gradients, fan-out accumulation, the layer formulas dW = delta x^T, db = delta, dx = W^T delta, softmax plus cross-entropy giving p - y, and vanishing or exploding gradients. Start from my level (school algebra plus basic derivatives), use one small numeric example per idea with every multiplication shown, then quiz me with 8 questions of increasing difficulty, one at a time. Wait for my answer, tell me exactly where my reasoning went wrong, and only then continue.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>Act as a careful reviewer of my backpropagation work. I will paste either a hand calculation on a small network or my NumPy / micro-autograd code. Check each step: are the forward values right, is every local gradient evaluated at the right value, are gradients accumulated (+=) at fan-out nodes, do all gradient shapes match their variables, is the 1/N for the mean loss present, and does a numerical gradient check agree? List every error with the corrected line and the reason, explain what symptom it would cause during training (nan, flat loss, slow first layers), and suggest a gradient-check test that would have caught it. Do not just give me the final answer, show the corrected steps.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>Run a mock technical interview for a machine learning engineer role, focused on backpropagation. Ask me one question at a time: derive the softmax cross-entropy gradient, explain reverse versus forward mode and why reverse wins for training, explain vanishing gradients and why ReLU, He initialisation and residual connections help, compute a small backward pass by hand, explain gradient checkpointing and its trade-off, and explain what a Hessian-vector product is. After each answer, score me from 1 to 5, give the model answer in plain language, and point out what a strong candidate would add. Finish with a summary of my weak spots and a 3-day practice plan.</pre></div>

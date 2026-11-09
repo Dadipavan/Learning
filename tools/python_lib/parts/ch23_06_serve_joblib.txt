@@ -1,0 +1,296 @@
+
+<h2>23.5 Serving and Speed: FastAPI, a Standard-Library API, and joblib</h2>
+<h3>FastAPI</h3>
+<p><strong>FastAPI</strong> turns type-hinted Python functions into a web API. You declare the shape of the input with a <strong>pydantic</strong> model; FastAPI validates every request against it, answers <code>422</code> with a precise error list when it is wrong, converts the output to JSON and writes interactive documentation at <code>/docs</code>. It runs on an ASGI server such as <strong>uvicorn</strong>. Neither FastAPI, pydantic nor uvicorn is installed here, so the FastAPI code is <strong>not run here</strong>. Right after it, a runnable stdlib server shows the same request and response flow. Use FastAPI when other programs need on-demand predictions; for a nightly batch use a CLI.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>FastAPI(title=...)</code></td><td>Creates the application</td><td><code>app = FastAPI()</code></td></tr>
+<tr><td><code>@app.get / post / put / delete</code></td><td>Maps an HTTP method and path to a function</td><td><code>@app.get("/health")</code></td></tr>
+<tr><td>path parameter</td><td>A part of the URL, converted by its hint</td><td><code>@app.get("/items/{item_id}")<br>def f(item_id: int)</code></td></tr>
+<tr><td>query parameter</td><td>A function argument not in the path</td><td><code>def f(limit: int = 10)</code> for <code>?limit=5</code></td></tr>
+<tr><td><code>pydantic.BaseModel</code></td><td>Typed body schema with validation</td><td><code>class Item(BaseModel): name: str</code></td></tr>
+<tr><td><code>Field(ge=, le=, gt=, min_length=)</code></td><td>Constraints on a value</td><td><code>age: int = Field(ge=18, le=100)</code></td></tr>
+<tr><td><code>response_model=</code></td><td>Shape of the reply; filters extra fields</td><td><code>@app.post("/p", response_model=Out)</code></td></tr>
+<tr><td><code>status_code=</code></td><td>Success status</td><td><code>@app.post("/items", status_code=201)</code></td></tr>
+<tr><td><code>HTTPException</code></td><td>Return an error status</td><td><code>raise HTTPException(404, "not found")</code></td></tr>
+<tr><td><code>Depends</code></td><td>Dependency injection: shared logic, auth, database sessions</td><td><code>def f(db=Depends(get_db))</code></td></tr>
+<tr><td><code>lifespan</code></td><td>Code at start-up and shut-down; load the model once</td><td><code>FastAPI(lifespan=lifespan)</code></td></tr>
+<tr><td><code>APIRouter</code></td><td>Group routes in separate files</td><td><code>router = APIRouter(prefix="/v1")</code></td></tr>
+<tr><td><code>def</code> vs <code>async def</code></td><td><code>def</code> runs in a thread pool; <code>async def</code> must never block</td><td>use <code>def</code> for CPU-bound model calls</td></tr>
+<tr><td><code>BackgroundTasks</code></td><td>Do work after the response is sent</td><td><code>tasks.add_task(log_it, row)</code></td></tr>
+<tr><td><code>Header</code>, <code>Cookie</code>, <code>Query</code></td><td>Read or constrain other inputs</td><td><code>x_key: str = Header()</code></td></tr>
+<tr><td><code>field_validator</code></td><td>Custom check on one field</td><td><code>@field_validator("email")</code></td></tr>
+<tr><td><code>model_dump()</code></td><td>Pydantic model to dict</td><td><code>item.model_dump()</code></td></tr>
+<tr><td><code>TestClient</code></td><td>Calls the app in-process, no server needed (uses httpx)</td><td><code>client = TestClient(app)</code></td></tr>
+<tr><td><code>app.dependency_overrides</code></td><td>Replace a dependency in tests</td><td><code>app.dependency_overrides[get_db] = fake</code></td></tr>
+<tr><td><code>uvicorn app:app --reload</code></td><td>Run the server (<code>--reload</code> only for development)</td><td><code>uvicorn app:app --port 8000</code></td></tr>
+<tr><td><code>/docs</code>, <code>/openapi.json</code></td><td>Automatic interactive docs and machine-readable schema</td><td>open in a browser</td></tr>
+</tbody></table></div>
+<h3>Example 18: a prediction API with validation (not run here)</h3>
+@@np
+# app.py  -- NOT RUN HERE: fastapi, pydantic and uvicorn are not installed
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import joblib
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+MODEL_PATH = Path("model.joblib")
+state = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    state["model"] = joblib.load(MODEL_PATH)      # load once, not per request
+    yield
+    state.clear()
+
+app = FastAPI(title="Churn API", lifespan=lifespan)
+
+class Customer(BaseModel):
+    age: int = Field(ge=18, le=100)
+    tenure_months: float = Field(ge=0)
+    monthly_spend: float = Field(gt=0)
+
+class Prediction(BaseModel):
+    churn_probability: float
+    label: int
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+@app.post("/predict", response_model=Prediction)
+def predict(c: Customer):
+    x = [[c.age, c.tenure_months, c.monthly_spend]]
+    p = float(state["model"].predict_proba(x)[0, 1])
+    return Prediction(churn_probability=round(p, 4), label=int(p >= 0.5))
+@@end
+@@np
+# test_app.py  -- NOT RUN HERE
+from fastapi.testclient import TestClient
+from app import app
+
+def test_health():
+    with TestClient(app) as client:               # the with-block runs lifespan
+        r = client.get("/health")
+        assert r.status_code == 200
+        assert r.json() == {"status": "ok"}
+
+def test_predict_ok():
+    with TestClient(app) as client:
+        r = client.post("/predict", json={"age": 40, "tenure_months": 12, "monthly_spend": 30.5})
+        assert r.status_code == 200
+        body = r.json()
+        assert 0.0 <= body["churn_probability"] <= 1.0
+        assert body["label"] in (0, 1)
+
+def test_predict_rejects_young_customer():
+    with TestClient(app) as client:
+        r = client.post("/predict", json={"age": 17, "tenure_months": 1, "monthly_spend": 5})
+        assert r.status_code == 422
+        assert r.json()["detail"][0]["loc"][-1] == "age"
+
+def test_predict_missing_field():
+    with TestClient(app) as client:
+        r = client.post("/predict", json={"age": 30})
+        assert r.status_code == 422
+@@end
+<ol><li><code>lifespan</code> loads the trained model from disk once when the server starts. Loading inside <code>predict</code> would re-read the file on every request, a very common slowdown.</li>
+<li><code>Customer</code> is the contract. <code>Field(ge=18, le=100)</code> means "greater or equal 18, less or equal 100"; <code>gt=0</code> is strictly greater. A JSON body with the wrong type or range never reaches your function.</li>
+<li><code>response_model=Prediction</code> fixes the shape of the answer and appears in the generated documentation.</li>
+<li><code>predict</code> is a plain <code>def</code> because <code>predict_proba</code> is CPU work; FastAPI runs it in a worker thread so it does not freeze the event loop. Use <code>async def</code> only for code that awaits I/O.</li>
+<li>The tests use <code>TestClient</code>, which calls the app in-process through httpx. The <code>with</code> form is needed so the lifespan code runs. They check the happy path, a business-rule rejection (age 17 gives status 422 and the error location points at <code>age</code>), and a missing field.</li>
+<li>Run it with <code>uvicorn app:app --port 8000</code> and open <code>http://127.0.0.1:8000/docs</code> to try the endpoints by hand.</li></ol>
+<figure><img src="images/lib23_api_flow.png" alt="Request flow: client sends POST with JSON body, validation checks types and ranges, a failing request returns 422 with problems, a valid one reaches the handler that calls the model loaded once at startup, and returns a 200 JSON response" loading="lazy"/><figcaption>The life of one prediction request.</figcaption></figure>
+<p><strong>How to read it:</strong> the horizontal path is the happy case. The downward arrow is the rejection path: invalid data never touches the model. The box above the handler is a reminder that the expensive model object is created once, outside the request path.</p>
+<h3>Example 19: the same flow with the standard library (run)</h3>
+<p>Python's <code>http.server</code> is not for production, but it is perfect for understanding what a framework does for you. This server trains a scikit-learn model, validates the JSON by hand and answers with the same status codes (200 and 422). The client is httpx, which is installed. The server runs in a background thread on a free port (<code>port 0</code> means "any free port").</p>
+@@py
+import json
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+import httpx
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(0)
+X = np.column_stack([rng.integers(18, 80, 400), rng.uniform(0, 60, 400), rng.uniform(5, 100, 400)])
+y = ((X[:, 1] < 12) & (X[:, 2] > 40)).astype(int)
+model = LogisticRegression(max_iter=2000).fit(X / [100, 60, 100], y)
+
+RULES = {"age": (18, 100), "tenure_months": (0, 1000), "monthly_spend": (0.01, 10_000)}
+
+def validate(body):
+    problems = []
+    for name, (lo, hi) in RULES.items():
+        v = body.get(name)
+        if not isinstance(v, (int, float)) or isinstance(v, bool):
+            problems.append({"loc": name, "msg": "field required or not a number"})
+        elif not lo <= v <= hi:
+            problems.append({"loc": name, "msg": f"must be between {lo} and {hi}"})
+    return problems
+
+class Handler(BaseHTTPRequestHandler):
+    def _send(self, code, payload):
+        data = json.dumps(payload).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/health":
+            self._send(200, {"status": "ok"})
+        else:
+            self._send(404, {"detail": "not found"})
+
+    def do_POST(self):
+        if self.path != "/predict":
+            return self._send(404, {"detail": "not found"})
+        raw = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+        try:
+            body = json.loads(raw)
+        except json.JSONDecodeError:
+            return self._send(400, {"detail": "invalid JSON"})
+        problems = validate(body)
+        if problems:
+            return self._send(422, {"detail": problems})
+        x = np.array([[body["age"], body["tenure_months"], body["monthly_spend"]]]) / [100, 60, 100]
+        p = float(model.predict_proba(x)[0, 1])
+        self._send(200, {"churn_probability": round(p, 4), "label": int(p >= 0.5)})
+
+    def log_message(self, *args):          # keep the console quiet
+        pass
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+base = f"http://127.0.0.1:{server.server_port}"
+
+with httpx.Client(base_url=base, timeout=30, trust_env=False) as client:
+    r = client.get("/health")
+    print(r.status_code, r.json())
+    r = client.post("/predict", json={"age": 40, "tenure_months": 3, "monthly_spend": 80})
+    print(r.status_code, r.json())
+    r = client.post("/predict", json={"age": 40, "tenure_months": 50, "monthly_spend": 10})
+    print(r.status_code, r.json())
+    r = client.post("/predict", json={"age": 17, "tenure_months": 1, "monthly_spend": 5})
+    print(r.status_code, r.json())
+    r = client.post("/predict", content=b"not json")
+    print(r.status_code, r.json())
+    r = client.get("/nothing")
+    print(r.status_code)
+server.shutdown()
+@@end
+<ol><li>We generate 400 fake customers and define churn as "short tenure and high spend", then fit a logistic regression on scaled features. The scaling vector <code>[100, 60, 100]</code> must be applied again at prediction time; forgetting it is a classic training-serving mismatch.</li>
+<li><code>validate</code> plays the role of the pydantic model: it checks presence, type and range and returns a list of problems, shaped like FastAPI's <code>detail</code> list.</li>
+<li>The handler class maps HTTP methods to <code>do_GET</code> and <code>do_POST</code>. <code>_send</code> writes the status line, headers (<code>Content-Length</code> is needed so the client knows when the body ends) and the JSON bytes.</li>
+<li><code>do_POST</code> reads exactly <code>Content-Length</code> bytes, parses them, returns 400 for broken JSON, 422 for invalid fields and otherwise predicts. This is the same decision flow as the figure above.</li>
+<li><code>HTTPServer(("127.0.0.1", 0), Handler)</code> binds to a free port; <code>serve_forever</code> in a daemon thread lets the same script act as client. The client sets a generous <code>timeout</code> and <code>trust_env=False</code> so that proxy environment variables on your machine cannot intercept the local call.</li>
+<li>The outputs, in order: health returns 200 with <code>ok</code>; a short-tenure high-spend customer gets probability 0.6531 and label 1; a long-tenure low-spend customer gets 0.0034 and label 0; age 17 returns 422 with the problem list; invalid JSON returns 400; an unknown path returns 404. The probabilities depend on the seeded data and the solver, and are exact for this setup.</li></ol>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A framework adds no magic: it parses the request, validates it, calls your function, converts the answer to JSON and picks the status code. What FastAPI adds is that your type hints do the validation, the documentation and the conversion in one declaration, which is far less code to get wrong.</div></div>
+
+<h3>joblib: cache, parallelise, save models</h3>
+<p><strong>joblib</strong> is a small library used throughout scikit-learn. Three jobs: <code>dump/load</code> to save big numpy-heavy objects (like fitted models), <code>Memory</code> to cache results of slow functions on disk, and <code>Parallel/delayed</code> to run independent calls on several CPU cores.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>joblib.dump(obj, path)</code></td><td>Saves an object to disk</td><td><code>joblib.dump(model, "m.joblib")</code></td></tr>
+<tr><td><code>joblib.load(path)</code></td><td>Loads it back (only from sources you trust)</td><td><code>model = joblib.load("m.joblib")</code></td></tr>
+<tr><td><code>compress=</code></td><td>Smaller files, slower save (0 to 9, or a name)</td><td><code>joblib.dump(m, p, compress=3)</code></td></tr>
+<tr><td><code>mmap_mode="r"</code></td><td>Load big arrays lazily from disk</td><td><code>joblib.load(p, mmap_mode="r")</code></td></tr>
+<tr><td><code>Memory(location, verbose=0)</code></td><td>Creates a disk cache folder</td><td><code>mem = Memory("cache_dir")</code></td></tr>
+<tr><td><code>mem.cache(func)</code></td><td>Wraps a function so repeated calls with the same arguments read the stored result</td><td><code>slow = mem.cache(slow)</code></td></tr>
+<tr><td><code>func.clear()</code>, <code>mem.clear()</code></td><td>Delete cached results</td><td><code>mem.clear(warn=False)</code></td></tr>
+<tr><td><code>Parallel(n_jobs=)</code></td><td>Runs tasks on several worker processes; <code>-1</code> means all cores</td><td><code>Parallel(n_jobs=4)(...)</code></td></tr>
+<tr><td><code>delayed(f)(args)</code></td><td>Describes a call without running it</td><td><code>delayed(f)(3)</code></td></tr>
+<tr><td><code>cpu_count()</code></td><td>Number of cores</td><td><code>joblib.cpu_count()</code></td></tr>
+<tr><td><code>parallel_config</code></td><td>Choose backend and worker count for a block</td><td><code>with parallel_config(backend="threading", n_jobs=4):</code></td></tr>
+<tr><td><code>joblib.hash(obj)</code></td><td>Stable fingerprint of any object</td><td><code>joblib.hash(df)</code></td></tr>
+</tbody></table></div>
+<h3>Example 20: save and load a model</h3>
+@@py
+import tempfile
+from pathlib import Path
+
+import joblib
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+
+rng = np.random.default_rng(1)
+X = rng.normal(size=(300, 5))
+y = (X[:, 0] + X[:, 1] > 0).astype(int)
+model = RandomForestClassifier(n_estimators=50, random_state=0).fit(X, y)
+
+with tempfile.TemporaryDirectory() as tmp:
+    path = Path(tmp) / "model.joblib"
+    joblib.dump(model, path)
+    small = Path(tmp) / "model_c.joblib"
+    joblib.dump(model, small, compress=3)
+    print(path.stat().st_size > small.stat().st_size)
+    loaded = joblib.load(path)
+
+print(np.array_equal(model.predict(X), loaded.predict(X)))
+print(type(loaded).__name__, loaded.n_estimators)
+@@end
+<ol><li>We fit a small random forest on synthetic data whose label depends on the first two columns.</li>
+<li><code>dump</code> writes the fitted object. <code>compress=3</code> trades a little speed for a smaller file; the first printed value (<code>True</code>) confirms the compressed file is smaller.</li>
+<li><code>load</code> rebuilds an equivalent object. The predictions of original and loaded model are identical (<code>True</code>).</li>
+<li>The loaded object is a <code>RandomForestClassifier</code> with 50 trees. Remember: joblib files are Python pickles; <strong>loading one can run arbitrary code</strong>, so never load a file from an untrusted source, and record the scikit-learn version used to create it (a model saved with one version may not load in another).</li></ol>
+<h3>Example 21: cache a slow function</h3>
+@@py
+import tempfile
+
+from joblib import Memory
+
+calls = []
+
+def slow_square(x):
+    calls.append(x)               # a side effect, so we can count real executions
+    return x * x
+
+with tempfile.TemporaryDirectory() as tmp:
+    memory = Memory(tmp, verbose=0)
+    cached = memory.cache(slow_square)
+    print(cached(12), cached(12), cached(13))
+    print("real calls:", calls)
+    cached.clear(warn=False)
+    cached(12)
+    print("after clear:", calls)
+@@end
+<ol><li><code>Memory(tmp)</code> chooses a folder for the cache. In a project use a folder such as <code>.cache/</code> that is in <code>.gitignore</code>.</li>
+<li><code>memory.cache(slow_square)</code> returns a wrapped function. joblib computes a hash of the function's source code and arguments to find stored results.</li>
+<li>The first <code>cached(12)</code> executes the function and stores the result; the second finds it on disk. <code>cached(13)</code> has a new argument and executes. The print shows <code>144 144 169</code> and the real calls are <code>[12, 13]</code>: only two executions for three calls.</li>
+<li>After <code>clear</code>, the next call recomputes, so 12 is appended again: <code>[12, 13, 12]</code>.</li></ol>
+<h3>Example 22: Parallel and when it does not help</h3>
+@@py
+import time
+from joblib import Parallel, delayed
+
+def tiny(i):
+    return i * i
+
+def heavy(n):
+    s = 0
+    for k in range(n):
+        s += k % 7
+    return s
+
+def clock(f):
+    t = time.perf_counter()
+    f()
+    return time.perf_counter() - t
+
+print(Parallel(n_jobs=2)(delayed(tiny)(i) for i in range(6)))
+
+clock(lambda: Parallel(n_jobs=4)(delayed(tiny)(i) for i in range(4)))      # warm up the workers
+for name, fn, arg in (("tiny", tiny, 5), ("heavy", heavy, 2_000_000)):
+    serial = clock(lambda: [fn(arg) for _ in range(16)])
+    par = clock(lambda: Parallel(n_jobs=4)(delayed(fn)(arg) for _ in range(16)))
+    print(name, "parallel faster:", par < serial)
+@@end
+<ol><li><code>Parallel(n_jobs=2)(generator)</code> runs the delayed calls on two worker processes and returns the results <strong>in the order submitted</strong>: <code>[0, 1, 4, 9, 16, 25]</code>.</li>
+<li><code>clock</code> measures wall time with <code>perf_counter</code>. The first parallel call only starts the worker processes, so it is excluded from the comparison.</li>
+<li>For <code>tiny</code> tasks (microseconds) sending arguments to another process costs far more than the work, so parallel is slower (<code>False</code>). For <code>heavy</code> tasks (tens of milliseconds each) the work dominates and four workers win (<code>True</code>), on a machine with several cores.</li>
+<li>We print a boolean rather than a time, because exact timings vary from run to run and machine to machine. The measured bars in the figure below came from one machine and also vary.</li></ol>
+<figure><img src="images/lib23_joblib_timing.png" alt="Left: joblib Memory first call versus cached call, cached much shorter. Right, log scale: for tiny tasks parallel is slower than serial, for heavy tasks parallel is faster" loading="lazy"/><figcaption>Measured on one machine, your numbers will differ. Caching pays on the second call; parallelism pays only when each task is heavy.</figcaption></figure>
+<p><strong>How to read it:</strong> the left panel compares a first call (computes and stores) with a repeated call (loads the result from disk). The right panel has a logarithmic axis, so each gridline is ten times larger than the one below. For tiny tasks the parallel bar is thousands of times taller, which is overhead; for heavy tasks it is lower than the serial bar, which is the benefit.</p>

@@ -1,0 +1,20 @@
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt, sqlite3, re, html, subprocess, sys, tempfile, os
+src = open("/Users/c2487352/Personal/Career/final/study/sql/ch16.html").read()
+code = html.unescape(re.findall(r'<pre class="code lang-python"><code>(.*?)</code></pre>', src, re.S)[0])
+d = tempfile.mkdtemp(); open(d + "/g.py", "w").write(code)
+subprocess.run([sys.executable, d + "/g.py", d + "/c.db"], check=True, capture_output=True)
+db = sqlite3.connect(d + "/c.db")
+rows = db.execute("""select cast(julianday(appt_date)-julianday(booked_on) as int) lead, count(*), sum(status='no_show')
+ from appointments where status<>'cancelled' group by 1 order by 1""").fetchall()
+fig, ax = plt.subplots(figsize=(8, 4.2))
+x = [r[0] for r in rows]; y = [100.0 * r[2] / r[1] for r in rows]
+ax.bar(range(len(x)), y, color="#2b4fd6")
+ax.set_xticks(range(len(x))); ax.set_xticklabels([str(v) for v in x])
+for i, r in enumerate(rows):
+    ax.text(i, y[i] + .8, "%.0f%%" % y[i], ha="center", fontsize=9)
+    ax.text(i, 1.2, "n=%d" % r[1], ha="center", fontsize=7.5, color="white", rotation=90, va="bottom")
+ax.set_xlabel("days between booking and appointment (lead time)"); ax.set_ylabel("no-show rate, percent")
+ax.set_title("No-show rate climbs with lead time (non-cancelled appointments)")
+for sp in ("top", "right"): ax.spines[sp].set_visible(False)
+plt.tight_layout(); plt.savefig("ch16_lead.png", dpi=110)

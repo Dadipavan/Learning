@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 7: Model Serving</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#2b4fd6"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 7</div><h1>Model Serving</h1><p>How to wrap a trained model in a safe, observable, fast service that other systems can call.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-7-1-a-prediction-service-with-validation-and-health-checks">7.1 A Prediction Service with Validation and Health Checks</a></li><li><a href="#s2-7-2-batching-why-one-row-at-a-time-is-wasteful">7.2 Batching: Why One Row at a Time Is Wasteful</a></li><li><a href="#s3-7-3-model-formats-and-the-pickle-risk">7.3 Model Formats and the Pickle Risk</a></li><li><a href="#s4-7-4-serving-frameworks-and-llm-serving-concepts">7.4 Serving Frameworks and LLM Serving (Concepts)</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>A model file on your laptop helps nobody. The app team needs a URL they can call, get an answer from in a few milliseconds, and trust at 3 a.m. In this chapter you will take the churn model from earlier chapters and put it behind an HTTP service that checks its input, reports its health, counts its own errors and can score many rows at once. You will measure why batching makes a model faster, simulate a dynamic batcher, see why loading a pickle file from a stranger is dangerous, and learn the names and jobs of the serving tools you will meet at work (ONNX, Triton, KServe, vLLM). Think of a bank counter: latency is how long one customer waits, throughput is customers served per hour, and queues form when customers arrive faster than the teller works. Here those ideas meet a model.</p>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 7: Model Serving</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#2b4fd6"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 7</div><h1>Model Serving</h1><p>How to wrap a trained model in a safe, observable, fast service that other systems can call.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-7-1-a-prediction-service-with-validation-and-health-checks">7.1 A Prediction Service with Validation and Health Checks</a></li><li><a href="#s2-7-2-batching-why-one-row-at-a-time-is-wasteful">7.2 Batching: Why One Row at a Time Is Wasteful</a></li><li><a href="#s3-7-3-model-formats-and-the-pickle-risk">7.3 Model Formats and the Pickle Risk</a></li><li><a href="#s4-7-4-serving-frameworks-and-llm-serving-concepts">7.4 Serving Frameworks and LLM Serving (Concepts)</a></li><li><a href="#s5-7-5-latency-budgets-queues-and-autoscaling">7.5 Latency Budgets, Queues and Autoscaling</a></li><li><a href="#s6-7-6-llm-serving-arithmetic-kv-cache-bandwidth-and-batching">7.6 LLM Serving Arithmetic: KV Cache, Bandwidth and Batching</a></li><li><a href="#s7-chapter-recap">Chapter recap</a></li><li><a href="#s8-practice-set">Practice set</a></li><li><a href="#s9-prompt-pack">Prompt pack</a></li></ol></details><p>A model file on your laptop helps nobody. The app team needs a URL they can call, get an answer from in a few milliseconds, and trust at 3 a.m. In this chapter you will take the churn model from earlier chapters and put it behind an HTTP service that checks its input, reports its health, counts its own errors and can score many rows at once. You will measure why batching makes a model faster, simulate a dynamic batcher, see why loading a pickle file from a stranger is dangerous, and learn the names and jobs of the serving tools you will meet at work (ONNX, Triton, KServe, vLLM). Think of a bank counter: latency is how long one customer waits, throughput is customers served per hour, and queues form when customers arrive faster than the teller works. Here those ideas meet a model.</p>
 <p>Words you need in this chapter:</p>
 <div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Endpoint</td><td>One URL path the service answers, for example <code>/v1/predict</code>.</td></tr><tr><td>Payload</td><td>The data sent in a request (here, JSON with the features).</td></tr><tr><td>Validation</td><td>Checking that the input has the right shape and type before using it.</td></tr><tr><td>HTTP status code</td><td>A number in the reply: 200 means OK, 4xx means the caller was wrong, 5xx means the server was wrong.</td></tr><tr><td>Health check</td><td>A tiny endpoint that says "I am alive" or "I am ready".</td></tr><tr><td>Batch (of rows)</td><td>Several inputs scored in one model call.</td></tr><tr><td>Serialisation</td><td>Saving a model object to bytes (a file) so it can be loaded elsewhere.</td></tr></tbody></table></div>
 <p>Our running example is the <code>churn-api</code> from Chapter 1 and Chapter 3: a model that takes 8 numeric features of a customer and returns a churn probability. The model is a random forest saved as <code>model_v1.joblib</code>. The service code ran for real; FastAPI could not be installed on this machine, so I use Python's standard library and show the FastAPI version labelled "not run here".</p>
@@ -202,10 +202,209 @@ spec:
 <ul><li><strong>MLOps</strong>: KServe on Kubernetes as the standard serving layer for many team models.</li><li><strong>Deep learning</strong>: Triton for image models on GPUs.</li><li><strong>GenAI</strong>: vLLM behind an internal chat API with a request queue.</li><li><strong>Cloud</strong>: managed SageMaker or Vertex endpoints when the team is small.</li></ul>
 <p><strong>Check yourself</strong></p>
 <ol><li>What does continuous batching do? Answer: New requests join a running batch as soon as a slot frees, so the GPU stays busy.</li><li>Name two Triton batching settings. Answer: <code>max_batch_size</code> and <code>max_queue_delay_microseconds</code>.</li><li>What is a cold start? Answer: The delay on the first request after idle while the container starts and the model loads.</li></ol>
-<h2 id="s5-chapter-recap">Chapter recap</h2>
+<h2 id="s5-7-5-latency-budgets-queues-and-autoscaling">7.5 Latency Budgets, Queues and Autoscaling</h2>
+<p>So far you sized services by throughput alone. Real users feel latency, and latency depends on how full the service is. This section gives you three tools you will use in design reviews: a latency budget, Little's law, and a queue model that predicts the wait time at a given load.</p>
+<h3>Beginner: the latency budget</h3>
+<p>A latency budget is a plan for where the milliseconds go. The caller gives you a limit (the SLO, for example p99 under 300 ms). You split it between the parts of the path, then measure each part against its share.</p>
+<p class="problem"><span class="pl">Problem 7.5.1</span> A checkout page needs the fraud score in under 300 ms at p99. The path is: gateway 10 ms, feature lookup 40 ms, model call 60 ms, post-processing 10 ms, network between services 30 ms. All figures are p99 budgets. Is there room, and where would you spend the spare time?</p>
+<table class="steps"><tr><th>Sum</th><td>10 + 40 + 60 + 10 + 30 = 150 ms.</td></tr><tr><th>Spare</th><td>300 − 150 = 150 ms, or 50% of the limit.</td></tr><tr><th>Rule</th><td>Never plan to use all of it. Adding p99 figures is pessimistic (the worst case rarely hits every part at once) but queueing adds delay when load rises. Keep half the spare as a safety margin: 75 ms.</td></tr><tr><th>Spend</th><td>The other 75 ms can pay for a retry on the feature lookup (a second try at 40 ms), or a bigger model that costs up to 35 ms more.</td></tr><tr><th>Meaning</th><td>A budget turns 'make it fast' into a number each team can own.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Testing latency with one request at a time and reporting the average. One client sees no queue, so 'mean 20 ms' looks great. Users arrive together and in bursts. The right test sends traffic at the real arrival rate and reports p95 and p99, not the mean. A service with a 20 ms mean can have a 900 ms p99.</div></div>
+<h3>Intermediate: Little's law</h3>
+<p>Little's law is the simplest and most useful formula in capacity planning. It says: the average number of requests inside the system equals the arrival rate times the average time each one spends there.</p>
+<div class="eq">L = λ × W</div>
+<p>Here L is the average number of requests in flight, λ (lambda) is arrivals per second, and W is the average seconds per request. It holds for any stable system, whatever the arrival pattern. At a bank, 2 customers arrive per minute and each stays 5 minutes, so on average 10 customers are inside. The same count tells you how many chairs, tellers, threads or GPU slots you need.</p>
+<p class="problem"><span class="pl">Problem 7.5.2</span> A service receives 250 requests per second and each takes 80 ms from arrival to reply. Each request holds one worker slot. How many slots do you need at a 60% target utilisation?</p>
+<table class="steps"><tr><th>Formula</th><td>L = λ × W</td></tr><tr><th>Plug in</th><td>L = 250 × 0.080</td></tr><tr><th>Compute</th><td>L = 20 requests in flight on average.</td></tr><tr><th>Headroom</th><td>20 ÷ 0.6 = 33.3, so 34 slots.</td></tr><tr><th>Check</th><td>In code the same result appears below.</td></tr></table>
+<pre class="code lang-python"><code># Little's law: L = lambda * W  (average number in the system)
+lam = 250          # requests per second
+W = 0.080          # seconds each request spends in the service
+L = lam * W
+print("in flight:", L)
+# if each request holds 1 worker slot, you need at least L slots, plus headroom
+import math
+print("slots at 60% target:", math.ceil(L / 0.6))</code></pre>
+<pre class="code lang-text"><code>in flight: 20.0
+slots at 60% target: 34</code></pre>
+<p>Little's law has a sharp use in debugging. If the number of in-flight requests keeps growing while arrivals stay the same, W must be growing: something got slower. If W stays the same and L grows, arrivals grew.</p>
+<h3>Intermediate: why the last 10% of capacity is so expensive</h3>
+<p>A queue model predicts the wait. The simplest one, M/M/1, has one worker, random arrivals with rate λ and random service times with average rate μ (mu, the replica capacity). The utilisation is ρ = λ ÷ μ. The time a request spends in the system is then exponentially distributed with rate μ − λ. That gives three formulas.</p>
+<div class="eq">mean = 1 ÷ (μ − λ)</div>
+<div class="eq">p95 = ln(1 ÷ 0.05) ÷ (μ − λ), p99 = ln(1 ÷ 0.01) ÷ (μ − λ)</div>
+<p>The number ln(100) is 4.605, so p99 is about 4.6 times the mean. Look at the denominator: as λ approaches μ, μ − λ approaches zero and the latency goes to infinity. Real services have limits and timeouts, so they fail rather than reach infinity, but the shape is the same. Real output for a replica with μ = 100 requests per second:</p>
+<pre class="code lang-python"><code>import math
+# M/M/1 queue: one worker, random arrivals (rate lam), random service (rate mu)
+mu = 100.0                       # requests per second one replica can finish
+print("util  mean_wait_ms  p95_ms   p99_ms")
+for u in (0.5, 0.7, 0.8, 0.9, 0.95, 0.99):
+    lam = u * mu
+    rate = mu - lam              # time in system ~ Exponential(rate)
+    mean = 1000 / rate
+    p95 = 1000 * math.log(1/0.05) / rate
+    p99 = 1000 * math.log(1/0.01) / rate
+    print(f"{u:.2f}  {mean:10.1f}  {p95:7.1f}  {p99:7.1f}")</code></pre>
+<pre class="code lang-text"><code>util  mean_wait_ms  p95_ms   p99_ms
+0.50        20.0     59.9     92.1
+0.70        33.3     99.9    153.5
+0.80        50.0    149.8    230.3
+0.90       100.0    299.6    460.5
+0.95       200.0    599.1    921.0
+0.99      1000.0   2995.7   4605.2</code></pre>
+<figure><img src="images/ch07_util_latency.png" alt="Mean and p99 latency against utilisation for one replica" loading="lazy"/><figcaption>Latency of a single replica as it fills up. Capacity is 100 requests per second.</figcaption></figure>
+<p>How to read it: the x axis is how busy the replica is, the y axis is latency. Both curves are flat at low load and then bend upward. The orange p99 line crosses the red 200 ms limit at about 77% busy, so a 70% target (green dotted line) leaves a small safety margin. Past 90% a small rise in traffic multiplies the wait.</p>
+<p class="problem"><span class="pl">Problem 7.5.3</span> Using the table, a replica runs at 90% utilisation and the SLO is p99 under 200 ms. Does it pass? What utilisation do you need?</p>
+<table class="steps"><tr><th>Read</th><td>At 0.90 the p99 is 460.5 ms. That is above 200 ms, so it fails.</td></tr><tr><th>Solve</th><td>Use the formula: 1000 × 4.605 ÷ (100 − λ) ≤ 200, so 100 − λ ≥ 23.0, so λ ≤ 77.0.</td></tr><tr><th>Answer</th><td>Utilisation must be at most 77%.</td></tr><tr><th>Meaning</th><td>The 70% rule of thumb in the recap table is not magic. It comes from this curve: it keeps p99 near 150 ms for a 100-per-second replica.</td></tr></table>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of a motorway. At 50% full, cars flow freely. At 90% full, one car braking makes a jam that takes a long time to clear. Servers behave the same way: random bursts arrive, and a nearly full server has no spare room to clear them.</div></div>
+<h3>Intermediate: sizing replicas with several workers</h3>
+<p>With c replicas sharing a load balancer, waiting is rarer than with one. The Erlang C formula gives the probability that an arriving request has to wait at all. I wrote it in a few lines and applied it to a peak of 400 requests per second, where one replica does 100 per second. Real output. The p99 here is a rough estimate (the 99th percentile of waiting plus the mean service time), good enough for sizing and not a replacement for a load test.</p>
+<pre class="code lang-python"><code>import math
+def erlang_c(c, a):
+    """Chance an arriving request must wait. c servers, offered load a = lam/mu."""
+    top = (a**c / math.factorial(c)) * (c / (c - a))
+    bottom = sum(a**k / math.factorial(k) for k in range(c)) + top
+    return top / bottom
+
+def p99_ms(c, lam, mu):
+    """Rough p99 of time in system for M/M/c (wait tail plus mean service)."""
+    a = lam / mu
+    pw = erlang_c(c, a)
+    # waiting time tail: P(W &gt; t) = pw * exp(-(c*mu - lam) t)
+    t99_wait = max(0.0, math.log(pw / 0.01) / (c * mu - lam))
+    return 1000 * (t99_wait + 1 / mu)
+
+lam, mu = 400.0, 100.0          # 400 req/s peak, one replica does 100 req/s
+for c in range(5, 10):
+    util = lam / (c * mu)
+    print(c, f"util={util:.2f}", f"P(wait)={erlang_c(c, lam/mu):.3f}", f"p99~{p99_ms(c, lam, mu):.0f} ms")</code></pre>
+<pre class="code lang-text"><code>5 util=0.80 P(wait)=0.554 p99~50 ms
+6 util=0.67 P(wait)=0.285 p99~27 ms
+7 util=0.57 P(wait)=0.135 p99~19 ms
+8 util=0.50 P(wait)=0.059 p99~14 ms
+9 util=0.44 P(wait)=0.024 p99~12 ms</code></pre>
+<p class="problem"><span class="pl">Problem 7.5.4</span> Peak is 400 requests per second, one replica does 100 per second, and the SLO is p99 under 30 ms. How many replicas?</p>
+<table class="steps"><tr><th>Utilisation rule</th><td>400 ÷ (100 × 0.70) = 5.7, so 6 replicas.</td></tr><tr><th>Queue model</th><td>5 replicas: utilisation 0.80, 55% of requests wait, p99 about 50 ms. Fails.</td></tr><tr><th>Queue model</th><td>6 replicas: utilisation 0.67, 28.5% wait, p99 about 27 ms. Passes.</td></tr><tr><th>Answer</th><td>6 replicas. Add 1 more (7) so that one replica failing during a deploy still leaves 6.</td></tr><tr><th>Check</th><td>With 7 in the model, p99 is about 19 ms. With only 5 left after a node loss from 6, p99 jumps to about 50 ms. That is why N + 1 matters.</td></tr></table>
+<p>Notice that 8 replicas at 50% utilisation gives about 14 ms. Doubling cost from 4 (the bare minimum) to 8 cut p99 from infinity to 14 ms, but going from 6 to 8 only saves 13 ms. You are buying less each step. Pick the point where the SLO is met with N + 1 safety, then stop.</p>
+<h3>Autoscaling: the Kubernetes HPA formula</h3>
+<p>The Horizontal Pod Autoscaler (Chapter 11) computes the desired replica count with one formula and ignores changes inside a 10% tolerance band so it does not flap.</p>
+<pre class="code lang-python"><code>import math
+# Kubernetes HPA rule: desired = ceil(current * currentMetric / targetMetric)
+# The controller ignores changes while the ratio is within 10% of 1 (default tolerance).
+def hpa(current, metric, target, tolerance=0.10):
+    ratio = metric / target
+    if abs(ratio - 1) &lt;= tolerance:
+        return current
+    return math.ceil(current * ratio)
+print(hpa(4, 90, 60))     # CPU at 90%, target 60%
+print(hpa(4, 30, 60))     # CPU at 30%
+print(hpa(10, 65, 60))    # ratio 1.083, inside the tolerance band
+print(hpa(10, 75, 60))    # ratio 1.25</code></pre>
+<pre class="code lang-text"><code>6
+2
+10
+13</code></pre>
+<p class="problem"><span class="pl">Problem 7.5.5</span> Four replicas run at 90% CPU and the target is 60%. Pods take 90 seconds to start and traffic is rising 10% per minute. Is the HPA fast enough?</p>
+<table class="steps"><tr><th>Desired</th><td>ceil(4 × 90 ÷ 60) = 6 replicas.</td></tr><tr><th>Delay</th><td>The metric is read every 15 seconds. The pod takes 90 seconds to become ready. So new capacity arrives at least 105 seconds after the load rose.</td></tr><tr><th>Traffic</th><td>In 2 minutes traffic grows by about 21% (1.1² = 1.21). Four replicas at 90% will be at about 109%: overloaded before the new pods exist.</td></tr><tr><th>Answer</th><td>Not fast enough. Lower the target (scale at 50%), keep a minimum of 5, use a pre-warmed image, or scale on request rate or queue length (KEDA) instead of CPU.</td></tr><tr><th>Meaning</th><td>Scale before the limit, as the chapter said. The numbers say how much earlier.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Setting the autoscaler target at 90% 'to save money'. The curve above shows p99 at 90% is 4 times the mean, and at 95% it doubles again. You save one replica and break the SLO. Also check that CPU is the right signal: GPU services are often limited by GPU memory or by queue length while CPU sits at 20%.</div></div>
+<h3>Going deeper</h3>
+<ul><li><strong>Service times are not exponential.</strong> Model calls are often almost constant (an M/D/1 queue), where the mean wait is half the M/M/1 value. Heavy-tailed times (large inputs, cache misses) are worse. Use the formulas to find the shape, then load test for the numbers.</li><li><strong>Tail at scale.</strong> If one request fans out to 20 backends, the chance that at least one is slow is 1 − 0.99<sup>20</sup> = 18%, so the user sees your p99 about one time in five. Hedged requests (send a second copy after the p95 time and take the first reply) trade 5% extra load for a much shorter tail.</li><li><strong>Load shedding.</strong> When the queue is longer than the SLO allows, rejecting new requests at once (HTTP 429 or 503) keeps latency good for the others. A request that waits 5 seconds and then times out burns CPU for nothing.</li><li><strong>Concurrency limits.</strong> Set the in-flight limit from Little's law (λ × SLO), not from the maximum the process can hold.</li></ul>
+
+<h2 id="s6-7-6-llm-serving-arithmetic-kv-cache-bandwidth-and-batching">7.6 LLM Serving Arithmetic: KV Cache, Bandwidth and Batching</h2>
+<p>Serving an LLM is different from serving a churn model because the model writes its answer one token at a time, and it must remember everything it has read. The memory for that remembering, the KV cache, is usually what limits how many users one GPU can serve. This section gives you the arithmetic. Every number below is computed by code you can run, but I did not run a real GPU server here: the figures are calculations, not benchmarks. Treat them as upper bounds and measure on your hardware (not run here).</p>
+<h3>Beginner: what the KV cache is</h3>
+<p>To produce each new token, the model looks back at every earlier token through attention. For each earlier token it stores two vectors per layer per attention head: a key (K) and a value (V). Storing them avoids recomputing them for every new token. That store is the KV cache. It grows by one entry per token, per user, and it lives in GPU memory next to the model weights.</p>
+<div class="eq">KV bytes per token = 2 × layers × KV heads × head size × bytes per number</div>
+<p>The 2 is for K and V. fp16 numbers take 2 bytes. Newer models use grouped-query attention (GQA): many query heads share a few KV heads, so the cache is smaller. Real output:</p>
+<pre class="code lang-python"><code># KV cache bytes per token = 2 (K and V) x layers x kv_heads x head_dim x bytes per number
+def kv_per_token(layers, kv_heads, head_dim, nbytes=2):
+    return 2 * layers * kv_heads * head_dim * nbytes
+
+models = {
+    "7B, full multi-head (32 layers, 32 KV heads)": (32, 32, 128),
+    "8B, grouped-query (32 layers, 8 KV heads)": (32, 8, 128),
+    "70B, grouped-query (80 layers, 8 KV heads)": (80, 8, 128),
+}
+for name, (L, h, d) in models.items():
+    b = kv_per_token(L, h, d)
+    print(f"{name}: {b} bytes = {b/1024:.0f} KiB per token, 4096 tokens = {b*4096/2**30:.2f} GiB")</code></pre>
+<pre class="code lang-text"><code>7B, full multi-head (32 layers, 32 KV heads): 524288 bytes = 512 KiB per token, 4096 tokens = 2.00 GiB
+8B, grouped-query (32 layers, 8 KV heads): 131072 bytes = 128 KiB per token, 4096 tokens = 0.50 GiB
+70B, grouped-query (80 layers, 8 KV heads): 327680 bytes = 320 KiB per token, 4096 tokens = 1.25 GiB</code></pre>
+<p class="problem"><span class="pl">Problem 7.6.1</span> For the 8B grouped-query model above, how much KV cache does one user with a 4,096-token conversation need? Check the arithmetic by hand.</p>
+<table class="steps"><tr><th>Per token</th><td>2 × 32 × 8 × 128 × 2 bytes = 131,072 bytes.</td></tr><tr><th>For 4,096 tokens</th><td>131,072 × 4,096 = 536,870,912 bytes.</td></tr><tr><th>In GiB</th><td>536,870,912 ÷ 1,073,741,824 = 0.5 GiB.</td></tr><tr><th>Meaning</th><td>Half a gigabyte per user is small once, but 100 users at once is 50 GB.</td></tr></table>
+<h3>Intermediate: how many users fit on one GPU</h3>
+<p>Take an 80 GB GPU and keep 10% free for activations and the framework. Subtract the weights. What remains is the KV budget. Divide by the cache per user.</p>
+<pre class="code lang-python"><code># How many users fit? 80 GB GPU, keep 10% free, fp16 weights
+gpu = 80e9 * 0.90
+weights = 8.03e9 * 2                  # 8.03 billion parameters x 2 bytes
+per_tok = 2 * 32 * 8 * 128 * 2        # 131072 bytes
+budget = gpu - weights
+print("KV budget GB:", round(budget / 1e9, 1))
+for ctx in (2048, 8192, 32768):
+    per_user = per_tok * ctx
+    print(ctx, "tokens: per user", round(per_user / 1e9, 2), "GB, users:", int(budget // per_user))
+# same model with INT8 weights (1 byte) and fp8 KV cache (1 byte)
+budget8 = gpu - 8.03e9 * 1
+for ctx in (2048, 8192, 32768):
+    per_user = per_tok // 2 * ctx
+    print("int8 weights + fp8 KV,", ctx, "tokens: users:", int(budget8 // per_user))</code></pre>
+<pre class="code lang-text"><code>KV budget GB: 55.9
+2048 tokens: per user 0.27 GB, users: 208
+8192 tokens: per user 1.07 GB, users: 52
+32768 tokens: per user 4.29 GB, users: 13
+int8 weights + fp8 KV, 2048 tokens: users: 476
+int8 weights + fp8 KV, 8192 tokens: users: 119
+int8 weights + fp8 KV, 32768 tokens: users: 29</code></pre>
+<figure><img src="images/ch07_kv_users.png" alt="Concurrent users that fit on an 80 GB GPU against context length" loading="lazy"/><figcaption>How many users fit on one 80 GB GPU for two model designs.</figcaption></figure>
+<p>How to read it: both axes are logarithmic. Each doubling of context length halves the number of users. The blue line (grouped-query attention, 8 KV heads) sits four times higher than the orange line (32 KV heads), because it stores a quarter of the cache per token. This one design choice in the model changes your GPU bill by 4 times.</p>
+<p class="problem"><span class="pl">Problem 7.6.2</span> A product manager wants 100 simultaneous chats with 8,192 tokens of context each on the 8B model, in fp16, on 80 GB GPUs. How many GPUs?</p>
+<table class="steps"><tr><th>Per GPU</th><td>From the table, 52 users at 8,192 tokens.</td></tr><tr><th>GPUs</th><td>100 ÷ 52 = 1.92, so 2 GPUs.</td></tr><tr><th>With int8 and fp8</th><td>119 users per GPU, so 1 GPU, with about 19% spare.</td></tr><tr><th>Trade</th><td>Quantisation can lose a little quality. Test on your own evaluation set (Chapter 13) before shipping it.</td></tr><tr><th>Meaning</th><td>Memory arithmetic decides the hardware before any benchmark runs.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Sizing the GPU from the weights alone. 'An 8B model is 16 GB, an 80 GB GPU holds five copies.' Five copies leave no room for any KV cache, so you can serve zero users. Always subtract weights, then divide the rest by the cache per user at the longest context you promise.</div></div>
+<h3>Why decode is slow: memory bandwidth</h3>
+<p>Generating one token needs the GPU to read every weight once. The arithmetic is tiny compared with the reading, so decode speed is capped by memory bandwidth, not by compute. The cap is bandwidth ÷ bytes of weights.</p>
+<pre class="code lang-python"><code># Decode speed is limited by memory bandwidth: each new token reads all weights once.
+bandwidth = 3.35e12                   # bytes/s, an H100-class GPU (3.35 TB/s)
+for name, nbytes in (("8B fp16", 16.06e9), ("8B int8", 8.03e9), ("8B 4-bit", 4.0e9)):
+    one_stream = bandwidth / nbytes
+    print(f"{name}: upper bound {one_stream:.0f} tokens/s for ONE stream")
+# batching: 32 streams share one read of the weights (ignoring KV reads)
+print("32 streams, fp16:", round(32 * bandwidth / 16.06e9), "tokens/s total (upper bound)")</code></pre>
+<pre class="code lang-text"><code>8B fp16: upper bound 209 tokens/s for ONE stream
+8B int8: upper bound 417 tokens/s for ONE stream
+8B 4-bit: upper bound 838 tokens/s for ONE stream
+32 streams, fp16: 6675 tokens/s total (upper bound)</code></pre>
+<p class="problem"><span class="pl">Problem 7.6.3</span> Using the bound above, what is the fastest a single user can get a 500-token reply from the 8B fp16 model on this GPU, and what changes if you serve 32 users at once?</p>
+<table class="steps"><tr><th>Per stream</th><td>209 tokens per second at best.</td></tr><tr><th>Time</th><td>500 ÷ 209 = 2.4 seconds for one user, ignoring the first-token delay.</td></tr><tr><th>32 users</th><td>Weights are read once per step for all 32, so each user still sees about 209 tokens per second while the GPU makes about 6,675 per second in total (a bound: KV reads and overhead lower it).</td></tr><tr><th>Meaning</th><td>Batching is the main trick of LLM serving. This is why continuous batching exists: keep the batch full at every step.</td></tr></table>
+<p>Two latency numbers matter for users. Time to first token (TTFT) is the delay before the first word appears. It is dominated by prefill, where the whole prompt is processed at once, which is compute-heavy, so TTFT grows with prompt length. Inter-token latency (or tokens per second) is the speed afterwards, set by decode. A chat product needs TTFT under about 1 second and a steady stream. A batch summariser only cares about total tokens per second.</p>
+<h3>Intermediate: PagedAttention and continuous batching</h3>
+<p>Early servers reserved the maximum context length for every request, because they did not know how long the answer would be. Most requests are much shorter, so most of the reserved memory sat empty. vLLM's PagedAttention stores the cache in small fixed blocks (for example 16 tokens), like pages of virtual memory, and allocates a new block only when needed. I compared the two for 8 requests with real lengths.</p>
+<pre class="code lang-python"><code># PagedAttention vs reserving the maximum length for every request
+max_len, per_tok = 4096, 131072
+actual = [300, 900, 150, 2500, 600, 1200, 400, 700]     # real tokens used by 8 requests
+reserved = len(actual) * max_len * per_tok
+paged = sum(-(-t // 16) * 16 for t in actual) * per_tok  # blocks of 16 tokens
+print("reserved GB:", round(reserved / 1e9, 2))
+print("paged GB:", round(paged / 1e9, 2))
+print("saving:", f"{1 - paged/reserved:.0%}")</code></pre>
+<pre class="code lang-text"><code>reserved GB: 4.29
+paged GB: 0.89
+saving: 79%</code></pre>
+<p>Memory saved becomes more users per GPU. Continuous batching complements this: at every decoding step the server adds new requests and removes finished ones, instead of waiting for the slowest request in a fixed batch to end.</p>
+<h3>Going deeper</h3>
+<ul><li><strong>Speculative decoding.</strong> A small draft model guesses k tokens. The big model checks all k in one pass and keeps the correct prefix. With acceptance probability a per token, the expected number of tokens per big-model pass is (1 − a<sup>k+1</sup>) ÷ (1 − a). The output text is the same as the big model would produce. Real output (rows are a, columns are k = 2, 4, 8):</li></ul>
+<pre class="code lang-python"><code># Speculative decoding: a small draft model proposes k tokens, the big model checks them in one pass.
+# If each draft token is accepted with probability a, expected tokens per big-model pass:
+def expected(a, k):
+    return (1 - a ** (k + 1)) / (1 - a)
+for a in (0.5, 0.7, 0.9):
+    print(a, [round(expected(a, k), 2) for k in (2, 4, 8)])</code></pre>
+<pre class="code lang-text"><code>0.5 [1.75, 1.94, 2.0]
+0.7 [2.19, 2.77, 3.2]
+0.9 [2.71, 4.1, 6.13]</code></pre>
+<ul><li>Read it carefully: with a = 0.7 and k = 4 you get 2.77 tokens per big pass, not 2.77 times the speed, because the draft model also takes time. Gains are largest for predictable text such as code and structured JSON.</li><li><strong>Quantisation.</strong> INT8 and FP8 halve weight memory, 4-bit methods (AWQ, GPTQ) quarter it. The cache can be quantised too. Gains are in memory and bandwidth. Costs are a small accuracy drop that varies by task, so evaluate on your own cases.</li><li><strong>Prefix caching.</strong> If many requests start with the same system prompt, the server computes its KV once and shares it. A 2,000-token shared prompt across 100 users saves 99 prefills.</li><li><strong>Tensor parallelism.</strong> A 70B model in fp16 needs 140 GB of weights alone, so it must be split over at least 2 GPUs (more in practice for KV room). Splitting costs communication time, so use the fewest GPUs that fit.</li><li><strong>Interview angle.</strong> 'How many users can one GPU serve?' The answer is the three-line calculation above: weights, then budget, then cache per user at the target context.</li></ul>
+
+<h2 id="s7-chapter-recap">Chapter recap</h2>
 <ul><li>A model service parses, validates, predicts and reports. Validation turns bad input into a 422, not a 500.</li><li><code>/health</code> says alive (restart on failure); <code>/ready</code> says able to serve (remove from traffic on failure); <code>/metrics</code> feeds Prometheus.</li><li>Put the API version in the path (<code>/v1/predict</code>).</li><li>A model call has a fixed cost and a per-row cost. Batching shares the fixed cost: in my test throughput rose from 289 to 50,572 rows per second.</li><li>Dynamic batching helps at high load (it avoided overload at 400 requests per second) and hurts at low load. Use the smallest wait that works.</li><li>Never unpickle untrusted files. Prefer ONNX, safetensors or plain JSON weights across trust boundaries, and check converted models against the original.</li><li>Triton and KServe give you batching, versions and autoscaling; vLLM adds continuous batching and a paged KV cache for LLMs.</li><li>Serverless is cheap for spiky traffic but suffers cold starts; scale before the limit, not at it.</li></ul>
 <div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Formula or command</th><th>Note</th></tr></thead><tbody><tr><td>Call time</td><td><code>fixed + per_row × n</code></td><td>Fit from two measurements</td></tr><tr><td>Capacity</td><td><code>1000 ÷ ms per call</code> per second per worker</td><td>Single worker, no batching</td></tr><tr><td>Replicas</td><td><code>⌈peak ÷ (capacity × target utilisation)⌉</code></td><td>Target 60-70%</td></tr><tr><td>Error rate</td><td><code>errors ÷ requests</code></td><td>From two Prometheus scrapes</td></tr><tr><td>Liveness / readiness</td><td><code>/health</code> / <code>/ready</code></td><td>Kubernetes probes</td></tr><tr><td>Run a FastAPI app</td><td><code>uvicorn main:app --port 8000</code></td><td>Not run here</td></tr></tbody></table></div>
-<h2 id="s6-practice-set">Practice set</h2>
+<h2 id="s8-practice-set">Practice set</h2>
 <p><strong>1.</strong> (Easy) A service answers 4,850 of 5,000 requests with 200 and the rest with 422. What is the error rate?</p>
 <p><strong>Answer:</strong> 150 ÷ 5,000 = 0.03 = 3%. All errors are client errors, so check callers, not the model.</p>
 <p><strong>2.</strong> (Easy) A request body is <code>{"feature": [1,2,3,4,5,6,7,8]}</code> (note the missing "s"). Which status does our service return, and why?</p>
@@ -224,9 +423,23 @@ spec:
 <p><strong>Answer:</strong> Gateway checks auth and rate limits, routes to a replica via the load balancer (which only uses ready pods). The service parses and validates the payload, fetches online features if needed, optionally queues for dynamic batching, calls the model (with a timeout), applies post-processing, logs request ID and model version, increments metrics, and returns JSON. If the model fails or times out, a fallback (a rule or the previous model) answers.</p>
 <p><strong>9.</strong> (Interview) "Your p99 latency doubled after you enabled dynamic batching. What are three possible causes?"</p>
 <p><strong>Answer:</strong> (1) The maximum wait is too long for the traffic level, so requests wait for batches that rarely fill. (2) The maximum batch size is too big, so one slow large batch delays everyone in it. (3) Traffic is low, so there is no benefit and only waiting cost. Check batch-size histograms, queue time and arrival rate, then lower the wait.</p>
-<h2 id="s7-prompt-pack">Prompt pack</h2>
+<p><strong>10.</strong> (Medium) A service has 120 requests per second and mean time in system 150 ms. How many requests are in flight on average? If each uses one slot and you target 50% utilisation, how many slots?</p>
+<p><strong>Answer:</strong> L = 120 × 0.15 = 18 requests. Slots = 18 ÷ 0.5 = 36.</p>
+<p><strong>11.</strong> (Medium) Under M/M/1 with capacity 50 requests per second, what is the mean time in the system at 40 requests per second, and at 48?</p>
+<p><strong>Answer:</strong> Mean = 1000 ÷ (50 − 40) = 100 ms at 40. At 48: 1000 ÷ 2 = 500 ms. Load rose 20% and latency rose 5 times.</p>
+<p><strong>12.</strong> (Hard) Find the bug in the plan: 'Our model does 200 requests per second per replica, peak is 600, so 3 replicas.' List two things wrong.</p>
+<p><strong>Answer:</strong> Three replicas run at 100% at peak, so queues grow without limit (use at most 60 to 70%: at least 5). There is also no spare replica for deploys or a node failure (N + 1: 6). Also the 200 per second figure must come from a load test with real payloads, not a single-request test.</p>
+<p><strong>13.</strong> (Medium) A 70B model has 80 layers, 8 KV heads, head size 128. How many GiB of KV cache does a 4,096-token conversation need in fp16?</p>
+<p><strong>Answer:</strong> Per token 2 × 80 × 8 × 128 × 2 = 327,680 bytes. Times 4,096 = 1,342,177,280 bytes = 1.25 GiB.</p>
+<p><strong>14.</strong> (Hard) A 7B model with 32 KV heads and a 8B model with 8 KV heads both serve 8,192-token chats on a GPU with 56 GB free for cache. Roughly how many users does each fit?</p>
+<p><strong>Answer:</strong> 7B: 524,288 × 8,192 = 4.29 GB per user, 56 ÷ 4.29 = 13 users. 8B: 131,072 × 8,192 = 1.07 GB per user, 56 ÷ 1.07 = 52 users. Four times more for the GQA model.</p>
+<p><strong>15.</strong> (Hard) Memory bandwidth is 2 TB/s. What is the upper bound on decode speed for a 13B model in fp16 for one stream, and with 4-bit weights?</p>
+<p><strong>Answer:</strong> fp16 weights: 26 GB, 2,000 ÷ 26 = 77 tokens per second. 4-bit: 6.5 GB, 2,000 ÷ 6.5 = 308 tokens per second.</p>
+<p><strong>16.</strong> (Interview) 'Your chat app has good tokens per second but users complain it feels slow.' What do you check?</p>
+<p><strong>Answer:</strong> Time to first token. Check prompt length (prefill cost), queueing before the batch (is the server saturated?), cold starts, and prefix caching for shared system prompts. Tokens per second only describes decode, not the wait before it starts.</p>
+<h2 id="s9-prompt-pack">Prompt pack</h2>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into MLOps and ML engineering, and English is my second language. Teach me Chapter 7 topic "building a prediction API with input validation, health checks and metrics". Explain step by step with a small churn model, using simple English. Show a FastAPI plus Pydantic version, say which status codes to return for which errors, and explain liveness versus readiness probes. After each part, ask me one question and wait for my answer before continuing. Check my understanding at the end with three scenario questions.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning MLOps. The topic is "batching for model inference: static batching, dynamic batching, fixed cost versus per-row cost". Give me 8 graded exercises with real numbers (easy to hard), including one queueing scenario at high and low traffic, and one about choosing max batch size and max wait. Do not give solutions yet. After I answer, mark my work and explain each mistake in simple English.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML engineering. The topic is "model serialisation formats and the pickle security risk (pickle, joblib, ONNX, safetensors, TorchScript)". Quiz me one question at a time on which format is safe, when to use which, and how to verify an ONNX conversion. Start easy and get harder. After each answer tell me if I am right, explain why, and keep a running score. End with a short list of what to revise.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning MLOps. Review my work on "serving a model": here is my service code, my load-test results and my batching settings: [PASTE HERE]. Check input validation, health and readiness endpoints, error handling, metrics, security of model loading, and whether my batching choice makes sense for my traffic. Give a prioritised list of problems and fixes in simple English, and tell me which single fix to do first.</pre></div>
-<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into MLOps, preparing for interviews. Run a mock interview on "model serving": Triton, KServe, vLLM, ONNX, dynamic batching, autoscaling, cold starts and safe model formats. Ask me one question at a time, ranging from basic to design-level. After each answer, give feedback, a stronger model answer, and a score out of 5. Include one question that asks me to design a serving setup for a fraud model with an 80 ms latency limit.</pre></div><div class="readbtn"><button class="btn" data-read="study:mlops:ch07">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch06.html">← Chapter 6: Training Pipelines, Distributed Training</a><a class="btn" href="ch08.html">Chapter 8: Deployment Strategies →</a></div></div><script src="../../assets/study.js"></script></body></html>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into MLOps, preparing for interviews. Run a mock interview on "model serving": Triton, KServe, vLLM, ONNX, dynamic batching, autoscaling, cold starts and safe model formats. Ask me one question at a time, ranging from basic to design-level. After each answer, give feedback, a stronger model answer, and a score out of 5. Include one question that asks me to design a serving setup for a fraud model with an 80 ms latency limit.</pre></div><div class="readbtn"><button class="btn" data-read="study:mlops:ch07">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch06.html">← Chapter 6: Training Pipelines, Distributed Training and GPU Cost Control</a><a class="btn" href="ch08.html">Chapter 8: Deployment Strategies →</a></div></div><script src="../../assets/study.js"></script></body></html>

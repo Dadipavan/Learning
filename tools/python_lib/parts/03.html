@@ -1,0 +1,162 @@
+<h2>22.3 Parquet and columnar file formats</h2>
+<h3>Beginner: why CSV is the wrong format for big data</h3>
+<p>A CSV file is plain text. That is friendly (you can open it anywhere) and wasteful. The number 49.99 is stored as five characters, not one 8-byte float. Nothing says whether a column is an integer or a date, so the reader must guess. You cannot read one column without scanning every line. And a CSV cannot be split safely in the middle of a quoted multi-line field. <strong>Parquet</strong> is an open file format built for analytics. It stores data by column, with a schema (names and types), compression, and small statistics (minimum and maximum) for each block. The same data is typically many times smaller than the CSV, and a query that needs two columns reads two columns.</p>
+<div class="callout blue"><div class="lab">DEFINITION</div><div class="txt"><strong>Row group</strong>: a block of rows (for example 100,000 to 1,000,000) inside a Parquet file. <strong>Column chunk</strong>: the data of one column inside one row group. <strong>Footer</strong>: metadata at the end of the file with the schema and, for each column chunk, its location, row count and minimum/maximum. A reader jumps to the footer first, decides which chunks it needs, and reads only those. <strong>Apache Arrow</strong> is the matching in-memory columnar format that Polars, DuckDB, PyArrow, and (optionally) pandas use, so data moves between them with little copying.</div></div>
+<figure><img src="images/lib22_layout.png" alt="Directory tree sales/year=2025/region=EU/part-0.parquet with grey skipped branches and green selected branch." loading="lazy"/><figcaption>Figure 22.4. A Hive-style partitioned dataset. The folder names carry the values of the partition columns, so a filter on them skips whole folders.</figcaption></figure>
+<p><strong>How to read it:</strong> the dataset is a folder, not a file. Each level of sub-folders is named <code>column=value</code>. The query asks for year 2025 and region EU, so the engine lists the folders, discards every branch whose name fails the filter (grey) and opens one file (green). Nothing was read from the other three files. This is called <strong>partition pruning</strong>. Inside the one file we additionally get <strong>row-group skipping</strong> from the footer statistics.</p>
+
+<h3>Reference table: the 24 most useful Parquet-related calls</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example (not run here)</th></tr></thead><tbody>
+<tr><td><code>df.to_parquet(path)</code></td><td>pandas: write a DataFrame (needs pyarrow or fastparquet)</td><td><code>df.to_parquet("o.parquet", index=False)</code></td></tr>
+<tr><td><code>pd.read_parquet(path, columns=)</code></td><td>pandas: read, optionally only some columns</td><td><code>pd.read_parquet("o.parquet", columns=["region"])</code></td></tr>
+<tr><td><code>pd.read_parquet(filters=)</code></td><td>pandas: push a filter down to the reader</td><td><code>filters=[("year", "==", 2025)]</code></td></tr>
+<tr><td><code>df.to_parquet(partition_cols=)</code></td><td>pandas: write a partitioned folder</td><td><code>df.to_parquet("sales/", partition_cols=["year"])</code></td></tr>
+<tr><td><code>df.to_parquet(compression=)</code></td><td>Choose snappy (fast), zstd (small and fast) or gzip (small, slow)</td><td><code>compression="zstd"</code></td></tr>
+<tr><td><code>pa.Table.from_pandas(df)</code></td><td>pyarrow: convert pandas to an Arrow table</td><td><code>t = pa.Table.from_pandas(df)</code></td></tr>
+<tr><td><code>pq.write_table(t, path)</code></td><td>pyarrow: write an Arrow table</td><td><code>pq.write_table(t, "o.parquet", row_group_size=500_000)</code></td></tr>
+<tr><td><code>pq.read_table(path, columns=)</code></td><td>pyarrow: read to an Arrow table</td><td><code>pq.read_table("o.parquet", columns=["qty"])</code></td></tr>
+<tr><td><code>pq.ParquetFile(path).metadata</code></td><td>Inspect rows, row groups and column statistics without reading data</td><td><code>pq.ParquetFile("o.parquet").metadata.num_row_groups</code></td></tr>
+<tr><td><code>pq.ParquetFile(path).schema_arrow</code></td><td>Show column names and types</td><td><code>print(pf.schema_arrow)</code></td></tr>
+<tr><td><code>pq.ParquetFile(path).iter_batches()</code></td><td>Stream a big file in batches (chunking for Parquet)</td><td><code>for b in pf.iter_batches(batch_size=100_000):</code></td></tr>
+<tr><td><code>pyarrow.dataset.dataset(path)</code></td><td>Open a folder of files as one lazy dataset</td><td><code>ds.dataset("sales/", format="parquet", partitioning="hive")</code></td></tr>
+<tr><td><code>dataset.to_table(filter=, columns=)</code></td><td>Read only what the filter and columns need</td><td><code>d.to_table(filter=ds.field("year") == 2025)</code></td></tr>
+<tr><td><code>pl.read_parquet(path)</code></td><td>Polars: read eagerly</td><td><code>pl.read_parquet("o.parquet")</code></td></tr>
+<tr><td><code>pl.scan_parquet(path)</code></td><td>Polars: lazy scan with pushdown; globs allowed</td><td><code>pl.scan_parquet("sales/**/*.parquet")</code></td></tr>
+<tr><td><code>df.write_parquet(path)</code></td><td>Polars: write a DataFrame</td><td><code>df.write_parquet("o.parquet")</code></td></tr>
+<tr><td><code>lf.sink_parquet(path)</code></td><td>Polars: run a lazy query and stream the result to disk without holding it</td><td><code>lf.sink_parquet("out.parquet")</code></td></tr>
+<tr><td><code>read_parquet('glob')</code> (DuckDB SQL)</td><td>Query files as a table</td><td><code>SELECT * FROM read_parquet('sales/*/*.parquet')</code></td></tr>
+<tr><td><code>COPY ... TO ... (FORMAT PARQUET)</code></td><td>DuckDB: write a query result as Parquet</td><td><code>COPY (SELECT ...) TO 'out.parquet' (FORMAT PARQUET)</code></td></tr>
+<tr><td><code>PARTITION_BY</code> (DuckDB)</td><td>DuckDB: write a Hive-partitioned folder</td><td><code>COPY t TO 'sales' (FORMAT PARQUET, PARTITION_BY (year))</code></td></tr>
+<tr><td><code>hive_partitioning = true</code></td><td>DuckDB: turn folder names into columns on read</td><td><code>read_parquet('sales/*/*.parquet', hive_partitioning = true)</code></td></tr>
+<tr><td><code>dd.read_parquet(path)</code></td><td>Dask: lazy read, one partition per file or row-group chunk</td><td><code>dd.read_parquet("sales/")</code></td></tr>
+<tr><td><code>ddf.to_parquet(path, partition_on=)</code></td><td>Dask: write partitioned output</td><td><code>ddf.to_parquet("out/", partition_on=["year"])</code></td></tr>
+<tr><td><code>spark.read.parquet(path)</code></td><td>Spark: read a file or folder (schema comes from the files)</td><td><code>spark.read.parquet("sales/")</code></td></tr>
+<tr><td><code>df.write.partitionBy().parquet()</code></td><td>Spark: write a partitioned folder</td><td><code>df.write.partitionBy("year").mode("overwrite").parquet("out/")</code></td></tr>
+</tbody></table></div>
+
+<h3>Intermediate: see the columnar idea with tools you have</h3>
+<p>We cannot write Parquet here (no PyArrow), but we can show the principle with NumPy. Store each numeric column as its own binary <code>.npy</code> file (typed, no parsing, one file per column), and compare with the CSV.</p>
+<p class="problem"><span class="pl">Problem 22.3.1</span> Write the 1-million-row table as one CSV and as one binary file per column. Then compute the total of the price column from each, and report how many bytes each approach had to touch.</p>
+<py>
+import os, tempfile
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(42)
+n = 1_000_000
+df = pd.DataFrame({
+    "order_id": np.arange(n, dtype="uint32"),
+    "customer_id": rng.integers(0, 50_000, n).astype("uint16"),
+    "region": pd.Categorical(rng.choice(["EU", "US", "APAC", "LATAM", "MEA"], n)),
+    "qty": rng.integers(1, 20, n).astype("uint8"),
+    "price": rng.normal(50, 15, n).round(2),
+})
+d = tempfile.mkdtemp()
+csv_path = os.path.join(d, "orders.csv")
+df.to_csv(csv_path, index=False)
+for c in ["order_id", "customer_id", "qty", "price"]:
+    np.save(os.path.join(d, c + ".npy"), df[c].to_numpy())
+np.save(os.path.join(d, "region_codes.npy"), df["region"].cat.codes.to_numpy())
+
+size = lambda p: os.path.getsize(p)
+col_files = [f for f in os.listdir(d) if f.endswith(".npy")]
+print("csv MB          :", round(size(csv_path) / 1e6, 1))
+print("all columns MB  :", round(sum(size(os.path.join(d, f)) for f in col_files) / 1e6, 1))
+print("price.npy MB    :", round(size(os.path.join(d, "price.npy")) / 1e6, 1))
+
+total_csv = pd.read_csv(csv_path)["price"].sum()
+price = np.load(os.path.join(d, "price.npy"), mmap_mode="r")
+total_npy = float(price.sum())
+print("same total      :", np.isclose(total_csv, total_npy))
+print("bytes touched, binary vs csv:", f"{size(os.path.join(d, 'price.npy')) / size(csv_path):.0%}")
+</py>
+<ol>
+<li>The table uses already-small dtypes, built with the knowledge from Section 22.2.</li>
+<li>The CSV is the row-oriented, text version. Each numeric column is saved by <code>np.save</code> into its own file; the region column is saved as 8-bit category codes.</li>
+<li>The CSV is about 25 MB. All column files together are about 16 MB, because 8-bit and 16-bit numbers need fewer bytes than their decimal text.</li>
+<li>For the total price, the CSV approach must parse the entire file. The column approach opens only <code>price.npy</code>.</li>
+<li><code>mmap_mode="r"</code> memory-maps the file: the operating system pages bytes in on demand and the array behaves like a normal NumPy array.</li>
+<li>The last line reports that the binary price column is about a third of the size of the CSV that held all five columns. Real Parquet adds compression on top (dictionary encoding, run-length encoding, a general compressor), so it usually does better still, and it adds a schema and statistics that this toy lacks.</li>
+</ol>
+<p>Now the folder idea. Here we write a small dataset in the Hive layout (as CSV files, since Parquet is unavailable), then answer a filtered query by opening only the matching folder.</p>
+<p class="problem"><span class="pl">Problem 22.3.2</span> Write 100,000 orders into <code>year=.../region=.../part-0.csv</code> folders. Answer "total amount for year 2025 and region EU" by reading only one file, and prove the answer equals the full scan.</p>
+<py>
+import os, tempfile
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(5)
+n = 100_000
+df = pd.DataFrame({
+    "year": rng.choice([2024, 2025], n),
+    "region": rng.choice(["EU", "US", "APAC"], n),
+    "amount": rng.integers(1, 500, n),
+})
+root = Path(tempfile.mkdtemp()) / "sales"
+for (year, region), part in df.groupby(["year", "region"]):
+    folder = root / f"year={year}" / f"region={region}"
+    folder.mkdir(parents=True)
+    part[["amount"]].to_csv(folder / "part-0.csv", index=False)
+
+for p in sorted(root.rglob("*.csv")):
+    print(p.relative_to(root))
+
+wanted = root / "year=2025" / "region=EU" / "part-0.csv"
+fast = pd.read_csv(wanted)
+print("rows read with pruning:", len(fast), "of", n)
+full = df[(df.year == 2025) & (df.region == "EU")]["amount"].sum()
+print("same total:", fast["amount"].sum() == full)
+</py>
+<ol>
+<li>The generator makes three columns; <code>year</code> and <code>region</code> will become folder names.</li>
+<li><code>groupby(["year", "region"])</code> yields one group per combination. For each, we build the path <code>year=2025/region=EU</code> and write only the <code>amount</code> column, because the other two are encoded in the folder names (that is how Hive layout saves space).</li>
+<li><code>rglob("*.csv")</code> walks the tree; printing the relative paths shows the six files.</li>
+<li>A reader that knows the layout builds the path for the wanted year and region and opens that single file: about one sixth of the rows.</li>
+<li>The check compares with a brute-force filter over the full table. Equal totals prove that pruning changes how much you read, never the answer.</li>
+</ol>
+<p>Real engines do this automatically. The same task in real libraries (not run here):</p>
+<np>
+import pandas as pd
+import duckdb
+import polars as pl
+import pyarrow.dataset as ds
+
+# df is the 100,000-row DataFrame (year, region, amount) from the block above
+# 1. pandas + pyarrow: write a partitioned folder, then read with a filter
+df.to_parquet("sales", partition_cols=["year", "region"], index=False)
+eu_2025 = pd.read_parquet("sales", filters=[("year", "==", 2025), ("region", "==", "EU")])
+
+# 2. DuckDB: the folder names become columns; the WHERE clause prunes folders
+total = duckdb.sql("""
+    SELECT SUM(amount) FROM read_parquet('sales/*/*/*.parquet', hive_partitioning = true)
+    WHERE year = 2025 AND region = 'EU'
+""").fetchone()[0]
+
+# 3. Polars lazy: scan, filter, aggregate, collect
+total = (pl.scan_parquet("sales/**/*.parquet", hive_partitioning=True)
+           .filter((pl.col("year") == 2025) & (pl.col("region") == "EU"))
+           .select(pl.col("amount").sum())
+           .collect()
+           .item())
+
+# 4. pyarrow dataset
+dataset = ds.dataset("sales", format="parquet", partitioning="hive")
+table = dataset.to_table(filter=(ds.field("year") == 2025) & (ds.field("region") == "EU"), columns=["amount"])
+</np>
+<ol>
+<li>All four read only the matching folder and only the <code>amount</code> column. The answer is the same number as the runnable block above prints (<code>fast["amount"].sum()</code>).</li>
+<li><code>partition_cols</code> in pandas and <code>PARTITION_BY</code> in DuckDB create the <code>column=value</code> folders for you.</li>
+<li>In DuckDB, <code>hive_partitioning = true</code> turns the folder names back into columns, so the <code>WHERE</code> can use them.</li>
+<li>Polars <code>scan_parquet</code> is lazy: nothing is read until <code>collect()</code>, and the optimizer pushes the filter and the column choice into the scan.</li>
+<li>The PyArrow dataset API is the lower-level building block that several of the others sit on.</li>
+</ol>
+<h3>Expert: choosing a layout</h3>
+<ul>
+<li><strong>Partition by a column that queries filter on and that has few values</strong> (date, country, tenant). Do not partition by a high-cardinality column such as <code>customer_id</code>: you will create millions of tiny files, and listing them costs more than reading them.</li>
+<li><strong>Aim for files of roughly 100 MB to 1 GB</strong> in a distributed setting. Thousands of tiny files (the "small files problem") slow every engine, since each file costs an open, a footer read and a task.</li>
+<li><strong>Sort within files by the column you filter on.</strong> Row-group statistics then become tight (a small min-max range per group), so more groups can be skipped.</li>
+<li><strong>Compression</strong>: snappy is quick and moderate; zstd gives smaller files at a similar speed; gzip is small but slow. Measure on your data.</li>
+<li><strong>Schema is part of the file.</strong> Write dates as dates and money as decimals or integers, not strings. Changing a column type later means rewriting files.</li>
+</ul>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Convert once, query many times. Reading a 10 GB CSV costs minutes every time you do it. Convert it to partitioned Parquet once (the recipe in Section 22.9), and every later query reads only the columns and folders it needs.</div></div>

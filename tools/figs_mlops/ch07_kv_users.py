@@ -1,0 +1,10 @@
+import numpy as np, matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+ctx=np.array([512,1024,2048,4096,8192,16384,32768])
+def users(budget_gb,per_tok): return budget_gb*1e9/(per_tok*ctx)
+fig,ax=plt.subplots(figsize=(8,4.2))
+ax.plot(ctx,users(72-16.06,131072),"o-",color="#2b4fd6",lw=2,label="8B model, 8 KV heads (128 KiB/token)")
+ax.plot(ctx,users(72-13.5,524288),"s-",color="#b84a22",lw=2,label="7B model, 32 KV heads (512 KiB/token)")
+ax.set_xscale("log",base=2); ax.set_yscale("log"); ax.set_xticks(ctx); ax.set_xticklabels([str(c) for c in ctx])
+ax.set_xlabel("Context length per user (tokens)"); ax.set_ylabel("Concurrent users that fit (log)")
+ax.set_title("KV cache limits concurrency on one 80 GB GPU (fp16)"); ax.legend(); ax.grid(alpha=.25,which="both")
+fig.tight_layout(); fig.savefig("ch07_kv_users.png",dpi=110)

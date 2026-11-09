@@ -1,0 +1,294 @@
+
+<h2>20.12 Recipes: How do I ...?</h2>
+<p>Ten solved tasks. Each is a complete script you can copy. The first four are the big ones that tie several libraries together. The rest are short answers to questions that come up every week.</p>
+
+<h3>Recipe 1. How do I ingest a paginated API into SQLite, safely and repeatably?</h3>
+<p>Plan: fetch page by page with a cursor, validate each record, set aside the bad ones, and upsert the good ones so that running the job twice gives the same table. To keep the recipe short, <code>fetch_page</code> stands in for <code>requests.get(url, params=..., timeout=5).json()</code>; the real HTTP code with a local server is in 20.7.</p>
+<pre class="code lang-python"><code>import sqlite3
+
+ITEMS = [{"id": i, "name": f"item{i}", "price": str(i * 1.5)} for i in range(1, 8)]
+ITEMS[4]["price"] = "n/a"                               # one bad record from the provider
+
+def fetch_page(after, limit):
+    page = [x for x in ITEMS if x["id"] &gt; after][:limit]
+    return {"items": page, "next": page[-1]["id"] if len(page) == limit else None}
+
+con = sqlite3.connect(":memory:")
+con.execute("create table items(id integer primary key, name text not null, price real not null)")
+UPSERT = """insert into items values (?, ?, ?)
+            on conflict(id) do update set name = excluded.name, price = excluded.price"""
+rejected = []
+
+def ingest(page_size=3):
+    after, loaded = 0, 0
+    while True:
+        body = fetch_page(after, page_size)
+        good = []
+        for rec in body["items"]:
+            try:
+                good.append((int(rec["id"]), rec["name"], float(rec["price"])))
+            except (KeyError, ValueError) as e:
+                rejected.append((rec.get("id"), str(e)))
+        with con:
+            con.executemany(UPSERT, good)
+        loaded += len(good)
+        if body["next"] is None:
+            return loaded
+        after = body["next"]
+
+print("run 1 loaded:", ingest())
+print("run 2 loaded:", ingest())
+print("rows in table:", con.execute("select count(*) from items").fetchone()[0])
+print("rejected:", rejected[:1])
+print(con.execute("select * from items where id = 7").fetchone())</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>Seven provider items; the fifth has a broken price. <code>fetch_page</code> does cursor paging: ids above <code>after</code>, and <code>next</code> is <code>None</code> on a short page.</li><li>The table has a primary key and <code>not null</code> columns as the last line of defence. <code>UPSERT</code> overwrites an existing id, so a re-run is harmless.</li><li>Each record is converted inside <code>try</code>; a bad one goes to <code>rejected</code> with the reason and the loop continues. <code>with con:</code> commits each page as one transaction.</li><li>Each run loads 6 good rows (3, 2 and 1 per page). Run 2 changes nothing: still 6 rows. The bad record is rejected in both runs (only the first is shown).</li></ol>
+
+<h3>Recipe 2. How do I scrape a multi-page table into a DataFrame, politely?</h3>
+<pre class="code lang-python"><code>import time
+import pandas as pd
+from bs4 import BeautifulSoup
+from urllib.robotparser import RobotFileParser
+
+PAGES = {
+    "https://shop.example/list?p=1": "<table><tr><th>SKU</th><th>Price</th></tr><tr><td>A</td><td>$1.10</td></tr><tr><td>B</td><td>$2.20</td></tr></table>",
+    "https://shop.example/list?p=2": "<table><tr><th>SKU</th><th>Price</th></tr><tr><td>B</td><td>$2.20</td></tr><tr><td>C</td><td>$3.30</td></tr></table>",
+    "https://shop.example/list?p=3": "<p>No table here</p>",
+}
+rp = RobotFileParser()
+rp.parse(["User-agent: *", "Disallow: /admin/"])
+
+def fetch(url):                       # stand-in for requests.get(url, headers=..., timeout=...).text
+    return PAGES[url]
+
+frames = []
+for url in PAGES:
+    if not rp.can_fetch("study-bot", url):
+        continue
+    table = BeautifulSoup(fetch(url), "html.parser").find("table")
+    if table is None:
+        print("no table at", url[-3:])
+        continue
+    rows = [[c.get_text(strip=True) for c in tr.find_all(["th", "td"])] for tr in table.find_all("tr")]
+    frames.append(pd.DataFrame(rows[1:], columns=rows[0]))
+    time.sleep(0.01)                  # be polite: real crawls wait seconds, not 0.01
+
+df = pd.concat(frames, ignore_index=True).drop_duplicates().reset_index(drop=True)
+df["Price"] = df["Price"].str.lstrip("$").astype(float)
+print(df)</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>The dictionary stands in for three web pages; replace <code>fetch</code> with <code>requests.get(...).text</code> (plus timeout and error handling). <code>can_fetch</code> is asked before every page.</li><li>Page 3 has no table, so <code>find</code> returns <code>None</code> and is reported instead of crashing. Each row (header included) is read into a list of strings; the first row names the columns.</li><li><code>concat</code> and <code>drop_duplicates</code> remove product B, which appears on both pages; <code>reset_index</code> renumbers. The price text is cleaned and converted to float.</li></ol>
+
+<h3>Recipe 3. How do I validate a schema and keep the rejects?</h3>
+<pre class="code lang-python"><code>import json, tempfile
+from pathlib import Path
+
+lines = [
+    '{"id": 1, "total": 10.5, "region": "north"}',
+    '{"id": 2, "total": "oops", "region": "south"}',
+    'not json at all',
+    '{"id": 4, "total": -1, "region": "east"}',
+    '{"id": 5, "total": 3, "region": "mars"}',
+    '{"id": 6, "region": "west"}',
+]
+REGIONS = {"north", "south", "east", "west"}
+
+def parse(line):
+    rec = json.loads(line)
+    total = float(rec["total"])
+    if total &lt; 0:
+        raise ValueError("negative total")
+    if rec["region"] not in REGIONS:
+        raise ValueError(f"unknown region {rec['region']!r}")
+    return {"id": int(rec["id"]), "total": total, "region": rec["region"]}
+
+good = []
+rejects = Path(tempfile.mkdtemp()) / "rejected.jsonl"
+with rejects.open("w", encoding="utf-8") as bad:
+    for n, line in enumerate(lines, 1):
+        try:
+            good.append(parse(line))
+        except (ValueError, KeyError) as e:      # JSONDecodeError is a ValueError
+            bad.write(json.dumps({"line": n, "error": f"{type(e).__name__}: {e}"}) + "\n")
+
+print(len(good), "good:", good)
+for row in rejects.read_text().splitlines():
+    print(row)</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>The input has every kind of damage: bad number, broken JSON, negative value, unknown category, missing key.</li><li>One <code>except</code> catches <code>ValueError</code> (which includes <code>JSONDecodeError</code>) and <code>KeyError</code>.</li><li>Each reject is one JSON object with the line number and reason in a JSON Lines file: an audit trail for the data owner. One record passes, five are rejected with five different messages.</li></ol>
+
+<h3>Recipe 4. How do I do an incremental load with a watermark?</h3>
+<p>A <strong>watermark</strong> is the highest <code>updated_at</code> value you have already loaded. Each run asks the source only for rows at or after it. The watermark is stored in the target database and updated in the same transaction as the data, so a crash can never advance it without the rows.</p>
+<pre class="code lang-python"><code>import sqlite3
+from datetime import datetime, timedelta
+
+src, dst = sqlite3.connect(":memory:"), sqlite3.connect(":memory:")
+for c in (src, dst):
+    c.execute("create table orders(id integer primary key, total real, updated_at text)")
+dst.execute("create table etl_state(name text primary key, watermark text)")
+UPSERT = """insert into orders values (?, ?, ?) on conflict(id) do update
+            set total = excluded.total, updated_at = excluded.updated_at"""
+
+def load(overlap_hours=0):
+    row = dst.execute("select watermark from etl_state where name = 'orders'").fetchone()
+    wm = row[0] if row else "1970-01-01T00:00:00"
+    start = (datetime.fromisoformat(wm) - timedelta(hours=overlap_hours)).isoformat()
+    rows = src.execute("select id, total, updated_at from orders where updated_at &gt;= ? order by updated_at",
+                       (start,)).fetchall()
+    with dst:                                         # data and watermark commit together
+        dst.executemany(UPSERT, rows)
+        if rows:
+            dst.execute("""insert into etl_state values ('orders', ?)
+                           on conflict(name) do update set watermark = max(watermark, excluded.watermark)""",
+                        (rows[-1][2],))
+    return len(rows)
+
+src.executemany("insert into orders values (?, ?, ?)",
+                [(1, 10.0, "2025-03-01T09:00:00"), (2, 20.0, "2025-03-01T10:00:00"), (3, 30.0, "2025-03-01T11:00:00")])
+print("run 1 read", load())
+print("run 2 read", load(), "(only the boundary row again)")
+
+src.execute("update orders set total = 25.0, updated_at = '2025-03-01T12:00:00' where id = 2")
+src.execute("insert into orders values (4, 40.0, '2025-03-01T12:30:00')")
+print("run 3 read", load())
+print(dst.execute("select * from orders order by id").fetchall())
+
+src.execute("insert into orders values (5, 50.0, '2025-03-01T11:30:00')")      # arrives late, older timestamp
+print("run 4 (no overlap) read", load(), "-> rows in target:", dst.execute("select count(*) from orders").fetchone()[0])
+print("run 5 (2 h overlap) read", load(overlap_hours=2), "-> rows in target:", dst.execute("select count(*) from orders").fetchone()[0])</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>Two in-memory databases play the source and the warehouse; the warehouse has a state table with one row per job.</li><li><code>load</code> reads the watermark (1970 on the first run), steps back by an optional overlap, and selects rows with <code>updated_at &gt;= start</code>. Using <code>&gt;=</code> means rows sharing the exact watermark are never missed; they are read again and the upsert makes that harmless.</li><li>Inside <code>with dst:</code> the rows and the new watermark commit together, or neither does. <code>max(...)</code> stops the watermark moving backwards during an overlap run.</li><li>Run 1 reads 3 rows; run 2 reads only the boundary row. Run 3 sees the changed order 2 (now 25.0), the new order 4 and the boundary row.</li><li>Run 4 shows the weakness: order 5 arrives late with an older timestamp (11:30, watermark 12:30) and is never read. Run 5 uses a two-hour overlap and catches it, at the price of re-reading recent data.</li></ol>
+<figure><img src="images/lib20_watermark.png" alt="Bar chart of rows loaded in each of five runs and a line of the cumulative rows in the target table" loading="lazy"/><figcaption>Illustrative numbers: a first full load, then small incremental loads, one run with nothing new.</figcaption></figure>
+<p><strong>How to read it:</strong> blue bars are the rows each run touches; the orange line is how many rows the target holds in total. After the big first load the bars are small, which is the whole point: later runs do a tiny amount of work. Run 4 brought nothing new and the orange line stays flat, which is a healthy result and not an error.</p>
+
+<h3>Recipe 5. How do I combine many CSV files and remember where each row came from?</h3>
+<pre class="code lang-python"><code>import tempfile
+from pathlib import Path
+import pandas as pd
+
+root = Path(tempfile.mkdtemp())
+(root / "sales_2025-01.csv").write_text("sku,units\nA,3\nB,5\n")
+(root / "sales_2025-02.csv").write_text("sku,units\nA,4\nC,1\n")
+(root / "notes.txt").write_text("ignore me")
+
+frames = [pd.read_csv(p).assign(source=p.stem) for p in sorted(root.glob("sales_*.csv"))]
+df = pd.concat(frames, ignore_index=True)
+df["month"] = df["source"].str[-7:]
+print(df)
+print(df.groupby("month")["units"].sum().to_dict())</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li><code>glob("sales_*.csv")</code> ignores the notes file; <code>sorted</code> makes the order reproducible.</li><li><code>assign(source=p.stem)</code> tags each row with its file, so a wrong number can be traced back; <code>concat(..., ignore_index=True)</code> gives a fresh index.</li></ol>
+
+<h3>Recipe 6. How do I open a mystery CSV (unknown delimiter, encoding and decimal comma)?</h3>
+<pre class="code lang-python"><code>import csv, io
+import pandas as pd
+
+raw = "id;name;amount\n1;Zoë;12,5\n2;Müller;7,25\n".encode("cp1252")
+
+def guess(raw):
+    for enc in ("utf-8", "cp1252"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    sep = csv.Sniffer().sniff(text[:2000], delimiters=",;\t|").delimiter
+    return enc, sep
+
+enc, sep = guess(raw)
+print(enc, repr(sep))
+df = pd.read_csv(io.BytesIO(raw), sep=sep, encoding=enc, decimal=",")
+print(df)
+print(df["amount"].sum())</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>The bytes imitate a Windows export: cp1252, semicolons, decimal comma.</li><li><code>guess</code> tries strict UTF-8 first, fails on the accented byte, then uses <code>cp1252</code>. <code>csv.Sniffer</code> finds the delimiter among the allowed ones.</li><li><code>decimal=","</code> makes pandas read <code>12,5</code> as 12.5; without it the column would be text.</li></ol>
+
+<h3>Recipe 7. How do I write a formatted Excel report?</h3>
+<pre class="code lang-python"><code>import tempfile
+from pathlib import Path
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill
+
+path = Path(tempfile.mkdtemp()) / "report.xlsx"
+wb = Workbook()
+ws = wb.active
+ws.title = "Summary"
+ws.append(["Region", "Revenue"])
+for row in [("North", 1234.5), ("South", 987.25)]:
+    ws.append(row)
+for cell in ws[1]:
+    cell.font = Font(bold=True, color="FFFFFF")
+    cell.fill = PatternFill("solid", fgColor="2B4FD6")
+for (cell,) in ws.iter_rows(min_row=2, min_col=2, max_col=2):
+    cell.number_format = "#,##0.00"
+ws.freeze_panes = "A2"
+ws.column_dimensions["A"].width = 18
+ws.auto_filter.ref = ws.dimensions
+wb.save(path)
+
+check = load_workbook(path)["Summary"]
+print(check["A1"].font.bold, check["B2"].number_format, check.freeze_panes, check.auto_filter.ref)
+print(check["B2"].value)</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>Data goes in with <code>append</code>; styling is applied afterwards: bold white header text on a blue fill (hex without <code>#</code>).</li><li><code>number_format</code> changes only the display; the cell still holds the number 1234.5, so finance can still sum it. Freeze panes, a column width and a filter finish the sheet.</li><li>Reloading the file confirms what was really saved.</li></ol>
+
+<h3>Recipe 8. How do I upsert a whole DataFrame into a table?</h3>
+<pre class="code lang-python"><code>import sqlite3
+import pandas as pd
+
+con = sqlite3.connect(":memory:")
+con.execute("create table prices(sku text primary key, price real)")
+con.execute("insert into prices values ('A', 1.0), ('B', 2.0)")
+new = pd.DataFrame({"sku": ["B", "C"], "price": [2.5, 3.0]})
+
+with con:
+    new.to_sql("prices_stage", con, if_exists="replace", index=False)
+    con.execute("""insert into prices select sku, price from prices_stage where true
+                   on conflict(sku) do update set price = excluded.price""")
+    con.execute("drop table prices_stage")
+print(pd.read_sql_query("select * from prices order by sku", con))</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li><code>to_sql</code> cannot upsert, so the DataFrame goes to a throw-away <strong>staging table</strong>.</li><li>One SQL statement moves staging rows into the real table (in SQLite, <code>where true</code> after the <code>select</code> avoids a parsing ambiguity before <code>on conflict</code>), then the stage is dropped, all in one transaction.</li><li>Result: A unchanged, B updated to 2.5, C inserted. PostgreSQL uses the same <code>insert ... on conflict</code>.</li></ol>
+
+<h3>Recipe 9. How do I flatten nested JSON that contains lists?</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+orders = [
+    {"id": 1, "customer": {"name": "Ana"}, "lines": [{"sku": "A", "qty": 2}, {"sku": "B", "qty": 1}]},
+    {"id": 2, "customer": {"name": "Bo"}, "lines": [{"sku": "A", "qty": 5}]},
+    {"id": 3, "customer": {"name": "Cy"}, "lines": []},
+]
+lines = pd.json_normalize(orders, record_path="lines", meta=["id", ["customer", "name"]])
+print(lines)
+print(lines.groupby("customer.name")["qty"].sum().to_dict())</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>Each order has a list of lines, so the natural table has one row per line. <code>record_path="lines"</code> expands that list.</li><li><code>meta</code> copies parent fields onto every child row, including the nested <code>["customer", "name"]</code>. Order 3 has an empty list and therefore no rows; join the parent table back if you need it.</li></ol>
+
+<h3>Recipe 10. How do I cache API responses so reruns are cheap?</h3>
+<pre class="code lang-python"><code>import hashlib, json, tempfile, time
+from pathlib import Path
+
+cache_dir = Path(tempfile.mkdtemp())
+calls = {"n": 0}
+
+def fake_api(url):                                    # stands in for requests.get(url).json()
+    calls["n"] += 1
+    return {"url": url, "value": len(url)}
+
+def cached_get(url, max_age=3600, fetch=fake_api):
+    f = cache_dir / (hashlib.sha256(url.encode()).hexdigest()[:16] + ".json")
+    if f.exists() and time.time() - f.stat().st_mtime &lt; max_age:
+        return json.loads(f.read_text())
+    data = fetch(url)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(f)
+    return data
+
+for u in ["https://api.example/a", "https://api.example/b", "https://api.example/a"]:
+    cached_get(u)
+print("api calls:", calls["n"])
+cached_get("https://api.example/a", max_age=0)
+print("api calls after forcing a refresh:", calls["n"])</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>The cache key is a hash of the URL, so any URL becomes a safe file name. A file younger than <code>max_age</code> seconds is returned without a network call.</li><li>Otherwise the function fetches and writes through a temporary file plus <code>replace</code> (the atomic write from 20.2).</li><li>Three lookups cost two real calls; <code>max_age=0</code> forces a refresh, giving a third. Caching also keeps development runs far below rate limits.</li></ol>

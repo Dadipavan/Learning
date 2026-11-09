@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 10: Monitoring, Drift and Observability</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 10</div><h1>Monitoring, Drift and Observability</h1><p>How to know that a model in production is still healthy, when no one is telling you it is broken.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-10-1-what-to-monitor-and-prometheus-and-grafana">10.1 What to Monitor, and Prometheus and Grafana</a></li><li><a href="#s2-10-2-data-drift-psi-ks-wasserstein-and-friends">10.2 Data Drift: PSI, KS, Wasserstein and Friends</a></li><li><a href="#s3-10-3-concept-drift-prediction-drift-and-delayed-labels">10.3 Concept Drift, Prediction Drift and Delayed Labels</a></li><li><a href="#s4-10-4-alert-design-runbooks-and-incident-response">10.4 Alert Design, Runbooks and Incident Response</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>A normal web service fails loudly: errors, timeouts, red dashboards. A model fails quietly. It keeps answering in 20 ms with a clean HTTP 200 while its answers slowly become wrong, because customers changed, a data source changed or the world changed. Nobody gets paged. Weeks later a business report shows lost money. This chapter teaches you to watch for quiet failure. You will learn what to measure at four levels, compute the main drift scores (PSI, KS, Wasserstein, chi-square) by hand and with code on real numbers, see why drift in the inputs and drift in the <em>meaning</em> of the labels are different problems, estimate accuracy when labels arrive late, and design alerts that people do not learn to ignore. You know the first level from performance work: dashboards for latency, errors and saturation. We extend it to data and model quality.</p>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 10: Monitoring, Drift and Observability</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 10</div><h1>Monitoring, Drift and Observability</h1><p>How to know that a model in production is still healthy, when no one is telling you it is broken.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-10-1-what-to-monitor-and-prometheus-and-grafana">10.1 What to Monitor, and Prometheus and Grafana</a></li><li><a href="#s2-10-2-data-drift-psi-ks-wasserstein-and-friends">10.2 Data Drift: PSI, KS, Wasserstein and Friends</a></li><li><a href="#s3-10-3-concept-drift-prediction-drift-and-delayed-labels">10.3 Concept Drift, Prediction Drift and Delayed Labels</a></li><li><a href="#s4-10-4-alert-design-runbooks-and-incident-response">10.4 Alert Design, Runbooks and Incident Response</a></li><li><a href="#s5-10-5-advanced-monitoring-joint-drift-label-free-estimates-slices-and-b">10.5 Advanced Monitoring: Joint Drift, Label-free Estimates, Slices and Burn Rates</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p>A normal web service fails loudly: errors, timeouts, red dashboards. A model fails quietly. It keeps answering in 20 ms with a clean HTTP 200 while its answers slowly become wrong, because customers changed, a data source changed or the world changed. Nobody gets paged. Weeks later a business report shows lost money. This chapter teaches you to watch for quiet failure. You will learn what to measure at four levels, compute the main drift scores (PSI, KS, Wasserstein, chi-square) by hand and with code on real numbers, see why drift in the inputs and drift in the <em>meaning</em> of the labels are different problems, estimate accuracy when labels arrive late, and design alerts that people do not learn to ignore. You know the first level from performance work: dashboards for latency, errors and saturation. We extend it to data and model quality.</p>
 <p>Words you need in this chapter:</p>
 <div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Observability</td><td>Being able to understand what a system is doing from the data it emits (metrics, logs, traces).</td></tr><tr><td>Metric</td><td>A number measured over time, for example requests per second.</td></tr><tr><td>Reference data</td><td>The "normal" data to compare against, usually the training data.</td></tr><tr><td>Current (live) data</td><td>Recent production inputs.</td></tr><tr><td>Drift</td><td>A change in data or in the relation between inputs and outcome, compared with training time.</td></tr><tr><td>Label</td><td>The true answer (did the customer really leave?). Often arrives late.</td></tr><tr><td>SLO</td><td>Service level objective: a target such as "99.9% of requests succeed".</td></tr></tbody></table></div>
 <p>Running example: the churn model from earlier chapters, served by <code>churn-api</code> (Chapter 7). One input feature, "average order value", has a training mean of 50 and spread (standard deviation) of 10.</p>
@@ -169,10 +169,157 @@ day 8 psi 0.30 streak 4  ALERT</code></pre>
 <ul><li><strong>SRE and MLOps</strong>: tiered alerts with runbooks for every ML service.</li><li><strong>Risk and compliance</strong>: audit logs of model decisions and monitoring reports.</li><li><strong>Data engineering</strong>: freshness and volume alerts on feature tables.</li><li><strong>Product</strong>: weekly model health summaries for non-technical owners.</li></ul>
 <p><strong>Check yourself</strong></p>
 <ol><li>Name two properties of a good alert. Answer: Actionable, persistent (not a single spike), linked to a runbook, tiered by severity.</li><li>What do you do first in an incident? Answer: Stabilise (roll back or fall back), then investigate.</li><li>What does <code>for: 10m</code> in a Prometheus rule do? Answer: The condition must hold for 10 minutes before the alert fires.</li></ol>
-<h2 id="s5-chapter-recap">Chapter recap</h2>
+<h2 id="s5-10-5-advanced-monitoring-joint-drift-label-free-estimates-slices-and-b">10.5 Advanced Monitoring: Joint Drift, Label-free Estimates, Slices and Burn Rates</h2>
+<p>Section 10.2 and 10.3 gave you the single-feature drift tests and the delayed-label problem. This section covers what experts add: checks that see several features together, estimates of performance when labels are late, slice monitoring that does not cry wolf, and alerting and retraining rules driven by numbers. Every output below was produced by code run here. Services such as Prometheus are not needed for these ideas, so nothing here is unrunnable.</p>
+<h3>Drift that single-feature tests cannot see</h3>
+<p>PSI, KS and Wasserstein look at one feature at a time. A model uses relations between features. If two features used to rise together and now move in opposite directions, every single-feature histogram can look the same while the model is wrong. Two tools catch this. A domain classifier is a model trained to tell reference rows from today's rows: if it can (AUC clearly above 0.5), the data changed, and its feature importances say where. MMD (maximum mean discrepancy) is one number for the distance between two clouds of points. Real output for the case above:</p>
+<figure><img src="images/ch10_multivariate.png" alt="Joint scatter and single-feature histograms of reference and today" loading="lazy"/><figcaption>The same two features, seen jointly (left) and one at a time (middle and right).</figcaption></figure>
+<p>How to read it: on the left, blue points rise from lower left to upper right (the features move together) while orange points fall (they move in opposite directions). In the middle and right plots, the histograms of each feature on its own overlap almost exactly. A monitor that checks features one by one sees nothing, yet the model, which uses the relation between them, is in a world it never saw.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy.stats import ks_2samp
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import cross_val_predict
+from sklearn.metrics import roc_auc_score
+
+rng = np.random.default_rng(0)
+n = 4000
+cov_ref = [[1, 0.8], [0.8, 1]]               # reference: the two features move together
+cov_new = [[1, -0.8], [-0.8, 1]]             # today: they move in opposite directions
+ref = rng.multivariate_normal([0, 0], cov_ref, n)
+new = rng.multivariate_normal([0, 0], cov_new, n)
+
+for j in range(2):                           # one feature at a time: nothing to see
+    print(f"feature {j}: KS p-value {ks_2samp(ref[:, j], new[:, j]).pvalue:.2f}")
+
+# Domain classifier: can a model tell reference rows from new rows?
+X = np.vstack([ref, new]); y = np.r_[np.zeros(n), np.ones(n)]
+p = cross_val_predict(RandomForestClassifier(100, min_samples_leaf=20, random_state=0, n_jobs=1), X, y, cv=5, method="predict_proba")[:, 1]
+print("domain classifier AUC:", round(roc_auc_score(y, p), 3), "(0.5 = cannot tell apart)")</code></pre>
+<pre class="code lang-text"><code>feature 0: KS p-value 0.50
+feature 1: KS p-value 0.25
+domain classifier AUC: 0.895 (0.5 = cannot tell apart)</code></pre>
+<p class="problem"><span class="pl">Problem 10.5.1</span> Read the output. What do the KS p-values say, and what does the domain classifier say?</p>
+<table class="steps"><tr><th>KS</th><td>p = 0.50 and 0.25: no evidence of change in either feature.</td></tr><tr><th>Domain classifier</th><td>AUC 0.895. It separates reference from today with high accuracy, so the joint distribution changed.</td></tr><tr><th>Why</th><td>The classifier uses the sign of the product of the features, which flipped.</td></tr><tr><th>Answer</th><td>Alert on the domain classifier. Look at the feature importances and at pairwise plots to find which relation changed.</td></tr><tr><th>Meaning</th><td>The test you choose decides what you can see. One-feature tests cannot see relation changes.</td></tr></table>
+<p>MMD on the same idea, with an RBF kernel (a similarity that falls with distance). Real output; the first row is the baseline for two samples from the same distribution, so you can see what noise looks like:</p>
+<pre class="code lang-python"><code>import numpy as np
+# MMD (maximum mean discrepancy) with an RBF kernel: one number for "how different are two clouds of points?"
+def mmd2(a, b, gamma=0.5):
+    def k(x, y):
+        d = ((x[:, None, :] - y[None, :, :]) ** 2).sum(-1)
+        return np.exp(-gamma * d)
+    return k(a, a).mean() + k(b, b).mean() - 2 * k(a, b).mean()
+
+rng = np.random.default_rng(1)
+base = rng.multivariate_normal([0, 0], [[1, .8], [.8, 1]], 800)
+same = rng.multivariate_normal([0, 0], [[1, .8], [.8, 1]], 800)
+flip = rng.multivariate_normal([0, 0], [[1, -.8], [-.8, 1]], 800)
+shift = rng.multivariate_normal([0.5, 0], [[1, .8], [.8, 1]], 800)
+print("same distribution :", round(mmd2(base, same), 4))
+print("correlation flipped:", round(mmd2(base, flip), 4))
+print("mean shifted 0.5   :", round(mmd2(base, shift), 4))</code></pre>
+<pre class="code lang-text"><code>same distribution : 0.003
+correlation flipped: 0.1185
+mean shifted 0.5   : 0.0387</code></pre>
+<p class="problem"><span class="pl">Problem 10.5.2</span> How would you turn an MMD number into an alert?</p>
+<table class="steps"><tr><th>Baseline</th><td>Compare many pairs of samples from the reference period: they give about 0.003 here, the noise level.</td></tr><tr><th>Threshold</th><td>Set it a few times above the noise range, for example 0.02. The flipped correlation (0.1185) and the mean shift (0.0387) both exceed it.</td></tr><tr><th>Better</th><td>Use a permutation test: shuffle the labels 'reference' and 'today' many times, compute MMD each time, and report the share of shuffles above the observed value (a p-value).</td></tr><tr><th>Answer</th><td>Calibrate the threshold on history, not by guessing.</td></tr><tr><th>Meaning</th><td>Any distance needs a noise baseline to mean something.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Alerting on drift of every feature with p below 0.05. With 100 features, about 5 will fire by chance on any day, and a big sample makes tiny harmless shifts significant. Use an effect size (PSI above 0.2, or a domain classifier AUC above 0.6), alert on the top few features by model importance, and review the rest weekly.</div></div>
+<h3>Estimating performance when labels are late</h3>
+<p>The chapter said labels can take weeks. You still want a number today. If the model's probabilities are well calibrated (when it says 0.8, it is right 80% of the time), then the expected accuracy on today's rows is the average of max(p, 1 − p). That is the idea behind confidence-based performance estimation (CBPE, used in the NannyML library). It needs no labels. It works when only the inputs change and the relation to the label stays the same. It fails when the relation changes (concept drift). Real output with both cases:</p>
+<pre class="code lang-python"><code>import numpy as np
+# Performance estimation without labels (the idea behind CBPE): if the model's probabilities are
+# calibrated, expected accuracy = mean of max(p, 1-p) over today's rows. No labels needed.
+rng = np.random.default_rng(3)
+def day(shift, slope=2.0, n=5000):
+    x = rng.normal(shift, 1, n)
+    p_true = 1 / (1 + np.exp(-slope * x))          # the real world today
+    y = (rng.random(n) &lt; p_true).astype(int)
+    return x, y
+def model_p(x):                                    # the model learned slope 2 and still believes it
+    return 1 / (1 + np.exp(-2 * x))
+print("case                      true accuracy  estimated (no labels)")
+for name, shift, slope in (("no change", 0.0, 2.0), ("inputs shift +0.5", 0.5, 2.0), ("inputs shift +1.0", 1.0, 2.0),
+                           ("concept drift (slope 0.5)", 0.0, 0.5)):
+    x, y = day(shift, slope)
+    p = model_p(x)
+    true_acc = ((p &gt; 0.5) == y).mean()
+    est = np.maximum(p, 1 - p).mean()
+    print(f"{name:25s} {true_acc:9.3f}      {est:9.3f}")</code></pre>
+<pre class="code lang-text"><code>case                      true accuracy  estimated (no labels)
+no change                     0.782          0.781
+inputs shift +0.5             0.796          0.796
+inputs shift +1.0             0.845          0.845
+concept drift (slope 0.5)     0.597          0.779</code></pre>
+<p class="problem"><span class="pl">Problem 10.5.3</span> Read the table. When can you trust the estimate, and when not?</p>
+<table class="steps"><tr><th>Inputs shift</th><td>The estimate matches the true accuracy to three digits (0.796 vs 0.796, 0.845 vs 0.845). The model's probabilities are still right for the new inputs.</td></tr><tr><th>Concept drift</th><td>The true accuracy is 0.597 but the estimate says 0.779. The model still believes the old relation, so its probabilities are wrong and the estimate is wrong in the same way.</td></tr><tr><th>Answer</th><td>Trust it for covariate shift. It cannot see concept drift, so you still need real labels, even a small sample.</td></tr><tr><th>Action</th><td>Pair it with a labelled sample (for example 200 rows a week, labelled by hand or from early outcomes) and a check of the calibration on that sample.</td></tr><tr><th>Meaning</th><td>Label-free estimates reduce the delay, they do not remove the need for labels.</td></tr></table>
+<h3>Slice monitoring that does not cry wolf</h3>
+<p>Overall metrics hide failing groups: the kiosk channel below is 0.4% of traffic, so it barely changes the total. Small groups also have wide error bars: 400 rows give a 95% interval about ±3.7 points wide. A fair alert looks at the interval, not the point value. Alert when even the optimistic end of the interval is below the limit. Real output:</p>
+<pre class="code lang-python"><code>import numpy as np
+# Monitoring slices: an overall metric hides a failing group, and small groups are noisy.
+rng = np.random.default_rng(5)
+groups = {"web": (60000, 0.95), "ios": (30000, 0.95), "android": (9000, 0.94), "kiosk": (400, 0.80)}
+print("group     n      accuracy   95% interval          alert?")
+tot_c = tot_n = 0
+for g, (n, acc) in groups.items():
+    correct = rng.binomial(n, acc); tot_c += correct; tot_n += n
+    p = correct / n; se = (p * (1 - p) / n) ** 0.5
+    lo, hi = p - 1.96 * se, p + 1.96 * se
+    print(f"{g:8s} {n:6d}   {p:.3f}     [{lo:.3f}, {hi:.3f}]    {'YES' if hi &lt; 0.90 else 'no'}")
+print("overall:", round(tot_c / tot_n, 3))</code></pre>
+<pre class="code lang-text"><code>group     n      accuracy   95% interval          alert?
+web       60000   0.949     [0.947, 0.951]    no
+ios       30000   0.951     [0.948, 0.953]    no
+android    9000   0.937     [0.932, 0.942]    no
+kiosk       400   0.830     [0.793, 0.867]    YES
+overall: 0.948</code></pre>
+<p class="problem"><span class="pl">Problem 10.5.4</span> The kiosk accuracy is 0.830 with an interval of [0.793, 0.867], and the limit is 0.90. Is it a real problem? And if the kiosk had 20 rows?</p>
+<table class="steps"><tr><th>Rule</th><td>Alert when the upper end of the interval is below the limit.</td></tr><tr><th>400 rows</th><td>Upper end 0.867 is below 0.90: alert. The group is really worse than the limit.</td></tr><tr><th>20 rows</th><td>The standard error would be about 0.084, so the interval would be about ±0.17: too wide to say anything. No alert from a single day; accumulate several days.</td></tr><tr><th>Meaning</th><td>Intervals make alerts depend on evidence, not luck. Choose slices by business risk and a minimum size.</td></tr></table>
+<h3>SLO alerting with burn rates</h3>
+<p>Section 10.1 introduced error budgets. The expert version alerts on how fast the budget burns. A 99.9% SLO over 30 days allows 0.1% errors. The burn rate is the observed error rate divided by the allowed rate: 1 means you spend exactly the budget by day 30, 14.4 means you spend it in about 50 hours. A common rule is to page when both a long window (1 hour) and a short window (5 minutes) are above 14.4: the long window prevents flapping and the short window stops the page soon after the problem is fixed. Real output:</p>
+<pre class="code lang-python"><code># Multi-window burn-rate alerts for an SLO of 99.9% (error budget 0.1%).
+# burn rate = observed error rate / allowed error rate. 30 days = 720 hours.
+slo_err = 0.001
+def burn(err_rate): return err_rate / slo_err
+for err in (0.002, 0.0144, 0.05):
+    b = burn(err)
+    hours_to_empty = 720 / b
+    print(f"error rate {err:.2%}: burn rate {b:5.1f}x, budget gone in {hours_to_empty:6.1f} hours")
+# Typical rule: page when BOTH the 1-hour and the 5-minute burn rate exceed 14.4
+# (14.4x burns 2% of the 30-day budget in one hour).
+print("share of monthly budget used in 1 hour at 14.4x:", f"{14.4 / 720:.1%}")</code></pre>
+<pre class="code lang-text"><code>error rate 0.20%: burn rate   2.0x, budget gone in  360.0 hours
+error rate 1.44%: burn rate  14.4x, budget gone in   50.0 hours
+error rate 5.00%: burn rate  50.0x, budget gone in   14.4 hours
+share of monthly budget used in 1 hour at 14.4x: 2.0%</code></pre>
+<p class="problem"><span class="pl">Problem 10.5.5</span> An inference service has a 99.9% SLO. Errors run at 0.5% for 3 hours. How much of the 30-day budget is gone, and does it page?</p>
+<table class="steps"><tr><th>Burn rate</th><td>0.5% ÷ 0.1% = 5 times.</td></tr><tr><th>Budget used</th><td>5 × 3 hours = 15 budget-hours, out of 720: 2.1%.</td></tr><tr><th>Rule</th><td>Burn rate 5 is below 14.4, so no page. A slower alert (burn rate 6 over 6 hours) would raise a ticket.</td></tr><tr><th>Answer</th><td>It does not page, but a ticket is raised for the next working day if the 6-hour rule exists.</td></tr><tr><th>Meaning</th><td>Two or three rules at different speeds let you page for fast burns and ticket for slow ones.</td></tr></table>
+<h3>Putting a price on retraining</h3>
+<p>Retrain on a rule of thumb ("monthly") or on numbers. A stale model loses accuracy every day, retraining has a fixed cost. If accuracy decays at rate d per day, the best interval balances the cost of retraining against the lost value, T = √(2 × cost ÷ (decisions per day × loss per error × d)). Real output with made-up but plausible numbers:</p>
+<pre class="code lang-python"><code># When to retrain: compare the expected loss from waiting with the cost of a retrain.
+cost_retrain = 1_800            # dollars: compute + checks + people time
+decisions_per_day = 20_000
+loss_per_error = 4.0            # dollars lost per wrong decision
+acc_now, acc_fresh = 0.905, 0.925
+daily_loss = decisions_per_day * (acc_fresh - acc_now) * loss_per_error
+print("extra loss per day from the stale model: $", round(daily_loss))
+print("retrain pays back in", round(cost_retrain / daily_loss, 1), "days")
+# Accuracy decay of 0.0015 per day since the last retrain: best interval?
+import math
+decay = 0.0015                  # accuracy lost per day
+# average extra loss over an interval T is decisions * loss * decay * T/2 per day; plus cost/T per day
+best = math.sqrt(2 * cost_retrain / (decisions_per_day * loss_per_error * decay))
+print("best retrain interval:", round(best, 1), "days")</code></pre>
+<pre class="code lang-text"><code>extra loss per day from the stale model: $ 1600
+retrain pays back in 1.1 days
+best retrain interval: 5.5 days</code></pre>
+<p class="problem"><span class="pl">Problem 10.5.6</span> Using the output, retrain every 30 days or every 5 days?</p>
+<table class="steps"><tr><th>Best interval</th><td>5.5 days from the formula.</td></tr><tr><th>Why</th><td>Daily loss grows with the staleness. At 30 days the average extra loss is 20,000 × 4 × 0.0015 × 15 = $1,800 per day, about $1,200 per day more than at 5 days ($300 stale loss plus $360 retraining cost, $660 in total, against $1,860 at 30 days).</td></tr><tr><th>Check at 5.5 days</th><td>Retrain cost per day 1,800 ÷ 5.5 = $327. Average stale loss 120 × 5.5 ÷ 2 = $330. Total $657 per day, and the curve is flat near the minimum.</td></tr><tr><th>Answer</th><td>Every 5 to 7 days. The real constraints (people, review time, risk of a bad release) may force a longer interval.</td></tr><tr><th>Meaning</th><td>Even rough numbers give a defensible schedule and show what automating retraining would be worth.</td></tr></table>
+<h3>Going deeper</h3>
+<ul><li><strong>Embedding drift for text and images.</strong> For LLM and vision systems, track the embedding of inputs: the distance between the mean embedding of today and the reference, or a domain classifier on the embeddings. Cluster today's inputs and watch for a new cluster, which shows a new kind of request. Output-side signals: response length, refusal rate, language mix and a quality score from a sampled judge (Chapter 13).</li><li><strong>Prediction drift is a cheap early warning.</strong> The share of positive predictions per day needs no labels and no features. A sudden jump often means an upstream change.</li><li><strong>Feedback loops.</strong> If the model decides who gets a loan, you only see outcomes for approved people. Keep a small random exploration group, or evaluate with inverse propensity weights, so you can measure what you would have missed.</li><li><strong>Fairness monitoring.</strong> Track the same metric per protected group (when you may lawfully hold the attribute, or with a proxy and legal advice), and the gap between groups, with intervals as above. A growing gap is an incident even if the average is flat.</li><li><strong>Alert fatigue is a reliability risk.</strong> Count pages per week and the share that led to action (actionable rate, as in Problem 10.4.2). Delete or demote alerts that nobody acts on.</li></ul>
+
+<h2 id="s6-chapter-recap">Chapter recap</h2>
 <ul><li>Models fail quietly. Monitor four levels: system, data, model performance, business and cost.</li><li>Prometheus scrapes <code>/metrics</code>; counters become rates; histograms give percentiles by interpolation (p95 81.25 ms in our example); never average percentiles.</li><li>Burn rate = observed error rate ÷ allowed error rate. 2% errors against a 99.9% SLO burns the budget in 36 hours.</li><li>Data drift is a change in input distribution. PSI measures size (below 0.1 stable), KS says whether a difference exists, Wasserstein gives the shift in feature units, chi-square handles categories.</li><li>A p-value measures evidence, not importance: KS had p = 2e-42 for a shift of only 0.3 standard deviations.</li><li>Concept drift changes the relation from inputs to the answer. In our example PSI was 0.0075 while accuracy fell from 0.849 to 0.157.</li><li>Confidence-based estimates fail under concept drift; a random labelled sample works, with known uncertainty (0.844 ± 0.016 for 1,958 labels).</li><li>Alerts must be actionable, persistent, tiered and linked to a runbook; during an incident, stabilise first.</li></ul>
 <div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Formula or tool</th><th>Note</th></tr></thead><tbody><tr><td>PSI</td><td><code>Σ (live − ref) × ln(live ÷ ref)</code> over bins</td><td>0.1 and 0.25 are common limits</td></tr><tr><td>KS</td><td>Largest gap between two cumulative curves</td><td>Add the p-value only as evidence</td></tr><tr><td>Wasserstein</td><td>Mean absolute difference of sorted values</td><td>In feature units</td></tr><tr><td>Chi-square</td><td><code>Σ (obs − exp)² ÷ exp</code></td><td>Categories, df = categories − 1</td></tr><tr><td>Error rate in PromQL</td><td><code>rate(errors[5m]) / rate(requests[5m])</code></td><td>Counters need <code>rate</code></td></tr><tr><td>Burn rate</td><td><code>error rate ÷ (1 − SLO)</code></td><td>Page on fast burn</td></tr><tr><td>Label sample noise</td><td><code>√(p(1−p)/n)</code></td><td>95% is about ±2 times this</td></tr></tbody></table></div>
-<h2 id="s6-practice-set">Practice set</h2>
+<h2 id="s7-practice-set">Practice set</h2>
 <p><strong>1.</strong> (Easy) A counter reads 1,200 at 10:00:00 and 1,500 at 10:01:00. What is the rate per second?</p>
 <p><strong>Answer:</strong> (1,500 − 1,200) ÷ 60 = 5 requests per second.</p>
 <p><strong>2.</strong> (Easy) Which metric type would you use for "current queue length"?</p>
@@ -195,7 +342,17 @@ day 8 psi 0.30 streak 4  ALERT</code></pre>
 <p><strong>Answer:</strong> Watch input drift (PSI, KS, Wasserstein, null and range checks), prediction drift (score distribution, positive rate), proxy metrics, and a small randomly labelled sample; use performance-estimation methods only with calibrated models and as hints. Say plainly that concept drift cannot be proven without labels, then show the flipped-rule example.</p>
 <p><strong>11.</strong> (Interview) "Your drift alert fires every Monday. What do you do?"</p>
 <p><strong>Answer:</strong> Check for seasonality or a weekly business event. Compare with a same-weekday reference or a seasonal baseline, add persistence, and if the drift is harmless and explained, lower its severity or remove the alert. Document it in the runbook.</p>
-<h2 id="s7-prompt-pack">Prompt pack</h2>
+<p><strong>12.</strong> (Medium) A domain classifier gets AUC 0.52 between last month and this week. What do you conclude?</p>
+<p><strong>Answer:</strong> The classifier cannot tell the two periods apart, so there is no sign of joint drift. Do not alert. With a small sample, 0.52 is within noise.</p>
+<p><strong>13.</strong> (Medium) A service has a 99.5% SLO over 30 days. What is the budget in minutes, and what burn rate drains it in 2 days?</p>
+<p><strong>Answer:</strong> 30 days = 43,200 minutes. The budget is 0.5% = 216 minutes of full failure. A burn rate b drains it in 30 ÷ b days: 30 ÷ b = 2 gives b = 15.</p>
+<p><strong>14.</strong> (Hard) A model's estimated accuracy (label-free) is flat at 0.88 for 4 weeks, but the labelled sample says 0.88, 0.87, 0.84, 0.80. What is happening and what do you do?</p>
+<p><strong>Answer:</strong> The label-free estimate relies on calibration and cannot see concept drift. The labelled sample shows real decay. Investigate concept drift (the relation between inputs and label changed), retrain with recent labelled data, and recalibrate. Do not trust the label-free metric alone.</p>
+<p><strong>15.</strong> (Hard) Slice size is 150 rows, accuracy 0.84. Compute the 95% interval and decide on an alert for a limit of 0.88.</p>
+<p><strong>Answer:</strong> SE = √(0.84 × 0.16 ÷ 150) = √0.000896 = 0.0299. Interval 0.84 ± 0.0587 = [0.781, 0.899]. The upper end is above 0.88, so no alert: the evidence is not enough. Keep watching, or pool several days.</p>
+<p><strong>16.</strong> (Interview) 'Your model's monitoring shows no data drift, but business KPIs are falling. Where do you look?'</p>
+<p><strong>Answer:</strong> Concept drift or a feedback loop (no input drift is expected for those): check labelled outcomes in a sample, slices and calibration, prediction distribution, joint (multivariate) drift with a domain classifier, upstream data meaning (a field with the same name and different meaning), and non-model causes (pricing, seasonality, product changes). Use the labelled sample to separate the model from the business.</p>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into MLOps, and English is my second language. Teach me Chapter 10 topic "monitoring an ML model in production: four levels, Prometheus counters, histograms and Grafana dashboards". Explain step by step with simple English, include a PromQL error-ratio example and how a percentile is computed from histogram buckets using real numbers. Ask me one check question after each part and wait for my answer.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning ML operations. The topic is "data drift metrics: PSI, KS test, Wasserstein distance, chi-square". Give me 8 graded exercises with small numbers I can calculate by hand (PSI on three bins, KS on two tiny samples, Wasserstein on sorted values, chi-square for categories), plus one that asks which metric to use for which feature type. Do not give solutions. When I send my answers, mark them and explain my mistakes simply.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML roles. The topic is "concept drift versus data drift, and delayed labels". Quiz me one question at a time, starting with easy definitions, then scenarios such as fraud labels arriving after 45 days or a model with no input drift but falling conversions. Explain what I can and cannot detect without labels. Keep a score and end with three revision points.</pre></div>

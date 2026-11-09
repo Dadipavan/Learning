@@ -1,0 +1,170 @@
+
+@@H2 8.13 End-to-End: a One-Page Sales Dashboard in matplotlib, then plotly
+@@CALL blue|INTUITION|A dashboard is not a chart that grew up. It is a handful of answers to a handful of questions, laid out so the eye goes top-left to bottom-right: the headline numbers first, then the trend, then the breakdowns. Build it the way you build a report: decide the questions, prepare small tables that answer them, then draw each panel from its own table. If a panel needs more than one sentence to explain, remove it.
+<h3>Step 1: write the questions and the table each one needs</h3>
+@@TABLE
+Question | Panel | pandas that feeds it | Shape the chart wants
+How are we doing overall? | 4 KPI tiles | <code>orders["amount"].sum()</code>, <code>len(orders)</code>, <code>.mean()</code>, Q2 over Q1 | Four single numbers
+Is the trend up or down? | Line of monthly sales | <code>groupby(month)["amount"].sum()</code> | One value per month (a Series)
+Which city sells most? | Sorted bars | <code>groupby("city")["amount"].sum().sort_values()</code> | One value per city
+Which category is strong? | Bars of average order | <code>groupby("category")["amount"].mean()</code> | One value per category
+What does a typical order look like? | Histogram | the raw <code>amount</code> column | A column of numbers (not aggregated)
+@@END
+<h3>Step 2: the tables, printed</h3>
+@@PY dash_data
+import numpy as np
+import pandas as pd
+
+#ORD
+orders["month"] = orders["date"].dt.to_period("M").dt.to_timestamp()
+orders["quarter"] = np.where(orders["date"] < "2025-04-01", "Q1", "Q2")
+
+kpi = {"sales": orders["amount"].sum(), "orders": len(orders), "avg_order": orders["amount"].mean(),
+       "q2_vs_q1": orders.loc[orders.quarter == "Q2", "amount"].sum() / orders.loc[orders.quarter == "Q1", "amount"].sum() - 1}
+monthly = orders.groupby("month")["amount"].sum().div(1000).round(1)
+by_city = orders.groupby("city")["amount"].sum().div(1000).sort_values().round(1)
+by_cat = orders.groupby("category")["amount"].mean().sort_values().round(0)
+print({k: round(float(v), 3) for k, v in kpi.items()})
+print(monthly.rename_axis(None).rename(lambda d: d.strftime("%b")).to_string())
+print(by_city.to_string())
+print(by_cat.to_string())
+print("shapes:", monthly.shape, by_city.shape, by_cat.shape, orders["amount"].shape)
+@@END
+<p>This is the whole data step: five small objects, each the exact shape its chart needs. Notice that nothing is drawn yet. If a number looks wrong on the dashboard, you will open this block, not the drawing code. Sales total 276,237 (Rs 276.2k); Q2 over Q1 is 130,065 / 146,172 - 1 = -11.0%; the average order is Rs 921.</p>
+<h3>Step 3: draw the dashboard from those tables</h3>
+<p>The structure is a grid (3 rows by 4 columns), one small function per kind of panel, and one call per panel. Reusable functions are what make a dashboard maintainable: to change the look of every tile you change one function.</p>
+@@PY dashboard
+#H
+#ORD
+orders["month"] = orders["date"].dt.to_period("M").dt.to_timestamp()
+orders["quarter"] = np.where(orders["date"] < "2025-04-01", "Q1", "Q2")
+q = orders.groupby("quarter")["amount"].sum()
+kpi = {"Sales": f"Rs {orders['amount'].sum() / 1000:,.1f}k", "Orders": f"{len(orders):,}",
+       "Average order": f"Rs {orders['amount'].mean():,.0f}", "Q2 vs Q1": f"{q['Q2'] / q['Q1'] - 1:+.1%}"}
+monthly = orders.groupby("month")["amount"].sum() / 1000
+by_city = (orders.groupby("city")["amount"].sum() / 1000).sort_values()
+by_cat = orders.groupby("category")["amount"].mean().sort_values()
+chg_city = (orders.pivot_table(index="city", columns="quarter", values="amount", aggfunc="sum").diff(axis=1)["Q2"] / 1000)
+chg_cat = (orders.pivot_table(index="category", columns="quarter", values="amount", aggfunc="sum").diff(axis=1)["Q2"] / 1000)
+worst_city, worst_cat = chg_city.idxmin(), chg_cat.idxmin()
+
+def tile(ax, label, value, color="#222"):
+    ax.axis("off")
+    ax.add_patch(plt.Rectangle((0, 0), 1, 1, transform=ax.transAxes, color="#f3f5fa", zorder=0))
+    ax.text(0.06, 0.74, label, transform=ax.transAxes, fontsize=12, color="#555")
+    ax.text(0.06, 0.22, value, transform=ax.transAxes, fontsize=24, fontweight="bold", color=color)
+
+def bars(ax, s, title, highlight, fmt, xlabel):
+    colors = [BLUE if i == highlight else GREY for i in s.index]
+    b = ax.barh(s.index, s.values, color=colors, height=0.65)
+    ax.bar_label(b, labels=[fmt.format(v) for v in s.values], padding=4, fontsize=11)
+    ax.set_title(title, fontsize=13); ax.set_xlabel(xlabel, fontsize=11)
+    ax.set_xlim(0, s.max() * 1.22); ax.tick_params(axis="y", length=0, labelsize=11); ax.tick_params(axis="x", labelsize=10)
+
+fig = plt.figure(figsize=(12, 7), layout="constrained")
+gs = fig.add_gridspec(3, 4, height_ratios=[0.75, 2.3, 2.3])
+for j, (label, value) in enumerate(kpi.items()):
+    tile(fig.add_subplot(gs[0, j]), label, value, RED if label == "Q2 vs Q1" else "#222")
+ax = fig.add_subplot(gs[1, :3])                                         # trend
+ax.plot(monthly.index, monthly.values, color=BLUE, lw=3, marker="o")
+ax.set_xticks(monthly.index, [d.strftime("%b") for d in monthly.index])
+ax.set_ylim(0, 70); ax.set_ylabel("Rs thousand", fontsize=11); ax.set_title("Monthly sales", fontsize=13)
+ax.annotate("April dip", xy=(monthly.index[3], monthly.iloc[3]), xytext=(monthly.index[3], 12), ha="center",
+            arrowprops=dict(arrowstyle="->", color="#444"), fontsize=11, color="#444")
+bars(fig.add_subplot(gs[1, 3]), by_city, "Sales by city\n(blue: biggest Q2 fall)", worst_city, "{:,.0f}k", "Rs thousand")
+bars(fig.add_subplot(gs[2, :2]), by_cat, "Average order by category\n(blue: biggest Q2 fall in sales)", worst_cat, "Rs {:,.0f}", "Rs")
+ax = fig.add_subplot(gs[2, 2:])
+ax.hist(orders["amount"], bins=np.arange(0, 5800, 250), color=TEAL, edgecolor="white")
+ax.axvline(orders["amount"].median(), color=ORANGE, lw=2.5)
+ax.text(orders["amount"].median() + 80, ax.get_ylim()[1] * 0.9, f"median Rs {orders['amount'].median():,.0f}", color=ORANGE, fontweight="bold")
+ax.set_title("Order size", fontsize=13); ax.set_xlabel("Rs per order", fontsize=11); ax.set_ylabel("Orders", fontsize=11)
+fig.suptitle(f"Sales fell {abs(q['Q2'] / q['Q1'] - 1):.0%} in Q2: {worst_city} ({chg_city.min():+.1f}k) and {worst_cat} ({chg_cat.min():+.1f}k) lead the drop",
+             x=0.01, ha="left", fontsize=17, fontweight="bold")
+fig.savefig("ch08v_dashboard.png", dpi=110)
+print(kpi)
+print("worst city:", worst_city, round(chg_city.min(), 1), "| worst category:", worst_cat, round(chg_cat.min(), 1))
+print("saved")
+@@END
+@@FIG dashboard|A one-page dashboard with four KPI tiles on top, a monthly sales line with an April dip annotation, city bars, category average-order bars and an order-size histogram|One-page sales dashboard drawn with matplotlib from five small tables. The headline states the main finding.
+<p><strong>How to read it.</strong> The title gives the answer: sales fell 11% in Q2, led by Mumbai (-24.6k) and Fashion (-13.1k). The tiles confirm the size; the line shows the April dip; the city bars show where; the category bars show which products; the histogram shows what an order looks like (and that the median Rs 695 is below the mean Rs 921). Mumbai is highlighted in blue on the city panel and Fashion on the category panel: blue marks the largest Q2 fall, the same two names as in the title, so the colour links panels to the headline.</p>
+<h3>Numbered line-by-line explanation</h3>
+<ol><li><code>q = orders.groupby("quarter")["amount"].sum()</code> gives Q1 and Q2 totals; the KPI strings are formatted from the data (<code>f"{...:+.1%}"</code> shows the sign), never typed by hand.</li><li><code>chg_city = pivot_table(...).diff(axis=1)["Q2"]</code>: <code>diff(axis=1)</code> subtracts each column from the next one along a row, so the Q2 column becomes Q2 minus Q1. <code>idxmin()</code> finds the city with the biggest fall; it feeds the title and the highlight colour.</li><li><code>def tile(ax, label, value, color)</code>: a KPI tile is just an axes with its frame hidden (<code>ax.axis("off")</code>), a pale rectangle in axes coordinates (<code>transform=ax.transAxes</code>) and two texts, a small label and a large value. Changing the font size once changes every tile.</li><li><code>def bars(ax, s, ...)</code> draws any sorted bar panel and highlights one label. It is called twice (city and category), which is the point of a function.</li><li><code>fig.add_gridspec(3, 4, height_ratios=[0.75, 2.3, 2.3])</code> makes the layout: a thin row for tiles and two tall rows. <code>gs[1, :3]</code> means row 1, columns 0 to 2 (a wide panel); <code>gs[2, :2]</code> and <code>gs[2, 2:]</code> split the last row in half.</li><li><code>layout="constrained"</code> keeps titles, labels and tiles from overlapping, even when panel contents change length.</li><li><code>ax.annotate("April dip", ...)</code> marks the dip; <code>fig.suptitle(..., x=0.01, ha="left")</code> sets the left-aligned headline over the whole dashboard.</li><li><code>fig.savefig(..., dpi=110)</code> at 12 x 7 inches gives 1320 x 770 pixels, close to a 16:9 slide. For a bigger screen raise the dpi, not the font sizes.</li></ol>
+<h3>Step 4: the same dashboard in plotly (not run here)</h3>
+<p>In plotly the layout is declared with <code>make_subplots</code>: a grid where each cell has a <em>type</em> (indicator for tiles, xy for charts) and may span columns. Hover and zoom come free, and the tiles can show a coloured change with <code>go.Indicator</code>.</p>
+@@NORUN
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+# orders: the 300-row DataFrame from the earlier blocks
+orders["month"] = orders["date"].dt.to_period("M").dt.to_timestamp()
+orders["quarter"] = np.where(orders["date"] < "2025-04-01", "Q1", "Q2")
+q = orders.groupby("quarter")["amount"].sum()
+monthly = (orders.groupby("month")["amount"].sum() / 1000).reset_index(name="sales_k")
+by_city = (orders.groupby("city")["amount"].sum() / 1000).sort_values().reset_index(name="sales_k")
+by_cat = orders.groupby("category")["amount"].mean().sort_values().reset_index(name="avg")
+
+fig = make_subplots(
+    rows=3, cols=4, row_heights=[0.2, 0.4, 0.4], vertical_spacing=0.12,
+    specs=[[{"type": "indicator"}] * 4,
+           [{"type": "xy", "colspan": 3}, None, None, {"type": "xy"}],
+           [{"type": "xy", "colspan": 2}, None, {"type": "xy", "colspan": 2}, None]],
+    subplot_titles=("", "", "", "", "Monthly sales (Rs thousand)", "Sales by city", "Average order by category", "Order size"))
+fig.add_trace(go.Indicator(mode="number", value=orders["amount"].sum() / 1000, number={"prefix": "Rs ", "suffix": "k", "valueformat": ",.1f"},
+                           title={"text": "Sales"}), row=1, col=1)
+fig.add_trace(go.Indicator(mode="number", value=len(orders), title={"text": "Orders"}), row=1, col=2)
+fig.add_trace(go.Indicator(mode="number", value=orders["amount"].mean(), number={"prefix": "Rs ", "valueformat": ",.0f"},
+                           title={"text": "Average order"}), row=1, col=3)
+fig.add_trace(go.Indicator(mode="delta", value=q["Q2"], delta={"reference": q["Q1"], "relative": True, "valueformat": ".1%"},
+                           title={"text": "Q2 vs Q1"}), row=1, col=4)
+fig.add_trace(go.Scatter(x=monthly["month"], y=monthly["sales_k"], mode="lines+markers", line={"color": "#2b4fd6", "width": 3},
+                         hovertemplate="%{x|%b %Y}: Rs %{y:.1f}k<extra></extra>"), row=2, col=1)
+fig.add_trace(go.Bar(y=by_city["city"], x=by_city["sales_k"], orientation="h", marker_color="#9a9a9a",
+                     text=by_city["sales_k"].round(0), textposition="outside"), row=2, col=4)
+fig.add_trace(go.Bar(y=by_cat["category"], x=by_cat["avg"], orientation="h", marker_color="#9a9a9a",
+                     text=by_cat["avg"].round(0), textposition="outside"), row=3, col=1)
+fig.add_trace(go.Histogram(x=orders["amount"], xbins={"size": 250}, marker_color="#357a70"), row=3, col=3)
+fig.update_layout(template="plotly_white", showlegend=False, height=700, width=1200,
+                  title={"text": "Sales fell 11% in Q2: Mumbai and Fashion lead the drop", "x": 0.01})
+fig.write_html("sales_dashboard.html", include_plotlyjs="cdn")
+@@END
+<p><em>Not run here.</em> It produces a page about 1200 by 700 pixels: four number tiles on top (the last shows the Q2 versus Q1 change in red with a down arrow, because <code>go.Indicator</code> with <code>mode="delta"</code> colours decreases red by default); a line with markers whose tooltip reads "Apr 2025: Rs 33.3k"; horizontal bars for city and category with the values outside the bars; and a histogram of order amounts in Rs 250 bins. Hovering any bar shows its value; dragging on the line zooms into a period; a toolbar at the top right resets and saves a PNG. Differences from matplotlib worth knowing: (1) layout is declared in <code>specs</code> with <code>colspan</code> instead of GridSpec slicing; (2) the tile is a built-in trace type, not a text box; (3) you pass columns of a DataFrame (<code>by_city["sales_k"]</code>) instead of index and values of a Series, so <code>reset_index(name=...)</code> is how the groupby result is wired in.</p>
+<h3>Step 5: wiring pandas groupby output to any plotting library</h3>
+@@TABLE
+Your pandas result | What it looks like | matplotlib | seaborn | plotly express
+<code>groupby("c")["v"].sum()</code> (a Series) | index = category, one value | <code>ax.bar(s.index, s.values)</code> | <code>sns.barplot(x=s.index, y=s.values)</code>, or <code>.reset_index()</code> first | <code>px.bar(s.reset_index(), x="c", y="v")</code>
+<code>groupby(["a","b"])["v"].sum()</code> (MultiIndex Series) | two keys, one value | <code>.unstack()</code> gives a wide table, then loop or <code>plot.bar</code> | <code>.reset_index()</code> gives long data for <code>hue="b"</code> | <code>.reset_index()</code> then <code>color="b"</code>
+<code>pivot_table(index, columns, values)</code> (wide) | grid of numbers | <code>ax.imshow</code>, <code>ax.plot(df)</code> per column | <code>sns.heatmap(df)</code> | <code>px.imshow(df)</code>
+<code>df.melt(...)</code> (long) | one row per observation and variable | loop over groups | <code>hue=</code>, <code>col=</code> | <code>color=</code>, <code>facet_col=</code>
+Raw rows (no groupby) | the original table | <code>ax.hist(df["v"])</code> | <code>sns.histplot(data=df, x="v")</code> | <code>px.histogram(df, x="v")</code>
+@@END
+<p>The rule of thumb: <strong>matplotlib likes arrays and wide tables, seaborn and plotly like long (tidy) tables</strong>. <code>reset_index()</code> turns a groupby index back into columns; <code>melt</code> goes wide to long; <code>pivot_table</code> goes long to wide. If a chart shows the wrong thing, print <code>df.head()</code> and <code>df.shape</code> and compare with what the function expects.</p>
+@@CALL red|COMMON MISTAKE|Aggregating inside the plotting code and forgetting the filter, so the dashboard silently shows all rows when you meant one quarter. Wrong: <code>ax.bar(orders.city, orders.amount)</code> (draws all 300 bars on top of each other). Right: aggregate first (<code>groupby("city")["amount"].sum()</code>), print it, then plot it. Second trap: a number in the title typed by hand ("fell 11%") that is no longer true after the data refresh.
+<h3>Step 6: ship it</h3>
+<ol><li><strong>Check every number</strong> against the printed tables: KPI tiles against <code>sum()</code> and <code>len()</code>; title numbers against the chart.</li><li><strong>Export</strong> for the destination: PNG at 110 to 150 dpi for e-mail and slides, PDF for print (vector, fonts embedded), HTML for plotly.</li><li><strong>Name and date</strong> the file; put the data source and the refresh date in a footnote (<code>fig.text(0.01, 0.005, "Source: ... refreshed ...")</code>).</li><li><strong>Automate</strong> by wrapping the code in a function <code>build_dashboard(orders, path)</code> and running it from a scheduler. A dashboard that a person has to rebuild by hand every Monday will be abandoned.</li><li><strong>Know the limits</strong>: a static image cannot be filtered. When people need to ask their own questions, move to Power BI (Chapters 9 to 11) or Streamlit/Dash (8.9).</li></ol>
+<h3>Going deeper: large data, datashader and print export</h3>
+<p><strong>Over-plotting.</strong> A scatter plot of 200,000 points becomes a solid blob: the points hide each other and the plot says nothing about density. Three remedies, in order of effort: (1) smaller markers with <code>alpha</code>; (2) a 2D histogram or <strong>hexbin</strong>, which counts points in hexagonal cells and colours by count; (3) <strong>datashader</strong>, a library that rasterises millions of points into a pixel grid on the fly and plugs into holoviews/bokeh/plotly (not installed here).</p>
+@@PY hexbin
+#H
+rng = np.random.default_rng(8)
+n = 200_000
+x = rng.normal(0, 1, n)
+y = 0.6 * x + rng.normal(0, 0.8, n)
+fig, (a, b) = plt.subplots(1, 2, figsize=(10, 4.2), sharex=True, sharey=True)
+a.scatter(x, y, s=4, color=BLUE)
+a.set_title("200,000 points: a blob")
+hb = b.hexbin(x, y, gridsize=40, cmap="Blues", mincnt=1, bins="log")
+b.set_title("Hexbin: density is visible")
+fig.colorbar(hb, ax=b, label="points per cell (log scale)")
+for ax in (a, b): ax.set_xlabel("x"); ax.set_xlim(-4.5, 4.5); ax.set_ylim(-4.5, 4.5)
+fig.tight_layout()
+fig.savefig("ch08v_hexbin.png", dpi=110)
+counts = hb.get_array()
+print("points:", n, "| occupied hexagons:", len(counts), "| busiest 40 x 40 square bin holds", int(np.histogram2d(x, y, bins=40)[0].max()), "points")
+print("correlation:", round(float(np.corrcoef(x, y)[0, 1]), 3))
+print("saved")
+@@END
+@@FIG hexbin|Left: a dense blue blob of 200,000 scatter points. Right: a hexagon heat map in shades of blue showing a diagonal elongated density|Over-plotting. The scatter hides density; the hexbin shows where the points really are.
+<p><strong>How to read it.</strong> Left: you can see a blob, but you cannot tell whether the centre holds 1,000 or 100,000 points. Right: each hexagon is coloured by how many points fall in it (log scale), so the dense diagonal core and the thin tails are visible. <code>hexbin(..., gridsize=40)</code> sets the number of hexagons across; <code>mincnt=1</code> leaves empty cells blank; <code>bins="log"</code> compresses the counts so the tails still show. In plotly use <code>px.density_heatmap</code>; in seaborn <code>sns.histplot(x=, y=)</code> or <code>sns.kdeplot(x=, y=)</code>.</p>
+<ul><li><strong>Rules of thumb for data size.</strong> Up to about 1,000 points: ordinary scatter. 1,000 to 50,000: small markers with alpha. 50,000 to 1 million: hexbin, 2D histogram or datashader. Beyond that: aggregate in SQL or pandas first; no screen can show a million points.</li><li><strong>Print export.</strong> Publishers want vector files (PDF, SVG or EPS) and fonts embedded (<code>pdf.fonttype: 42</code>). Check the final size: a 3.4 inch column at 300 dpi needs 1,020 pixels. Journals often print in greyscale, so test that the series are still distinguishable (8.10) and use line styles as well as colours. CMYK, the printer's colour model, cannot reproduce all bright screen colours; ask the printer whether to supply RGB or CMYK and look at a proof.</li><li><strong>Reproducibility.</strong> Set seeds, keep the script next to the output, write the library versions in the footnote or README. A chart you cannot regenerate is a chart you cannot defend.</li></ul>

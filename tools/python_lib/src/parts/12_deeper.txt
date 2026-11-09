@@ -1,0 +1,102 @@
+
+<h2>19.12 Going Deeper: Internals, Memory, Speed and What Interviewers Probe</h2>
+<p>This section is for when you want to know <em>why</em> the library behaves as it does. Skip it on a first read.</p>
+<h3>Internals: the estimator contract</h3>
+<p>Scikit-learn works because of a few strict conventions, and breaking them causes strange failures in <code>clone</code>, grid search and pipelines.</p>
+<ul>
+<li><strong>The constructor only stores arguments</strong>, under the same names, with no validation and no changes. Validation happens in <code>fit</code>. This is what lets <code>get_params</code>, <code>set_params</code> and <code>clone</code> rebuild any object from its settings.</li>
+<li><strong>Learned state ends with an underscore</strong> and is created only in <code>fit</code>. <code>check_is_fitted</code> looks for such attributes.</li>
+<li><strong><code>fit</code> returns <code>self</code></strong>, which enables chaining (<code>model.fit(X, y).predict(X)</code>).</li>
+<li><strong>Input checking</strong> is done by <code>validate_data</code>: it converts lists and DataFrames to arrays, rejects NaN and infinity unless allowed, and records <code>n_features_in_</code> and <code>feature_names_in_</code>.</li>
+<li><strong>Tags</strong> (<code>__sklearn_tags__</code>) describe an estimator's capabilities, such as whether it accepts sparse input or NaN. Tools like pipelines and the test suite read them.</li>
+<li><strong>Randomness:</strong> <code>random_state</code> may be an integer (reproducible) or a <code>RandomState</code> instance. Using an integer in an estimator that is cloned many times gives each clone the same stream, which is what you want for reproducibility; passing a shared instance makes results depend on call order.</li>
+</ul>
+@@PY
+from sklearn.base import BaseEstimator, clone
+from sklearn.linear_model import LogisticRegression
+
+
+class Bad(BaseEstimator):
+    def __init__(self, scale=1.0):
+        self.scale = scale * 2          # forbidden: modifies the argument in the constructor
+
+
+class Good(BaseEstimator):
+    def __init__(self, scale=1.0):
+        self.scale = scale
+
+
+print(clone(Good(3.0)).scale)
+try:
+    clone(Bad(3.0))
+except RuntimeError as e:
+    print("clone failed:", str(e).splitlines()[0][:80])
+
+tags = LogisticRegression().__sklearn_tags__()
+print("sparse input:", tags.input_tags.sparse, " allows NaN:", tags.input_tags.allow_nan)
+@@END
+<ol>
+<li><code>Good</code> stores its argument unchanged. <code>clone</code> reads the parameters with <code>get_params</code>, builds a new object, and checks that the new object holds exactly the same parameter values. It does, so the clone has <code>scale</code> 3.0.</li>
+<li><code>Bad</code> doubles the value in its constructor, so <code>Bad(3.0)</code> holds 6.0. <code>clone</code> reads 6.0, builds <code>Bad(6.0)</code> (which would hold 12.0) and finds the stored value no longer matches, so it raises a <code>RuntimeError</code> pointing at the constructor, as the first line of the message shows. The same mistake breaks <code>GridSearchCV</code> and <code>cross_val_score</code>, which clone internally.</li>
+<li>The last lines read the tags of logistic regression: it accepts sparse input and does not accept NaN, which is why NaN needs an imputer in front of it.</li>
+</ol>
+<h3>Memory</h3>
+@@PY
+import numpy as np
+from scipy import sparse
+
+dense64 = np.zeros((10000, 1000))
+dense32 = dense64.astype(np.float32)
+rng = np.random.default_rng(0)
+mask = rng.random((10000, 1000)) < 0.01                 # 1% non-zero
+csr = sparse.csr_matrix(np.where(mask, 1.0, 0.0))
+
+print("float64 MB:", dense64.nbytes / 1e6)
+print("float32 MB:", dense32.nbytes / 1e6)
+print("csr MB    :", round((csr.data.nbytes + csr.indices.nbytes + csr.indptr.nbytes) / 1e6, 2))
+@@END
+<ol>
+<li>A 10,000 by 1,000 float64 matrix needs 8 bytes per cell, 80 MB.</li>
+<li>float32 halves it (40 MB). Many tree models and <code>HistGradientBoosting</code> bin or convert to smaller types internally anyway.</li>
+<li>A compressed sparse row (CSR) matrix stores only the 1% of cells that are non-zero, plus two index arrays, about 1.2 MB here. Text vectorisers and one-hot encoders produce CSR by default; avoid <code>.toarray()</code> unless you must.</li>
+<li>Remember that cross-validation, search and bagging make copies: memory use can be a multiple of the data size. <code>n_jobs</code> workers each get their own copy of the arrays unless the data is memory-mapped, which joblib does automatically for large NumPy arrays.</li>
+</ol>
+<h3>Speed: where time really goes</h3>
+<ul>
+<li><strong>Three layers of parallelism.</strong> joblib processes or threads (<code>n_jobs</code>) for independent fits; OpenMP threads inside Cython code (histogram boosting, k-means, some distances); BLAS threads inside NumPy linear algebra. They can multiply into oversubscription; limit one layer with <code>threadpoolctl.threadpool_limits</code> or the environment variables <code>OMP_NUM_THREADS</code>.</li>
+<li><strong>Histogram boosting is fast</strong> because it bins every feature into at most 255 buckets once, then each split search scans bucket statistics instead of sorting raw values. The cost per tree no longer depends on how many distinct values a feature has.</li>
+<li><strong>Solvers matter.</strong> <code>LogisticRegression</code> defaults to <code>lbfgs</code>; <code>saga</code> suits huge sparse data; <code>liblinear</code> suits small data and L1. PCA's <code>svd_solver="auto"</code> picks randomised SVD when you want few components from a big matrix.</li>
+<li><strong>K-means</strong> uses k-means++ seeding and Lloyd iterations. Its cost is about rows × clusters × features per iteration, times <code>n_init</code> restarts.</li>
+<li><strong>Complexity notes:</strong> kNN has no training cost but predicts slowly (it scans or searches an index); kernel SVM training grows faster than linearly with rows; a random forest's cost is roughly trees × rows × log(rows) × features tried per split.</li>
+</ul>
+<h3>Do I need more data? The learning curve</h3>
+@@PY
+import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import learning_curve
+
+X, y = make_classification(3000, 20, n_informative=6, flip_y=0.1, random_state=0)
+sizes, tr, va = learning_curve(LogisticRegression(max_iter=1000), X, y,
+                               train_sizes=[0.05, 0.1, 0.25, 0.5, 1.0], cv=5, random_state=0)
+for n, a, b in zip(sizes, tr.mean(axis=1), va.mean(axis=1)):
+    print(f"n={n:5d} train={a:.3f} validation={b:.3f} gap={a - b:.3f}")
+@@END
+<ol>
+<li><code>learning_curve</code> fits the model on growing fractions of the training folds and records train and validation scores.</li>
+<li>With 120 rows the model fits its training rows well (0.868) but generalises poorly (0.757), a gap of 0.111.</li>
+<li>As rows grow the two curves converge. If the validation curve has flattened and the gap is small, more data will not help; you need a better model or better features. If the curves are still converging, collecting more data pays off. Here the gap shrinks to 0.003 at 2,400 rows and validation creeps from 0.801 to 0.807, so more rows would add almost nothing; the ceiling is set by the 10% label noise.</li>
+</ol>
+<h3>What interviewers probe</h3>
+<ul>
+<li><strong>"Why not scale before splitting?"</strong> The scaler's mean and variance would include test rows, leaking information. Fit on train, transform test, ideally in a Pipeline.</li>
+<li><strong>"Explain bias versus variance with a tree."</strong> A shallow tree has high bias (underfits); a deep tree has high variance (overfits). A forest lowers variance by averaging; boosting lowers bias by sequential correction.</li>
+<li><strong>"Your AUC is 0.99. What do you check?"</strong> Leakage (target-derived features, duplicates across the split, group or time structure), then a shuffled-label test and permutation importances.</li>
+<li><strong>"Precision versus recall; when do you prefer each?"</strong> Recall when a miss is costly (disease screening); precision when a false alarm is costly (account lockouts). Choose the threshold from the cost, and use PR curves for rare classes.</li>
+<li><strong>"How does <code>fit_transform</code> differ from <code>fit</code> then <code>transform</code>?"</strong> Often identical; some transformers implement a faster joint path or behave differently on training data (for example <code>TargetEncoder</code> cross-fits during <code>fit_transform</code> to avoid leaking the target).</li>
+<li><strong>"What does <code>class_weight="balanced"</code> do?"</strong> Scales each row's loss by n / (k × class count). It changes training, and effectively moves the threshold.</li>
+<li><strong>"Why is permutation importance preferred over impurity importance?"</strong> Impurity importance is computed on training data and is biased toward high-cardinality and noisy continuous columns; permutation importance uses held-out data, but is distorted by correlated features.</li>
+<li><strong>"How would you tune a model without overfitting the CV?"</strong> Random search with CV on train only, a final untouched test set, and nested CV for an unbiased estimate of the whole procedure.</li>
+<li><strong>"What goes wrong with accuracy on imbalanced data, and what do you use?"</strong> The majority baseline looks great. Use recall, precision, PR AUC or average precision, balanced accuracy, and a tuned threshold.</li>
+<li><strong>"How do you deploy it?"</strong> Save the whole pipeline with <code>joblib</code>, record the library versions, validate input schema, monitor input drift and prediction drift, and keep the training script to rebuild.</li>
+</ul>

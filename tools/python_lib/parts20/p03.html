@@ -1,0 +1,195 @@
+
+<h2>20.5 Databases with sqlite3</h2>
+<p>SQLite is a complete SQL database stored in one file (or in memory), and Python ships with the driver. It is the best place to learn database access, and a good home for small pipelines, caches and ETL bookkeeping. The same ideas (connection, cursor, parameters, transaction) apply to PostgreSQL, MySQL and SQL Server drivers, because they all follow the Python DB-API.</p>
+<h3>Reference: sqlite3 essentials</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>sqlite3.connect(path)</code></td><td>Open (or create) a database file</td><td><code>con = sqlite3.connect("app.db")</code></td></tr>
+<tr><td><code>":memory:"</code></td><td>Temporary database that vanishes on close</td><td><code>sqlite3.connect(":memory:")</code></td></tr>
+<tr><td><code>con.execute(sql, params)</code></td><td>Run one statement, get a cursor</td><td><code>con.execute("select 1")</code></td></tr>
+<tr><td><code>con.executemany(sql, rows)</code></td><td>Run one statement for many parameter sets</td><td><code>con.executemany("insert into t values (?,?)", rows)</code></td></tr>
+<tr><td><code>cursor.fetchone()</code></td><td>Next row, or <code>None</code></td><td><code>cur.fetchone()</code></td></tr>
+<tr><td><code>cursor.fetchall()</code></td><td>All remaining rows as a list</td><td><code>cur.fetchall()</code></td></tr>
+<tr><td>iterate a cursor</td><td>Stream rows one by one</td><td><code>for row in con.execute(sql): ...</code></td></tr>
+<tr><td><code>? placeholder</code></td><td>Positional parameter binding</td><td><code>"where id = ?", (7,)</code></td></tr>
+<tr><td><code>:name placeholder</code></td><td>Named parameter binding</td><td><code>"where id = :id", {"id": 7}</code></td></tr>
+<tr><td><code>con.commit()</code>, <code>con.rollback()</code></td><td>Save or undo the open transaction</td><td><code>con.commit()</code></td></tr>
+<tr><td><code>with con:</code></td><td>Commit on success, roll back on error (does not close)</td><td><code>with con: con.execute(...)</code></td></tr>
+<tr><td><code>con.close()</code></td><td>Release the file</td><td><code>con.close()</code></td></tr>
+<tr><td><code>con.row_factory = sqlite3.Row</code></td><td>Rows accessible by column name</td><td><code>row["name"]</code></td></tr>
+<tr><td><code>cursor.lastrowid</code>, <code>cursor.rowcount</code></td><td>Id of last insert, rows changed</td><td><code>cur.rowcount</code></td></tr>
+<tr><td><code>insert ... on conflict do update</code></td><td>Upsert: insert or update by key</td><td><code>on conflict(id) do update set v = excluded.v</code></td></tr>
+<tr><td><code>sqlite3.IntegrityError</code></td><td>Constraint failed (duplicate key, NOT NULL)</td><td><code>except sqlite3.IntegrityError:</code></td></tr>
+<tr><td><code>pragma table_info(t)</code></td><td>List columns of a table</td><td><code>con.execute("pragma table_info(t)")</code></td></tr>
+<tr><td><code>pragma journal_mode = wal</code></td><td>Readers do not block the writer</td><td><code>con.execute("pragma journal_mode = wal")</code></td></tr>
+<tr><td><code>explain query plan ...</code></td><td>Show whether an index is used</td><td><code>con.execute("explain query plan select ...")</code></td></tr>
+</tbody></table></div>
+<p><strong>Parameter binding</strong> means you send the SQL text and the values separately. The database treats values only as data, never as SQL. It is the single most important habit in this section.</p>
+<h3>Example 1: create, insert, query</h3>
+<pre class="code lang-python"><code>import sqlite3
+
+con = sqlite3.connect(":memory:")
+con.execute("create table orders(id integer primary key, customer text, total real)")
+rows = [(1, "ana", 30.0), (2, "bo", 12.5), (3, "ana", 8.0)]
+con.executemany("insert into orders values (?, ?, ?)", rows)
+con.commit()
+
+cur = con.execute("select customer, sum(total) from orders group by customer order by 2 desc")
+print([d[0] for d in cur.description])
+for customer, spent in cur:
+    print(customer, spent)
+
+con.row_factory = sqlite3.Row
+row = con.execute("select * from orders where id = :id", {"id": 2}).fetchone()
+print(row["customer"], row["total"], tuple(row))
+con.close()</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li><code>":memory:"</code> makes a throw-away database, ideal for demos and tests. <code>executemany</code> runs one insert three times, binding each tuple to the three <code>?</code> marks; <code>commit()</code> makes the rows permanent for other connections.</li><li>The query groups by customer. <code>cursor.description</code> lists column names; iterating the cursor streams rows; <code>order by 2</code> means the second selected column.</li><li>With <code>row_factory = sqlite3.Row</code> a row works like a tuple and a dict. The named placeholder <code>:id</code> takes a dict.</li></ol>
+<h3>Example 2: SQL injection, shown and fixed</h3>
+<pre class="code lang-python"><code>import sqlite3
+
+con = sqlite3.connect(":memory:")
+con.execute("create table users(name text, role text)")
+con.executemany("insert into users values (?, ?)", [("ana", "admin"), ("bo", "user"), ("cy", "user")])
+
+evil = "x' OR '1'='1"
+bad_sql = f"select name from users where name = '{evil}'"
+print(bad_sql)
+print(con.execute(bad_sql).fetchall())
+
+safe = con.execute("select name from users where name = ?", (evil,)).fetchall()
+print(safe)</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li><code>evil</code> imitates what an attacker, or just a surname with an apostrophe, might type into a form.</li><li>The f-string pastes it into the SQL, giving <code>where name = 'x' OR '1'='1'</code>, which is always true: every user is returned. In a real system the same trick can read or delete other tables.</li><li>With <code>?</code> the driver sends the text as a value only. Nobody has that name, so the result is empty.</li><li>Values are bound with <code>?</code>; table and column names cannot be bound, so check them against a fixed allow-list.</li></ol>
+<h3>Example 3: transactions, rollback and upsert</h3>
+<pre class="code lang-python"><code>import sqlite3
+
+con = sqlite3.connect(":memory:")
+con.execute("create table stock(sku text primary key, qty integer not null)")
+con.execute("insert into stock values ('A1', 10)")
+con.commit()
+
+try:
+    with con:
+        con.execute("update stock set qty = qty - 4 where sku = 'A1'")
+        con.execute("insert into stock values ('A1', 99)")
+except sqlite3.IntegrityError as e:
+    print("rolled back:", e)
+print(con.execute("select * from stock").fetchall())
+
+sql = """insert into stock(sku, qty) values (?, ?)
+         on conflict(sku) do update set qty = qty + excluded.qty"""
+con.executemany(sql, [("A1", 5), ("B2", 7)])
+con.commit()
+print(con.execute("select * from stock order by sku").fetchall())</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>Inside <code>with con:</code> the first update succeeds, then the duplicate-key insert raises <code>IntegrityError</code>. The block is rolled back as a whole, so the update is undone too: stock is still 10.</li><li>The upsert says: insert the row, but if the key exists, add the new quantity to the old one (<code>excluded</code> is the rejected row). A1 becomes 15 and B2 is created with 7.</li></ol>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">A transaction is a promise: either every change in the block happens or none does. Wrap each logical unit of work (one batch load, one order) in <code>with con:</code>. Idempotent loads (safe to run twice) use upserts like the one above.</div></div>
+
+<h2>20.6 SQLAlchemy and pandas.read_sql</h2>
+<p>SQLAlchemy is the standard Python toolkit for relational databases. It was <strong>not installed on the study machine, so its code below is not run here</strong>. It has two layers. <strong>Core</strong> builds SQL from Python objects (tables, <code>select()</code>, <code>insert()</code>) and executes it. The <strong>ORM</strong> (object-relational mapper) sits on Core and maps tables to classes, so a row becomes an object and a <code>Session</code> tracks your changes. The examples use the SQLAlchemy 2.0 style (<code>select()</code>, <code>Mapped</code>, <code>mapped_column</code>).</p>
+<h3>Connection strings</h3>
+<p>An engine is created from a URL shaped like <code>dialect+driver://user:password@host:port/database</code>. The engine owns a <strong>connection pool</strong>, so create one engine per process, not one per query.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Database</th><th>URL example</th><th>Driver package</th></tr></thead><tbody>
+<tr><td>SQLite file (relative)</td><td><code>sqlite:///data/app.db</code></td><td>built in</td></tr>
+<tr><td>SQLite file (absolute)</td><td><code>sqlite:////home/me/app.db</code> (four slashes)</td><td>built in</td></tr>
+<tr><td>SQLite in memory</td><td><code>sqlite:///:memory:</code></td><td>built in</td></tr>
+<tr><td>PostgreSQL</td><td><code>postgresql+psycopg://user:pw@host:5432/sales</code></td><td><code>psycopg</code></td></tr>
+<tr><td>MySQL</td><td><code>mysql+pymysql://user:pw@host:3306/sales</code></td><td><code>pymysql</code></td></tr>
+<tr><td>SQL Server</td><td><code>mssql+pyodbc://user:pw@dsn_name</code></td><td><code>pyodbc</code></td></tr>
+</tbody></table></div>
+<p>Passwords with characters such as <code>@</code> or <code>/</code> must be percent-encoded, or the URL is parsed wrongly. This runnable check shows the anatomy of a URL using only the standard library:</p>
+<pre class="code lang-python"><code>from urllib.parse import urlsplit, quote_plus, unquote
+
+password = "p@ss/word"
+url = f"postgresql+psycopg://etl_user:{quote_plus(password)}@db.internal:5432/sales"
+print(url)
+u = urlsplit(url)
+print(u.scheme, u.username, unquote(u.password), u.hostname, u.port, u.path.lstrip("/"))</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li><code>quote_plus</code> turns the unsafe characters into <code>%40</code> and <code>%2F</code>.</li><li>The f-string assembles the URL. In real code the password comes from an environment variable, never from the source file.</li><li><code>urlsplit</code> cuts the URL into parts; the <code>+</code> in the scheme is allowed.</li><li><code>unquote</code> restores the original password, which shows the encoding is reversible. SQLAlchemy's <code>URL.create(...)</code> builds the URL from separate fields and does this encoding for you.</li></ol>
+<h3>Reference: SQLAlchemy 2.0 essentials (not run here)</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>create_engine(url)</code></td><td>Make the engine and pool</td><td><code>engine = create_engine("sqlite:///app.db")</code></td></tr>
+<tr><td><code>engine.connect()</code></td><td>Borrow a connection (use <code>with</code>)</td><td><code>with engine.connect() as conn:</code></td></tr>
+<tr><td><code>engine.begin()</code></td><td>Connection plus automatic commit or rollback</td><td><code>with engine.begin() as conn:</code></td></tr>
+<tr><td><code>text(sql)</code></td><td>Raw SQL with <code>:name</code> parameters</td><td><code>text("select * from t where id = :id")</code></td></tr>
+<tr><td><code>conn.execute(stmt, params)</code></td><td>Run a statement</td><td><code>conn.execute(text(...), {"id": 1})</code></td></tr>
+<tr><td><code>result.mappings().all()</code></td><td>Rows as dict-like objects</td><td><code>conn.execute(q).mappings().all()</code></td></tr>
+<tr><td><code>MetaData()</code>, <code>Table</code>, <code>Column</code></td><td>Describe tables in Core</td><td><code>Table("t", md, Column("id", Integer, primary_key=True))</code></td></tr>
+<tr><td><code>metadata.create_all(engine)</code></td><td>Create missing tables</td><td><code>md.create_all(engine)</code></td></tr>
+<tr><td><code>select(...)</code></td><td>Build a SELECT</td><td><code>select(t.c.name).where(t.c.id &gt; 3)</code></td></tr>
+<tr><td><code>insert(t)</code>, <code>update(t)</code>, <code>delete(t)</code></td><td>Build DML statements</td><td><code>conn.execute(insert(t), [{"name": "a"}])</code></td></tr>
+<tr><td><code>.where()</code>, <code>.join()</code>, <code>.group_by()</code>, <code>.order_by()</code></td><td>Compose clauses</td><td><code>select(t).order_by(t.c.id.desc())</code></td></tr>
+<tr><td><code>DeclarativeBase</code></td><td>Base class of ORM models</td><td><code>class Base(DeclarativeBase): pass</code></td></tr>
+<tr><td><code>Mapped[...]</code>, <code>mapped_column()</code></td><td>Declare typed columns</td><td><code>id: Mapped[int] = mapped_column(primary_key=True)</code></td></tr>
+<tr><td><code>Session(engine)</code></td><td>Unit of work for ORM objects</td><td><code>with Session(engine) as s:</code></td></tr>
+<tr><td><code>session.add</code>, <code>add_all</code></td><td>Queue new objects</td><td><code>s.add(Order(...))</code></td></tr>
+<tr><td><code>session.commit()</code>, <code>rollback()</code></td><td>Save or undo</td><td><code>s.commit()</code></td></tr>
+<tr><td><code>relationship()</code></td><td>Link two models</td><td><code>items: Mapped[list["Item"]] = relationship()</code></td></tr>
+<tr><td><code>selectinload</code>, <code>joinedload</code></td><td>Load related rows in one go (avoids N+1)</td><td><code>select(Order).options(selectinload(Order.items))</code></td></tr>
+</tbody></table></div>
+<h3>Core and ORM in one sketch (not run here)</h3>
+<pre class="code lang-text"><code># NOT RUN HERE: sqlalchemy is not installed on the study machine (pip install sqlalchemy)
+from sqlalchemy import create_engine, text, select, func, String
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
+
+engine = create_engine("sqlite:///:memory:")
+
+# Core with raw SQL and bound parameters
+with engine.begin() as conn:                      # commits at the end of the block
+    conn.execute(text("create table t(id integer primary key, name text)"))
+    conn.execute(text("insert into t(name) values (:n)"), [{"n": "ana"}, {"n": "bo"}])
+with engine.connect() as conn:
+    rows = conn.execute(text("select * from t where name = :n"), {"n": "ana"}).mappings().all()
+
+# ORM: a class per table, a Session per unit of work
+class Base(DeclarativeBase):
+    pass
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    customer: Mapped[str] = mapped_column(String(50))
+    total: Mapped[float]
+
+Base.metadata.create_all(engine)
+with Session(engine) as s:
+    s.add_all([Order(customer="ana", total=30.0), Order(customer="bo", total=12.5)])
+    s.commit()
+    big = s.scalars(select(Order).where(Order.total > 20)).all()
+    per_customer = s.execute(
+        select(Order.customer, func.sum(Order.total)).group_by(Order.customer)
+    ).all()</code></pre>
+<ol><li>One engine is created and reused. With <code>sqlite:///:memory:</code> stay in one thread, because each new connection would see its own empty database.</li><li><code>text()</code> with <code>:n</code> binds parameters separately, like <code>?</code> in sqlite3. <code>engine.begin()</code> commits at the end of the block or rolls back on error; <code>engine.connect()</code> does not commit by itself. <code>.mappings().all()</code> gives dict-like rows.</li><li>The class <code>Order</code> declares the table; <code>Mapped[float]</code> alone is a required column. The <code>Session</code> collects objects from <code>add_all</code> and writes them on <code>commit()</code>; <code>scalars().all()</code> unwraps objects into a list.</li><li>The last query is a group-by written with class attributes; SQLAlchemy parameterises it automatically.</li></ol>
+<div class="callout blue"><div class="lab">WHY IT MATTERS</div><div class="txt">The ORM is great for applications that create and update single objects. For analytics, where you read millions of rows into a DataFrame, plain SQL through <code>text()</code> or <code>pandas.read_sql</code> is shorter and faster. Use the ORM for writes with business rules and Core or SQL for bulk reads.</div></div>
+<h3>pandas.read_sql and to_sql (run with sqlite3)</h3>
+<p><code>pd.read_sql_query(sql, con, params=, parse_dates=, chunksize=)</code> runs a query and returns a DataFrame. It accepts a SQLAlchemy engine/connection, and, for SQLite only, a plain <code>sqlite3</code> connection. <code>df.to_sql(name, con, if_exists=, index=False, chunksize=)</code> writes a DataFrame. <code>if_exists</code> is <code>"fail"</code> (default), <code>"replace"</code> (drops the table!) or <code>"append"</code>.</p>
+<pre class="code lang-python"><code>import sqlite3
+import pandas as pd
+
+con = sqlite3.connect(":memory:")
+df = pd.DataFrame({
+    "id": [1, 2, 3, 4],
+    "customer": ["ana", "bo", "ana", "cy"],
+    "total": [30.0, 12.5, 8.0, 44.0],
+    "day": ["2025-03-01", "2025-03-02", "2025-03-02", "2025-03-03"],
+})
+df.to_sql("orders", con, index=False)
+more = pd.DataFrame({"id": [5], "customer": ["bo"], "total": [9.9], "day": ["2025-03-04"]})
+more.to_sql("orders", con, if_exists="append", index=False)
+
+q = "select * from orders where total > ? and day >= ?"
+out = pd.read_sql_query(q, con, params=(10, "2025-03-02"), parse_dates=["day"])
+print(out)
+print(out["day"].dtype, out["customer"].dtype)
+
+ids = [1, 3, 5]
+marks = ",".join("?" * len(ids))
+print(pd.read_sql_query(f"select id, total from orders where id in ({marks})", con, params=ids))
+
+total = 0
+for chunk in pd.read_sql_query("select * from orders", con, chunksize=2):
+    total += chunk["total"].sum()
+print(round(total, 1))</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li><code>to_sql</code> creates <code>orders</code> from the DataFrame (<code>index=False</code> keeps the index out); the second call uses <code>if_exists="append"</code> to add a fifth row.</li><li><code>params</code> supplies the two values for the two <code>?</code> marks. <code>parse_dates=["day"]</code> converts text to datetimes (first printed dtype <code>datetime64[us]</code>; the second, <code>str</code>, is the pandas 3 default text type). SQLite has no date type, so say which columns to parse.</li><li>An <code>IN</code> list cannot be one bound value: build one <code>?</code> per item (<code>"?" * 3</code> is <code>"???"</code>) and pass the list. Only the count of marks is formatted into the SQL, never the data.</li><li>With <code>chunksize=2</code> you get an iterator of small DataFrames, so you can aggregate a table larger than memory: the total is 104.4.</li></ol>

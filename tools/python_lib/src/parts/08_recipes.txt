@@ -1,0 +1,363 @@
+
+<h2>19.8 Recipes: How Do I ...?</h2>
+<p>Each recipe is a complete, runnable answer to a real task. Read the six big ones in order (they build skills), then use the quick ones as lookups.</p>
+
+<h3>Recipe 1: How do I build an end-to-end tabular classifier?</h3>
+<p>Task: predict churn, compare two candidates fairly, pick a threshold, test once, save. The data is the telecom table from section 19.3.</p>
+@@PY
+import joblib, os, tempfile
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import average_precision_score, roc_auc_score
+from sklearn.model_selection import StratifiedKFold, cross_validate, train_test_split
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+rng = np.random.default_rng(0)
+n = 4000
+df = pd.DataFrame({
+    "tenure": rng.integers(1, 72, n),
+    "monthly": rng.normal(65, 20, n).round(2),
+    "calls": rng.poisson(2, n),
+    "contract": rng.choice(["monthly", "yearly", "two-year"], n, p=[0.55, 0.25, 0.20]),
+    "payment": rng.choice(["card", "bank", "cheque"], n),
+})
+logit = (-2.5 - 0.04 * df["tenure"] + 0.02 * df["monthly"] + 0.3 * df["calls"]
+         + np.where(df["contract"] == "monthly", 1.0, 0.0)
+         + 0.02 * df["tenure"] * (df["contract"] == "monthly"))      # an interaction
+df["churn"] = (rng.random(n) < 1 / (1 + np.exp(-logit))).astype(int)
+df.loc[rng.random(n) < 0.08, "monthly"] = np.nan
+
+X, y = df.drop(columns="churn"), df["churn"]
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, stratify=y, random_state=0)
+
+num, cat = ["tenure", "monthly", "calls"], ["contract", "payment"]
+lin_prep = ColumnTransformer([
+    ("num", make_pipeline(SimpleImputer(strategy="median"), StandardScaler()), num),
+    ("cat", OneHotEncoder(handle_unknown="ignore"), cat)])
+candidates = {
+    "logistic": Pipeline([("prep", lin_prep), ("clf", LogisticRegression(max_iter=1000))]),
+    "hist boosting": Pipeline([("prep", ColumnTransformer(
+        [("cat", OneHotEncoder(handle_unknown="ignore"), cat)], remainder="passthrough")),
+        ("clf", HistGradientBoostingClassifier(random_state=0))]),
+}
+cv = StratifiedKFold(5, shuffle=True, random_state=0)
+for name, pipe in candidates.items():
+    r = cross_validate(pipe, X_tr, y_tr, cv=cv, scoring=["roc_auc", "average_precision"])
+    print(f"{name:14s} auc={r['test_roc_auc'].mean():.3f} ap={r['test_average_precision'].mean():.3f}")
+
+final = candidates["logistic"].fit(X_tr, y_tr)
+p = final.predict_proba(X_te)[:, 1]
+print("TEST auc:", round(roc_auc_score(y_te, p), 3), " ap:", round(average_precision_score(y_te, p), 3))
+with tempfile.TemporaryDirectory() as d:
+    joblib.dump(final, os.path.join(d, "churn.joblib"))
+    print("reloaded ok:", np.allclose(joblib.load(os.path.join(d, "churn.joblib")).predict_proba(X_te)[:, 1], p))
+@@END
+<ol>
+<li>We build a 4,000-row churn table with 8% missing monthly bills, and a small interaction: for monthly-contract customers a longer tenure raises churn a little. A pure linear model cannot represent the interaction.</li>
+<li>Split once with stratification. The test rows are not used again until the single test line.</li>
+<li>Two candidate pipelines. The linear one imputes, scales and one-hot encodes. The boosting one needs no scaling and handles missing values itself, so we only encode the text columns and pass numbers through (<code>remainder="passthrough"</code>; the encoder step returns the numeric columns unchanged after the one-hot columns).</li>
+<li>Both are scored with the same stratified folds on the <em>training</em> rows, with two metrics at once in <code>cross_validate</code>.</li>
+<li>We pick one, refit on all training rows, and score the test set once.</li>
+<li>Last, we save the fitted pipeline and verify the reload gives identical probabilities.</li>
+</ol>
+<p><strong>Reading the output:</strong> cross-validated ROC AUC is 0.752 for logistic regression and 0.709 for boosting, so the simple model wins here: the signal in this table is mostly additive and the interaction is small next to the noise, and with 3,000 training rows the flexible model has little room to pay off. Never assume the fancier model is better. The test AUC of the chosen pipeline is 0.751, matching its CV score of 0.752, which is what an honest process looks like. Average precision is 0.537 on test against a baseline of about 0.29 (the churn rate). The saved pipeline reloads with identical probabilities.</p>
+
+<h3>Recipe 2: How do I do regression with proper cross-validation?</h3>
+<p>Task: predict house prices (a skewed target), compare to a baseline, and report error in money units.</p>
+@@PY
+import numpy as np
+from sklearn.compose import TransformedTargetRegressor
+from sklearn.dummy import DummyRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import KFold, cross_validate
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(1)
+n = 1500
+area = rng.uniform(40, 250, n)
+rooms = np.clip((area / 40 + rng.normal(0, 0.7, n)).round(), 1, 8)
+age = rng.uniform(0, 60, n)
+price = np.exp(10.5 + 0.009 * area + 0.05 * rooms - 0.006 * age + rng.normal(0, 0.15, n))
+X = np.c_[area, rooms, age]
+
+cv = KFold(5, shuffle=True, random_state=0)
+models = {
+    "mean baseline": DummyRegressor(),
+    "ridge on price": make_pipeline(StandardScaler(), Ridge()),
+    "ridge on log(price)": TransformedTargetRegressor(
+        make_pipeline(StandardScaler(), Ridge()), func=np.log, inverse_func=np.exp),
+    "hist boosting": HistGradientBoostingRegressor(random_state=0),
+}
+for name, m in models.items():
+    r = cross_validate(m, X, price, cv=cv,
+                       scoring=["neg_root_mean_squared_error", "neg_mean_absolute_error", "r2"])
+    print(f"{name:20s} RMSE={-r['test_neg_root_mean_squared_error'].mean():9.0f} "
+          f"MAE={-r['test_neg_mean_absolute_error'].mean():9.0f} R2={r['test_r2'].mean():.3f}")
+@@END
+<ol>
+<li>The price is generated as the exponential of a linear formula plus noise, so it is right-skewed and the effect of each feature is multiplicative, a very common real-world shape.</li>
+<li>We use plain <code>KFold</code> with shuffling (regression has no classes to stratify).</li>
+<li>The baseline predicts the training mean every time. It is the floor, with R squared at or below 0.</li>
+<li><code>TransformedTargetRegressor</code> trains on <code>log(price)</code> and automatically applies <code>exp</code> to predictions, so the output is back in money.</li>
+<li>Scoring uses negated error names (<code>neg_root_mean_squared_error</code>), so we negate again when printing to show positive errors.</li>
+</ol>
+<p><strong>Reading the output:</strong> the mean baseline has R squared 0.000 and an RMSE of about 106,683. Ridge on the raw price cuts RMSE to 41,475 (R squared 0.848). Ridge on the log of the price does best: RMSE 29,709 and R squared 0.922, because the data really is multiplicative and the log makes it linear. Boosting reaches 32,853 (R squared 0.904): trees capture the shape without being told, but with 1,500 rows they are noisier than a correct linear model. A model that cannot beat the mean baseline by a wide margin is not ready, whatever its R squared looks like.</p>
+
+<h3>Recipe 3: How do I classify text with TfidfVectorizer?</h3>
+<p>Task: route support tickets to billing, technical or shipping. TF-IDF turns each text into a sparse vector: term frequency (how often a word appears in the ticket) times inverse document frequency (rare words across tickets count more). The real <code>fetch_20newsgroups</code> corpus needs a download, so we generate a small synthetic ticket set.</p>
+@@PY
+import numpy as np
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report
+from sklearn.model_selection import cross_val_score, train_test_split
+from sklearn.pipeline import make_pipeline
+
+rng = np.random.default_rng(0)
+pools = {
+    "billing": "invoice refund charge payment card overcharged receipt billing price".split(),
+    "technical": "error crash login password app update install bug screen".split(),
+    "shipping": "delivery package courier late tracking address parcel shipped lost".split(),
+}
+common = "please help my the is not working since yesterday order account thanks".split()
+texts, labels = [], []
+for lab, pool in pools.items():
+    for _ in range(200):
+        words = [rng.choice(pool) if rng.random() < 0.45 else rng.choice(common) for _ in range(9)]
+        texts.append(" ".join(words)); labels.append(lab)
+print(texts[0])
+
+X_tr, X_te, y_tr, y_te = train_test_split(texts, labels, stratify=labels, random_state=0)
+pipe = make_pipeline(TfidfVectorizer(ngram_range=(1, 2), min_df=2, sublinear_tf=True),
+                     LogisticRegression(max_iter=1000))
+print("CV acc:", cross_val_score(pipe, X_tr, y_tr, cv=5).mean().round(3))
+pipe.fit(X_tr, y_tr)
+print(classification_report(y_te, pipe.predict(X_te), digits=3))
+
+vec, clf = pipe[0], pipe[-1]
+names = np.array(vec.get_feature_names_out())
+for i, lab in enumerate(clf.classes_):
+    print(lab, "->", names[np.argsort(clf.coef_[i])[-4:][::-1]].tolist())
+print(pipe.predict(["my parcel never arrived and tracking is wrong"]))
+@@END
+<ol>
+<li>We make 600 tickets. Each has nine words; with probability 0.45 a word comes from the topic's pool and otherwise from shared filler words. The first ticket is printed so you see what the model sees.</li>
+<li>The split is stratified over the raw strings. Note we split <em>before</em> any vectoriser sees the text; the vocabulary and the IDF weights must be learned from training tickets only.</li>
+<li><code>TfidfVectorizer(ngram_range=(1, 2), min_df=2, sublinear_tf=True)</code> uses single words and word pairs, ignores terms that appear in fewer than two tickets, and uses <code>1 + log(tf)</code> so a word repeated ten times does not count ten times.</li>
+<li>The vectoriser and classifier are in one pipeline, so CV refits the vocabulary in every fold.</li>
+<li>The report gives per-class precision and recall.</li>
+<li><code>get_feature_names_out</code> gives the vocabulary; sorting each class's coefficients shows the four terms that push a ticket toward that class. This is the cheap, honest way to sanity-check a text model: do the top words make sense?</li>
+<li>Finally we predict the topic of a new sentence the model never saw.</li>
+</ol>
+<p><strong>Reading the output:</strong> cross-validated accuracy is 0.998 and the test report shows one error in 150 tickets (0.993). That is unrealistically easy because we wrote the data so topic words are clean; on real tickets expect far lower numbers. What transfers is the method. The top terms per class are sensible (<code>invoice</code> and <code>overcharged</code> for billing, <code>courier</code> and <code>tracking</code> for shipping, <code>login</code> and <code>bug</code> for technical), and the new sentence about a parcel is routed to shipping.</p>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">For real text, start with this exact pipeline. A <code>TfidfVectorizer</code> plus <code>LogisticRegression</code> or <code>LinearSVC</code> is a famously strong baseline, trains in seconds, and is explainable. Move to transformer embeddings only if this baseline is clearly not enough (see the GenAI document). Add <code>stop_words="english"</code>, <code>max_features</code> and <code>min_df</code> to control vocabulary size on large corpora.</div></div>
+
+<h3>Recipe 4: How do I cluster customers?</h3>
+<p>Task: group customers by recency (days since last order), frequency (orders) and monetary value (total spend), then describe each group.</p>
+@@PY
+import numpy as np
+import pandas as pd
+from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
+
+rng = np.random.default_rng(0)
+parts = []
+for recency, freq, money, size in [(10, 20, 2000, 150), (60, 6, 500, 250), (200, 2, 120, 200)]:
+    parts.append(pd.DataFrame({
+        "recency": rng.gamma(4, recency / 4, size),
+        "frequency": rng.poisson(freq, size) + 1,
+        "monetary": rng.lognormal(np.log(money), 0.35, size)}))
+rfm = pd.concat(parts, ignore_index=True)
+
+Z = StandardScaler().fit_transform(np.log1p(rfm))        # log tames skew, scaler equalises units
+for k in range(2, 7):
+    km = KMeans(k, n_init=10, random_state=0).fit(Z)
+    print(k, "silhouette", round(silhouette_score(Z, km.labels_), 3), " inertia", round(km.inertia_, 1))
+
+best = KMeans(3, n_init=10, random_state=0).fit(Z)
+rfm["segment"] = best.labels_
+print(rfm.groupby("segment").agg(n=("recency", "size"), recency=("recency", "mean"),
+                                 frequency=("frequency", "mean"), monetary=("monetary", "mean")).round(0))
+@@END
+<ol>
+<li>We simulate three kinds of customers (recent big spenders, middling regulars, lapsed small spenders) so we know the right answer is three groups. Real data has no such label.</li>
+<li>K-means uses Euclidean distance, so skewed columns and different units distort it. <code>np.log1p</code> reduces skew and <code>StandardScaler</code> puts columns on one scale.</li>
+<li>We run k from 2 to 6 and print the silhouette score (higher is better) and the inertia (total squared distance to the centres, always falling as k grows, so look for an elbow, not a minimum).</li>
+<li>We fit k=3, attach the labels to the original table and aggregate with <code>groupby</code> to profile each segment in original units. Describing segments in business terms is the real deliverable.</li>
+<li><code>n_init=10</code> restarts k-means from ten random starting points and keeps the best, because one start can land in a poor solution.</li>
+</ol>
+<p><strong>Reading the output:</strong> silhouette is highest at k=3 (0.567, with k=2 close at 0.561) and drops to 0.482 at k=4; inertia falls from 658.6 to 274.2 between k=2 and 3 and then declines slowly, an elbow at 3. Both agree with the three groups we planted. The profile table recovers them: segment 2 (151 customers) is recent, frequent and high spend (about 9 days, 21 orders, 2,096), segment 0 (247) is the middle group, and segment 1 (202) has lapsed (202 days, 3 orders, 130). The sizes are close to the 150, 250 and 200 we generated.</p>
+<figure><img src="images/lib19_clusters.png" alt="Left: scatter of four clusters of 2D points with black X centres; right: silhouette score and inertia against k, with the silhouette peaking at the true k" loading="lazy"/><figcaption>K-means on four blobs (left) and the two curves used to choose k (right).</figcaption></figure>
+<p><strong>How to read it:</strong> on the right, the blue line (silhouette) peaks at the correct k=4, while the orange line (inertia) falls steadily and only bends at 4. Use silhouette for a peak and inertia for an elbow, and then check that the clusters are <em>useful</em>: a cluster you cannot describe or act on is not worth keeping.</p>
+
+<h3>Recipe 5: How do I find anomalies?</h3>
+<p>Task: flag unusual transactions without labels. <code>IsolationForest</code> isolates a point by random splits; unusual points are isolated in fewer splits. We inject known anomalies only so we can grade the method.</p>
+@@PY
+import numpy as np
+from sklearn.ensemble import IsolationForest
+from sklearn.metrics import precision_score, recall_score, roc_auc_score
+from sklearn.neighbors import LocalOutlierFactor
+
+rng = np.random.default_rng(0)
+normal = np.c_[rng.lognormal(3.5, 0.5, 2000), rng.normal(14, 3, 2000)]      # amount, hour
+odd = np.c_[rng.lognormal(6.0, 0.4, 40), rng.normal(3, 1, 40)]              # big, at 3 am
+X = np.vstack([normal, odd])
+is_anomaly = np.r_[np.zeros(2000, int), np.ones(40, int)]
+
+iso = IsolationForest(n_estimators=200, contamination=0.02, random_state=0).fit(X)
+pred = (iso.predict(X) == -1).astype(int)            # predict gives -1 for outliers
+score = -iso.score_samples(X)                         # higher = more anomalous
+print("isolation forest: AUC", round(roc_auc_score(is_anomaly, score), 3),
+      " precision", round(precision_score(is_anomaly, pred), 3),
+      " recall", round(recall_score(is_anomaly, pred), 3))
+
+lof = LocalOutlierFactor(n_neighbors=30, contamination=0.02)
+pred2 = (lof.fit_predict(X) == -1).astype(int)
+print("local outlier factor: precision", round(precision_score(is_anomaly, pred2), 3),
+      " recall", round(recall_score(is_anomaly, pred2), 3))
+top = np.argsort(score)[-10:]
+print("top-10 flagged rows that are real anomalies:", int(is_anomaly[top].sum()))
+@@END
+<ol>
+<li>Normal transactions: amounts around 33 (the log-normal centre) and hours near mid-afternoon. Anomalies: much larger amounts around 3 am.</li>
+<li><code>IsolationForest(contamination=0.02)</code> sets the threshold so about 2% of rows are labelled outliers. It is a guess about prevalence; choose it from business knowledge. <code>score_samples</code> gives a continuous score (more negative means more abnormal), so we negate it for ranking.</li>
+<li><code>predict</code> returns +1 for normal and -1 for outlier, so we convert to 0/1 to use the usual metrics.</li>
+<li><code>LocalOutlierFactor</code> compares a point's local density to its neighbours'. With <code>fit_predict</code> it labels the training data directly (set <code>novelty=True</code> if you need to score new data later).</li>
+<li>Finally we check how many of the 10 highest-scoring rows are real injected anomalies, a "precision at 10" that matches how an analyst would use the list.</li>
+</ol>
+<p><strong>Reading the output:</strong> isolation forest ranks perfectly here (AUC 1.0); with the 2% cut-off it flags 41 rows, all 40 real anomalies plus one normal row (precision 0.976, recall 1.0), and all of the top 10 are real. Local outlier factor does much worse (precision 0.463, recall 0.475). The reason is instructive: the 40 anomalies are close to each other, so each has plenty of similar neighbours and looks locally normal. Density methods struggle when anomalies form a small cluster; isolation works because a point far from the bulk is separated in few splits. Also remember the ranking quality (AUC) and the thresholded precision and recall are separate things: precision and recall depend on the 2% contamination guess. With scarce labels, rank by score and let a human review the top of the list.</p>
+
+<h3>Recipe 6: How do I see data leakage with my own eyes?</h3>
+<p>Leakage means information from validation rows influences training. The most dramatic form is feature selection on all the data before cross-validation. Here the data is <strong>pure noise</strong>: 60 rows, 2,000 random columns, a random label. Honest accuracy is 50%.</p>
+@@PY
+import numpy as np
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import make_pipeline
+
+leaky, honest = [], []
+for seed in range(10):
+    r = np.random.RandomState(seed)
+    X = r.normal(size=(60, 2000))
+    y = r.randint(0, 2, 60)
+
+    X_sel = SelectKBest(f_classif, k=20).fit_transform(X, y)         # selection sees ALL labels
+    leaky.append(cross_val_score(LogisticRegression(), X_sel, y, cv=5).mean())
+
+    pipe = make_pipeline(SelectKBest(f_classif, k=20), LogisticRegression())
+    honest.append(cross_val_score(pipe, X, y, cv=5).mean())          # selection redone per fold
+
+print("leaky  mean accuracy:", round(float(np.mean(leaky)), 3))
+print("honest mean accuracy:", round(float(np.mean(honest)), 3))
+@@END
+<ol>
+<li>For ten different random datasets we generate 60 rows of 2,000 independent normal columns and a coin-flip label. Nothing can predict the label.</li>
+<li>Leaky route: <code>SelectKBest(k=20)</code> looks at all 60 labels and keeps the 20 columns that happen, by chance, to correlate best with y. With 2,000 candidates, some look excellent by luck. Then CV is run on those 20 columns. The validation folds already influenced which columns were kept.</li>
+<li>Honest route: the selector is inside the pipeline, so each fold re-selects using only that fold's training rows. The validation rows are truly unseen.</li>
+<li>We average over ten datasets to avoid one lucky run.</li>
+</ol>
+<figure><img src="images/lib19_leak.png" alt="Histogram of 5-fold accuracy on pure noise: the leaky procedure clusters near 0.9 to 0.98, the pipeline version clusters around 0.5, with a dashed line at chance" loading="lazy"/><figcaption>Thirty noise datasets scored two ways. The red group is an impossible result created by leakage.</figcaption></figure>
+<p><strong>Reading the output:</strong> averaged over ten noise datasets the leaky procedure scores 0.917 and the honest one 0.53. The truth is 0.5.</p>
+<p><strong>How to read it:</strong> the dashed line is chance. The blue bars (selection inside the Pipeline) scatter around 0.5, which is the truth for random data; their spread is also a reminder of how noisy a score on 60 rows is. The red bars sit between 0.85 and 0.98, an "excellent model" built from nothing. If your real project ever shows a result this good on a small, wide dataset, suspect leakage before celebrating.</p>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Anything that <em>learns from the data</em> (scalers, imputers, encoders with target statistics, selectors, PCA, vectorisers, resamplers, calibrators) belongs inside the Pipeline, so that cross-validation can fit it per fold.</div></div>
+
+<h3>Quick recipes</h3>
+<p><strong>Recipe 7: How do I compare two models fairly?</strong> Use the same folds, repeat the CV, and look at the paired differences per fold, not just the means.</p>
+@@PY
+import numpy as np
+from sklearn.datasets import load_breast_cancer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import RepeatedStratifiedKFold, cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+X, y = load_breast_cancer(return_X_y=True)
+cv = RepeatedStratifiedKFold(n_splits=5, n_repeats=4, random_state=0)   # 20 identical folds for both
+a = cross_val_score(make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000)), X, y, cv=cv)
+b = cross_val_score(RandomForestClassifier(200, random_state=0), X, y, cv=cv)
+diff = a - b
+print("means:", a.mean().round(3), b.mean().round(3))
+print("paired diff mean:", diff.mean().round(4), " std:", diff.std(ddof=1).round(4),
+      " logistic wins in", int((diff > 0).sum()), "of 20 folds")
+@@END
+<ol>
+<li><code>RepeatedStratifiedKFold</code> yields 20 splits (5 folds, 4 repetitions). Passing the same object to both calls guarantees identical splits.</li>
+<li>Subtracting fold by fold gives paired differences, which are more informative than two separate means because both models face the same hard or easy fold.</li>
+<li>We report the mean difference, its spread and the number of folds the first model wins. A mean difference smaller than its spread (and wins near half) means "no clear winner".</li>
+</ol>
+<p><strong>Reading the output:</strong> logistic regression averages 0.975 against 0.963 for the forest. The mean difference of 0.0123 is smaller than the spread of the differences (0.0188) and logistic wins in 13 of 20 folds, so the evidence is suggestive but not decisive. Note that the 20 folds overlap in their training data, so they are not independent; treat any formal test on them with caution.</p>
+<p><strong>Recipe 8: How do I get out-of-fold predictions for every row?</strong> <code>cross_val_predict</code> returns, for each row, the prediction made by the model that did not train on it. Use it to draw honest confusion matrices or to build stacking features.</p>
+@@PY
+from sklearn.datasets import load_wine
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import confusion_matrix
+from sklearn.model_selection import cross_val_predict
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+X, y = load_wine(return_X_y=True)
+pipe = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000))
+oof = cross_val_predict(pipe, X, y, cv=5)
+print(confusion_matrix(y, oof))
+print("oof accuracy:", round((oof == y).mean(), 3))
+@@END
+<ol>
+<li>Each of the 178 wines is predicted by a pipeline trained on the other four folds.</li>
+<li>The confusion matrix has true classes in rows and predicted classes in columns; the diagonal is correct predictions.</li>
+<li>The accuracy computed from these out-of-fold predictions is a fair estimate. Do not use <code>cross_val_predict</code> output as a "score per fold": predictions from different models are pooled.</li>
+</ol>
+<p><strong>Reading the output:</strong> 3 of 178 wines are misclassified (class 0 mistaken for 1 once, class 1 mistaken for 2 twice), so out-of-fold accuracy is 0.983.</p>
+<p><strong>Recipe 9: How do I stack models?</strong> <code>StackingClassifier</code> trains base models, builds out-of-fold predictions from them, and trains a final model on those.</p>
+@@PY
+from sklearn.datasets import load_breast_cancer
+from sklearn.ensemble import HistGradientBoostingClassifier, RandomForestClassifier, StackingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
+
+X, y = load_breast_cancer(return_X_y=True)
+base = [("svm", make_pipeline(StandardScaler(), SVC())),
+        ("rf", RandomForestClassifier(200, random_state=0)),
+        ("hgb", HistGradientBoostingClassifier(random_state=0))]
+stack = StackingClassifier(base, final_estimator=LogisticRegression(max_iter=1000), cv=5)
+print("stack:", cross_val_score(stack, X, y, cv=5).mean().round(3))
+print("svm  :", cross_val_score(base[0][1], X, y, cv=5).mean().round(3))
+@@END
+<ol>
+<li>Three different base models. The SVM has no probabilities in scikit-learn 1.9 (its <code>probability=True</code> option is deprecated), and that is fine: with the default <code>stack_method="auto"</code> the stack uses <code>predict_proba</code> where available and falls back to <code>decision_function</code> for the SVM.</li>
+<li>The final estimator is a simple logistic regression that learns how much to trust each base model. Keep the final model simple.</li>
+<li>Internally, <code>cv=5</code> makes the base predictions out-of-fold so the final model is not trained on leaked predictions.</li>
+<li>We compare with the best single base model. Stacking costs several times more training time and often gains little over a well-tuned single model; add it last.</li>
+</ol>
+<p><strong>Reading the output:</strong> the stack scores 0.977 against 0.974 for the SVM alone. A gain of 0.3 points (about two rows in 569) is far inside the fold-to-fold noise, so stacking added essentially nothing here, a common outcome for a few extra minutes of training.</p>
+<p><strong>Recipe 10: How do I get a DataFrame out of my pipeline, with names?</strong></p>
+@@PY
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+df = pd.DataFrame({"age": [25, 40, 31], "city": ["Oslo", "Rome", "Oslo"]})
+ct = ColumnTransformer([("num", StandardScaler(), ["age"]),
+                        ("cat", OneHotEncoder(sparse_output=False), ["city"])],
+                       verbose_feature_names_out=False).set_output(transform="pandas")
+out = ct.fit_transform(df)
+print(out.round(2))
+print(type(out).__name__, list(out.columns))
+@@END
+<ol>
+<li><code>set_output(transform="pandas")</code> makes every transformer in the composite return a DataFrame instead of a bare array.</li>
+<li><code>verbose_feature_names_out=False</code> removes the <code>num__</code> and <code>cat__</code> prefixes when the names are unique. Leave it at the default <code>True</code> if two steps could produce the same name.</li>
+<li>Now downstream code can use column names, and you can inspect the transformed table the way you would any DataFrame.</li>
+</ol>

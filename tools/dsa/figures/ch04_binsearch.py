@@ -1,0 +1,41 @@
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+BLUE, ORANGE, TEAL, RED, PURPLE = "#2b4fd6", "#b84a22", "#357a70", "#aa2d26", "#6a2fd0"
+LT = {"blue": "#d6defa", "orange": "#f3d9cc", "teal": "#cfe5e0", "red": "#f1cfcc", "purple": "#e0d4f7", "grey": "#e4e4ea", "white": "#ffffff"}
+plt.rcParams.update({"font.size": 14})
+
+def cells(ax, vals, x0=0.0, y=0.0, fc=None, fs=16, idx=True, w=1.0, h=0.8):
+    for i, v in enumerate(vals):
+        c = LT[fc[i]] if fc and fc[i] else LT["white"]
+        ax.add_patch(Rectangle((x0 + i * w, y), w, h, fc=c, ec="#333333", lw=1.5))
+        ax.text(x0 + i * w + w / 2, y + h / 2, str(v), ha="center", va="center", fontsize=fs, color="#111111")
+        if idx:
+            ax.text(x0 + i * w + w / 2, y - 0.08, str(i), ha="center", va="top", fontsize=11, color="#666666")
+
+def below(ax, x, y, label, color, fs=13):
+    ax.annotate(label, xy=(x, y - 0.3), xytext=(x, y - 0.95), ha="center", va="top", fontsize=fs, color=color,
+                fontweight="bold", arrowprops=dict(arrowstyle="-|>", color=color, lw=2))
+
+def above(ax, x, y, label, color, fs=13):
+    ax.annotate(label, xy=(x, y + 0.85), xytext=(x, y + 1.35), ha="center", va="bottom", fontsize=fs, color=color,
+                fontweight="bold", arrowprops=dict(arrowstyle="-|>", color=color, lw=2))
+
+def save(fig, name):
+    fig.savefig(name, dpi=110, bbox_inches="tight", facecolor="white")
+fig, ax = plt.subplots(figsize=(8, 6))
+arr = [2,5,8,12,16,23,38,45,56,72,91]
+steps = [(0,10,5), (6,10,8), (9,10,9)]
+for r, (lo, hi, mid) in enumerate(steps):
+    y = (2 - r) * 2.5
+    fc = ["white" if lo <= i <= hi else "grey" for i in range(11)]
+    fc[mid] = "orange"
+    cells(ax, arr, x0=1.0, y=y, fc=fc, fs=14)
+    below(ax, 1.0 + lo + 0.5, y - 0.1, "lo", BLUE)
+    above(ax, 1.0 + hi + 0.5, y, "hi", RED)
+    ax.text(0.9, y + 0.4, "step %d" % (r + 1), ha="right", va="center", fontsize=13)
+    ax.text(12.1, y + 0.4, "mid=%d\n%d %s 72" % (mid, arr[mid], "<" if arr[mid] < 72 else "="), ha="left", va="center", fontsize=12, color=ORANGE)
+ax.set_xlim(-0.5, 14.2); ax.set_ylim(-1.8, 7.9); ax.axis("off")
+ax.set_title("Find 72: grey cells are ruled out, orange is mid", fontsize=14)
+save(fig, "dsa4_binsearch.png")

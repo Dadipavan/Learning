@@ -1,0 +1,204 @@
+
+<h2>19.7 Feature Selection, Model Inspection, Saving Models and Custom Transformers</h2>
+<p>Once a model scores well, four practical questions follow. Do I need all these columns? Why did the model decide that? How do I ship it? And what if scikit-learn has no transformer for my cleaning step? This section answers all four.</p>
+<h3>Reference: selection, inspection, persistence and extension</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>VarianceThreshold</code></td><td>Drop columns that barely vary (constants)</td><td><code>VarianceThreshold(0.0)</code></td></tr>
+<tr><td><code>SelectKBest</code></td><td>Keep the k columns with the best univariate score</td><td><code>SelectKBest(f_classif, k=10)</code></td></tr>
+<tr><td><code>SelectPercentile</code></td><td>Keep the top percent of columns</td><td><code>SelectPercentile(f_classif, percentile=20)</code></td></tr>
+<tr><td><code>f_classif</code>, <code>f_regression</code></td><td>ANOVA or correlation F-score of a column against y</td><td><code>f_regression(X, y)</code></td></tr>
+<tr><td><code>mutual_info_classif</code></td><td>Score that also catches nonlinear relations (slower)</td><td><code>SelectKBest(mutual_info_classif, k=5)</code></td></tr>
+<tr><td><code>chi2</code></td><td>Score for non-negative counts (text) against a class</td><td><code>SelectKBest(chi2, k=1000)</code></td></tr>
+<tr><td><code>SelectFromModel</code></td><td>Keep columns a model rates as important (L1 weights or importances)</td><td><code>SelectFromModel(Lasso(0.05))</code></td></tr>
+<tr><td><code>RFE</code>, <code>RFECV</code></td><td>Repeatedly drop the weakest column; the CV version picks how many</td><td><code>RFECV(LogisticRegression(), cv=5)</code></td></tr>
+<tr><td><code>SequentialFeatureSelector</code></td><td>Greedily add (or remove) one column at a time, scored by CV</td><td><code>SequentialFeatureSelector(m, n_features_to_select=5)</code></td></tr>
+<tr><td><code>selector.get_support()</code></td><td>Boolean mask of the kept columns</td><td><code>sel.get_support()</code></td></tr>
+<tr><td><code>model.feature_importances_</code></td><td>Tree-based importance (computed on training data; biased)</td><td><code>rf.feature_importances_</code></td></tr>
+<tr><td><code>model.coef_</code></td><td>Linear-model weights (meaningful when columns are scaled)</td><td><code>lr.coef_</code></td></tr>
+<tr><td><code>permutation_importance</code></td><td>Score drop when one column is shuffled on held-out data</td><td><code>permutation_importance(m, X_te, y_te, n_repeats=10)</code></td></tr>
+<tr><td><code>partial_dependence</code></td><td>Average prediction as one feature varies (numbers)</td><td><code>partial_dependence(m, X, [0])</code></td></tr>
+<tr><td><code>PartialDependenceDisplay</code></td><td>Plot of partial dependence or ICE curves</td><td><code>PartialDependenceDisplay.from_estimator(m, X, [0])</code></td></tr>
+<tr><td><code>joblib.dump</code>, <code>joblib.load</code></td><td>Save and load a fitted model or pipeline</td><td><code>joblib.dump(pipe, "m.joblib")</code></td></tr>
+<tr><td><code>BaseEstimator</code></td><td>Gives <code>get_params</code>, <code>set_params</code>, nice printing</td><td><code>class My(BaseEstimator): ...</code></td></tr>
+<tr><td><code>TransformerMixin</code></td><td>Gives <code>fit_transform</code> and <code>set_output</code></td><td><code>class My(TransformerMixin, BaseEstimator)</code></td></tr>
+<tr><td><code>validate_data</code></td><td>Check and convert X, record <code>n_features_in_</code> and column names</td><td><code>X = validate_data(self, X)</code></td></tr>
+<tr><td><code>FunctionTransformer</code></td><td>Quickest custom step: wrap a function</td><td><code>FunctionTransformer(np.log1p, validate=False)</code></td></tr>
+</tbody></table></div>
+<h3>Example 1: feature selection, the leak-free way</h3>
+<p>We have 30 columns, only 5 informative. We compare using all columns with two selection strategies, both placed <em>inside</em> the pipeline so they are re-learned in every CV fold.</p>
+@@PY
+from sklearn.datasets import make_classification
+from sklearn.feature_selection import SelectFromModel, SelectKBest, f_classif
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+X, y = make_classification(400, 30, n_informative=5, n_redundant=0, random_state=0)
+lr = LogisticRegression(max_iter=1000)
+variants = {
+    "all 30 columns": make_pipeline(StandardScaler(), lr),
+    "SelectKBest k=5": make_pipeline(StandardScaler(), SelectKBest(f_classif, k=5), lr),
+    "L1 SelectFromModel": make_pipeline(
+        StandardScaler(),
+        SelectFromModel(LogisticRegression(l1_ratio=1, solver="liblinear", C=0.1)),
+        lr),
+}
+for name, m in variants.items():
+    print(f"{name:20s} {cross_val_score(m, X, y, cv=5).mean():.3f}")
+
+fitted = variants["SelectKBest k=5"].fit(X, y)
+print("kept columns:", fitted[1].get_support().nonzero()[0])
+@@END
+<ol>
+<li>The dataset has 400 rows, 30 columns, 5 informative ones, and the rest noise.</li>
+<li>Each variant is a pipeline. Selection steps sit between the scaler and the final model, so in each fold they are fitted on the fold's training rows only.</li>
+<li><code>SelectKBest(f_classif, k=5)</code> scores each column separately with an F-test against y and keeps the top five.</li>
+<li><code>SelectFromModel</code> fits an L1-penalised logistic regression (which zeroes weak columns) and keeps the columns with non-negligible weights.</li>
+<li>We print the 5-fold accuracy of each variant.</li>
+<li>After fitting one pipeline on all the data, <code>fitted[1]</code> is the selector step and <code>get_support()</code> is a boolean mask; <code>.nonzero()[0]</code> turns it into column numbers.</li>
+</ol>
+<p><strong>Reading the output:</strong> using all 30 columns scores 0.865, while keeping only five columns gives 0.885 with <code>SelectKBest</code> and 0.883 with the L1 selector. Removing noise helps a little. The kept indices (5, 6, 14, 15, 16) are the columns the F-test ranked highest. Because the selection happens inside each fold, these scores are honest; section 19.8 shows what happens when you select first on all rows. Univariate selection judges each column alone, so it can miss columns that matter only in combination, which is why the model-based selector is a useful second opinion.</p>
+<h3>Example 2: why permutation importance beats the built-in importance</h3>
+<p>The <code>feature_importances_</code> of a forest are computed from the training data and favour columns with many distinct values, even useless ones. Permutation importance shuffles one column of <em>held-out</em> data and measures how much the score drops, which is an honest test of "does the model rely on this?". Here we add a random ID-like column that carries no signal.</p>
+@@PY
+import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.model_selection import train_test_split
+
+X, y = make_classification(1500, 5, n_informative=3, n_redundant=0, random_state=0, shuffle=False)
+rng = np.random.default_rng(0)
+X = np.c_[X, rng.normal(size=len(X))]                  # column 5: pure noise with many distinct values
+names = ["f0", "f1", "f2", "f3", "f4", "noise"]
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, random_state=0)
+
+rf = RandomForestClassifier(300, min_samples_leaf=1, random_state=0).fit(X_tr, y_tr)
+pi = permutation_importance(rf, X_te, y_te, n_repeats=20, random_state=0)
+print(f"{'feature':8s} {'builtin':>8s} {'permutation':>12s}")
+for i, n in enumerate(names):
+    print(f"{n:8s} {rf.feature_importances_[i]:8.3f} {pi.importances_mean[i]:8.3f} +/- {pi.importances_std[i]:.3f}")
+@@END
+<ol>
+<li>Five real columns (the first three informative) plus a sixth column of random numbers.</li>
+<li>The forest is trained on the training part only.</li>
+<li><code>permutation_importance</code> shuffles each column of the <em>test</em> set 20 times, re-scores, and reports the mean drop in accuracy and its standard deviation. A drop near zero means the model does not use that column.</li>
+<li>We print both importance types side by side.</li>
+</ol>
+<p><strong>Reading the output:</strong> the three informative columns have permutation importances of 0.285, 0.146 and 0.227 (accuracy lost when shuffled). The pure-noise column gets a built-in importance of 0.092, as large as the two real-but-useless columns f3 and f4 (0.087 and 0.085), so the built-in numbers hand about a quarter of the total credit to three useless columns. Permutation importance gives all three a value of about zero (-0.003, -0.011, -0.009, each within about two standard deviations of zero), which is the right answer: shuffling them costs nothing. Caveat: if two columns are strongly correlated, shuffling one barely hurts because the model leans on the other, so both look unimportant. Check correlated groups together.</p>
+<figure><img src="images/lib19_importance.png" alt="Left: bar chart of permutation importance for six features of a forest regressor, with error bars; right: partial dependence line rising almost linearly with feature f0" loading="lazy"/><figcaption>Permutation importance (left) and partial dependence of one feature (right) for a random forest regressor.</figcaption></figure>
+<p><strong>How to read it:</strong> in the left panel each bar is how much R squared falls when that feature is shuffled on test data; the thin line is the spread over repeats. Three features matter and three bars are invisible because they are essentially zero. In the right panel the line is the model's average prediction as f0 sweeps over its range while everything else keeps its real values. The tick marks on the x-axis show where the data lives; trust the curve only where ticks exist.</p>
+<h3>Example 3: partial dependence as numbers</h3>
+@@PY
+import numpy as np
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.inspection import partial_dependence
+
+rng = np.random.default_rng(0)
+X = rng.uniform(0, 10, size=(2000, 2))
+y = 3 * np.sin(X[:, 0]) + 0.5 * X[:, 1] + rng.normal(scale=0.3, size=2000)
+m = HistGradientBoostingRegressor(random_state=0).fit(X, y)
+
+pd0 = partial_dependence(m, X, features=[0], grid_resolution=6, method="brute")
+print("grid  :", pd0["grid_values"][0].round(2))
+print("effect:", pd0["average"][0].round(2))
+print("truth :", (3 * np.sin(pd0["grid_values"][0]) + 0.5 * X[:, 1].mean()).round(2))
+@@END
+<ol>
+<li>The target depends on a sine wave of the first column and a gentle linear trend in the second.</li>
+<li>We fit a boosted regressor to the whole data (for the demonstration, not for scoring).</li>
+<li><code>partial_dependence</code> evaluates the model on a grid of six values of feature 0 (<code>method="brute"</code> does this literally, by predicting on modified copies of the data; the default <code>"auto"</code> may use a faster tree shortcut for boosted trees that leaves out the model's baseline constant, so levels would not match the truth below). At each grid value it sets feature 0 to that value for <em>every</em> row, predicts, and averages.</li>
+<li>The result dictionary holds <code>grid_values</code> and <code>average</code> (the partial dependence).</li>
+<li>For comparison we compute the true average effect from the formula we used to make the data.</li>
+</ol>
+<p><strong>Reading the output:</strong> the model's averaged curve follows the true sine shape (rise, peak, fall) to within about 0.1 at every grid point (for example 3.89 against 3.90 at the first point and 5.36 against 5.43 at the fifth). That is what partial dependence is for: showing the <em>shape</em> of a relationship that a single coefficient cannot.</p>
+<h3>Example 4: saving and loading a model</h3>
+<p>Persist the <em>whole pipeline</em>, so the preprocessing travels with the model. <code>joblib</code> is the standard tool because it stores NumPy arrays efficiently.</p>
+@@PY
+import os
+import tempfile
+
+import joblib
+import numpy as np
+from sklearn.datasets import load_breast_cancer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+
+X, y = load_breast_cancer(return_X_y=True)
+pipe = make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000)).fit(X, y)
+
+with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "model.joblib")
+    joblib.dump({"model": pipe, "sklearn": "1.9.1", "features": 30}, path, compress=3)
+    print("file exists:", os.path.exists(path), " size under 20 KB:", os.path.getsize(path) < 20000)
+    bundle = joblib.load(path)
+
+same = np.array_equal(pipe.predict(X), bundle["model"].predict(X))
+print("identical predictions after reload:", same)
+print(bundle["sklearn"], bundle["features"])
+@@END
+<ol>
+<li>We fit a scaler-plus-model pipeline on all rows (in real work you would fit on training rows only).</li>
+<li>We save inside a temporary folder so the example leaves nothing behind.</li>
+<li>Saving a <em>dictionary</em> that holds the model and metadata (library version, expected column count) is a good habit: it records how the model must be used.</li>
+<li><code>compress=3</code> trades a little time for a smaller file.</li>
+<li><code>joblib.load</code> returns the same dictionary, and the reloaded pipeline gives identical predictions.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> loading a <code>.joblib</code> or pickle file from an untrusted source, or loading in an environment with a different scikit-learn version. <strong>Symptom:</strong> the first is an arbitrary-code-execution risk (pickle can run code on load); the second gives warnings, wrong results or crashes. <strong>Fix:</strong> only load files you created, pin the library versions (store them with the model), and keep the training script so you can rebuild. For sharing between organisations, consider a safer format such as <code>skops</code> (not installed here, so not run) or export to ONNX.</div></div>
+<h3>Example 5: a custom transformer</h3>
+<p>Suppose you want to cap extreme values at the 5th and 95th percentile of each column, learned from training data. Scikit-learn has no such step, so we write one. The recipe: inherit from <code>TransformerMixin</code> and <code>BaseEstimator</code>; store constructor arguments untouched; learn into attributes ending in an underscore in <code>fit</code>; apply in <code>transform</code>.</p>
+@@PY
+import numpy as np
+import pandas as pd
+from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.linear_model import LinearRegression
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import make_pipeline
+from sklearn.utils.validation import check_is_fitted, validate_data
+
+
+class Winsorizer(TransformerMixin, BaseEstimator):
+    def __init__(self, lower=0.05, upper=0.95):
+        self.lower = lower
+        self.upper = upper
+
+    def fit(self, X, y=None):
+        X = validate_data(self, X, dtype=float)
+        self.lo_ = np.quantile(X, self.lower, axis=0)
+        self.hi_ = np.quantile(X, self.upper, axis=0)
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self)
+        X = validate_data(self, X, dtype=float, reset=False)
+        return np.clip(X, self.lo_, self.hi_)
+
+    def get_feature_names_out(self, input_features=None):
+        return np.asarray(input_features if input_features is not None
+                          else self.feature_names_in_, dtype=object)
+
+
+df = pd.DataFrame({"a": [1, 2, 3, 4, 100.0], "b": [5, 6, 7, 8, 9.0]})
+w = Winsorizer(0.0, 0.8).set_output(transform="pandas")
+print(w.fit_transform(df))
+print(clone(w).get_params())
+
+rng = np.random.default_rng(0)
+X = rng.normal(size=(300, 1)); X[:5] = 40                 # 5 wild outliers
+y = 2 * X[:, 0] + rng.normal(scale=0.2, size=300)
+gs = GridSearchCV(make_pipeline(Winsorizer(), LinearRegression()),
+                  {"winsorizer__upper": [0.9, 0.99]}, cv=3).fit(X, y)
+print(gs.best_params_)
+@@END
+<ol>
+<li>The constructor only stores its arguments, with the same names as the parameters. This rule is what makes <code>get_params</code>, <code>clone</code> and grid search work.</li>
+<li><code>fit</code> calls <code>validate_data(self, X, dtype=float)</code>, which converts to a float array, checks for NaN or infinity, and records <code>n_features_in_</code> (and <code>feature_names_in_</code> for DataFrames). It then learns the two percentile vectors <code>lo_</code> and <code>hi_</code> and returns <code>self</code>.</li>
+<li><code>transform</code> first calls <code>check_is_fitted</code>, then validates with <code>reset=False</code> so that the column count must match what <code>fit</code> saw, and clips with <code>np.clip</code>.</li>
+<li><code>get_feature_names_out</code> is what lets <code>set_output(transform="pandas")</code> return a DataFrame with the right column names.</li>
+<li>For column <code>a</code> the 80th percentile (with linear interpolation, position 0.8 × 4 = 3.2) is 4 + 0.2 × 96 = 23.2, so 100 becomes 23.2 in the printed DataFrame; column <code>b</code> is clipped at its own 80th percentile, 8.2.</li>
+<li><code>clone(w).get_params()</code> proves the class behaves like a real estimator: parameters are discoverable and copyable.</li>
+<li>Last, the transformer slots into <code>GridSearchCV</code> with the double-underscore name <code>winsorizer__upper</code>, so its setting can be tuned like any other. Here the search prefers clipping at the 99th percentile over the 90th: the five wild rows are only 1.7% of the data, so the 90th percentile clips a lot of good data too.</li>
+</ol>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">For a stateless function (no learning, such as <code>np.log1p</code> or "add a ratio column"), <code>FunctionTransformer</code> is enough and needs no class. Write a class only when <code>fit</code> must learn something from the training data, such as quantiles, a vocabulary or a lookup table.</div></div>

@@ -1670,7 +1670,7 @@ SERVE:  raw rows --build_features(today)----------------------------------------
 <h3>The sample size formula</h3>
 <p>For a yes/no metric, with control rate <code>p1</code>, treatment rate <code>p2</code>, <code>p̄ = (p1 + p2)/2</code>:</p>
 <pre class="code lang-text"><code>n per arm = ( z_α/2 · √(2·p̄·(1−p̄))  +  z_β · √(p1(1−p1) + p2(1−p2)) )²  /  (p2 − p1)²</code></pre>
-<p><code>z_α/2</code> is the normal-curve cut-off for the false alarm rate. For α = 0.05 (two-sided) it is 1.96. <code>z_β</code> is the cut-off for power. For power 0.80 it is 0.8416. A handy rule: <code>n ≈ 16 · p(1−p) / δ²</code> where <code>δ</code> is the absolute lift you want to detect.</p>
+<p><code>z_α/2</code> is the normal-curve cut-off for the false alarm rate. For α = 0.05 (two-sided) it is 1.96. <code>z_β</code> is the cut-off for power. For power 0.80 it is 0.8416. A handy rule: <code>n ≈ 16 · p(1−p) / δ²</code> where <code>δ</code> is the absolute lift you want to detect. The 16 assumes a two-sided test at α = 0.05 with 80% power (it is 2 × (1.96 + 0.84)² = 15.7, rounded up); Section 7.6 shows the constant for a one-sided test or 90% power.</p>
 <p class="problem"><span class="pl">Problem 7.1.1</span> (tiny numbers) Using the rule of thumb, how many customers per arm to detect a lift from 10% to 11%?</p>
 <table class="steps"><tr><th>Formula</th><td>n ≈ 16 · p(1−p) / δ²</td></tr><tr><th>Plug in</th><td>16 × 0.10 × 0.90 / (0.01)²</td></tr><tr><th>Compute</th><td>16 × 0.09 = 1.44, and 0.01² = 0.0001, so 1.44 / 0.0001 = 14,400</td></tr><tr><th>Answer</th><td>About 14,400 customers per arm.</td></tr><tr><th>Check</th><td>The exact formula in the next problem gives 14,751, close to the rule.</td></tr><tr><th>Why it matters</th><td>In a meeting you can do this on paper and tell the PM "we need about 15 thousand per arm" before anyone writes code.</td></tr></table>
 <p class="problem"><span class="pl">Problem 7.1.2</span> (exact formula) Same test, full formula.</p>
@@ -1820,10 +1820,231 @@ best possible (always the 12% offer): 1200</code></pre>
 <div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using a bandit and then analysing it with a plain A/B z-test. The data are not independent draws from fixed arms, so p-values are wrong. Use methods built for adaptive data.</div></div>
 <p><strong>Check yourself</strong></p>
 <ol><li>Which has lower regret, equal split or Thompson? Answer: Thompson (39 vs 104 orders in our run).</li><li>Why can a test be significant but not worth shipping? Answer: the effect can be too small to pay for the cost; convert lift to money.</li><li>Name one case where an A/B test beats a bandit. Answer: when you need a precise, defensible estimate of the effect, or the outcome is delayed.</li></ol>
-<h2 id="s5-chapter-recap">Chapter recap</h2>
+<h2 id="s5-7-5-ratio-metrics-and-the-delta-method">7.5 Ratio Metrics and the Delta Method</h2>
+<p>Many headline metrics are ratios: click-through rate is clicks per session, revenue per session, orders per visit. The unit you randomise is the <em>user</em>, but the denominator counts <em>sessions</em>. Users with many sessions contribute many rows, and a user's sessions are not independent (a person who likes clicking clicks in most sessions). If you treat each session as an independent coin flip you get a standard error that is too small and too many false wins.</p>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Ten sessions from one enthusiastic user are not ten independent opinions. They are closer to one opinion counted ten times. The right count of independent pieces of evidence is the number of <em>users</em>, so the standard error must be built at the user level.</div></div>
+<h3>The delta method in one formula</h3>
+<p>Let each user have clicks <code>c</code> and sessions <code>s</code>. The metric is <code>R = Σc / Σs = c̄ / s̄</code>. A first-order Taylor expansion (the delta method) gives the variance of a ratio of two means across <code>n</code> users:</p>
+<div class="eq">Var(R) ≈ ( Var(c) − 2·R·Cov(c, s) + R²·Var(s) ) / ( n · s̄² )</div>
+<p>To test a difference between arms, compute <code>R</code> and <code>Var(R)</code> in each arm, add the two variances and take the square root for the standard error of the difference.</p>
+<p class="problem"><span class="pl">Problem 7.5.1</span> Five users in one arm have sessions 1, 2, 4, 3, 10 and clicks 0, 1, 1, 1, 4. Find the CTR and its delta-method standard error.</p>
+<table class="steps"><tr><th>Ratio</th><td>R = 7 / 20 = 0.35.</td></tr><tr><th>Moments</th><td>s̄ = 4, Var(s) = 12.5, Var(c) = 2.3, Cov(c, s) = 5.25 (sample versions with n − 1).</td></tr><tr><th>Numerator</th><td>2.3 − 2 × 0.35 × 5.25 + 0.35² × 12.5 = 2.3 − 3.675 + 1.53125 = 0.15625.</td></tr><tr><th>Divide</th><td>n·s̄² = 5 × 16 = 80, so Var(R) = 0.15625 / 80 = 0.001953 and SE = 0.0442.</td></tr><tr><th>Check</th><td>A bootstrap over users (code below) gives 0.0485. With only 5 users the first-order approximation is rough; with thousands of users the two agree closely.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+# Tiny hand example: 5 users in one arm
+s = np.array([1, 2, 4, 3, 10.0])      # sessions
+c = np.array([0, 1, 1, 1, 4.0])       # clicks
+n = len(s)
+R = c.sum() / s.sum()
+ms, mc = s.mean(), c.mean()
+vs, vc = s.var(ddof=1), c.var(ddof=1)
+cov = np.cov(c, s, ddof=1)[0, 1]
+var_R = (vc - 2 * R * cov + R**2 * vs) / (n * ms**2)
+print("R", R, "var_c", vc, "var_s", vs, "cov", cov)
+print("delta var", round(var_R, 5), "se", round(var_R**.5, 4))
+rng = np.random.default_rng(0)
+idx = rng.integers(0, n, (20000, n))
+boot = c[idx].sum(1) / s[idx].sum(1)
+print("bootstrap se", boot.std().round(4))
+</code></pre>
+<pre class="code lang-text"><code>R 0.35 var_c 2.3 var_s 12.5 cov 5.25
+delta var 0.00195 se 0.0442
+bootstrap se 0.0485</code></pre>
+<p class="problem"><span class="pl">Problem 7.5.2</span> Now a realistic arm of 20,000 users. Compare the naive session-level standard error with the delta method and a user-level bootstrap.</p>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(1)
+n = 20000
+# heavy users have many sessions AND a user-specific click rate (users are clustered)
+rate = rng.beta(2, 18, n)                        # user click propensity, mean 0.10
+sess = rng.poisson(1, n) + 1 + (rng.random(n) &lt; 0.05) * rng.poisson(30, n)
+clicks = rng.binomial(sess, rate)
+R = clicks.sum() / sess.sum()
+# naive: treat every session as independent Bernoulli
+se_naive = np.sqrt(R * (1 - R) / sess.sum())
+# delta method at user level
+ms = sess.mean()
+cov = np.cov(clicks, sess)[0, 1]
+var_R = (clicks.var(ddof=1) - 2 * R * cov + R**2 * sess.var(ddof=1)) / (n * ms**2)
+# bootstrap users
+idx = rng.integers(0, n, (400, n))
+boot = clicks[idx].sum(1) / sess[idx].sum(1)
+print("CTR", round(R, 4), "sessions per user", round(ms, 2))
+print("naive SE", round(se_naive, 5), " delta SE", round(var_R**.5, 5), " bootstrap SE", round(boot.std(), 5))
+print("naive understates SE by factor", round(var_R**.5 / se_naive, 2))
+</code></pre>
+<pre class="code lang-text"><code>CTR 0.0963 sessions per user 3.48
+naive SE 0.00112  delta SE 0.00146  bootstrap SE 0.00152
+naive understates SE by factor 1.3</code></pre>
+<p><strong>How to read it.</strong> The naive standard error is about 23% too small (the delta SE is 1.30 times larger). Using the naive number would turn a borderline result into a false win. The delta method and the bootstrap agree with each other (0.00146 and 0.00152). The gap grows with the clustering of sessions inside users and with how unequal the session counts are.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Running a two-proportion z-test on <em>sessions</em> when randomisation was by <em>user</em>. The test assumes independent rows. Either analyse at user level (clicks per user, then the delta method for the ratio) or bootstrap by user. Also check that the denominator itself is not affected by the treatment: if the new design changes the number of sessions, the ratio mixes two effects.</div></div>
+<h3>Going deeper</h3>
+<p>A neat equivalent view is <strong>linearisation</strong>: replace each user's pair (c, s) with <code>c − R·s</code> where <code>R</code> is the control ratio. The treatment effect on that single per-user number is, to first order, the effect on the ratio, and you can use ordinary t-tests, CUPED and sample-size formulas on it. This is how most experimentation platforms implement ratio metrics.</p>
+
+<h2 id="s6-7-6-sample-size-for-non-binary-metrics-and-smarter-variance-reduction">7.6 Sample Size for Non-Binary Metrics and Smarter Variance Reduction</h2>
+<p>Section 7.1 sized a yes/no metric. The rule of thumb <code>n ≈ 16 p(1−p)/δ²</code> assumes a two-sided 5% test and 80% power (<code>2·(1.96 + 0.84)² = 15.7</code>, rounded to 16). For other settings change the 15.7: a one-sided 5% test needs about 12.4 (<code>2·(1.645+0.842)²</code>), and 90% power at two-sided 5% needs about 21.0 (<code>2·(1.96+1.282)²</code>). In general, for a metric with standard deviation <code>σ</code> per user, <code>n per arm = 2·(z<sub>α/2</sub> + z<sub>β</sub>)²·σ² / δ²</code>.</p>
+<p class="problem"><span class="pl">Problem 7.6.1</span> Three sample-size calculations. (a) Revenue per user has σ = 120 rupees; detect +2 rupees. (b) The same with CUPED where ρ = 0.5. (c) A ratio metric (CTR 0.10) whose linearised per-user value has σ = 0.35 (assumed); detect +0.005. (d) The 10% to 11% binary case under three settings.</p>
+<pre class="code lang-python"><code>from scipy import stats
+za, zb = stats.norm.ppf(0.975), stats.norm.ppf(0.8)
+k = 2 * (za + zb) ** 2
+print("2*(za+zb)^2 =", round(k, 3))
+# continuous: revenue per user mean 50, sd 120, detect +2
+sd, delta = 120, 2
+print("continuous n per arm", round(k * sd**2 / delta**2))
+# CUPED with rho = 0.5 cuts variance by 25%
+print("with rho 0.5:", round(k * sd**2 * (1 - 0.25) / delta**2))
+# ratio metric: delta-method variance per user of the linearised metric
+# CTR 0.10, sd of linearised value per user = 0.35, detect +0.005
+print("ratio n per arm", round(k * 0.35**2 / 0.005**2))
+# one-sided 5% and power 90% for the binary 10% vs 11% case
+def n_bin(p1, p2, alpha, power, two=True):
+    za = stats.norm.ppf(1 - alpha / (2 if two else 1)); zb = stats.norm.ppf(power)
+    pb = (p1 + p2) / 2
+    return (za*(2*pb*(1-pb))**.5 + zb*(p1*(1-p1)+p2*(1-p2))**.5)**2 / (p2-p1)**2
+print("binary 10 to 11:", round(n_bin(.10,.11,.05,.8)), round(n_bin(.10,.11,.05,.8,False)), round(n_bin(.10,.11,.05,.9)))
+</code></pre>
+<pre class="code lang-text"><code>2*(za+zb)^2 = 15.698
+continuous n per arm 56512
+with rho 0.5: 42384
+ratio n per arm 76919
+binary 10 to 11: 14751 11619 19747</code></pre>
+<table class="steps"><tr><th>(a) by hand</th><td>15.698 × 120² / 2² = 15.698 × 14,400 / 4 = 56,513 per arm (the code rounds the unrounded constant and prints 56,512).</td></tr><tr><th>(b) by hand</th><td>CUPED multiplies the variance by (1 − ρ²) = 0.75, so n falls by a quarter: 42,384.</td></tr><tr><th>(c) by hand</th><td>15.698 × 0.35² / 0.005² = 15.698 × 0.1225 / 0.000025 = 76,920 (code: 76,919).</td></tr><tr><th>(d)</th><td>14,751 for two-sided 5% with 80% power. A one-sided test needs 11,619 (21% fewer), and 90% power needs 19,747 (34% more).</td></tr></table>
+<p><strong>Reading the answers.</strong> Continuous revenue metrics are heavy-tailed, so σ is large relative to a small lift, and they need far more users than a conversion rate. This is why teams cap outliers (winsorise at the 99th percentile), use CUPED, or test a conversion proxy.</p>
+<figure><img src="images/ds_ch07_power_curve.png" alt="Power curves rising with sample size for lifts of 0.5, 1 and 2 points on a 10 percent baseline" loading="lazy"/><figcaption>Power against customers per arm for three lifts. The dashed line is 80% power.</figcaption></figure>
+<p><strong>How to read it.</strong> Find where each curve crosses the dashed line: that x value is the sample size for that lift (about 3,800, 14,750 and 57,800 per arm). A curve only reaches the top of the chart when n is large for that lift. A test that stops at 10,000 per arm has only about 64% power for the 1-point lift and about 21% for 0.5 points.</p>
+<h3>Variance reduction beyond CUPED</h3>
+<p>CUPED is one case of <strong>regression adjustment</strong>: add pre-experiment covariates to a regression of the outcome on treatment. The treatment coefficient is still unbiased because assignment is random, and the standard error shrinks by <code>√(1 − R²)</code> of the covariates. <strong>Post-stratification</strong> instead computes the effect inside each segment (for example free and premium customers) and averages with population weights; it removes the variance that comes from random imbalance in segment mix.</p>
+<p class="problem"><span class="pl">Problem 7.6.2</span> Simulate 8,000 customers with a pre-period spend and a premium flag, true effect +3. Repeat the random assignment 600 times and compare the spread of three estimators.</p>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(3)
+n = 8000
+pre = rng.gamma(2, 25, n)                        # last quarter spend
+seg = (rng.random(n) &lt; 0.3).astype(int)          # 1 = premium segment
+y0 = 0.6 * pre + 40 * seg + rng.normal(0, 30, n)
+def one_trial(rng):
+    t = rng.integers(0, 2, n)
+    y = y0 + 3 * t + rng.normal(0, 5, n)         # true effect +3
+    plain = y[t == 1].mean() - y[t == 0].mean()
+    # post-stratified by segment
+    est = 0
+    for g in (0, 1):
+        m = seg == g
+        est += m.mean() * (y[m &amp; (t == 1)].mean() - y[m &amp; (t == 0)].mean())
+    # regression adjustment: y ~ t + pre + seg
+    X = np.c_[np.ones(n), t, pre - pre.mean(), seg - seg.mean()]
+    beta = np.linalg.lstsq(X, y, rcond=None)[0]
+    return plain, est, beta[1]
+res = np.array([one_trial(rng) for _ in range(600)])
+print("mean estimate (truth 3):", res.mean(0).round(2))
+print("empirical SE: plain, stratified, regression:", res.std(0).round(2))
+print("variance vs plain:", (res.var(0) / res.var(0)[0]).round(2))
+</code></pre>
+<pre class="code lang-text"><code>mean estimate (truth 3): [3.1  3.06 3.04]
+empirical SE: plain, stratified, regression: [0.9  0.79 0.65]
+variance vs plain: [1.   0.77 0.52]</code></pre>
+<p><strong>How to read it.</strong> All three are centred near the truth (3), so none is biased. The spread differs: stratifying by segment cuts the variance to 77% of the plain estimator, and regression on pre-spend and segment cuts it to 52%, the same as using a sample about twice as large. Covariates must be measured <em>before</em> assignment; one measured after can be changed by the treatment and will bias the estimate.</p>
+
+<h2 id="s7-7-7-many-metrics-guardrails-and-false-discovery-control">7.7 Many Metrics: Guardrails and False Discovery Control</h2>
+<p>A real test tracks 20 or 30 metrics. At a 5% level each, a null test shows about one "significant" metric by luck. Two standard fixes: <strong>Bonferroni</strong> (use <code>α/m</code> for each of <code>m</code> metrics; strict, controls the chance of <em>any</em> false alarm) and <strong>Benjamini-Hochberg (BH)</strong>, which controls the expected share of false discoveries among the metrics you call significant (the false discovery rate, FDR).</p>
+<p class="problem"><span class="pl">Problem 7.7.1</span> Ten metrics have p-values 0.001, 0.008, 0.012, 0.041, 0.049, 0.20, 0.30, 0.50, 0.70, 0.90. Apply Bonferroni and BH at 5%.</p>
+<table class="steps"><tr><th>Bonferroni</th><td>Threshold 0.05 / 10 = 0.005. Only 0.001 passes: 1 metric.</td></tr><tr><th>BH step 1</th><td>Sort the p-values (already sorted). The k-th smallest is compared with k × 0.05 / 10: 0.005, 0.010, 0.015, 0.020, 0.025, ...</td></tr><tr><th>BH step 2</th><td>k = 1: 0.001 ≤ 0.005 yes. k = 2: 0.008 ≤ 0.010 yes. k = 3: 0.012 ≤ 0.015 yes. k = 4: 0.041 ≤ 0.020 no. k = 5: 0.049 ≤ 0.025 no.</td></tr><tr><th>BH step 3</th><td>Take the largest k that passes: k = 3. Reject the three smallest p-values.</td></tr><tr><th>Answer</th><td>Bonferroni finds 1, BH finds 3. BH is less strict because it accepts a few false findings in exchange for power.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+p = np.array([0.001, 0.008, 0.012, 0.041, 0.049, 0.2, 0.3, 0.5, 0.7, 0.9])
+m, q = len(p), 0.05
+order = np.argsort(p); ps = p[order]
+thr = q * np.arange(1, m + 1) / m
+ok = ps &lt;= thr
+k = np.max(np.where(ok)[0]) + 1 if ok.any() else 0
+print("BH thresholds", thr.round(3)[:5], "largest k", k, "rejected", ps[:k])
+print("Bonferroni rejects", (p &lt;= q / m).sum())
+adj = np.minimum.accumulate((ps * m / np.arange(1, m + 1))[::-1])[::-1]
+print("BH adjusted p-values", adj.round(3))
+</code></pre>
+<pre class="code lang-text"><code>BH thresholds [0.005 0.01  0.015 0.02  0.025] largest k 3 rejected [0.001 0.008 0.012]
+Bonferroni rejects 1
+BH adjusted p-values [0.01  0.04  0.04  0.098 0.098 0.333 0.429 0.625 0.778 0.9  ]</code></pre>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Use a hierarchy. Pick <em>one</em> primary metric before the test (no correction needed). Treat a small set of secondary metrics with BH. Treat guardrails (latency, refunds, complaints) differently: you are not trying to prove they moved, you are trying to rule out harm, so use a one-sided non-inferiority bound such as "refund rate rose by less than 0.3 points with 95% confidence".</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Slicing a flat result by 12 segments and announcing the one that is significant. That is 12 tests; the chance of at least one p below 0.05 is 1 − 0.95<sup>12</sup> = 46%. Pre-register the slices, correct with BH, and treat a surprise segment as a hypothesis for the next test.</div></div>
+
+<h2 id="s8-7-8-when-users-affect-each-other-interference-switchbacks-and-geo-test">7.8 When Users Affect Each Other: Interference, Switchbacks and Geo Tests</h2>
+<p>A/B testing assumes each user's outcome depends only on their own assignment (no interference, the "stable unit" assumption). That fails in marketplaces (drivers, riders, inventory), social products (friends see each other's changes) and auctions (ad budgets). Then user-level randomisation can show a lift that does not exist after launch.</p>
+<p class="problem"><span class="pl">Problem 7.8.1</span> A market has 100,000 users and only 45,000 delivery slots. Each user requests a slot with probability 0.5 (control) or 0.6 (new design). Requests are served at random up to capacity. Compare the user-level A/B lift with the true effect of launching to everyone, and with a daily switchback.</p>
+<table class="steps"><tr><th>Truth, hand</th><td>All control: 50,000 requests, 45,000 slots, so 90% served and 0.5 × 0.9 = 0.45 orders per user. All treatment: 60,000 requests, 75% served, 0.6 × 0.75 = 0.45. Launching changes nothing: the extra requests just fight for the same slots.</td></tr><tr><th>A/B, hand</th><td>Half and half: requests = 100,000 × (0.25 + 0.30) = 55,000, so 45,000 / 55,000 = 81.8% served. Control: 0.5 × 0.818 = 0.409. Treatment: 0.6 × 0.818 = 0.491. The test says +0.082 (+20%).</td></tr><tr><th>Why</th><td>Treated users steal slots from control users. The comparison between arms is not a comparison between worlds.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(0)
+N, C, p0, p1 = 100000, 45000, 0.5, 0.6
+def served(requests): return min(1.0, C / requests)       # share of requests that get a slot
+# truth by rolling out to everyone
+ctrl = p0 * served(N * p0) ; trt = p1 * served(N * p1)
+print("global control orders per user", round(ctrl, 3), " global treatment", round(trt, 3), " true effect", round(trt - ctrl, 3) + 0.0)
+# user-level A/B inside the same market
+treated = rng.random(N) &lt; 0.5
+req = rng.random(N) &lt; np.where(treated, p1, p0)
+sv = served(req.sum())
+order = req &amp; (rng.random(N) &lt; sv)
+print("A/B measured: control", round(order[~treated].mean(), 3), "treatment", round(order[treated].mean(), 3),
+      "lift", round(order[treated].mean() - order[~treated].mean(), 3))
+# switchback: whole market alternates by day, 28 days
+days = np.arange(28); tday = days % 2 == 1
+o = []
+for t in tday:
+    r = rng.random(N) &lt; (p1 if t else p0)
+    o.append((r &amp; (rng.random(N) &lt; served(r.sum()))).mean())
+o = np.array(o)
+print("switchback estimate", round(o[tday].mean() - o[~tday].mean(), 3) + 0.0)
+</code></pre>
+<pre class="code lang-text"><code>global control orders per user 0.45  global treatment 0.45  true effect 0.0
+A/B measured: control 0.409 treatment 0.492 lift 0.083
+switchback estimate 0.0</code></pre>
+<p><strong>How to read it.</strong> The A/B test reports +0.083 orders per user (a 20% lift) when the true launch effect is zero. The switchback, which flips the <em>whole market</em> between control and treatment on alternating days, recovers the zero. Its cost is fewer independent units (28 days instead of 100,000 users), so it needs a longer run and care about carry-over from one day to the next (drop a washout period) and weekday effects (alternate so each weekday appears in both arms).</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Design</th><th>Randomise</th><th>Use when</th><th>Main cost</th></tr></thead><tbody><tr><td>User-level A/B</td><td>Person</td><td>No sharing of supply, no network</td><td>Biased under interference</td></tr><tr><td>Cluster randomisation</td><td>Friend groups or cities</td><td>Social or local effects stay inside the cluster</td><td>Few clusters, less power</td></tr><tr><td>Switchback</td><td>Time blocks for the whole market</td><td>Marketplaces, pricing, dispatch</td><td>Carry-over, few units</td></tr><tr><td>Geo experiment</td><td>Matched regions</td><td>Ads and offline effects, no user-level tracking</td><td>Needs a synthetic control analysis (Chapter 8)</td></tr></tbody></table></div>
+<h3>Novelty, primacy and long-term holdouts</h3>
+<p>Plot the daily lift. A <strong>novelty effect</strong> starts high and decays as users get used to a change; a <strong>primacy effect</strong> starts low as users learn the new layout and then rises. A two-week test can mislead in either direction. For decisions with long-term consequences, keep a small <strong>holdout</strong> (for example 1% of users who never receive the feature for months) and compare it with everyone else. The cost is that 1% of users miss the feature; the gain is a clean estimate of long-run impact.</p>
+
+<h2 id="s9-7-9-looking-early-without-cheating-group-sequential-and-always-valid-t">7.9 Looking Early Without Cheating: Group-Sequential and Always-Valid Tests</h2>
+<p>Section 7.3 showed that peeking at a fixed-sample test inflates false positives. The answer is not "never look". It is to use a method whose error rate is correct <em>because it expects you to look</em>. Two families: group-sequential designs (a few planned looks with stricter cut-offs) and always-valid tests such as the mixture sequential probability ratio test (mSPRT), which allows continuous monitoring.</p>
+<p class="problem"><span class="pl">Problem 7.9.1</span> Plan 5 equally spaced looks at α = 0.05. How bad is naive testing at 1.96, and what cut-offs fix it?</p>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(5)
+paths = 400000
+z = np.cumsum(rng.normal(size=(paths, 5)), axis=1) / np.sqrt(np.arange(1, 6))   # z-stat at each of 5 equal looks
+naive = (np.abs(z) &gt; 1.96).any(1).mean()
+pocock = (np.abs(z) &gt; 2.413).any(1).mean()
+ob = 2.04 * np.sqrt(5 / np.arange(1, 6))
+obf = (np.abs(z) &gt; ob).any(1).mean()
+print("naive 1.96 at every look:", round(naive, 4))
+print("Pocock 2.413 at every look:", round(pocock, 4))
+print("O'Brien-Fleming style bounds", ob.round(3), "false positive rate", round(obf, 4))
+print("independent-looks formula 1-0.95^5 =", round(1 - 0.95**5, 4))
+</code></pre>
+<pre class="code lang-text"><code>naive 1.96 at every look: 0.1413
+Pocock 2.413 at every look: 0.0505
+O'Brien-Fleming style bounds [4.562 3.226 2.634 2.281 2.04 ] false positive rate 0.0493
+independent-looks formula 1-0.95^5 = 0.2262</code></pre>
+<p><strong>How to read it.</strong> Naive testing at five looks gives 14.1%, not the 22.6% from <code>1 − 0.95<sup>5</sup></code>. That formula assumes the five looks are independent, but the z-statistic at look 2 includes the data from look 1, so the looks are positively correlated and the true inflation is smaller. Treat 22.6% as an upper bound. A constant Pocock cut-off of 2.413 restores 5%. An O'Brien-Fleming style plan (4.56, 3.23, 2.63, 2.28, 2.04) also gives 5%, and keeps the final look nearly as sensitive as a fixed test, so it is the usual choice: it makes it hard to stop early on a lucky start, yet costs almost no power at the end.</p>
+<figure><img src="images/ds_ch07_boundaries.png" alt="Three lines showing the z cut-off at each of five looks for naive, Pocock and O'Brien-Fleming plans" loading="lazy"/><figcaption>The z-statistic needed to stop at each of five looks.</figcaption></figure>
+<p><strong>How to read it.</strong> The red dashed line is the cut-off many people use without thinking: 1.96 at every look. The green line starts very strict and relaxes towards the final look. Early on, only an enormous effect can stop the test.</p>
+<h3>Always-valid inference (mSPRT)</h3>
+<p>With a normal metric of known variance 1 and a prior of N(0, τ²) on the effect, the mixture likelihood ratio after <code>n</code> paired observations with mean <code>x̄</code> is <code>Λ = √(1/(1+nτ²)) · exp( n²τ²x̄² / (2(1+nτ²)) )</code>. Reject the null the first time <code>Λ ≥ 1/α</code>. Because <code>Λ</code> is a martingale under the null, the chance it <em>ever</em> crosses 1/α is at most α, however often you look.</p>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(2)
+paths, n, tau2, alpha = 4000, 3000, 0.01, 0.05
+x = rng.normal(size=(paths, n))                  # paired differences under the null, variance 1
+k = np.arange(1, n + 1); xbar = np.cumsum(x, 1) / k
+lam = np.sqrt(1 / (1 + k * tau2)) * np.exp(k**2 * tau2 * xbar**2 / (2 * (1 + k * tau2)))
+print("share of null paths that EVER cross 1/alpha:", (lam.max(1) &gt;= 1 / alpha).mean().round(4))
+d = x + 0.1                                      # true effect 0.1 sd
+xbar = np.cumsum(d, 1) / k
+lam = np.sqrt(1 / (1 + k * tau2)) * np.exp(k**2 * tau2 * xbar**2 / (2 * (1 + k * tau2)))
+hit = (lam &gt;= 1 / alpha).argmax(1)[(lam &gt;= 1 / alpha).any(1)] + 1
+print("with a real effect of 0.1 sd: stop rate", (lam &gt;= 1/alpha).any(1).mean().round(3), "median stop at n =", int(np.median(hit)))
+</code></pre>
+<pre class="code lang-text"><code>share of null paths that EVER cross 1/alpha: 0.0355
+with a real effect of 0.1 sd: stop rate 0.996 median stop at n = 727</code></pre>
+<p><strong>How to read it.</strong> Under the null only 3.6% of paths ever cross the line, below 5% even with 3,000 looks (the guarantee is "at most 5%", and it is conservative). With a true effect of 0.1 standard deviations, 99.6% of paths stop, with a median stopping time of 727 observations. The price of always-valid monitoring is some power compared with a fixed-sample test of the same length, and the choice of τ matters: pick it near the effect sizes you care about.</p>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">Experiment platforms usually offer one of these methods. Your job is to choose the plan before launch: how many looks, which boundary, which metric, and what you will do for each outcome. Write it in the design doc next to the sample-size calculation.</div></div>
+<h2 id="s10-chapter-recap">Chapter recap</h2>
 <ul><li>Randomising by a fair coin makes groups alike, so a difference in outcome is caused by the change.</li><li>Decide hypothesis, primary metric, guardrails, unit and exposure BEFORE the test.</li><li>Sample size depends on baseline, MDE, α and power. Halving the lift needs 4 times the customers.</li><li>Run whole weeks to cover weekday and weekend behaviour.</li><li>Report absolute lift, relative lift and a CI; a p-value alone is not enough.</li><li>CUPED subtracts the part of the outcome predicted by pre-test behaviour; variance falls by 1 − ρ².</li><li>Always check SRM first. A failed SRM check means do not trust the result.</li><li>Peeking with a fixed threshold made a 5% error rate into about 19%. Use one look or a sequential method.</li><li>Bandits lose less while learning, but give weaker estimates. Use them for many cheap variants.</li><li>Convert lift to money, then decide. Log every test.</li></ul>
 <div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Formula or pattern</th></tr></thead><tbody><tr><td>Sample size (rule of thumb)</td><td><code>n ≈ 16·p(1−p)/δ²</code> per arm</td></tr><tr><td>Sample size (exact)</td><td><code>(z_α/2·√(2p̄(1−p̄)) + z_β·√(p1q1+p2q2))² / δ²</code></td></tr><tr><td>z-test</td><td><code>z = (pB−pA)/√(p(1−p)(1/nA+1/nB))</code></td></tr><tr><td>CUPED</td><td><code>Y_adj = Y − θ(X − mean X)</code>, <code>θ = Cov(Y,X)/Var(X)</code>, variance × <code>(1−ρ²)</code></td></tr><tr><td>SRM</td><td><code>χ² = Σ(O−E)²/E</code>, alarm if p &lt; 0.001</td></tr><tr><td>Peeking fix</td><td>Pocock z about 2.555 for 10 looks; or mSPRT</td></tr><tr><td>Ratio metric</td><td>Delta method or user-level bootstrap</td></tr><tr><td>Bandit</td><td>Thompson: draw from Beta(s,f), play the max, update</td></tr></tbody></table></div>
-<h2 id="s6-practice-set">Practice set</h2>
+<h2 id="s11-practice-set">Practice set</h2>
 <p><strong>1. (easy)</strong> Control rate 20%, you want to detect a 2-point lift. Use the rule of thumb for n per arm. <strong>Answer:</strong> 16 × 0.2 × 0.8 / 0.02² = 2.56 / 0.0004 = 6,400 per arm.</p>
 <p><strong>2. (easy)</strong> True or false: a test that finds "no significant difference" proves the change does nothing. <strong>Answer:</strong> False. It may be underpowered; check the CI and compare to the MDE.</p>
 <p><strong>3. (easy)</strong> Traffic is 500 eligible customers per day and you need 8,000 in total. How many days, rounded to full weeks? <strong>Answer:</strong> 8,000 / 500 = 16 days, round up to 3 weeks (21 days).</p>
@@ -1835,7 +2056,14 @@ best possible (always the 12% offer): 1200</code></pre>
 <p><strong>9. (hard, scenario)</strong> Your offer lifts orders by 0.8 points (CI 0.1 to 1.5), costs ₹10 per customer, and an order is worth ₹300 margin. Ship? <strong>Answer:</strong> 0.008 × 300 = ₹2.40 versus a cost of ₹10, net −₹7.60. Even the top of the CI (0.015 × 300 = ₹4.50) loses money. Do not ship; break-even needs 10/300 = 3.3 points.</p>
 <p><strong>10. (interview)</strong> "We ran a test for 3 days and the p-value is 0.01. Can we ship?" <strong>Answer:</strong> Not yet. 3 days misses the weekly cycle, and if the sample size was fixed at 3 weeks, stopping early because p is low is peeking. Check SRM, the planned n, and guardrails. Also check novelty by looking at lift by day.</p>
 <p><strong>11. (interview)</strong> "When would you use a bandit instead of an A/B test?" <strong>Answer:</strong> Many cheap variants, a quick feedback metric, and a high cost of showing weak options (headlines, notification times). Use A/B when you need a precise, defensible effect estimate or outcomes are delayed.</p>
-<h2 id="s7-prompt-pack">Prompt pack</h2>
+<p><strong>12. (easy)</strong> State the assumptions behind <code>n ≈ 16 p(1−p)/δ²</code>. <strong>Answer:</strong> Two-sided test at α = 0.05, 80% power, and a binary metric with variance about p(1−p) in both arms. For one-sided 5% replace 16 by about 12.4, and for 90% power by about 21.</p>
+<p><strong>13. (medium)</strong> Revenue per user has σ = 80 rupees. Detect +1.5 rupees at two-sided 5%, 80% power. Per arm? <strong>Answer:</strong> n = 15.698 × 80² / 1.5² = 15.698 × 6,400 / 2.25 = 44,653 per arm.</p>
+<p><strong>14. (medium)</strong> With the same test, a pre-period covariate has correlation 0.6 with revenue. New sample size? <strong>Answer:</strong> Variance factor 1 − 0.36 = 0.64, so n = 44,653 × 0.64 = 28,578 per arm.</p>
+<p><strong>15. (medium)</strong> Twenty metrics are all truly unaffected. What is the chance that at least one has p &lt; 0.05, if they were independent? Under Bonferroni? <strong>Answer:</strong> 1 − 0.95<sup>20</sup> = 0.642. With Bonferroni each metric uses 0.05/20 = 0.0025, so the chance is about 1 − 0.9975<sup>20</sup> = 0.049.</p>
+<p><strong>16. (hard)</strong> p-values 0.003, 0.010, 0.020, 0.030, 0.40 for five metrics. Which are significant under BH at 5%? <strong>Answer:</strong> Thresholds k × 0.05/5 = 0.01, 0.02, 0.03, 0.04, 0.05. 0.003 ≤ 0.01 yes; 0.010 ≤ 0.02 yes; 0.020 ≤ 0.03 yes; 0.030 ≤ 0.04 yes; 0.40 ≤ 0.05 no. Largest passing k = 4, so the first four are significant. Bonferroni (0.01) would keep only two (0.003 and 0.010).</p>
+<p><strong>17. (hard)</strong> (find the flaw) A ride-hailing team randomises riders 50/50 to a coupon and sees a 15% rise in trips. After a full launch trips are flat. Give the likely reason and a better design. <strong>Answer:</strong> Interference through shared supply: coupon riders take drivers that control riders would have used, so the arms are not independent worlds. Use a switchback by city-hour or randomise whole cities, and compare to the user-level result to size the bias.</p>
+<p><strong>18. (hard)</strong> (interview) "Your CTR test has 200,000 sessions per arm but only 20,000 users per arm. The z-test on sessions gives p = 0.03. Do you ship?" <strong>Answer:</strong> Not on that number. Randomisation was by user and sessions are clustered inside users, so the session-level SE is too small (in our simulation by about 23%). Recompute at user level with the delta method or a user bootstrap, check SRM at user level, and decide on the corrected interval.</p>
+<h2 id="s12-prompt-pack">Prompt pack</h2>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional at an Indian MNC moving into data science, studying one hour a day. Topic: sample size, power and MDE for an online A/B test with a yes/no metric. Explain step by step with small numbers, using the idea of how many timed deliveries you need before an average is trustworthy. Then give me a baseline of 8% and an MDE of 0.5 points and walk me through the full calculation. Finish by asking me three questions, one at a time, and check my answers before moving on.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Topic: CUPED variance reduction in A/B tests. Explain the idea with a classroom analogy, derive why variance falls by (1 - rho squared), and show a tiny numeric example I can verify by hand. Then give me 8 graded exercises, from easy to hard, without solutions, including one where the covariate is wrongly chosen. After I answer, grade me honestly.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Topic: sample ratio mismatch (SRM) and peeking in A/B tests. Quiz me one question at a time. Use realistic numbers (group sizes, chi-square, p-values, number of looks). After each answer, tell me what I got right, what I missed, and explain the correct reasoning in simple English. Start easy and get harder over 10 questions.</pre></div>
@@ -1858,6 +2086,8 @@ best possible (always the 12% offer): 1200</code></pre>
 <p><strong>The backdoor rule.</strong> A "backdoor path" is any path from <code>T</code> to <code>Y</code> that starts with an arrow INTO <code>T</code>. Here: <code>T ← Engagement → Y</code>. This path carries a false (non-causal) association. To get the true effect, block every backdoor path by adjusting for (holding fixed) a variable on it, without opening a new one.</p>
 <p>What to adjust for:</p>
 <ul><li><strong>Confounders:</strong> YES, adjust.</li><li><strong>Mediators:</strong> NO if you want the total effect, since you would remove part of the effect you are after.</li><li><strong>Colliders:</strong> NO. Adjusting for a collider creates a false link between its two causes.</li></ul>
+<figure><img src="images/ds_ch08_dag_patterns.png" alt="Three small graphs: a confounder pointing to offer and orders, a mediator between offer and orders, a collider pointed to by offer and late order" loading="lazy"/><figcaption>The three patterns that decide what you adjust for.</figcaption></figure>
+<p><strong>How to read it:</strong> an arrow means "causes". Left: the orange node sends arrows into both offer and orders, so it creates a false link and you must adjust for it. Middle: the teal node sits on the path from offer to orders, so adjusting for it removes part of the real effect. Right: the red node receives arrows from two causes, so adjusting for it (or filtering on it) invents a link between them.</p>
 <p class="problem"><span class="pl">Problem 8.1.1</span> (tiny numbers, by hand) 1,500 customers in two engagement groups.</p>
 <div class="tablewrap"><table class="data"><thead><tr><th>Group</th><th>Offer</th><th>Customers</th><th>Order rate</th></tr></thead><tbody><tr><td>Low engagement</td><td>yes</td><td>800</td><td>0.30</td></tr><tr><td>Low engagement</td><td>no</td><td>200</td><td>0.20</td></tr><tr><td>High engagement</td><td>yes</td><td>100</td><td>0.70</td></tr><tr><td>High engagement</td><td>no</td><td>400</td><td>0.60</td></tr></tbody></table></div>
 <ul><li><strong>Step 1 (naive)</strong> Treated rate = (800×0.30 + 100×0.70) / 900 = (240 + 70) / 900 = 0.3444. Control rate = (200×0.20 + 400×0.60) / 600 = (40 + 240) / 600 = 0.4667.</li><li><strong>Step 2</strong> Naive difference = 0.3444 − 0.4667 = −0.122. It says the offer HURTS by 12.2 points.</li><li><strong>Step 3 (within groups)</strong> Low group: 0.30 − 0.20 = +0.10. High group: 0.70 − 0.60 = +0.10.</li><li><strong>Step 4</strong> Average with the population weights (1,000 low and 500 high, so two thirds and one third): (2/3)(0.10) + (1/3)(0.10) = 0.10.</li><li><strong>Answer</strong> The true effect is +10 points. The naive comparison is wrong because most treated customers were low-engagement, who order less anyway.</li><li><strong>Check</strong> The sign flipped from −12 to +10. This is exactly Simpson's paradox from Chapter 4.1, now seen as confounding.</li><li><strong>Why it matters</strong> The adjustment did not use any fancy model. It compared like with like, then averaged.</li></ul>
@@ -2035,10 +2265,171 @@ uplift = m1.predict_proba(X[te])[:,1] - m0.predict_proba(X[te])[:,1]</code></pre
 <div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Evaluating an uplift model with AUC on the outcome. AUC says nothing about the effect. Use uplift-by-decile, Qini curves and a randomised holdout.</div></div>
 <p><strong>Check yourself</strong></p>
 <ol><li>Which customers should you never target? Answer: sleeping dogs (negative uplift) and, for cost reasons, sure things and lost causes.</li><li>Why can uplift modelling not be trained on any old data? Answer: you need random or well-adjusted treatment assignment, otherwise confounding contaminates the effect estimates.</li><li>What does the T-learner use? Answer: separate models for treated and controls; uplift is the difference.</li></ol>
-<h2 id="s8-chapter-recap">Chapter recap</h2>
+<h2 id="s8-8-8-meta-learners-and-double-machine-learning-in-depth">8.8 Meta-Learners and Double Machine Learning in Depth</h2>
+<p>Section 8.7 introduced uplift with one T-learner on randomised data. Real life is harder in two ways. First, the treatment is often NOT randomised, so the model must also handle confounding. Second, you need to know which learner to trust. Here we put four estimators on one dataset where we know the true individual effect, and score each by how close it gets.</p>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">The average effect answers "does it work?". The conditional effect <code>τ(x)</code> answers "for whom?". Each learner is a different way to get <code>τ(x)</code> out of ordinary prediction models: S puts treatment inside one model, T fits two models, X patches T's weakness when groups are unequal, and double ML first removes everything that confounding could explain, then fits the leftover.</div></div>
+<h3>The four recipes</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Learner</th><th>Recipe</th><th>Strength</th><th>Weakness</th></tr></thead><tbody>
+<tr><td>S</td><td>One model of <code>y</code> on <code>x</code> and <code>t</code>. Effect = prediction with <code>t=1</code> minus <code>t=0</code>.</td><td>Simple, uses all data</td><td>A regularised model can shrink the <code>t</code> effect to zero</td></tr>
+<tr><td>T</td><td>Separate models for treated and control. Effect = difference.</td><td>Cannot ignore <code>t</code></td><td>Noisy when one arm is small; the two errors do not cancel</td></tr>
+<tr><td>X</td><td>Impute each person's missing outcome with the other arm's model, fit models on those imputed gaps, blend using the propensity <code>e(x)</code>.</td><td>Better when arms are unequal</td><td>More steps; needs a good propensity</td></tr>
+<tr><td>Double ML</td><td>Predict <code>y</code> from <code>x</code> and <code>t</code> from <code>x</code> using cross-fitting. Regress the <code>y</code> residual on the <code>t</code> residual.</td><td>Robust to confounding that models can capture; has a standard error</td><td>Needs enough overlap; the effect form you regress on is a modelling choice</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 8.8.1</span> 20,000 customers. Engagement <code>x1</code> drives who gets the offer (confounding). The true effect is <code>τ = 1 + 1.5·x2</code>, so it depends only on <code>x2</code>. Compare naive, S, T, X and double ML.</p>
+<table class="steps"><tr><th>Setup</th><td><code>y = 2·x1 + x2 + τ·t + noise</code>. Offer chance is <code>sig(0.8·x1)</code>. True average effect is 1 because <code>x2</code> has mean 0.</td></tr><tr><th>Naive</th><td>Treated customers have higher <code>x1</code> and so higher <code>y</code>. The raw gap will be far above 1.</td></tr><tr><th>Cross-fitting</th><td>Split in halves. Fit the nuisance models on one half, predict the other half, and swap. This stops a flexible model from memorising the very rows it residualises.</td></tr><tr><th>DML step</th><td>Residuals <code>ry = y − ŷ(x)</code> and <code>rt = t − ê(x)</code>. Regress <code>ry</code> on <code>rt</code> and <code>rt·x2</code>. The coefficients give <code>τ(x) = a + b·x2</code>.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+from sklearn.ensemble import GradientBoostingRegressor
+from sklearn.linear_model import LinearRegression
+rng = np.random.default_rng(8)
+n = 20000
+x1, x2 = rng.normal(size=n), rng.normal(size=n)
+e = 1/(1+np.exp(-(0.8*x1)))                 # confounded treatment: x1 drives T
+t = (rng.random(n) &lt; e).astype(int)
+tau = 1.0 + 1.5*x2                          # true effect depends on x2 only
+y = 2*x1 + x2 + tau*t + rng.normal(size=n)
+X = np.c_[x1, x2]
+print("true ATE      ", round(tau.mean(), 3))
+print("naive diff    ", round(y[t==1].mean() - y[t==0].mean(), 3))
+def gb(): return GradientBoostingRegressor(n_estimators=150, max_depth=3, random_state=0)
+# S-learner
+s = gb().fit(np.c_[X, t], y)
+tau_s = s.predict(np.c_[X, np.ones(n)]) - s.predict(np.c_[X, np.zeros(n)])
+# T-learner
+m1 = gb().fit(X[t==1], y[t==1]); m0 = gb().fit(X[t==0], y[t==0])
+tau_t = m1.predict(X) - m0.predict(X)
+# X-learner
+d1 = y[t==1] - m0.predict(X[t==1]); d0 = m1.predict(X[t==0]) - y[t==0]
+g1 = gb().fit(X[t==1], d1); g0 = gb().fit(X[t==0], d0)
+tau_x = e*g0.predict(X) + (1-e)*g1.predict(X)   # true propensity used for weights
+# Double ML (partialling out, 2-fold cross-fitting)
+idx = rng.permutation(n); A, B = idx[:n//2], idx[n//2:]
+ry = np.zeros(n); rt = np.zeros(n)
+for tr, te in [(A, B), (B, A)]:
+    ry[te] = y[te] - gb().fit(X[tr], y[tr]).predict(X[te])
+    rt[te] = t[te] - gb().fit(X[tr], t[tr]).predict(X[te])
+theta = (rt*ry).sum() / (rt*rt).sum()
+# CATE by DML: regress ry on rt*[1, x2]
+Z = np.c_[rt, rt*x2]
+coef = np.linalg.lstsq(Z, ry, rcond=None)[0]
+tau_d = coef[0] + coef[1]*x2
+print(f"{'method':10s}{'mean':&gt;8s}{'RMSE':&gt;8s}{'corr':&gt;8s}")
+for name, v in [("S", tau_s), ("T", tau_t), ("X", tau_x), ("DML", tau_d)]:
+    print(f"{name:10s}{v.mean():8.3f}{np.sqrt(((v-tau)**2).mean()):8.3f}{np.corrcoef(v, tau)[0,1]:8.3f}")
+print("DML scalar theta", round(theta, 3), " DML slope on x2", round(coef[1], 3))</code></pre>
+<pre class="code lang-text"><code>true ATE       0.999
+naive diff     2.287
+method        mean    RMSE    corr
+S            0.969   0.250   0.988
+T            0.976   0.280   0.983
+X            0.969   0.171   0.994
+DML          0.965   0.039   1.000
+DML scalar theta 0.961  DML slope on x2 1.481</code></pre>
+<ul><li><strong>Step 1</strong> The naive gap is 2.287, more than double the true 0.999. Confounding inflates it.</li><li><strong>Step 2</strong> All four learners fix the average (0.965 to 0.976). The average hides the real difference between them.</li><li><strong>Step 3</strong> On individual effects, RMSE is S 0.250, T 0.280, X 0.171 and DML 0.039. DML wins here because we told it the right shape (effect linear in <code>x2</code>). With the wrong shape its advantage would shrink.</li><li><strong>Step 4</strong> DML recovers the slope: 1.481 against a true 1.5.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Comparing learners by outcome accuracy (R squared of <code>y</code>). All four predict <code>y</code> well. What matters is accuracy of the <em>difference</em>, which you can only measure on simulated data, or approximately with Qini curves and randomised holdouts on real data. A learner with great R squared can have a useless <code>τ(x)</code>.</div></div>
+<h3>Going deeper</h3>
+<ul><li><strong>Why residualise?</strong> The Frisch-Waugh idea: the part of <code>t</code> that <code>x</code> predicts is exactly the part carrying confounding. Removing it leaves variation in <code>t</code> that behaves like a coin flip given <code>x</code>. Removing the predictable part of <code>y</code> only reduces noise.</li><li><strong>Neyman orthogonality.</strong> The DML estimating equation is insensitive to small errors in the nuisance models. That is why a rough forest for <code>ŷ</code> and <code>ê</code> still gives a root-n estimate. A plain "plug in a model" approach does not have this property.</li><li><strong>Causal forests</strong> (EconML <code>CausalForestDML</code>, grf in R) are DML with a forest in the last stage that finds where the effect varies and gives per-person intervals. Not run here, since the library is not installed, but the recipe above is its core.</li><li><strong>Overlap.</strong> Where propensity is near 0 or 1, residuals of <code>t</code> are tiny and the estimate explodes. Trim to a propensity range such as 0.05 to 0.95 and say so.</li></ul>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">When a stakeholder asks for "who should get the offer", start with the T-learner on a randomised pilot (cheap, explainable). If only observational data exists, use DML or an X-learner with a checked propensity model, and always keep a small randomised holdout to validate the ranking.</div></div>
+
+<h2 id="s9-8-9-staggered-rollouts-why-two-way-fixed-effects-can-fail">8.9 Staggered Rollouts: Why Two-Way Fixed Effects Can Fail</h2>
+<p>Section 8.3 compared one treated group with one control group at one launch date. Companies rarely do that. Stores get the new checkout in waves, cities get a feature month by month. The habit is to run one regression with a unit fixed effect, a time fixed effect and a 0/1 "treated now" dummy, called two-way fixed effects (TWFE). With one launch date it equals DiD. With several launch dates and effects that change over time, it can be badly wrong, even wrong in sign.</p>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">TWFE averages many 2x2 comparisons. Some of them use units that were treated EARLIER as the "control" for units treated later. Those units are not untreated: their effect is still growing. Subtracting a growing effect from the later group's effect gives a smaller, sometimes negative, number. This is the "forbidden comparison".</div></div>
+<p class="problem"><span class="pl">Problem 8.9.1</span> 300 units over 12 periods. Cohort A (100 units) is treated from period 4 and its effect grows by 0.5 each period (0.5, 1.0, 1.5, ...). Cohort B (100 units) is treated from period 8 with a flat effect of 0.5. Cohort C (100 units) is never treated. Estimate the average effect on treated cells by TWFE and by cohort-by-cohort DiD against never-treated units.</p>
+<table class="steps"><tr><th>Truth</th><td>Average over all treated unit-periods. We compute it directly from the effects we planted.</td></tr><tr><th>TWFE</th><td>OLS with unit dummies, period dummies and the treated dummy.</td></tr><tr><th>Clean DiD</th><td>For each cohort and each period after launch, compare the change since the last pre-period for the cohort with the same change for never-treated units. Average these cells.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(1)
+U, T = 300, 12
+cohort = np.repeat([4, 8, 99], 100)             # first treated period; 99 = never treated
+ufe = rng.normal(0, 1, U); tfe = 0.3*np.arange(T)
+def effect(c, t):
+    if t &lt; c: return 0.0
+    return 0.5*(t - c + 1) if c == 4 else 0.5   # early cohort: grows; late cohort: flat 0.5
+Y = np.zeros((U, T)); E = np.zeros((U, T)); D = np.zeros((U, T))
+for u in range(U):
+    for t in range(T):
+        E[u, t] = effect(cohort[u], t); D[u, t] = t &gt;= cohort[u]
+        Y[u, t] = ufe[u] + tfe[t] + E[u, t] + rng.normal(0, 0.5)
+print("true average effect over all treated cells:", round(E[D == 1].mean(), 3))
+uu, tt = np.meshgrid(np.arange(U), np.arange(T), indexing="ij")
+Uo = (uu.ravel()[:, None] == np.arange(1, U)[None, :]).astype(float)
+To = (tt.ravel()[:, None] == np.arange(1, T)[None, :]).astype(float)
+Z = np.c_[D.ravel(), np.ones(U*T), Uo, To]
+b = np.linalg.lstsq(Z, Y.ravel(), rcond=None)[0]
+print("TWFE estimate:", round(b[0], 3))
+nv = cohort == 99; ests = []
+for c in (4, 8):
+    g = cohort == c
+    for t in range(c, T):
+        ests.append((Y[g, t] - Y[g, c-1]).mean() - (Y[nv, t] - Y[nv, c-1]).mean())
+print("cohort-by-cohort DiD vs never-treated, averaged:", round(np.mean(ests), 3))</code></pre>
+<pre class="code lang-text"><code>true average effect over all treated cells: 1.667
+TWFE estimate: 0.883
+cohort-by-cohort DiD vs never-treated, averaged: 1.703</code></pre>
+<ul><li><strong>Step 1</strong> The truth is 1.667.</li><li><strong>Step 2</strong> TWFE reports 0.883, about half. Cohort B's flat 0.5 effect is compared against cohort A, whose effect is already large and growing, which drags the estimate down.</li><li><strong>Step 3</strong> The cohort-by-cohort estimator gives 1.703, close to the truth, because it only ever compares against units that are still untreated.</li></ul>
+<figure><img src="images/ds_ch08_twfe_bias.png" alt="Bar chart: true effect 1.67, TWFE 0.88, cohort by cohort 1.70" loading="lazy"/><figcaption>The same data analysed two ways.</figcaption></figure>
+<p><strong>How to read it:</strong> the grey bar is the planted truth. The red bar is the habit that many analysts still use. The teal bar uses only clean comparisons. If your rollout is staggered and effects change over time, the red bar can be far off.</p>
+<h3>What to do in practice</h3>
+<ol><li>Plot an event study: average outcome gap by periods since launch, for each cohort. Flat lines before launch support parallel trends. Look at the shape after launch too, not just the average.</li><li>Use an estimator built for staggered timing: Callaway and Sant'Anna, Sun and Abraham, de Chaisemartin and D'Haultfoeuille, or the stacked approach. Not run here, since the packages are not installed, but the code above is the simplest version of the idea.</li><li>If everyone is eventually treated, "never treated" does not exist. Use not-yet-treated units as controls and say so.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Running one TWFE regression on a rolling launch and quoting the coefficient as "the effect". Always check whether the effect changes over time or differs between cohorts. If it does, TWFE averages with weights that can be negative.</div></div>
+
+<h2 id="s10-8-10-one-treated-unit-over-time-and-how-wrong-could-we-be">8.10 One Treated Unit Over Time, and How Wrong Could We Be?</h2>
+<h3>Counterfactual from control series (the CausalImpact idea)</h3>
+<p>A national campaign launches in one region. You have daily orders for that region and for several untouched regions. The idea: learn how the treated region moves with the controls BEFORE launch, predict what it would have done AFTER launch, and read the gap as the effect. Google's CausalImpact does this with a Bayesian structural time series. The version below uses plain regression, which teaches the same logic and runs here.</p>
+<p class="problem"><span class="pl">Problem 8.10.1</span> 100 days. Launch on day 70. Three control regions share a common trend with the treated region. The planted lift is 3 orders per day. Fit the treated series on the controls over days 0 to 69, predict days 70 to 99, and average the gap. Then do a placebo: pretend the launch was on day 50.</p>
+<table class="steps"><tr><th>Idea</th><td>Pre-period regression is the counterfactual machine. The controls must not be affected by the launch.</td></tr><tr><th>Effect</th><td>Mean of (observed − predicted) after launch.</td></tr><tr><th>Placebo</th><td>Same procedure at a fake launch date inside the pre-period. It should give about 0.</td></tr><tr><th>Interval</th><td>Rough: pre-period residual sd, doubled to allow for autocorrelation, divided by the root of the post-period length. A real tool uses a proper time-series model.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(5)
+T, T0 = 100, 70                                   # launch at day 70
+common = np.cumsum(rng.normal(0, 1, T)) + 0.05*np.arange(T)
+c1 = common + rng.normal(0, 0.8, T) + 10
+c2 = 0.8*common + rng.normal(0, 0.8, T) + 20
+c3 = 1.2*common + rng.normal(0, 0.8, T) + 5
+treated = 1.0*common + rng.normal(0, 0.8, T) + 15
+treated[T0:] += 3.0                               # true lift of 3 per day after launch
+C = np.c_[np.ones(T), c1, c2, c3]
+beta = np.linalg.lstsq(C[:T0], treated[:T0], rcond=None)[0]
+resid = treated[:T0] - C[:T0] @ beta
+sd = resid.std(ddof=4)
+cf = C[T0:] @ beta
+gap = treated[T0:] - cf
+print("pre-period fit sd:", round(sd, 3))
+print("average daily lift:", round(gap.mean(), 3))
+# placebo: pretend launch at day 50 using only days 0..69
+beta_p = np.linalg.lstsq(C[:50], treated[:50], rcond=None)[0]
+gap_p = treated[50:70] - C[50:70] @ beta_p
+print("placebo lift (days 50-69, no launch):", round(gap_p.mean(), 3))
+# rough interval: sd of the mean of gap errors, inflated for autocorrelation by 2
+se = 2*sd/np.sqrt(T-T0)
+print("approx 95% interval:", round(gap.mean()-1.96*se, 2), "to", round(gap.mean()+1.96*se, 2))</code></pre>
+<pre class="code lang-text"><code>pre-period fit sd: 0.874
+average daily lift: 2.82
+placebo lift (days 50-69, no launch): 0.02
+approx 95% interval: 2.19 to 3.45</code></pre>
+<ul><li><strong>Step 1</strong> Estimated lift is 2.82 per day against a true 3.0, with a rough interval of 2.19 to 3.45 that covers the truth.</li><li><strong>Step 2</strong> The placebo effect is 0.02, so the method does not invent effects when none exist.</li></ul>
+<figure><img src="images/ds_ch08_counterfactual.png" alt="Observed line rises above a dashed counterfactual band after launch" loading="lazy"/><figcaption>Observed region against the counterfactual built from three control regions.</figcaption></figure>
+<p><strong>How to read it:</strong> before the dotted launch line, the two lines hide each other, which is what a good fit means. After launch the solid blue line lifts away from the dashed orange line. The shaded band is the plausible range for the counterfactual. A gap inside the band is not convincing.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using controls that the launch also touched (for example a neighbouring region where customers saw the same ads). The model then learns the effect into the counterfactual and reports a smaller lift. Also never fit on the post-period.</div></div>
+<h3>Sensitivity analysis: how strong would a hidden confounder have to be?</h3>
+<p>Every observational estimate carries one unprovable assumption: no unmeasured confounding. You cannot prove it, but you can say how strong a hidden confounder would have to be to explain the result away. The <strong>E-value</strong> (VanderWeele and Ding) does that for a risk ratio <code>RR</code>:</p>
+<div class="eq">E-value = RR + √( RR × (RR − 1) )  (use 1/RR first if RR &lt; 1)</div>
+<p class="problem"><span class="pl">Problem 8.10.2</span> An observational study finds that customers who used the new feature are 1.8 times as likely to renew (RR = 1.8, 95% interval lower limit 1.3). How strong must a hidden confounder be?</p>
+<table class="steps"><tr><th>By hand, point</th><td>1.8 + √(1.8 × 0.8) = 1.8 + √1.44 = 1.8 + 1.2 = 3.0</td></tr><tr><th>By hand, limit</th><td>1.3 + √(1.3 × 0.3) = 1.3 + 0.6245 = 1.924</td></tr><tr><th>Meaning</th><td>A hidden factor would need to be associated with both feature use and renewal by a risk ratio of at least 3.0 each (beyond what you adjusted for) to fully explain the point estimate, or 1.92 to move the interval to include 1.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+def evalue(rr):
+    rr = 1/rr if rr &lt; 1 else rr
+    return rr + np.sqrt(rr*(rr-1))
+print("E-value for RR 1.8:", round(evalue(1.8), 3))
+print("E-value for CI limit 1.3:", round(evalue(1.3), 3))
+print("E-value for RR 0.5:", round(evalue(0.5), 3))</code></pre>
+<pre class="code lang-text"><code>E-value for RR 1.8: 3.0
+E-value for CI limit 1.3: 1.924
+E-value for RR 0.5: 3.414</code></pre>
+<p>The code agrees with the hand calculation. For a protective effect, RR = 0.5 is treated as 2, giving 3.414.</p>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Compare the E-value to the strongest confounder you actually measured. If "tenure" has an association of 1.5 with renewal and feature use, a hidden factor of 3.0 is unlikely to be much stronger than tenure. A low E-value (say 1.2) means the finding is fragile whatever else you do.</div></div>
+<h3>Check yourself</h3>
+<ol><li>When does an S-learner underperform? Answer: when regularisation or tree depth lets the model ignore <code>t</code>, so the effect shrinks toward zero.</li><li>Why does cross-fitting matter? Answer: without it, the nuisance model has seen the rows it residualises and overfitting leaks into the effect estimate.</li><li>Your controls were also exposed to the campaign. What happens? Answer: the counterfactual absorbs part of the effect and the lift is understated.</li></ol>
+<h2 id="s11-chapter-recap">Chapter recap</h2>
 <ul><li>Causal questions ask "what if we do X", which prediction cannot answer. Confounding makes naive comparisons wrong, even in sign.</li><li>Draw a DAG first. Adjust for confounders, not for mediators or colliders.</li><li>Propensity score <code>e(x) = P(T=1|x)</code> summarises how treatment was assigned. Weighting by <code>1/e</code> and <code>1/(1−e)</code> rebuilds a fair comparison.</li><li>Check overlap and balance (SMD &lt; 0.1). Compare several methods; doubly robust estimators are safer.</li><li>Difference-in-differences needs parallel trends; check the pre-period and run placebo tests.</li><li>Synthetic control builds a weighted twin of one treated unit; judge it by pre-fit and placebo ranking.</li><li>Regression discontinuity compares customers just above and below a rule; report several window sizes.</li><li>IV needs relevance, independence and exclusion; report the first-stage F; the answer is for compliers.</li><li>Uplift models target the people whose behaviour changes; judge them by observed uplift per decile and Qini, not AUC.</li><li>Every method rests on assumptions you must state. Run sensitivity analysis for hidden confounders.</li></ul>
 <div class="tablewrap"><table class="data"><thead><tr><th>Method</th><th>Use when</th><th>Key assumption</th><th>Quick check</th></tr></thead><tbody><tr><td>Adjustment / IPW / AIPW</td><td>All confounders measured</td><td>No unmeasured confounding, overlap</td><td>SMD, propensity range</td></tr><tr><td>DiD</td><td>Treated and control groups, before and after</td><td>Parallel trends</td><td>Pre-trends, placebo</td></tr><tr><td>Synthetic control</td><td>One or few treated units</td><td>Pre-fit good, donors unaffected</td><td>Pre RMSE, placebo rank</td></tr><tr><td>RD</td><td>Rule with a cut-off</td><td>No manipulation, smooth otherwise</td><td>Histogram, window sweep</td></tr><tr><td>IV</td><td>Hidden confounding plus a random lever</td><td>Relevance, independence, exclusion</td><td>First-stage F</td></tr><tr><td>Uplift</td><td>Who to target</td><td>Random or adjusted assignment</td><td>Decile uplift, Qini</td></tr></tbody></table></div>
-<h2 id="s9-practice-set">Practice set</h2>
+<h2 id="s12-practice-set">Practice set</h2>
 <p><strong>1. (easy)</strong> Treated customers ordered at 40%, controls at 30%, but treated customers were twice as engaged on average. Can you call the 10-point gap the effect? <strong>Answer:</strong> No. Engagement likely confounds; adjust for it or randomise.</p>
 <p><strong>2. (easy)</strong> IPW weight for a control customer whose propensity is 0.75? <strong>Answer:</strong> 1/(1 − 0.75) = 4.</p>
 <p><strong>3. (easy)</strong> Treated sales went from 50 to 70; control from 40 to 52. DiD? <strong>Answer:</strong> (70 − 50) − (52 − 40) = 20 − 12 = 8.</p>
@@ -2051,7 +2442,12 @@ uplift = m1.predict_proba(X[te])[:,1] - m0.predict_proba(X[te])[:,1]</code></pre
 <p><strong>10. (hard)</strong> Uplift: the average effect of an offer is +1 point, but the top decile shows +30 and the bottom decile −20. Costs: offer ₹50, order margin ₹400. Is it worth targeting the top decile? <strong>Answer:</strong> Expected gain per customer = 0.30 × 400 − 50 = ₹70. Yes. In the bottom decile it is −0.20 × 400 − 50 = −₹130, so never target.</p>
 <p><strong>11. (interview)</strong> "How would you measure the impact of a feature launched to everyone at once?" <strong>Answer:</strong> Check whether a control exists (a holdout, a staggered rollout, regions launched later). Use DiD, synthetic control or interrupted time series; state the assumptions and the checks. Recommend a holdout next time.</p>
 <p><strong>12. (interview)</strong> "Your regression says discount users spend more. Does the discount work?" <strong>Answer:</strong> Not necessarily. Customers who receive discounts may differ (confounding). Draw a DAG, adjust with propensity methods or find a quasi-experiment, check balance, and run a sensitivity analysis. Best: a randomised test.</p>
-<h2 id="s10-prompt-pack">Prompt pack</h2>
+<p><strong>13. (medium)</strong> Propensity for a treated customer is 0.02. What IPW weight does that customer get and why is it a worry? <strong>Answer:</strong> 1/0.02 = 50. One customer counts as 50, so the estimate swings on a single row. Trim propensities (for example to 0.05 to 0.95), use stabilised or capped weights, or narrow the population.</p>
+<p><strong>14. (medium)</strong> E-value for RR = 2.5. <strong>Answer:</strong> 2.5 + √(2.5 × 1.5) = 2.5 + √3.75 = 2.5 + 1.936 = 4.436. A hidden confounder would need an association of about 4.4 with both treatment and outcome.</p>
+<p><strong>15. (hard, find the bug)</strong> A team rolled a feature out in three waves, ran a TWFE regression and got an effect of 0.2 that is significant, though every wave's own before-after chart shows an effect near 1.0 that keeps growing. What is the likely cause and the fix? <strong>Answer:</strong> Later waves are compared with earlier, already treated waves whose effect is growing, which pulls the TWFE coefficient down. Use an estimator with clean comparisons (never-treated or not-yet-treated controls), and report an event study.</p>
+<p><strong>16. (hard, code)</strong> In the counterfactual example, what happens to the estimated lift if you add the post-launch days to the regression fit? <strong>Answer:</strong> The model can bend toward the treated series after launch, so the predicted counterfactual moves up and the gap shrinks, often to near zero. Only the pre-period may be used for fitting.</p>
+<p><strong>17. (interview)</strong> "How would you decide between a T-learner and double ML for targeting?" <strong>Answer:</strong> With randomised data and a big sample, a T-learner is fine, easy to explain and checkable on a holdout. With observational data, use double ML or an X-learner that handles confounding through the propensity, check overlap, and validate the resulting ranking on a randomised test before spending budget.</p>
+<h2 id="s13-prompt-pack">Prompt pack</h2>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional at an Indian MNC moving into data science, studying one hour a day. Topic: confounding, DAGs and the backdoor rule in causal inference. Explain with an everyday analogy, then with a retention-offer example where engagement is the confounder. Use small numbers I can verify by hand to show Simpson's paradox flipping a result. Then ask me to draw a DAG for a new scenario and check my answer, including which variables to adjust for and which not to.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Topic: propensity scores, inverse probability weighting and balance checks (SMD). Walk me through a tiny hand-computable example, then a Python example with synthetic data that has a known true effect. Then give me 8 graded exercises without solutions, including overlap problems and extreme weights. After I answer, grade me and explain my errors in simple English.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Topic: difference-in-differences and synthetic control for business launches. Quiz me one question at a time using realistic scenarios (store pilots, city launches). After each answer, tell me what I got right, what I missed, and which assumption I should have checked (parallel trends, placebo tests, pre-fit). Start easy and get harder over 10 questions.</pre></div>
@@ -2189,10 +2585,165 @@ Regression (Prophet-style)     19.50                  19.87       20.60</code></
 <div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Handing the business a single "most likely" number and forgetting that decisions are asymmetric. Always ask "what does it cost to be 10% too low, and 10% too high?"</div></div>
 <p><strong>Check yourself</strong></p>
 <ol><li>What do you check after building a prediction interval? Answer: its coverage on held-out data.</li><li>Costs: missed sale ₹30, leftover ₹10. Critical ratio? Answer: 30 / 40 = 0.75.</li><li>Why separate bias from error? Answer: a forecast can have small errors but always lean the same way, which costs money systematically.</li></ol>
-<h2 id="s5-chapter-recap">Chapter recap</h2>
+<h2 id="s5-9-5-hierarchies-making-forecasts-add-up">9.5 Hierarchies: Making Forecasts Add Up</h2>
+<p>A retailer forecasts sales for each store, and also for the whole company. If you build each forecast on its own, the store forecasts will not add up to the company forecast. Finance sees two different totals and loses trust. <strong>Forecast reconciliation</strong> adjusts all the forecasts together so that parts sum to the whole, and, done well, it also improves accuracy.</p>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Three friends estimate a bill. Two guess their own shares (40 and 55) and the third guesses the total (105). The shares add to 95. Somebody is wrong, but you do not know who. Reconciliation spreads the 10 gap across all three guesses, so that the numbers agree and every guess moves a little.</div></div>
+<h3>The summing matrix</h3>
+<p>Write the hierarchy as <code>y = S · b</code>, where <code>b</code> is the vector of bottom-level series (stores) and <code>S</code> is a 0/1 matrix that says how the upper levels are sums. For Total = A + B, S has rows Total (1, 1), A (1, 0) and B (0, 1). Given base forecasts <code>ŷ</code> for every row, the reconciled forecasts are <code>ỹ = S · G · ŷ</code>.</p>
+<ul><li><strong>Bottom-up:</strong> <code>G</code> keeps only the bottom forecasts. Totals are sums of stores. Simple, but total noise grows.</li><li><strong>Top-down:</strong> <code>G</code> splits the total by historical shares. Good totals, poor details.</li><li><strong>OLS and MinT:</strong> <code>G = (SᵀWS)⁻¹ Sᵀ W</code> with <code>W</code> a weight matrix. OLS uses identity weights. MinT (minimum trace) uses the covariance of forecast errors and, among all unbiased reconciliations, gives the smallest total error variance.</li></ul>
+<p class="problem"><span class="pl">Problem 9.5.1</span> Base forecasts: Total 105, A 40, B 55. Reconcile by bottom-up and by OLS, by hand and in code.</p>
+<table class="steps"><tr><th>Bottom-up</th><td>A = 40, B = 55, Total = 95. The total forecast of 105 is thrown away.</td></tr><tr><th>OLS, step 1</th><td>SᵀS = [[2,1],[1,2]]. Sᵀŷ = [105+40, 105+55] = [145, 160].</td></tr><tr><th>OLS, step 2</th><td>(SᵀS)⁻¹ = (1/3)[[2,−1],[−1,2]]. b̃ = (1/3)[2·145 − 160, −145 + 2·160] = (1/3)[130, 175] = [43.33, 58.33].</td></tr><tr><th>OLS, step 3</th><td>Total = 43.33 + 58.33 = 101.67. The 10 gap is split: the total drops 3.33 and each part rises 3.33.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+# Part 1: tiny hand example. Total = A + B, but base forecasts disagree.
+S = np.array([[1, 1], [1, 0], [0, 1]], float)           # rows: Total, A, B
+yhat = np.array([105., 40., 55.])
+bu = S @ yhat[1:]
+G = np.linalg.inv(S.T @ S) @ S.T                          # OLS reconciliation
+ols = S @ G @ yhat
+print("base       ", yhat, " sum of parts =", yhat[1] + yhat[2])
+print("bottom-up  ", bu)
+print("OLS recon  ", np.round(ols, 3))
+# Part 2: simulation. 6 stores, shared weekly pattern; base forecasts are noisy and incoherent.
+rng = np.random.default_rng(2)
+m, T, H = 6, 140, 28
+level = rng.uniform(40, 120, m)
+t = np.arange(T + H)
+dow = np.array([0.9, 0.95, 1.0, 1.0, 1.05, 1.2, 0.9])[t % 7]
+Y = level[:, None] * dow * (1 + 0.002*t) + rng.normal(0, 1, (m, T + H)) * np.sqrt(level)[:, None] * 1.5
+tot = Y.sum(0)
+def seas_naive(y):                                        # last observed week repeated
+    return np.tile(y[T - 7:T], H // 7)
+def ma_scaled(y):                                         # smooth level times weekday shape
+    return y[T - 28:T].mean() * dow[T:T + H] / dow[T - 28:T].mean()
+base_b = np.array([seas_naive(Y[i]) for i in range(m)])
+base_t = ma_scaled(tot)                                   # a different method for the total, so totals disagree
+Sfull = np.vstack([np.ones(m), np.eye(m)])
+yh = np.vstack([base_t, base_b])                          # (1+m) x H
+G = np.linalg.inv(Sfull.T @ Sfull) @ Sfull.T
+rec = Sfull @ G @ yh
+bu = Sfull @ base_b
+actual = np.vstack([tot[T:], Y[:, T:]])
+def mae(f, rows): return np.abs(f[rows] - actual[rows]).mean()
+print(f"{'method':12s}{'total MAE':&gt;10s}{'store MAE':&gt;10s}")
+for name, f in [("base", yh), ("bottom-up", bu), ("OLS recon", rec)]:
+    print(f"{name:12s}{mae(f, [0]):10.2f}{mae(f, list(range(1, m + 1))):10.2f}")
+print("gap in base total vs sum of stores (mean abs):", round(np.abs(yh[0] - yh[1:].sum(0)).mean(), 2))
+print("gap after reconciliation:", round(np.abs(rec[0] - rec[1:].sum(0)).max(), 6))</code></pre>
+<pre class="code lang-text"><code>base        [105.  40.  55.]  sum of parts = 95.0
+bottom-up   [95. 40. 55.]
+OLS recon   [101.667  43.333  58.333]
+method       total MAE store MAE
+base             31.58     13.56
+bottom-up        43.11     13.56
+OLS recon        32.68     12.92
+gap in base total vs sum of stores (mean abs): 16.34
+gap after reconciliation: 0.0</code></pre>
+<ul><li><strong>Step 1</strong> The hand result [101.667, 43.333, 58.333] matches the code.</li><li><strong>Step 2</strong> In the six-store simulation, base total MAE is 31.58 and store MAE 13.56. Bottom-up makes the total worse (43.11) because each store's forecast is a noisy copy of last week and the noise adds up. OLS reconciliation cuts the store MAE to 12.92 and holds the total at 32.68, and every forecast now adds up exactly.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Assuming reconciliation always improves every level. Here the total got slightly worse (31.58 to 32.68) while stores improved. You pick the method by the level the decision depends on, and you judge it on a rolling-origin backtest at that level.</div></div>
+<h3>Going deeper</h3>
+<ul><li>MinT needs a covariance matrix of forecast errors that is big for large hierarchies (thousands of SKUs). Practical versions use the diagonal ("WLS") or a shrunk covariance.</li><li>Coherence is not accuracy. Reconciliation only helps when the base forecasts carry independent information at different levels.</li><li>Grouped hierarchies (region by product, with two ways to roll up) and temporal hierarchies (daily, weekly, monthly) use the same <code>S</code> idea. In Python see <code>hierarchicalforecast</code>, not installed here.</li></ul>
+
+<h2 id="s6-9-6-intermittent-demand-croston-tsb-and-the-trap-of-mae">9.6 Intermittent Demand: Croston, TSB and the Trap of MAE</h2>
+<p>Spare parts, slow SKUs and rare events have many days of zero demand and occasional spikes. Standard methods smooth these badly: they forecast a small number every day, and the usual error metric then rewards the wrong answer.</p>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Split demand into two simple questions: how often does it happen, and how big is it when it does? Croston smooths the size and the gap between demands separately and divides: forecast = size / interval. TSB smooths the chance of demand on every day, so the forecast can decay when demand dries up (Croston cannot).</div></div>
+<p class="problem"><span class="pl">Problem 9.6.1</span> 400 days. Demand happens on 20% of days and the size is 1 plus a Poisson(4) draw. Use days 1 to 300 to forecast days 301 to 400 with a flat forecast. Compare zero, last value, mean, 28-day average, Croston, Croston with the SBA bias correction, and TSB.</p>
+<table class="steps"><tr><th>Croston</th><td>On a demand day, update size <code>z</code> and interval <code>p</code> by exponential smoothing (alpha 0.1). Forecast = z / p. SBA multiplies by (1 − alpha/2) because Croston is biased upward.</td></tr><tr><th>TSB</th><td>Update demand probability every day. On demand days also update size. Forecast = probability × size.</td></tr><tr><th>Score</th><td>MAE, RMSE and bias against the 100 test days.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(4)
+n, split = 400, 300
+occur = rng.random(n) &lt; 0.2                               # demand happens on 20% of days
+size = rng.poisson(4, n) + 1                              # size when it happens, 1 or more
+d = np.where(occur, size, 0).astype(float)
+train, test = d[:split], d[split:]
+print("share of zero days:", round((d == 0).mean(), 3), " mean demand/day:", round(d.mean(), 3))
+def croston(y, a=0.1, sba=False):
+    z = None; p = None; q = 1
+    for v in y:
+        if v &gt; 0:
+            if z is None: z, p = v, q
+            else: z += a*(v - z); p += a*(q - p)
+            q = 1
+        else: q += 1
+    f = z / p
+    return f * (1 - a/2) if sba else f
+def tsb(y, a=0.1, b=0.1):
+    prob = (y &gt; 0).mean(); z = y[y &gt; 0][0]
+    for v in y:
+        prob += b*((v &gt; 0) - prob)
+        if v &gt; 0: z += a*(v - z)
+    return prob * z
+fc = {"zero (median)": 0.0, "last value": train[-1], "mean of all": train.mean(),
+      "moving avg 28": train[-28:].mean(), "Croston": croston(train),
+      "Croston SBA": croston(train, sba=True), "TSB": tsb(train)}
+print(f"{'method':16s}{'forecast':&gt;9s}{'MAE':&gt;7s}{'RMSE':&gt;7s}{'bias':&gt;8s}")
+for k, f in fc.items():
+    e = f - test
+    print(f"{k:16s}{f:9.3f}{np.abs(e).mean():7.3f}{np.sqrt((e**2).mean()):7.3f}{e.mean():8.3f}")
+print("actual mean in test:", round(test.mean(), 3))</code></pre>
+<pre class="code lang-text"><code>share of zero days: 0.838  mean demand/day: 0.848
+method           forecast    MAE   RMSE    bias
+zero (median)       0.000  1.170  2.696  -1.170
+last value          6.000  5.090  5.406   4.830
+mean of all         0.740  1.584  2.467  -0.430
+moving avg 28       0.571  1.490  2.502  -0.599
+Croston             0.726  1.576  2.470  -0.444
+Croston SBA         0.689  1.556  2.476  -0.481
+TSB                 0.796  1.616  2.458  -0.374
+actual mean in test: 1.17</code></pre>
+<ul><li><strong>Step 1</strong> A forecast of exactly zero has the best MAE (1.170), because the median of a series that is mostly zeros is zero. A forecast that says "no demand ever" would be useless for stocking.</li><li><strong>Step 2</strong> RMSE and bias reward honest forecasts of the mean. TSB has the best RMSE (2.458) and the smallest bias (−0.374). The test days happened to average 1.17, above the training mean, so every method sits below.</li><li><strong>Step 3</strong> "Last value" is terrible (MAE 5.09) because the last day happened to be a 6.</li></ul>
+<figure><img src="images/ds_ch09_intermittent.png" alt="Bars of intermittent demand with horizontal lines for different flat forecasts" loading="lazy"/><figcaption>Test-period demand and three flat forecasts.</figcaption></figure>
+<p><strong>How to read it:</strong> most bars are missing because demand is zero on most days. The red line at zero touches most of the data, so it wins on average distance. The blue line sits at the average demand, which is what a planner needs to stock correctly.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Judging an intermittent forecast by MAE or MAPE. MAE crowns the zero forecast and MAPE divides by zero. Use RMSE or bias on the mean, or better, a quantile (pinball) loss on the stocking quantile, or the cost of the resulting stock decision.</div></div>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">The right metric depends on what the forecast is used for. A flat mean forecast is correct for expected total demand over a lead time. A high quantile is correct for how much stock to hold.</div></div>
+
+<h2 id="s7-9-7-honest-intervals-conformal-prediction-and-pinball-loss">9.7 Honest Intervals: Conformal Prediction and Pinball Loss</h2>
+<p>Section 9.4 built intervals from backtest percentiles. <strong>Split conformal prediction</strong> formalises that idea and gives a coverage promise under minimal assumptions. Hold out a calibration set. Compute the absolute errors of the model on it. Take the (1 − α)(n + 1)/n quantile of these errors, call it <code>q</code>. The interval is <code>forecast ± q</code>. If calibration and future errors are exchangeable, the interval covers the truth at least 90% of the time for α = 0.1.</p>
+<p class="problem"><span class="pl">Problem 9.7.1</span> 500 days with a trend, weekly cycle, and noise that slowly grows. Train on days 1 to 300, calibrate on 301 to 400, test on 401 to 500. Compare the conformal interval to a normal interval built from training residuals. Then compute the pinball loss.</p>
+<table class="steps"><tr><th>Step 1</th><td>Fit a linear model with trend plus weekly sine and cosine.</td></tr><tr><th>Step 2</th><td>Calibration errors give <code>q</code> as the ⌈101 × 0.9⌉ = 91st smallest error.</td></tr><tr><th>Step 3</th><td>Count test coverage for both intervals.</td></tr><tr><th>Step 4</th><td>Pinball loss at q = 0.9 for the upper bound; hand check on three numbers: errors (actual − forecast) of −2, 8, 18 cost 0.2, 7.2, 16.2, mean 7.867.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+from sklearn.linear_model import LinearRegression
+rng = np.random.default_rng(6)
+n = 500
+t = np.arange(n)
+y = 200 + 0.2*t + 25*np.sin(2*np.pi*t/7) + rng.normal(0, 8, n) * (1 + 0.004*t)   # noise grows a little
+X = np.c_[t, np.sin(2*np.pi*t/7), np.cos(2*np.pi*t/7)]
+tr, ca, te = slice(0, 300), slice(300, 400), slice(400, 500)           # train, calibration, test (time order)
+m = LinearRegression().fit(X[tr], y[tr])
+res = np.abs(y[ca] - m.predict(X[ca]))
+k = int(np.ceil((len(res) + 1) * 0.9))
+q = np.sort(res)[k - 1]                                  # 90% conformal half-width
+pred = m.predict(X[te])
+inside = (y[te] &gt;= pred - q) &amp; (y[te] &lt;= pred + q)
+print("conformal half-width:", round(q, 2))
+print("coverage on test: ", round(inside.mean(), 3), "(target 0.90)")
+# naive normal interval from training residual sd
+sd = (y[tr] - m.predict(X[tr])).std()
+inside_n = np.abs(y[te] - pred) &lt;= 1.645*sd
+print("normal interval half-width:", round(1.645*sd, 2), " coverage:", round(inside_n.mean(), 3))
+# pinball loss for the 0.9 quantile
+def pinball(a, f, qq): e = a - f; return np.mean(np.maximum(qq*e, (qq-1)*e))
+up = pred + q
+print("pinball q=0.9 for the upper bound:", round(pinball(y[te], up, 0.9), 3))
+print("pinball q=0.9 for the point forecast:", round(pinball(y[te], pred, 0.9), 3))
+# hand check with 3 numbers
+a = np.array([10., 20., 30.]); f = np.array([12., 12., 12.])
+print("hand check pinball q=0.9:", round(pinball(a, f, 0.9), 3))</code></pre>
+<pre class="code lang-text"><code>conformal half-width: 31.96
+coverage on test:  0.84 (target 0.90)
+normal interval half-width: 21.37  coverage: 0.65
+pinball q=0.9 for the upper bound: 4.169
+pinball q=0.9 for the point forecast: 9.616
+hand check pinball q=0.9: 7.867</code></pre>
+<ul><li><strong>Step 1</strong> The normal interval is too narrow and covers only 65% instead of 90%, because training residuals are smaller than the future ones (noise grew).</li><li><strong>Step 2</strong> The conformal half-width of 31.96 lifts coverage to 84%. It is better because it was calibrated on later data, but it still misses 90% because noise keeps growing, which breaks the exchangeability promise.</li><li><strong>Step 3</strong> The pinball loss of the upper bound is 4.169 and the point forecast scores 9.616 as a 0.9 quantile, so the interval edge is a far better 90th percentile than the plain forecast.</li></ul>
+<figure><img src="images/ds_ch09_conformal.png" alt="Actual series with a wider blue conformal band and a narrower orange normal band" loading="lazy"/><figcaption>Conformal band (blue) and normal band (orange) on the last 100 days.</figcaption></figure>
+<p><strong>How to read it:</strong> the black line is the truth. Whenever it leaves a band, that day is a miss. The narrow orange band lets the line escape often, in particular late on when noise has grown. The blue band is wider and misses less, but the drift in noise shows at the right edge.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Calibrating on random rows of a time series, or on old data, and promising 90%. Calibrate on the most recent window, refresh it regularly, and measure live coverage. When error size changes with time or level, use a scaled error (error divided by a local scale) or a rolling calibration window.</div></div>
+<h3>Going deeper</h3>
+<ul><li><strong>Adaptive conformal</strong> (ACI) nudges the target level after every miss, restoring long-run coverage when the data drift.</li><li><strong>Pinball loss</strong> is the proper scoring rule for a quantile. Averaging it over several quantiles approximates CRPS, the standard score for a full predictive distribution. A model that gives only the median gets only one pinball loss.</li><li><strong>Marginal versus conditional coverage.</strong> Conformal gives 90% on average over days, not 90% on each day. Weekends can be under-covered while weekdays are over-covered. Check coverage by weekday and by size bucket.</li></ul>
+<h2 id="s8-chapter-recap">Chapter recap</h2>
 <ul><li>A series has level, trend, seasonality, events and noise. Decompose it to see them.</li><li>Always run baselines first: naive, seasonal naive, moving average, drift. Seasonal naive halved our error (87.6 to 37.0).</li><li>Pick metrics that suit the data: MAE and WAPE for volumes, MASE across series, avoid MAPE near zero, track bias.</li><li>Differencing and the ACF reveal trend and seasonality; use seasonal differencing for weekly cycles.</li><li>ETS (Holt-Winters), SARIMA and Prophet-style regressions are strong, cheap workhorses. Give models the calendar.</li><li>ML with lag features needs <code>shift</code> before <code>rolling</code>, and shines with many series and external features, not necessarily on one short series.</li><li>Validate with walk-forward backtests over many origins, report error by horizon. Never random k-fold.</li><li>Give a prediction interval, and check its coverage; ours claimed 80% and covered 77%.</li><li>Decisions need quantiles: newsvendor critical ratio and safety stock turn a forecast into an order.</li><li>Anomaly detection, hierarchies, intermittent demand and cold start have their own tools.</li></ul>
 <div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Formula or pattern</th></tr></thead><tbody><tr><td>Seasonal naive</td><td><code>f(t+h) = y(t+h−m)</code></td></tr><tr><td>SES</td><td><code>level = α·y + (1−α)·level</code></td></tr><tr><td>WAPE</td><td>`Σ</td></tr><tr><td>MASE</td><td><code>MAE / MAE(naive on train)</code></td></tr><tr><td>Difference</td><td><code>y(t) − y(t−1)</code>, seasonal <code>y(t) − y(t−m)</code></td></tr><tr><td>Lag features</td><td><code>shift(k)</code>, <code>shift(1).rolling(w).mean()</code></td></tr><tr><td>Backtest</td><td>Train to origin, forecast h, roll origin forward</td></tr><tr><td>Empirical interval</td><td>Percentiles of backtest relative errors</td></tr><tr><td>Newsvendor</td><td>Order = quantile at <code>c_under / (c_under + c_over)</code></td></tr><tr><td>Safety stock</td><td><code>z · σ_daily · √lead time</code></td></tr></tbody></table></div>
-<h2 id="s6-practice-set">Practice set</h2>
+<h2 id="s9-practice-set">Practice set</h2>
 <p><strong>1. (easy)</strong> Seasonal naive on daily data with m = 7: forecast for next Tuesday if last Tuesday was 120? <strong>Answer:</strong> 120.</p>
 <p><strong>2. (easy)</strong> SES with α = 0.3, previous level 50, new observation 60. New level? <strong>Answer:</strong> 0.3 × 60 + 0.7 × 50 = 18 + 35 = 53.</p>
 <p><strong>3. (easy)</strong> Actuals 50 and 150, forecasts 60 and 120. Compute the WAPE. <strong>Answer:</strong> (10 + 30) / 200 = 20%.</p>
@@ -2205,7 +2756,12 @@ Regression (Prophet-style)     19.50                  19.87       20.60</code></
 <p><strong>10. (hard)</strong> A model has MAPE 8% but a bias of +12% (always over-forecasts). Is it fine? <strong>Answer:</strong> No. Errors of 8% that always lean 12% high mean systematic over-stocking. Investigate (maybe it learns promotion periods wrongly); fix or de-bias, and measure bias separately.</p>
 <p><strong>11. (interview)</strong> "Your LightGBM forecast loses to seasonal naive on the backtest. What do you do?" <strong>Answer:</strong> Report it honestly. Check leakage in features, whether trend or level shifts break the tree model, try differencing the target or predicting the ratio to last week's value, add calendar and promotion features, then compare again. If still behind, ship the baseline.</p>
 <p><strong>12. (interview)</strong> "How do you turn a demand forecast into an inventory decision?" <strong>Answer:</strong> Get a probabilistic forecast, estimate the costs of stockout and overstock, set order quantity at the critical-ratio quantile, add safety stock for lead time uncertainty, and monitor realised service level and bias.</p>
-<h2 id="s7-prompt-pack">Prompt pack</h2>
+<p><strong>13. (easy)</strong> Store A forecast 70, store B forecast 30, total forecast 110. Bottom-up total? <strong>Answer:</strong> 70 + 30 = 100. The base total of 110 is discarded.</p>
+<p><strong>14. (medium)</strong> Pinball loss at q = 0.8 for actual 50 and forecast 40, then forecast 60. <strong>Answer:</strong> 40 is below actual, error +10, loss 0.8 × 10 = 8. 60 is above actual, error −10, loss (0.8 − 1)(−10) = 2. Under-forecasting is four times as costly, matching a 0.8 quantile.</p>
+<p><strong>15. (medium, find the bug)</strong> A team reports a MAPE of 12% on a spare-parts series where 85% of days are zero. What is wrong? <strong>Answer:</strong> MAPE divides by the actual, which is zero on most days, so it is undefined or has been computed only on non-zero days, which hides the stock-out problem. Use RMSE, bias or a stocking-cost metric.</p>
+<p><strong>16. (hard)</strong> With 49 calibration errors, what rank gives the 80% split-conformal half-width? <strong>Answer:</strong> ⌈(49 + 1) × 0.8⌉ = ⌈40⌉ = 40, so the 40th smallest absolute error.</p>
+<p><strong>17. (interview)</strong> "Your 95% intervals cover only 80% in production. What do you check?" <strong>Answer:</strong> Whether calibration data are recent and the same distribution as production (drift, new promotions, a new product mix), whether errors grow with the level (use scaled errors), whether coverage differs by segment or weekday, and whether the model changed after calibration. Recalibrate on a recent window and monitor live coverage.</p>
+<h2 id="s10-prompt-pack">Prompt pack</h2>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional at an Indian MNC moving into data science, studying one hour a day. Topic: forecasting baselines (naive, seasonal naive, moving average, drift) and error metrics (MAE, RMSE, MAPE, WAPE, MASE, bias). Explain each with a daily orders example and small numbers, show when MAPE fails, and then give me 8 graded exercises without solutions. Wait for my answers, then grade them and explain every mistake in simple English.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Topic: exponential smoothing (SES, Holt, Holt-Winters), differencing and the ACF for daily data with weekly seasonality. Explain the idea with an everyday analogy, walk through one SES update by hand, show how to read an ACF, then quiz me one question at a time. Use simple English and check my understanding before moving on.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data science. Topic: building lag and rolling features for ML forecasting and validating with walk-forward backtesting. Here is my feature code: [PASTE HERE]. Review it for leakage (shift before rolling, future-known features), explain every problem in plain English, show the corrected code, and design a rolling-origin backtest for it with horizon-specific errors.</pre></div>
@@ -2682,10 +3238,246 @@ day hits limit 122.7 from day 90 = 32.7
 <div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Averaging waiting times. Averages hide the tail: a few customers who wait two hours matter more than a mean of 12 minutes. Report p50, p90, p99, and when you combine groups, combine the raw records, not the percentiles of percentiles.</div></div>
 <p><strong>Check yourself</strong></p>
 <ol><li>200 patients are in a hospital and each stays 0.5 hours on average. What is the admission rate? Answer: λ = L / W = 200 / 0.5 = 400 patients per hour.</li><li>Why does a rolling median beat a global threshold for a daily-cycle metric? Answer: It compares each point to its own recent level, so the daily peak is not flagged.</li><li>Why give a date interval for the capacity limit? Answer: The trend line has uncertainty; the bootstrap shows a range so planning can use the early end.</li></ol>
-<h2 id="s7-chapter-recap">Chapter recap</h2>
+<h2 id="s7-11-7-survival-regression-who-churns-sooner-and-by-how-much">11.7 Survival Regression: Who Churns Sooner, and by How Much</h2>
+<p>Kaplan-Meier (Section 11.1) gives one curve per group. It cannot say "how much does being on the pro plan change the risk, holding region and age fixed?". For that you need a model of the <strong>hazard</strong>: the chance that a customer who is still active at the start of month <code>t</code> churns during month <code>t</code>. Two practical routes are the discrete-time model (a logistic regression on a stacked table) and the Cox model (a regression on the hazard ratio that never specifies the baseline shape).</p>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of a leaky bucket per customer. Each month the bucket either drains completely (churn) or survives. The hazard is the chance it drains this month, given it has not yet. A covariate such as "pro plan" makes the hole smaller or bigger for everyone in that group by the same <em>factor</em>. That factor is the hazard ratio.</div></div>
+<h3>Route 1: the discrete-time model (person-period table)</h3>
+<p>Turn each customer into one row per month they were observed. The row says: this customer, this month, did they churn? A customer who churned in month 3 gives rows for months 1, 2 (outcome 0) and month 3 (outcome 1). A customer censored after month 2 gives months 1 and 2 (both 0) and nothing else. Then fit an ordinary logistic regression with <code>month</code> and the covariates as features.</p>
+<p class="problem"><span class="pl">Problem 11.7.1</span> Four customers: A churned in month 3, B was censored after month 2, C churned in month 1, D was censored after month 4. Build the person-period table and count rows and events.</p>
+<table class="steps"><tr><th>Idea</th><td>One row per customer per month observed. Outcome is 1 only on the churn month.</td></tr><tr><th>A</th><td>(A,1,0), (A,2,0), (A,3,1): 3 rows, 1 event.</td></tr><tr><th>B</th><td>(B,1,0), (B,2,0): 2 rows, 0 events (censored customers never get a 1).</td></tr><tr><th>C</th><td>(C,1,1): 1 row, 1 event.</td></tr><tr><th>D</th><td>(D,1,0), (D,2,0), (D,3,0), (D,4,0): 4 rows, 0 events.</td></tr><tr><th>Answer</th><td>10 rows, 2 events. The logistic model sees 2 positives out of 10 rows, but the right reading is a monthly hazard: month 1 has 4 at risk and 1 event (hazard 0.25), month 2 has 3 at risk and 0 events, month 3 has 2 at risk and 1 event (0.5), month 4 has 1 at risk and 0 events.</td></tr></table>
+<p class="problem"><span class="pl">Problem 11.7.2</span> Simulate 4,000 customers, half on the pro plan. The true monthly hazard on the logit scale is <code>-2.2</code> for free and <code>-2.2 - 0.8</code> for pro, constant over time, observed for at most 12 months. Fit the model and check that it recovers the plan effect and the 12-month survival.</p>
+<pre class="code lang-python"><code>import numpy as np, pandas as pd
+from sklearn.linear_model import LogisticRegression
+
+rng = np.random.default_rng(7)
+n = 4000
+pro = rng.integers(0, 2, n)
+h = 1 / (1 + np.exp(-(-2.2 - 0.8 * pro)))      # true monthly hazard
+T = rng.geometric(h)                            # month of churn
+event = (T &lt;= 12).astype(int)                   # churn seen inside the window
+tenure = np.minimum(T, 12)                      # censored at 12
+
+rows = []
+for i in range(n):
+    for m in range(1, tenure[i] + 1):
+        rows.append((m, pro[i], int(event[i] == 1 and m == tenure[i])))
+pp = pd.DataFrame(rows, columns=["month", "pro", "churn"])
+print("rows", len(pp), "events", pp.churn.sum())
+
+lr = LogisticRegression(C=1e6).fit(pp[["month", "pro"]], pp.churn)
+print("month coef", lr.coef_[0][0].round(3), "pro coef", lr.coef_[0][1].round(3),
+      "odds ratio", np.exp(lr.coef_[0][1]).round(3))
+
+for p in (0, 1):
+    hz = lr.predict_proba(pd.DataFrame({"month": range(1, 13), "pro": p}))[:, 1]
+    print("plan", p, "model S(12)", np.prod(1 - hz).round(3),
+          "empirical share still active", (T[pro == p] &gt; 12).mean().round(3))
+</code></pre>
+<pre class="code lang-text"><code>rows 32786 events 2361
+month coef 0.005 pro coef -0.764 odds ratio 0.466
+plan 0 model S(12) 0.278 empirical share still active 0.278
+plan 1 model S(12) 0.541 empirical share still active 0.541</code></pre>
+<p><strong>How to read it.</strong> The pro coefficient is close to the true value of -0.8, so the odds of churning in any given month for pro customers are about 0.47 times those of free customers. The month coefficient is near zero because we built a constant hazard. On real data it is usually not zero (hazards fall or rise with tenure), and that is the point of including <code>month</code>. The model survival at 12 months matches the share who really were still active.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Dropping censored customers, or treating "still active" as "never churns". Both bias survival upward or downward. The person-period table includes censored customers for exactly the months they were observed and no more. Another frequent error is a random row split: one customer then lands in both train and test. Split by customer id.</div></div>
+<h3>Route 2: the Cox model</h3>
+<p>The Cox proportional hazards model writes the hazard for a customer with covariates <code>x</code> as <code>h(t | x) = h0(t) · exp(β·x)</code>. The baseline <code>h0(t)</code> can be any shape and is never estimated; only <code>β</code> is. <code>exp(β)</code> is the hazard ratio: 0.5 means half the churn risk at every moment. The fit maximises the <strong>partial likelihood</strong>: at each churn time, the probability that it was <em>this</em> customer who churned, among everyone still at risk.</p>
+<p class="problem"><span class="pl">Problem 11.7.3</span> Three customers. A (free, x = 1) churns on day 2. B (pro, x = 0) churns on day 5. C (free, x = 1) is censored on day 7. Find the hazard ratio of free versus pro by hand.</p>
+<table class="steps"><tr><th>Setup</th><td>Let u = exp(β), the hazard ratio of free (x = 1) against pro (x = 0). Risk weights: free = u, pro = 1.</td></tr><tr><th>Day 2</th><td>Everyone is at risk: weights u + 1 + u = 2u + 1. Chance it was A: u / (2u + 1).</td></tr><tr><th>Day 5</th><td>At risk are B and C: weights 1 + u. Chance it was B: 1 / (1 + u).</td></tr><tr><th>Log-likelihood</th><td>l = ln u - ln(2u + 1) - ln(1 + u). Differentiate with respect to u and set to zero: 1/u - 2/(2u+1) - 1/(1+u) = 0.</td></tr><tr><th>Solve</th><td>1/u - 2/(2u+1) = 1/(u(2u+1)), so 1/(u(2u+1)) = 1/(1+u). That gives 1 + u = 2u² + u, so u² = 1/2 and u = 0.7071.</td></tr><tr><th>Meaning</th><td>Hazard ratio 0.707 for free against pro, so β = ln 0.7071 = -0.3466. With three customers this is noise, not evidence; it only shows the mechanics.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+from scipy.optimize import minimize_scalar
+
+def neg_log_lik(b):
+    return -(b - np.log(2 * np.exp(b) + 1) - np.log(1 + np.exp(b)))
+
+r = minimize_scalar(neg_log_lik, bounds=(-3, 3), method="bounded")
+print("beta", round(r.x, 4), "hazard ratio", round(float(np.exp(r.x)), 4))
+</code></pre>
+<pre class="code lang-text"><code>beta -0.3466 hazard ratio 0.7071</code></pre>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Discrete-time logistic regression and Cox regression answer the same question. The logistic route is easier to build with scikit-learn and lets you use any model (even gradient boosting) on the stacked table. The Cox route needs a survival library (such as lifelines or scikit-survival; not run here) but gives hazard ratios with standard errors and does not need you to bin time.</div></div>
+<h3>Going deeper</h3>
+<p>The proportional hazards assumption says the ratio is the same at every tenure. Check it: fit the model separately on early months (1 to 3) and later months (4 to 12). If the plan coefficient changes sign or halves, add an interaction <code>pro × month</code> or stratify. Another expert point is the <strong>competing risk</strong>: a customer who moves country can never churn for price reasons, so treating those as ordinary censoring overstates how long the rest would last. Fine and Gray models or cause-specific hazards handle this; the stats document covers the formal theory.</p>
+
+<h2 id="s8-11-8-expected-purchases-and-spend-bg-nbd-and-gamma-gamma">11.8 Expected Purchases and Spend: BG/NBD and Gamma-Gamma</h2>
+<p>Section 11.1 said BG/NBD was "not run here". We now build it, because it is the clearest example of a <em>probabilistic customer model</em>: a few interpretable assumptions, a likelihood you can code in 20 lines, and a forecast of future purchases for each customer. It suits a non-contractual retailer where you never see the customer leave.</p>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A customer is a coin-and-clock pair. While alive, they buy at their own steady rate (some often, some rarely). After every purchase there is a small chance they quietly stop forever. If a customer who used to buy every week has been silent for 20 weeks, they are probably gone. If a customer who buys twice a year has been silent for 20 weeks, they are probably fine. The model does this arithmetic for you.</div></div>
+<h3>The assumptions</h3>
+<ul><li>While alive, purchases for customer <code>i</code> arrive at random with rate <code>λ</code> per week (a Poisson process).</li><li>After each purchase the customer drops out with probability <code>p</code>, and never returns.</li><li><code>λ</code> varies across customers as a Gamma distribution with shape <code>r</code> and rate <code>α</code>.</li><li><code>p</code> varies across customers as a Beta distribution with parameters <code>a</code> and <code>b</code>.</li><li>Each customer is summarised by three numbers: <code>x</code> repeat purchases, <code>t_x</code> the week of the last one, and <code>T</code> the weeks observed (the "recency, frequency, T" summary).</li></ul>
+<p class="problem"><span class="pl">Problem 11.8.1</span> By hand: customer 1 has x = 0 (bought once, then nothing for T weeks). Customer 2 has x = 5, t_x = 40, T = 52. Which one does the model call "alive for sure"?</p>
+<table class="steps"><tr><th>Idea</th><td>Dropout can only happen right after a purchase. With x = 0 repeat purchases, there has been no repeat event after which a dropout could have been noticed.</td></tr><tr><th>Customer 1</th><td>P(alive) = 1 in BG/NBD. (This is a known quirk: customers with no repeat purchases are treated as alive, but with a low expected rate because λ is shrunk towards the population.)</td></tr><tr><th>Customer 2</th><td>P(alive) is below 1 because 12 silent weeks (52 - 40) is long for someone buying about every 8 weeks (40 / 5). The formula in the code below gives the exact number.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+from scipy.special import gammaln, hyp2f1
+from scipy.optimize import minimize
+
+rng = np.random.default_rng(11)
+N, T, H = 3000, 52.0, 26.0                       # customers, weeks observed, weeks held out
+r0, al0, a0, b0 = 0.8, 8.0, 1.2, 3.0             # true population parameters
+lam = rng.gamma(r0, 1 / al0, N)
+p = rng.beta(a0, b0, N)
+
+x = np.zeros(N); tx = np.zeros(N); fut = np.zeros(N)
+for i in range(N):
+    t, times = 0.0, []
+    while True:
+        t += rng.exponential(1 / lam[i])
+        if t &gt; T + H: break
+        times.append(t)
+        if rng.random() &lt; p[i]: break            # dropped out after this purchase
+    cal = [u for u in times if u &lt;= T]
+    x[i] = len(cal); tx[i] = cal[-1] if cal else 0.0
+    fut[i] = len(times) - len(cal)               # purchases in the held-out weeks
+
+def nll(th):
+    r, al, a, b = np.exp(th)
+    A = gammaln(r + x) - gammaln(r) + r * np.log(al)
+    B = gammaln(a + b) + gammaln(b + x) - gammaln(b) - gammaln(a + b + x)
+    t1 = -(r + x) * np.log(al + T)
+    t2 = np.where(x &gt; 0, np.log(a) - np.log(np.maximum(b + x - 1, 1e-9)) - (r + x) * np.log(al + tx), -np.inf)
+    return -np.sum(A + B + np.logaddexp(t1, t2))
+
+res = minimize(nll, np.log([1, 1, 1, 1]), method="Nelder-Mead",
+               options={"maxiter": 4000, "xatol": 1e-6, "fatol": 1e-8})
+r, al, a, b = np.exp(res.x)
+print("fitted r, alpha, a, b:", np.round([r, al, a, b], 3), " true:", [r0, al0, a0, b0])
+
+def p_alive(x, tx, T):
+    d = 1.0 if x &gt; 0 else 0.0
+    return 1 / (1 + d * a / (b + max(x, 1) - 1) * ((al + T) / (al + tx)) ** (r + x))
+
+def expected(x, tx, T, t):
+    d = 1.0 if x &gt; 0 else 0.0
+    core = (a + b + x - 1) / (a - 1) * (1 - ((al + T) / (al + T + t)) ** (r + x)
+                                          * hyp2f1(r + x, b + x, a + b + x - 1, t / (al + T + t)))
+    return core * p_alive(x, tx, T)
+
+print("customer 2 P(alive):", round(p_alive(5, 40, 52), 3), " expected next 26 weeks:", round(expected(5, 40, 52, 26), 3))
+ex = np.array([expected(x[i], tx[i], T, H) for i in range(N)])
+print("held-out purchases per customer: model", ex.mean().round(3), " actual", fut.mean().round(3))
+for lo, hi in [(0, 0), (1, 1), (2, 3), (4, 99)]:
+    m = (x &gt;= lo) &amp; (x &lt;= hi)
+    print("x in", (lo, hi), "n", int(m.sum()), "model", ex[m].mean().round(3), "actual", fut[m].mean().round(3))
+</code></pre>
+<pre class="code lang-text"><code>fitted r, alpha, a, b: [0.835 8.333 0.971 2.355]  true: [0.8, 8.0, 1.2, 3.0]
+customer 2 P(alive): 0.642  expected next 26 weeks: 1.389
+held-out purchases per customer: model 0.613  actual 0.576
+x in (0, 0) n 578 model 0.325 actual 0.324
+x in (1, 1) n 996 model 0.205 actual 0.19
+x in (2, 3) n 782 model 0.443 actual 0.4
+x in (4, 99) n 644 model 1.709 actual 1.613</code></pre>
+<p><strong>How to read it.</strong> The fit recovers the population parameters only roughly (0.97 against a true 1.2 for <code>a</code>; the customer-level parameters are never seen, so some drift is normal). The key check is the last table: for each frequency group the model's average forecast for the 26 held-out weeks lands within about 10% of what really happened in every frequency group (for example 1.71 against 1.61 for the most frequent buyers), and the overall average is 0.61 against 0.58. A model is never exact; you are checking for large, systematic gaps. Always run this holdout calibration check before you trust a CLV number.</p>
+<p><strong>Adding money: Gamma-Gamma.</strong> Average spend per order varies across customers too, and a customer with only 2 orders has a noisy average. Gamma-Gamma shrinks the observed average <code>m̄</code> towards the population mean. With <code>x</code> orders, the expected spend is a weighted average: <code>E[spend] = w · m̄ + (1 − w) · μ</code> where <code>w = p·x / (p·x + q − 1)</code> and the population mean is <code>μ = γ·p / (q − 1)</code> (<code>p</code>, <code>q</code>, <code>γ</code> are the model's three fitted parameters).</p>
+<p class="problem"><span class="pl">Problem 11.8.2</span> Fitted p = 6, q = 4, γ = 15. A customer has 3 orders averaging 50 rupees. What spend does the model expect for the next order, and what would it be with 30 orders at the same average?</p>
+<pre class="code lang-python"><code>p_, q_, g_ = 6.0, 4.0, 15.0
+mu = g_ * p_ / (q_ - 1)
+for x_, mbar in [(3, 50.0), (30, 50.0)]:
+    w = p_ * x_ / (p_ * x_ + q_ - 1)
+    print("orders", x_, "weight on own average", round(w, 3), "expected spend", round(w * mbar + (1 - w) * mu, 2))
+print("population mean", mu)
+</code></pre>
+<pre class="code lang-text"><code>orders 3 weight on own average 0.857 expected spend 47.14
+orders 30 weight on own average 0.984 expected spend 49.67
+population mean 30.0</code></pre>
+<p>By hand for 3 orders: <code>w = 18 / (18 + 3) = 0.857</code>, so the expectation is <code>0.857 × 50 + 0.143 × 30 = 47.14</code>. With 30 orders, the weight rises to 0.984 and the answer to 49.67. More evidence, less shrinkage.</p>
+<p>Then <strong>CLV over 26 weeks = expected purchases × expected spend per order × margin</strong>, optionally discounted. Multiply the two models only if spend and frequency are roughly uncorrelated (check this: <code>corr(x, m̄)</code> on repeat buyers).</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Validating CLV on the same weeks used for fitting. Hold out the last 26 weeks as in the code, compare predicted and actual totals per frequency group, and only then trust the model. A second mistake: fitting on customers who joined at different dates without aligning each customer's clock (T is weeks since <em>their own</em> first purchase).</div></div>
+<h3>Going deeper</h3>
+<p>BG/NBD assumes the dropout is a constant per-purchase probability, purchase rate is constant while alive, and customers are independent. Trends (promotions, seasons) break the second assumption; modern variants add covariates (PyMC-Marketing, not run here) or use a gradient-boosted model on RFM features to predict next-quarter spend directly. In practice many teams run both: BG/NBD as a transparent baseline and a GBM when there are rich features. The baseline is hard to beat for customers with very few orders.</p>
+
+<h2 id="s9-11-9-fraud-rare-events-cost-curves-and-graph-features">11.9 Fraud: Rare Events, Cost Curves and Graph Features</h2>
+<p>Section 11.3 showed precision, recall and thresholds on a fraud problem. This section adds the two ideas that separate a junior from a senior fraud analyst: choose the threshold from <em>money</em>, not from F1, and use <em>relationships</em> between accounts as features.</p>
+<h3>Cost curves: choosing the threshold in rupees</h3>
+<p>Let a missed fraud (false negative) cost the transaction amount, and let each flagged transaction (true or false positive) cost a 5 rupee manual review. Total cost at a threshold is <code>5 × flagged + sum of amounts of frauds not flagged</code>. Plot or tabulate it across thresholds and take the minimum. Two baselines belong on every cost table: "flag nothing" (pay every fraud) and "flag everything" (pay for every review).</p>
+<h3>Graph features: accounts that share a device</h3>
+<p>Fraud rings reuse devices, cards or addresses. A simple graph feature is the number of accounts seen on the same device. Honest families sometimes share a device too, so the feature is strong but not perfect. The synthetic data below has 60,000 transactions with 1% fraud; 60% of fraud rows come from a ring that shares 60 devices.</p>
+<p class="problem"><span class="pl">Problem 11.9.1</span> Train a gradient-boosted model with and without <code>acc_on_device</code>. Compare average precision (area under the precision-recall curve, the right summary for rare events), then find the cost-minimising threshold.</p>
+<pre class="code lang-python"><code>import numpy as np, pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.metrics import average_precision_score, roc_auc_score
+
+rng = np.random.default_rng(5)
+n = 60000
+fraud = (rng.random(n) &lt; 0.01).astype(int)
+amount = np.where(fraud == 1, rng.lognormal(5.0, 0.8, n), rng.lognormal(4.2, 0.8, n)).round(2)
+night = np.where(fraud == 1, rng.random(n) &lt; 0.45, rng.random(n) &lt; 0.2).astype(int)
+ring = (fraud == 1) &amp; (rng.random(n) &lt; 0.6)
+device = np.where(ring, rng.integers(0, 60, n), 1000 + np.arange(n))
+family = rng.random(n) &lt; 0.15
+device = np.where((fraud == 0) &amp; family, 1000 + rng.integers(0, 20000, n), device)
+df = pd.DataFrame(dict(amount=amount, night=night, device=device, fraud=fraud))
+df["acc_on_device"] = df.groupby("device").device.transform("size")
+
+train = np.arange(n) &lt; 40000
+test = ~train
+scores = {}
+for name, cols in [("amount+night", ["amount", "night"]), ("with graph", ["amount", "night", "acc_on_device"])]:
+    m = HistGradientBoostingClassifier(random_state=0).fit(df.loc[train, cols], df.fraud[train])
+    s = m.predict_proba(df.loc[test, cols])[:, 1]
+    scores[name] = s
+    print(name, "AUC", round(roc_auc_score(df.fraud[test], s), 3), "AP", round(average_precision_score(df.fraud[test], s), 3))
+
+y = df.fraud[test].values; amt = df.amount[test].values; review = 5.0
+print("flag nothing:", round(amt[y == 1].sum()), " flag everything:", round(review * len(y)))
+best = None
+for th in [0.01, 0.02, 0.03, 0.05, 0.1, 0.2, 0.3, 0.5]:
+    f = scores["with graph"] &gt;= th
+    cost = review * f.sum() + amt[(~f) &amp; (y == 1)].sum()
+    print("threshold", th, "flagged", int(f.sum()), "caught", int((f &amp; (y == 1)).sum()), "of", int(y.sum()), "cost", round(cost))
+</code></pre>
+<pre class="code lang-text"><code>amount+night AUC 0.771 AP 0.053
+with graph AUC 0.867 AP 0.542
+flag nothing: 47034  flag everything: 100000
+threshold 0.01 flagged 2756 caught 158 of 212 cost 19268
+threshold 0.02 flagged 1443 caught 143 of 212 cost 15864
+threshold 0.03 flagged 956 caught 131 of 212 cost 16762
+threshold 0.05 flagged 331 caught 114 of 212 cost 20109
+threshold 0.1 flagged 144 caught 107 of 212 cost 21749
+threshold 0.2 flagged 124 caught 102 of 212 cost 23265
+threshold 0.3 flagged 119 caught 100 of 212 cost 23772
+threshold 0.5 flagged 109 caught 97 of 212 cost 24374</code></pre>
+<figure><img src="images/ds_ch11_fraud_cost.png" alt="Line chart of total cost against score threshold for two fraud models, with a dashed line for flagging nothing" loading="lazy"/><figcaption>Total cost (5 rupees per review plus the amounts of missed frauds) against the flag threshold, with and without the device feature. Dots mark each minimum.</figcaption></figure>
+<p><strong>How to read the figure.</strong> Lower is better. Both curves start high on the left (flagging nearly everything costs reviews), fall to a minimum at a low threshold near 0.02, then rise to the dashed "flag nothing" line as the threshold climbs. The blue curve sits well below the orange one at every threshold, and its minimum is the lowest point on the chart. A threshold of 0.5 is nowhere near optimal for either model.</p>
+<p><strong>How to read it.</strong> Average precision jumps when the graph feature is added, while AUC rises less, a typical sign that AUC hides rare-event quality. In the cost table the best threshold is 0.02 (cost 15,864, against 47,034 for flagging nothing and 24,374 at 0.5), which is far from 0.5 because a missed fraud costs much more than a review. Note the leak risk: <code>acc_on_device</code> must be computed only from transactions <em>before</em> the one being scored. Here we counted over the whole table to keep the example short, which flatters the result; in production compute it point-in-time (Chapter 2).</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reporting accuracy or AUC on a 1% problem and shipping at threshold 0.5. A model that flags nothing is 99% accurate. Use average precision, recall at a fixed review capacity, and the cost table above.</div></div>
+
+<h2 id="s10-11-10-scorecards-reject-inference">11.10 Scorecards: Reject Inference</h2>
+<p>A credit model is trained on applicants you <em>approved</em>, because only they have a repayment outcome. But it will score <em>everyone</em> who applies. The rejected group is missing from training: this is <strong>selection bias</strong>, and fixing it is called <strong>reject inference</strong>.</p>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Imagine learning which students pass an exam by only observing students the teacher let sit it. If the teacher chose using marks you also have, you can still learn the rule. If the teacher chose using a gut feeling you never recorded, what you learn is bent by that hidden feeling.</div></div>
+<p class="problem"><span class="pl">Problem 11.10.1</span> Simulate 60,000 applicants, default driven by income, utilisation and a hidden officer impression. Compare two approval policies: A uses only recorded variables, B also uses the hidden impression. Fit on approved applicants only, and compare to a model fitted on everyone (which you can never do in real life).</p>
+<pre class="code lang-python"><code>import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+
+rng = np.random.default_rng(3)
+n = 60000
+inc = rng.normal(0, 1, n); util = rng.normal(0, 1, n); hid = rng.normal(0, 1, n)
+z = -2.0 - 0.9 * inc + 0.6 * util + 1.0 * hid
+d = (rng.random(n) &lt; 1 / (1 + np.exp(-z))).astype(int)
+X = np.c_[inc, util]
+tr = np.arange(n) &lt; 40000; te = ~tr
+
+def study(label, score):
+    appr = score &gt; 0
+    mA = LogisticRegression(C=1e6).fit(X[tr &amp; appr], d[tr &amp; appr])
+    mAll = LogisticRegression(C=1e6).fit(X[tr], d[tr])
+    print(label, "approved", appr.mean().round(2), "bad rate approved", d[appr].mean().round(3), "rejected", d[~appr].mean().round(3))
+    for nm, m in (("approved only", mA), ("all applicants", mAll)):
+        print("  ", nm, "coefs", m.coef_[0].round(2), "AUC", round(roc_auc_score(d[te], m.predict_proba(X[te])[:, 1]), 3),
+              "mean predicted PD", m.predict_proba(X[te])[:, 1].mean().round(3), "actual", d[te].mean().round(3))
+
+study("Policy A (recorded only):", 0.8 * inc - 0.5 * util + rng.normal(0, 0.3, n))
+study("Policy B (uses hidden view):", 0.5 * inc - 0.5 * util - 1.5 * hid + rng.normal(0, 0.3, n))
+</code></pre>
+<pre class="code lang-text"><code>Policy A (recorded only): approved 0.5 bad rate approved 0.091 rejected 0.281
+   approved only coefs [-0.8   0.58] AUC 0.738 mean predicted PD 0.192 actual 0.187
+   all applicants coefs [-0.79  0.52] AUC 0.738 mean predicted PD 0.185 actual 0.187
+Policy B (uses hidden view): approved 0.5 bad rate approved 0.062 rejected 0.308
+   approved only coefs [-0.69  0.34] AUC 0.736 mean predicted PD 0.077 actual 0.187
+   all applicants coefs [-0.79  0.52] AUC 0.738 mean predicted PD 0.185 actual 0.187</code></pre>
+<p><strong>How to read it.</strong> Under Policy A the approved-only coefficients match the all-applicants ones: when selection depends only on variables you recorded and model, there is no bias to fix. Under Policy B the utilisation coefficient shrinks (0.34 against 0.52) and the predicted default rate for the full applicant pool is far too low (mean predicted PD 0.077 against an actual 0.187). Ranking power (AUC) hardly moves, which is why this bias hides: the scorecard still ranks well but under-prices risk. Practical remedies: (1) keep a small random-approve test cell so you observe outcomes for some who would be rejected; (2) use the bounded-exposure data of past policies; (3) apply <em>parcelling or fuzzy augmentation</em> (label rejects with the model's own probabilities, weighted); this helps only when selection is on recorded variables, so it is a mitigation, not a cure.</p>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Selection on observed variables is fixable by modelling; selection on hidden variables is fixable only by new data (a randomised test cell). Say which case you are in when you present a scorecard.</div></div>
+<h2 id="s11-chapter-recap">Chapter recap</h2>
 <ul><li>Churn needs a definition first (contractual vs silent). Kaplan-Meier survival uses censored customers properly: 26% of free vs 57% of pro customers survive a year.</li><li>CLV from cohort revenue times margin: 1,522 (free) vs 4,940 (pro) rupees in year one; RFM gave churn rates from 2.7% to 59.3%.</li><li>Scorecards: WoE bins, IV to select, logistic regression on WoE, points from PDO. Test AUC 0.685, Gini 0.371, KS 0.295.</li><li>PSI under 0.1 is stable. A simulated shift gave PSI 0.456.</li><li>Fraud: accuracy is useless at 0.4% fraud; use precision at capacity and the cost threshold <code>c_review / (c_review + c_miss)</code> = 2%, which saved 24.9%.</li><li>MMM uses adstock and saturation, but parameters can be weakly identified. Pricing elasticity from observation is not causal and should not be extrapolated.</li><li>Safety stock <code>z × σ × √L</code> and newsvendor critical ratio turn forecasts into stock.</li><li>Healthcare needs calibration and net benefit. Operations data uses Little's law, the M/M/1 knee, rolling robust anomaly detection and capacity dates with intervals.</li></ul>
 <div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Formula</th><th>Example</th></tr></thead><tbody><tr><td>Kaplan-Meier</td><td><code>S × (1 − d/n)</code></td><td>0.8 → 0.6 → 0.3</td></tr><tr><td>WoE</td><td><code>ln(pg / pb)</code></td><td>ln(0.5) = −0.693</td></tr><tr><td>IV</td><td><code>Σ (pg − pb) × WoE</code></td><td>0.168 for utilisation</td></tr><tr><td>Gini</td><td><code>2 × AUC − 1</code></td><td>0.3706</td></tr><tr><td>PSI</td><td><code>Σ (a − e) × ln(a / e)</code></td><td>0.0405</td></tr><tr><td>Expected loss</td><td><code>PD × LGD × EAD</code></td><td>0.03 × 0.45 × 200,000 = 2,700</td></tr><tr><td>Cost threshold</td><td><code>c_fp / (c_fp + c_fn)</code></td><td>100 / 5,100 = 0.0196</td></tr><tr><td>Adstock, saturation</td><td><code>a × prev + x</code>, <code>x / (x + k)</code></td><td>100, 50, 25</td></tr><tr><td>Safety stock</td><td><code>z × σ × √L</code></td><td>98.7</td></tr><tr><td>Newsvendor</td><td><code>c_u / (c_u + c_o)</code></td><td>0.80 → Q = 584</td></tr><tr><td>Little's law, M/M/1</td><td><code>L = λW</code>, <code>R = S/(1−ρ)</code></td><td>20 patients, 2.0 h at 95%</td></tr></tbody></table></div>
-<h2 id="s8-practice-set">Practice set</h2>
+<h2 id="s12-practice-set">Practice set</h2>
 <p><strong>1.</strong> (Easy) Bin A has 40% of goods and 10% of bads. Find its WoE. <strong>Answer:</strong> ln(0.40/0.10) = ln 4 = 1.386. Very safe bin.</p>
 <p><strong>2.</strong> (Easy) PD 2%, LGD 50%, EAD 100,000 rupees. Expected loss? <strong>Answer:</strong> 0.02 × 0.5 × 100,000 = 1,000 rupees.</p>
 <p><strong>3.</strong> (Easy) A shop serves 120 customers per hour and each spends 0.25 hours inside. How many are inside on average? <strong>Answer:</strong> 120 × 0.25 = 30.</p>
@@ -2697,7 +3489,12 @@ day hits limit 122.7 from day 90 = 32.7
 <p><strong>9.</strong> (Interview) "Your credit model has Gini 0.85 on test. Is that great?" <strong>Answer:</strong> Suspicious. Check for leakage (variables created after the decision, such as collection status), a time-ordered split, IV above 0.5 for any variable, and that the label window is respected. Real application scorecards are usually far below such a number.</p>
 <p><strong>10.</strong> (Interview) "How would you detect a slow capacity problem versus a sudden breakdown in delivery-time data?" <strong>Answer:</strong> Sudden: rolling robust z-score plus a fixed service rule. Slow: weekly peaks regressed on time (trend with interval), plus a look at where waiting time explodes as utilisation rises. Report the date range at which a limit is hit.</p>
 <p><strong>11.</strong> (Hard) A random forest has AUC 0.87 and its 5% to 10% predicted-risk bin has an observed rate of 3%. A doctor will treat at 10%. Problem? <strong>Answer:</strong> Poor calibration. The probabilities are not real, so the threshold means something different. Calibrate on a held-out set, then re-check net benefit.</p>
-<h2 id="s9-prompt-pack">Prompt pack</h2>
+<p><strong>12.</strong> (Medium) Four customers: tenures 2 (churned), 4 (censored), 3 (churned), 1 (churned). How many person-month rows, and what is the month-1 hazard? <strong>Answer:</strong> Rows: 2 + 4 + 3 + 1 = 10. Month 1: 4 at risk, 1 churn (the tenure-1 customer), so hazard = 1/4 = 0.25.</p>
+<p><strong>13.</strong> (Medium) A Cox model gives a coefficient of -0.69 for the pro plan against free. State it as a hazard ratio and in words. <strong>Answer:</strong> exp(-0.69) = 0.50. At any moment a pro customer has half the churn risk of a comparable free customer (not "half the churn rate overall", and not "lives twice as long", unless the hazard is exactly constant).</p>
+<p><strong>14.</strong> (Medium) Gamma-Gamma with p = 6, q = 4, γ = 15 (population mean 30). A customer has 1 order of 90 rupees. Expected spend? <strong>Answer:</strong> w = 6 / (6 + 3) = 0.667. Expected = 0.667 × 90 + 0.333 × 30 = 60 + 10 = 70 rupees. One order is weak evidence, so it is pulled a long way towards 30.</p>
+<p><strong>15.</strong> (Hard) Fraud: a missed fraud costs its amount (average 200), a review costs 5. At what fraud probability is flagging worth it, for an average transaction? <strong>Answer:</strong> Flag if p × 200 &gt; 5, so p &gt; 0.025. A threshold of 0.5 would miss most worthwhile flags. For a 1,000 rupee transaction the threshold is 0.005.</p>
+<p><strong>16.</strong> (Hard) (find the flaw) A bank trains a scorecard only on approved loans, reports AUC 0.78, and claims the portfolio default rate will be 4% on all applicants. What is wrong? <strong>Answer:</strong> The 4% is estimated on approved applicants only and the model never saw rejects, so the pool-wide PD is probably higher. AUC on approved loans is also an optimistic proxy for ranking quality on the full pool. Ask for a random test cell or a reject-inference check, and report predicted versus actual default for the full applicant population only after it is available.</p>
+<h2 id="s13-prompt-pack">Prompt pack</h2>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me credit-risk scorecards step by step: PD, LGD, EAD, WoE binning, Information Value, logistic regression on WoE, converting to points (base score and PDO), KS, Gini and PSI. Use a tiny made-up table of 10 loans with real numbers I can compute by hand. After each step, ask me to compute the next number and check my answer before moving on.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: churn and customer lifetime value, covering contractual vs non-contractual churn, censoring, Kaplan-Meier survival, cohort CLV, RFM segments and why uplift beats churn scores for retention offers. Give me 8 graded exercises with small numbers and no solutions. When I send my answers, grade them, show every calculation step, and explain the business decision that each answer changes.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: fraud detection with extreme class imbalance: why accuracy fails, precision at fixed review capacity, PR-AUC, cost-based thresholds and concept drift. Quiz me one question at a time (10 questions, easy to hard), using numbers like 0.4% fraud rate and costs in rupees. Wait for my answer each time, then correct me and explain the intuition.</pre></div>
@@ -3630,10 +4427,106 @@ rolling-8-fold 80% interval coverage: 0.750 over 18 folds</code></pre>
 <p><strong>Interview talking points.</strong></p>
 <ul><li><em>Q: Why a rolling-origin backtest?</em> A: It repeats how the forecast is used, always predicting forward from the past. Shuffled splits let future patterns leak and flatter the model.</li><li><em>Q: Your model is only 4% better than seasonal naive. Ship it?</em> A: Maybe not. I would weigh the 4% against the extra maintenance, and check whether the gain holds on busy weeks.</li><li><em>Q: How do you know the interval is honest?</em> A: I count how often the actual falls inside across many backtest folds. Mine was 75% for an 80% target, so I would widen it slightly.</li></ul>
 <p><strong>README outline.</strong> Question; baselines table (naive, seasonal naive, model); backtest design diagram; interval coverage; error by horizon; limits; how to rerun.</p>
-<h2 id="s5-chapter-recap">Chapter recap</h2>
+<h2 id="s5-15-5-worked-debugging-problems-and-a-self-marking-rubric">15.5 Worked Debugging Problems and a Self-Marking Rubric</h2>
+<p>The three projects above tell you what to build. This section shows what usually goes wrong and how to find it. Each problem is a bug that real teams ship. Try to spot the bug before you read the steps. Then use the rubric at the end to mark your own project.</p>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A result that looks too good is a bug until proven otherwise. A held-out AUC of 1.0, a forecast that beats a seasonal naive by half, a lift that appears only after you drop some rows: each is a signal that something about time, selection or counting is wrong.</div></div>
+<p class="problem"><span class="pl">Problem 15.5.1</span> (churn project, leaky feature) You build "days since last order" for 6,000 customers. The label is "no order in the 30 days after day 100". Your model scores AUC 1.0 on a held-out set. What is wrong?</p>
+<table class="steps"><tr><th>Suspect</th><td>Which date was the feature measured at? If the pull date is day 130, "days since last order" at day 130 already knows whether an order happened in days 101 to 130.</td></tr><tr><th>Test</th><td>Rebuild the same feature at the cutoff (day 100) using only orders on or before that day. Compare AUC.</td></tr><tr><th>Rule</th><td>Every feature is computed from rows with timestamp at or before the cutoff. Every label from rows after it.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score
+rng = np.random.default_rng(10)
+n, cutoff, window = 6000, 100, 30
+rate = rng.gamma(2.0, 0.02, n) + 0.005                      # orders per day
+last_before = np.zeros(n); cnt90 = np.zeros(n); last_after = np.zeros(n); churn = np.zeros(n)
+for i in range(n):
+    times = np.cumsum(rng.exponential(1/rate[i], 60))
+    times = times[times &lt; cutoff + window]
+    before = times[times &lt;= cutoff]; after = times[times &gt; cutoff]
+    lb = before.max() if len(before) else 0.0
+    last_before[i] = cutoff - lb
+    cnt90[i] = ((before &gt; cutoff - 90)).sum()
+    churn[i] = float(len(after) == 0)                       # label: no order in next 30 days
+    allt = np.r_[before, after]
+    last_after[i] = (cutoff + window) - (allt.max() if len(allt) else 0.0)   # recency measured at pull date (leak)
+tr, te = slice(0, 4500), slice(4500, 6000)
+def auc(X): 
+    m = LogisticRegression(max_iter=1000).fit(X[tr], churn[tr]); return roc_auc_score(churn[te], m.predict_proba(X[te])[:, 1])
+honest = np.c_[last_before, cnt90]
+leaky = np.c_[last_after, cnt90]
+print("churn rate:", round(churn.mean(), 3))
+print("honest features (recency and count at cutoff) AUC:", round(auc(honest), 3))
+print("leaky feature (recency at the pull date) AUC:     ", round(auc(leaky), 3))
+print("correlation of leaky recency with label:", round(np.corrcoef(last_after, churn)[0, 1], 3))</code></pre>
+<pre class="code lang-text"><code>churn rate: 0.336
+honest features (recency and count at cutoff) AUC: 0.685
+leaky feature (recency at the pull date) AUC:      1.0
+correlation of leaky recency with label: 0.796</code></pre>
+<ul><li><strong>Step 1</strong> The leaky feature gives AUC 1.0 and correlates 0.796 with the label. A single feature that perfect is the giveaway.</li><li><strong>Step 2</strong> The honest features give 0.685, a believable churn model.</li><li><strong>Step 3</strong> Add a unit test: for a customer with a known order on day 110, assert that the feature at cutoff 100 does not change when that order is added.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Fixing the leak in the training data but not in the scoring path. In production the feature is computed "as of now", which is right. In training, "as of the pull date" is wrong. Build both from one function that takes the as-of date as an argument.</div></div>
+<p class="problem"><span class="pl">Problem 15.5.2</span> (A/B toolkit, a bug that fakes a win) 20,000 users are assigned 50/50. There is no real effect. The analyst drops users with no logged events and finds a lift of about 1.6 in mean spend with p below 0.001. Find the bug.</p>
+<table class="steps"><tr><th>Step 1</th><td>Run the SRM check on the assigned counts, then on the analysed counts.</td></tr><tr><th>Step 2</th><td>If the second check fails, filtering is related to treatment. Ask what the filter removes.</td></tr><tr><th>Step 3</th><td>Re-estimate using everyone assigned (intention to treat).</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+rng = np.random.default_rng(11)
+n = 20000
+arm = rng.integers(0, 2, n)                                  # fair coin
+spend = rng.gamma(2, 10, n)                                  # NO true effect of the treatment
+logged = ~((arm == 1) &amp; (spend &lt; 5))                         # bug: treated users with tiny spend lose their record
+nA, nB = (arm == 0).sum(), (arm == 1).sum()
+print("assigned:", nA, nB, " SRM p =", round(stats.chisquare([nA, nB]).pvalue, 3))
+kA, kB = ((arm == 0) &amp; logged).sum(), ((arm == 1) &amp; logged).sum()
+print("analysed:", kA, kB, " SRM p =", format(stats.chisquare([kA, kB]).pvalue, ".2e"))
+a, b = spend[(arm == 0) &amp; logged], spend[(arm == 1) &amp; logged]
+t = stats.ttest_ind(b, a)
+print("fake lift in mean spend:", round(b.mean() - a.mean(), 2), " p =", format(t.pvalue, ".3f"))
+a0, b0 = spend[arm == 0], spend[arm == 1]
+print("lift using everyone assigned:", round(b0.mean() - a0.mean(), 2))</code></pre>
+<pre class="code lang-text"><code>assigned: 9990 10010  SRM p = 0.888
+analysed: 9990 9122  SRM p = 3.42e-10
+fake lift in mean spend: 1.57  p = 0.000
+lift using everyone assigned: -0.04</code></pre>
+<ul><li><strong>Step 1</strong> The assignment is fine (p = 0.888). The analysed counts are not: 9,990 against 9,122, with p near 3e-10.</li><li><strong>Step 2</strong> In this simulation a bug dropped the treated users with the lowest spend. Removing the lowest values of one arm raises its mean, so a fake lift appears.</li><li><strong>Step 3</strong> Using everyone assigned, the lift is −0.04, effectively zero.</li></ul>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Analyse everyone you randomised. Run SRM at each stage (assigned, exposed, analysed). If a stage fails, fix the logging bug and do not trust the effect.</div></div>
+<p class="problem"><span class="pl">Problem 15.5.3</span> (forecasting project, a backtest that cheats) You smooth the series with a centred 3-day average, then forecast tomorrow as yesterday's smoothed value. Compared with the naive "yesterday" forecast, your MAE looks 35% better. Is it real?</p>
+<table class="steps"><tr><th>Suspect</th><td>A centred window at day t−1 uses days t−2, t−1 and t. The forecast has seen the day it predicts.</td></tr><tr><th>Test</th><td>Replace the centred window with a trailing one (only days up to the forecast origin).</td></tr><tr><th>Expectation</th><td>The honest smoother may be no better than naive. That is a normal outcome and a valid finding.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np, pandas as pd
+rng = np.random.default_rng(14)
+n = 300
+d = pd.Series(100 + 0.1*np.arange(n) + 10*np.sin(2*np.pi*np.arange(n)/7) + rng.normal(0, 6, n))
+train, test = d[:240], d[240:]
+# bug: smooth the WHOLE series with a centred window, then forecast from the smoothed history
+bad_smooth = d.rolling(3, center=True, min_periods=1).mean()
+# one-step-ahead forecast = yesterday's smoothed value; compare MAE
+f_bad = bad_smooth.shift(1)[240:]
+f_ok = d.rolling(3, min_periods=1).mean().shift(1)[240:]          # trailing window only
+f_naive = d.shift(1)[240:]
+mae = lambda f: float(np.abs(f - test).mean())
+print("naive yesterday    MAE:", round(mae(f_naive), 2))
+print("trailing mean      MAE:", round(mae(f_ok), 2))
+print("centred mean (leak) MAE:", round(mae(f_bad), 2))</code></pre>
+<pre class="code lang-text"><code>naive yesterday    MAE: 8.0
+trailing mean      MAE: 8.26
+centred mean (leak) MAE: 5.2</code></pre>
+<ul><li><strong>Step 1</strong> The centred version reports MAE 5.20 against 8.00 for naive, which looks like a 35% gain.</li><li><strong>Step 2</strong> The trailing version reports 8.26, slightly worse than naive. The gain was entirely the leak.</li></ul>
+<h3>Reference ranges to check yourself against</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Project</th><th>Healthy signal</th><th>Red flag</th></tr></thead><tbody>
+<tr><td>Churn analysis (15.2)</td><td>AUC 0.65 to 0.80 on a time-based split; top decile captures 2x to 3x the base churn rate</td><td>AUC above 0.95; one feature carrying almost all importance</td></tr>
+<tr><td>A/B toolkit (15.3)</td><td>Sizing test returns 14,751 for 10% to 11%; A/A false positive near 5% with one look</td><td>A/A false positives far from 5%; SRM p below 0.001 ignored</td></tr>
+<tr><td>Demand forecast (15.4)</td><td>Beats seasonal naive by a few percent on rolling origins; interval coverage within a few points of target</td><td>Beats naive by 30% or more with no new information; coverage far below target</td></tr></tbody></table></div>
+<h3>Rubric: mark your own project (0 to 2 each)</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Criterion</th><th>0</th><th>1</th><th>2</th></tr></thead><tbody>
+<tr><td>Question framed</td><td>No decision named</td><td>Decision named, no cost</td><td>Decision, metric and cost of errors stated</td></tr>
+<tr><td>Baseline</td><td>None</td><td>Naive baseline</td><td>Naive and strong simple baseline, same split</td></tr>
+<tr><td>Validation honesty</td><td>Random split on time data</td><td>Time split</td><td>Time split plus a leak test in code</td></tr>
+<tr><td>Uncertainty</td><td>Point numbers only</td><td>Intervals once</td><td>Intervals checked for coverage</td></tr>
+<tr><td>Tests</td><td>None</td><td>Some smoke tests</td><td>Known-answer tests for every module</td></tr>
+<tr><td>Communication</td><td>Code dump</td><td>Readable README</td><td>One-page decision memo with caveats</td></tr></tbody></table></div>
+<p>Score 10 to 12: portfolio-ready. 6 to 9: fix the lowest rows first. Below 6: start again from the baseline.</p>
+<h2 id="s6-chapter-recap">Chapter recap</h2>
 <ul><li>A project starts with one sentence: who decides, what you predict, what action follows, and what number means success.</li><li>The repo should let a stranger run it in five minutes; commits should read like a story.</li><li>Generated data is fine if you say so, and it gives you a known answer to test against.</li><li>Churn: judge ranking (AUC) and honesty (calibration), then convert probability to money with a cost rule.</li><li>A simpler model can win when the true pattern is simple. Report that, not hide it.</li><li>A/B toolkit: size first, check SRM first, use CUPED to cut noise, never peek without a correction.</li><li>Forecasting: rolling-origin backtest, two baselines, MASE, and check interval coverage.</li><li>Every project needs limits written honestly.</li></ul>
 <div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Formula or command</th></tr></thead><tbody><tr><td>Sample size per arm (rule)</td><td><code>n ≈ 16·p(1−p)/δ²</code></td></tr><tr><td>SRM</td><td>chi-square on arm counts vs plan</td></tr><tr><td>CUPED</td><td><code>y_adj = y − θ(x_pre − mean x_pre)</code>, <code>θ = cov/var</code></td></tr><tr><td>Expected gain of a contact</td><td><code>P(churn) × P(save) × value − cost</code></td></tr><tr><td>MASE</td><td><code>MAE / MAE of in-sample seasonal naive</code></td></tr></tbody></table></div>
-<h2 id="s6-practice-set">Practice set</h2>
+<h2 id="s7-practice-set">Practice set</h2>
 <p><strong>1.</strong> (easy) Using the rule of thumb, how many customers per arm to detect a lift of 2 points on a 10% baseline? <strong>Answer:</strong> <code>16 × 0.1 × 0.9 / 0.02² = 3,600</code> per arm.</p>
 <p><strong>2.</strong> (easy) Arms of 5,300 and 4,700 were planned as 50/50. Compute the chi-square statistic. <strong>Answer:</strong> expected 5,000 each; <code>(300²/5000) + (300²/5000) = 18 + 18 = 36</code>. With 1 degree of freedom that is far beyond 3.84, so SRM fails.</p>
 <p><strong>3.</strong> (easy) A customer has churn probability 0.20, a save rate of 30%, a value of 100 and an offer cost of 5. Send or not? <strong>Answer:</strong> <code>0.2 × 0.3 × 100 − 5 = +1</code>, so send. With probability 0.04 it is <code>−3.8</code>, so do not send.</p>
@@ -3642,7 +4535,9 @@ rolling-8-fold 80% interval coverage: 0.750 over 18 folds</code></pre>
 <p><strong>6.</strong> (find the bug) A forecaster scores a model with <code>train_test_split(shuffle=True)</code> on daily sales and reports MAPE 3%. What is wrong and what do you do? <strong>Answer:</strong> shuffling leaks neighbouring days into training. Use a rolling-origin backtest; expect the error to rise.</p>
 <p><strong>7.</strong> (scenario) The churn model has AUC 0.82, but the marketing team says the offer made no difference. Give two reasons. <strong>Answer:</strong> (a) The model finds customers likely to leave, not customers who are persuadable; the save rate may be near zero. (b) No control group existed, so the effect cannot be measured. Fix: run a randomised holdout.</p>
 <p><strong>8.</strong> (interview) "Your A/B test shows p = 0.04 after the fifth daily look. Ship?" <strong>Answer:</strong> Not yet. Ask whether the stopping rule was fixed in advance. With five unplanned looks, the false alarm rate is far above 5%. Use the planned sample size or a sequential boundary, and check SRM first.</p>
-<h2 id="s7-prompt-pack">Prompt pack</h2>
+<p><strong>9. (medium, find the bug)</strong> A churn model scores AUC 0.99 after you add "number of support tickets in the last 30 days". The tickets are counted up to the pull date, which is 30 days after the cutoff. What is wrong and what is the fix? <strong>Answer:</strong> The count includes tickets raised after the cutoff, and customers who are about to leave raise many tickets. It is label leakage through time. Count tickets only up to the cutoff, check by comparing AUC.</p>
+<p><strong>10. (hard)</strong> Your SRM check on assigned users passes, but it fails on users who reached the checkout page. Is the experiment broken? <strong>Answer:</strong> Not necessarily. Reaching checkout can be an effect of the treatment (a better product page sends more people there). Conditioning on a post-treatment variable breaks balance by itself. Analyse everyone assigned and treat checkout as a funnel metric.</p>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. I want to plan a portfolio project on customer churn with a decision step (contact or not). Ask me five questions one at a time about my data, the action the business can take and the cost of that action. Then help me write a one-sentence project question, a baseline, a metric and three acceptance criteria. Keep your English simple and define any jargon.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Review my churn project for leakage, split mistakes and calibration problems. Go through these checks one by one: feature timing, train/test split, class balance, baseline, calibration table and cost assumptions. For each check say pass, fail or unknown and what evidence you need. My code and results: [PASTE HERE]. Use simple English.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me to debug an A/B test toolkit step by step: sample size, sample ratio mismatch, CUPED and peeking. Give me a known-answer test for each tool that I can write in Python with a fixed seed, and tell me what number I should see. Then quiz me on one failure at a time. My code: [PASTE HERE]. Use simple English.</pre></div>
@@ -3908,7 +4803,7 @@ PSI train vs drifted applicants: 0.167</code></pre>
 <p><strong>Interview talking points.</strong></p>
 <ul><li><em>Q: What is WoE and why use it?</em> A: Weight of evidence turns each bin into a number that says how much it favours good over bad customers. It handles missing values, outliers and non-linear effects, and keeps the model easy to audit.</li><li><em>Q: KS versus Gini?</em> A: Both measure how well the score separates bad from good. Gini is a rescaled AUC over all thresholds. KS is the single best gap at one threshold. A model can have both a good Gini and a poor business cut-off.</li><li><em>Q: What does PSI of 0.17 mean?</em> A: The score distribution of today's applicants differs noticeably from the build sample. I would check which inputs moved, and re-validate the model before trusting it.</li></ul>
 <p><strong>README outline.</strong> Question; data rules; binning and WoE tables; model and points table; train/test metrics; PSI monitoring; fairness and limits; how to run.</p>
-<h2 id="s3-16-3-project-causal-analysis-with-propensity-scores-and-difference-in-differences-30">16.3 Project: Causal analysis with propensity scores and difference-in-differences (#30)</h2>
+<h2 id="s3-16-3-project-causal-analysis-with-propensity-scores-and-difference-in-">16.3 Project: Causal analysis with propensity scores and difference-in-differences (#30)</h2>
 <p><strong>Goal and why employers care.</strong> Many business questions ("did the loyalty club raise spending?") cannot be tested with a coin flip. Employers want to see that you know the difference between correlation and effect, that you can use two standard tools, and, most of all, that you test your own answer for weak spots.</p>
 <p><strong>Skills used.</strong> Chapter 8, <em>Causal Inference When You Cannot Randomise</em> (confounding, propensity scores, difference-in-differences); Chapter 4, <em>Statistical Thinking: Ways Data Fools You</em>; Chapter 7, <em>Experimentation</em> (what the ideal test would be).</p>
 <p><strong>Data.</strong> Two generators in one script. Part A: 20,000 shoppers, where "engagement" drives both joining a loyalty club and spending, and the true effect of joining is +10. We observe only a noisy proxy (prior spend) and age. Part B: 20 cities over 12 months; 10 get free delivery from month 7 with a true effect of +8 orders per 1,000 customers. Real data alternatives: public policy-evaluation datasets; check licences.</p>
@@ -4021,10 +4916,83 @@ pre-trend slope treated=0: 1.53</code></pre>
 <p><strong>Interview talking points.</strong></p>
 <ul><li><em>Q: Why not just compare joiners with non-joiners?</em> A: Joiners are different: more engaged people join and also spend more. The gap mixes the effect of the club with the effect of who joins.</li><li><em>Q: What does difference-in-differences assume?</em> A: That without the policy, treated and control groups would have moved in parallel. I check pre-period trends and a placebo date, but I can never prove it.</li><li><em>Q: Your adjusted estimate is still off. How would you tell?</em> A: In real data I cannot see the truth. I would remove covariates one at a time, compare methods and ask how strong a hidden confounder must be to erase the result. Then I would say what experiment would settle it.</li></ul>
 <p><strong>README outline.</strong> Question; why randomising was impossible; table of naive, adjusted and DiD estimates; balance and overlap figures; placebo and pre-trend; the list of unmeasured confounders; limits; how to run.</p>
-<h2 id="s4-chapter-recap">Chapter recap</h2>
+<h2 id="s4-16-4-worked-debugging-problems-and-marking-guide">16.4 Worked Debugging Problems and Marking Guide</h2>
+<p>Each project in this chapter has a classic failure that produces a flattering number. Here are three, with a test that catches each. Spot the bug first, then read the steps.</p>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Ask of every number: "which rows and which dates did this calculation see?" Metrics break when the evaluation sees information the real system will not have, or when the formula quietly changes the target.</div></div>
+<p class="problem"><span class="pl">Problem 16.4.1</span> (recommender, wrong NDCG) A user has 3 relevant items in the catalogue. Your ranked top 5 has relevance [0, 1, 0, 1, 0]. The code reports NDCG@5 of 0.651. Is that right?</p>
+<table class="steps"><tr><th>Formula</th><td>DCG = Σ rel / log2(rank + 1). Ideal DCG is the DCG of the best possible top 5 for that user, using ALL their relevant items.</td></tr><tr><th>DCG</th><td>Rank 2: 1/log2(3) = 0.6309. Rank 4: 1/log2(5) = 0.4307. Sum 1.0616.</td></tr><tr><th>Wrong ideal</th><td>Sorting the shown list gives [1, 1, 0, 0, 0]: 1 + 0.6309 = 1.6309. NDCG 1.0616 / 1.6309 = 0.651.</td></tr><tr><th>Right ideal</th><td>Three relevant items fit in the top 5: 1 + 0.6309 + 0.5 = 2.1309. NDCG 1.0616 / 2.1309 = 0.498.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+def dcg(rels): return sum(r / np.log2(i + 2) for i, r in enumerate(rels))
+shown = [0, 1, 0, 1, 0]            # relevance of the 5 items we ranked
+total_relevant = 3                 # the user actually has 3 relevant items in the catalogue
+wrong_ideal = dcg(sorted(shown, reverse=True))
+right_ideal = dcg([1] * min(total_relevant, 5))
+print("DCG@5:", round(dcg(shown), 4))
+print("wrong ideal (sorts the shown list):", round(wrong_ideal, 4), " NDCG", round(dcg(shown) / wrong_ideal, 3))
+print("right ideal (all relevant items):  ", round(right_ideal, 4), " NDCG", round(dcg(shown) / right_ideal, 3))</code></pre>
+<pre class="code lang-text"><code>DCG@5: 1.0616
+wrong ideal (sorts the shown list): 1.6309  NDCG 0.651
+right ideal (all relevant items):   2.1309  NDCG 0.498</code></pre>
+<ul><li><strong>Step 1</strong> The bug inflates NDCG from 0.498 to 0.651 because the ideal list was built only from items the system chose to show. A system that retrieves poorly looks good.</li><li><strong>Step 2</strong> The test: a ranking that shows none of the user's relevant items must score 0, and a perfect one must score 1 regardless of what is retrieved.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Computing the ideal from the retrieved list. Candidate generation errors then disappear from your metric. Ideal DCG must come from the ground truth, truncated to k.</div></div>
+<p class="problem"><span class="pl">Problem 16.4.2</span> (scorecard, leakage through binning) A noise feature with no relationship to default is cut into 60 quantile bins, WoE is computed, and the score is tested on a held-out set. Gini is 0.435. Real or leak?</p>
+<table class="steps"><tr><th>Suspect</th><td>Were the bins and WoE values learned on all 1,000 rows before the split? Then each held-out row's WoE was computed partly from its own label.</td></tr><tr><th>Test</th><td>Learn bins and WoE on training rows only, then apply them to the held-out rows.</td></tr><tr><th>Rule</th><td>Anything that learns from labels (WoE, target encoding, binning for IV) belongs inside the training fold.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+from sklearn.metrics import roc_auc_score
+rng = np.random.default_rng(15)
+n = 1000
+x = rng.normal(size=n)                                   # a pure-noise feature
+y = (rng.random(n) &lt; 0.2).astype(int)                    # labels unrelated to x
+idx = rng.permutation(n); tr, te = idx[:600], idx[600:]
+def woe_map(x_fit, y_fit, bins=60):
+    edges = np.quantile(x_fit, np.linspace(0, 1, bins + 1)); edges[0], edges[-1] = -np.inf, np.inf
+    b = np.digitize(x_fit, edges[1:-1])
+    g = np.bincount(b, weights=1 - y_fit, minlength=bins) + 0.5
+    bd = np.bincount(b, weights=y_fit, minlength=bins) + 0.5
+    return edges, np.log((g / g.sum()) / (bd / bd.sum()))
+def apply(x_new, edges, woe): return woe[np.digitize(x_new, edges[1:-1])]
+# bug: WOE learned from ALL rows, then evaluated on the test rows
+e_all, w_all = woe_map(x, y)
+leaky = roc_auc_score(y[te], -apply(x[te], e_all, w_all))
+e_tr, w_tr = woe_map(x[tr], y[tr])
+honest = roc_auc_score(y[te], -apply(x[te], e_tr, w_tr))
+print("test AUC with WOE fitted on all rows (leak):", round(leaky, 3), " Gini", round(2*leaky - 1, 3))
+print("test AUC with WOE fitted on train only:     ", round(honest, 3), " Gini", round(2*honest - 1, 3))</code></pre>
+<pre class="code lang-text"><code>test AUC with WOE fitted on all rows (leak): 0.718  Gini 0.435
+test AUC with WOE fitted on train only:      0.542  Gini 0.083</code></pre>
+<ul><li><strong>Step 1</strong> The leaky Gini is 0.435 on a feature that is pure noise. The honest Gini is 0.083, which is just small-sample luck.</li><li><strong>Step 2</strong> More bins and smaller samples make this leak bigger. With 60 bins and about 17 rows per bin, each bin's WoE mostly memorises its own labels.</li></ul>
+<p class="problem"><span class="pl">Problem 16.4.3</span> (causal project, parallel trends fail) A pilot region has been growing faster than the control region even before launch. The true effect of the launch is +4. Show that the plain DiD overstates it and what to do.</p>
+<table class="steps"><tr><th>Step 1</th><td>Plot or fit the gap between treated and control in the pre-period. If it trends, parallel trends fail.</td></tr><tr><th>Step 2</th><td>The plain DiD attributes the pre-existing extra growth to the launch.</td></tr><tr><th>Step 3</th><td>Option: extrapolate the pre-period gap trend and subtract it. This relies on the trend continuing, which is its own assumption.</td></tr></table>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(13)
+T, T0 = 16, 10
+t = np.arange(T)
+ctrl = 100 + 1.0*t + rng.normal(0, 0.5, T)
+treat = 110 + 2.0*t + rng.normal(0, 0.5, T)                  # already growing faster BEFORE launch
+treat[T0:] += 4.0                                            # true effect 4
+pre_gap = (treat - ctrl)[:T0]
+slope = np.polyfit(t[:T0], pre_gap, 1)[0]
+did = (treat[T0:].mean() - treat[:T0].mean()) - (ctrl[T0:].mean() - ctrl[:T0].mean())
+print("pre-period gap slope per period:", round(slope, 3), "(should be about 0)")
+print("naive DiD estimate:", round(did, 2), " true effect: 4.0")
+# fix: allow a group-specific linear trend estimated on the pre-period
+cf = np.polyval(np.polyfit(t[:T0], treat[:T0] - ctrl[:T0], 1), t[T0:])
+est = ((treat - ctrl)[T0:] - cf).mean()
+print("trend-adjusted estimate:", round(est, 2))</code></pre>
+<pre class="code lang-text"><code>pre-period gap slope per period: 1.091 (should be about 0)
+naive DiD estimate: 11.83  true effect: 4.0
+trend-adjusted estimate: 3.1</code></pre>
+<ul><li><strong>Step 1</strong> The pre-launch gap grows by 1.09 per period, so the "should be about 0" check fails.</li><li><strong>Step 2</strong> The plain DiD returns 11.83, nearly three times the truth of 4.</li><li><strong>Step 3</strong> The trend-adjusted estimate is 3.10. It is much closer, but extrapolating a noisy slope adds error. Report both, with the pre-trend check, and prefer a better control group or a synthetic control when you can build one.</li></ul>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">A causal estimate is only as good as its pre-launch diagnostics. Publish the pre-trend plot and the placebo test next to the headline number.</div></div>
+<h3>Marking guide for the three projects</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Project</th><th>Must have</th><th>Healthy ranges</th><th>Red flags</th></tr></thead><tbody>
+<tr><td>Recommender (16.1)</td><td>Popularity baseline, recall for stage 1, NDCG for stage 2, cold-start plan</td><td>Beats popularity on NDCG; recall at 100 candidates well above the ranker's top-10 hit rate</td><td>NDCG above 0.9 on real-looking data; ideal DCG from the shown list</td></tr>
+<tr><td>Scorecard (16.2)</td><td>Time-based split, WoE fitted on train only, KS, Gini, PSI</td><td>Gini 0.3 to 0.6 on retail credit data; PSI under 0.1 stable, 0.1 to 0.25 watch, above 0.25 act</td><td>Gini above 0.8; train Gini far above test Gini</td></tr>
+<tr><td>Causal (16.3)</td><td>DAG, overlap plot, balance table (SMD under 0.1), pre-trend and placebo checks</td><td>Estimates stable across adjustment, IPW and DiD</td><td>Single estimate, no diagnostics, SMD above 0.1 left unaddressed</td></tr></tbody></table></div>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
 <ul><li>Two-stage recommenders pair a fast candidate generator with a better ranker; report recall for stage 1 and NDCG for stage 2.</li><li>Compare with popularity; judge warm and cold items separately; test cold start with a cold-only ranking.</li><li>A scorecard is bins, WoE, logistic regression and points; every step is auditable.</li><li>Gini and KS measure separation; PSI measures drift; none of them measures calibration.</li><li>Fit bins on training data only; watch zero counts and non-monotonic WoE.</li><li>Naive group comparisons overstate effects when the groups differ.</li><li>Propensity weighting fixes imbalance on measured variables only; test with sensitivity runs.</li><li>DiD needs parallel trends; check pre-trends and a placebo, and resample units, not rows.</li></ul>
 <div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Formula</th></tr></thead><tbody><tr><td>NDCG@k</td><td><code>DCG/ideal DCG</code>, <code>DCG = Σ rel_i / log2(i+1)</code></td></tr><tr><td>WoE and IV</td><td><code>WoE = ln(%good/%bad)</code>, <code>IV = Σ (%good − %bad) × WoE</code></td></tr><tr><td>Gini</td><td><code>2 × AUC − 1</code></td></tr><tr><td>Score points</td><td><code>offset + (PDO/ln 2) × ln(odds good)</code></td></tr><tr><td>PSI</td><td><code>Σ (a − e) × ln(a/e)</code></td></tr><tr><td>IPW weights</td><td>treated <code>1/ps</code>, control <code>1/(1−ps)</code></td></tr><tr><td>DiD</td><td><code>(treated post − treated pre) − (control post − control pre)</code></td></tr></tbody></table></div>
-<h2 id="s5-practice-set">Practice set</h2>
+<h2 id="s6-practice-set">Practice set</h2>
 <p><strong>1.</strong> (easy) A relevant item appears at ranks 1 and 3 of the top 10; the user has 2 relevant items in total. Compute NDCG@10. <strong>Answer:</strong> <code>DCG = 1/log2(2) + 1/log2(4) = 1 + 0.5 = 1.5</code>. Ideal <code>= 1 + 1/log2(3) = 1.631</code>. NDCG <code>= 1.5/1.631 = 0.920</code>.</p>
 <p><strong>2.</strong> (easy) A bin holds 60% of goods and 30% of bads. Compute its WoE and its IV contribution. <strong>Answer:</strong> <code>WoE = ln(0.6/0.3) = ln 2 = 0.693</code>. IV <code>= (0.6 − 0.3) × 0.693 = 0.208</code>.</p>
 <p><strong>3.</strong> (easy) Treated sales went from 100 to 110; control from 90 to 95. DiD estimate? <strong>Answer:</strong> <code>(110 − 100) − (95 − 90) = 5</code>.</p>
@@ -4033,7 +5001,9 @@ pre-trend slope treated=0: 1.53</code></pre>
 <p><strong>6.</strong> (find the bug) A scorecard builder computes quantile bins and WoE on the full dataset, then splits into train and test. Test Gini is 0.40, but production Gini is 0.31. Why? <strong>Answer:</strong> the bins and WoE values saw the test labels, which leaked information. Fit bins and WoE on training data only.</p>
 <p><strong>7.</strong> (scenario) After weighting, SMD for all measured covariates is below 0.05, and a manager says the estimate is causal. Reply. <strong>Answer:</strong> balance holds only on measured variables. Ask about unmeasured drivers, show what happens when a covariate is dropped, report a sensitivity analysis and say what test would confirm it.</p>
 <p><strong>8.</strong> (interview) "Your recommender has NDCG@10 of 0.30 offline. Why might a live test show no gain?" <strong>Answer:</strong> offline data reflects past exposure, so the metric rewards items users already saw. Candidate recall may be limited, popularity may already capture most gain and users react to new lists. Run an A/B test with a pre-set sample size and guardrails.</p>
-<h2 id="s6-prompt-pack">Prompt pack</h2>
+<p><strong>9.</strong> (medium) A ranker retrieves only 1 of a user's 4 relevant items, at rank 1. Compute NDCG@5 correctly. <strong>Answer:</strong> DCG = 1. Ideal DCG at k = 5 with 4 relevant items = 1 + 0.6309 + 0.5 + 0.4307 = 2.5616. NDCG = 1 / 2.5616 = 0.390. A buggy ideal built from the shown list would give 1.0 and hide the missed items.</p>
+<p><strong>10.</strong> (hard) Pre-launch trends differ and the trend-adjusted DiD gives 3.1 while the plain DiD gives 11.8. Which do you report to the board? <strong>Answer:</strong> Report the adjusted estimate as the main figure, show the plain DiD and the pre-trend plot, and state that the adjustment assumes the pre-period trend gap would have continued. Offer a synthetic control or a holdout in the next rollout to remove that assumption.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Help me plan a two-stage recommender project on a MovieLens-style dataset: candidate generation, ranking, NDCG@10 and cold start. Ask me three questions about my data first, one at a time. Then propose the folder layout, the baselines I must beat and three acceptance criteria with numbers. Keep your English simple and explain every technical word.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Review my recommender evaluation for leakage and weak baselines. Check: train/test split by user, whether seen items are excluded, popularity baseline, candidate recall, NDCG@10 definition and how cold items are judged. Say pass, fail or unknown for each and what to fix. My code and numbers: [PASTE HERE]. Use simple English.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me to debug a credit scorecard: WoE and IV, monotonic bins, logistic regression on WoE, KS, Gini and PSI. Give me eight graded exercises with a tiny table of goods and bads, without solutions, then check my answers one at a time. If I make a mistake, ask a question that helps me find it. Use simple English.</pre></div>

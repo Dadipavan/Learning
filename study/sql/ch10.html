@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 10: Indexes, EXPLAIN and Query Optimization</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">SQL &amp; Databases Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 10</div><h1>Indexes, EXPLAIN and Query Optimization</h1><p>Why one query takes 4 ms and another takes 400, how to read the database&#x27;s plan, and how to fix slow SQL step by step, measuring before and after.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-10-1-what-an-index-is-and-what-it-costs">10.1 What an Index Is, and What It Costs</a></li><li><a href="#s2-10-2-composite-covering-partial-and-expression-indexes">10.2 Composite, Covering, Partial and Expression Indexes</a></li><li><a href="#s3-10-3-reading-explain-and-explain-analyze">10.3 Reading EXPLAIN and EXPLAIN ANALYZE</a></li><li><a href="#s4-10-4-query-optimization-a-measure-first-method">10.4 Query Optimization: A Measure-First Method</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>You already know how to find a bottleneck: measure, change one thing, measure again. This chapter applies that same habit to the database. A report that took 10 seconds in testing will take minutes with real data, and the usual cause is that the database reads every row when it could read a few. You will learn what an index is, how to see the database's plan with <code>EXPLAIN</code>, how to write queries the planner can speed up, and when an index makes things worse. By the end you can take a slow query, prove why it is slow, fix it, and show the before and after numbers.</p>
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 10: Indexes, EXPLAIN and Query Optimization</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b84a22"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">SQL &amp; Databases Mastery</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 10</div><h1>Indexes, EXPLAIN and Query Optimization</h1><p>Why one query takes 4 ms and another takes 400, how to read the database&#x27;s plan, and how to fix slow SQL step by step, measuring before and after.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-10-1-what-an-index-is-and-what-it-costs">10.1 What an Index Is, and What It Costs</a></li><li><a href="#s2-10-2-composite-covering-partial-and-expression-indexes">10.2 Composite, Covering, Partial and Expression Indexes</a></li><li><a href="#s3-10-3-reading-explain-and-explain-analyze">10.3 Reading EXPLAIN and EXPLAIN ANALYZE</a></li><li><a href="#s4-10-4-query-optimization-a-measure-first-method">10.4 Query Optimization: A Measure-First Method</a></li><li><a href="#s5-10-5-performance-lab-sargability-pagination-and-statistics-you-can-mea">10.5 Performance Lab: Sargability, Pagination and Statistics You Can Measure</a></li><li><a href="#s6-10-6-index-types-join-algorithms-and-partitioning">10.6 Index Types, Join Algorithms and Partitioning</a></li><li><a href="#s7-chapter-recap">Chapter recap</a></li><li><a href="#s8-practice-set">Practice set</a></li><li><a href="#s9-prompt-pack">Prompt pack</a></li></ol></details><p>You already know how to find a bottleneck: measure, change one thing, measure again. This chapter applies that same habit to the database. A report that took 10 seconds in testing will take minutes with real data, and the usual cause is that the database reads every row when it could read a few. You will learn what an index is, how to see the database's plan with <code>EXPLAIN</code>, how to write queries the planner can speed up, and when an index makes things worse. By the end you can take a slow query, prove why it is slow, fix it, and show the before and after numbers.</p>
 <p>Examples run in SQLite 3.51 using <code>EXPLAIN QUERY PLAN</code>. PostgreSQL's <code>EXPLAIN ANALYZE</code> is described but <strong>not run here</strong>, and I do not invent its numbers. Timings below are real runs on my laptop: your numbers will differ, but the ratios will look alike.</p>
 <p><strong>Running example.</strong> A table <code>big</code> with 200,000 rows, built so you can reproduce it:</p>
 <pre class="code lang-sql"><code>CREATE TABLE big (id INTEGER PRIMARY KEY, customer_id INTEGER,
@@ -208,11 +208,216 @@ SELECT sum(amount) FROM big WHERE customer_id &lt; 5000;</code></pre>
 <p>Answer: One query to get a list, then one more query per item, so N+1 calls instead of one.</p>
 <ol><li>Why can an index make a query slower?</li></ol>
 <p>Answer: If the filter keeps a large share of rows, jumping through the index costs more than a straight scan.</p>
-<h2 id="s5-chapter-recap">Chapter recap</h2>
+<!-- gen:lab10 -->
+<h2 id="s5-10-5-performance-lab-sargability-pagination-and-statistics-you-can-mea">10.5 Performance Lab: Sargability, Pagination and Statistics You Can Measure</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A phone book is sorted by surname. Finding 'Rao' takes seconds because you can jump. Finding everyone whose surname, <em>spelled backwards</em>, starts with 'oa' takes hours, because the sorting no longer helps and you must read every line. A query is <strong>sargable</strong> (Search ARGument ABLE) when its <code>WHERE</code> test is written so that an index can jump. This section makes you measure the difference instead of trusting it.</div></div>
+<p>To measure work without depending on a fast or slow laptop, the lab counts <strong>SQLite virtual-machine steps</strong>: every query is compiled into small instructions, and we count how many run. Fewer steps means less work. The exact counts depend on your SQLite version (this run used 3.50.4), so compare the ratios, not the digits. PostgreSQL shows the same ideas through <code>EXPLAIN ANALYZE</code> (not run here).</p>
+<h3>Sargability: five rewrites that decide whether an index is used</h3>
+<p>The rule: an index stores the <em>column value</em>, so the test must compare the bare column with something. Wrap the column in a function or arithmetic and the database cannot use the sorted order.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Slow form (index ignored)</th><th>Fast form (index usable)</th><th>Why</th></tr></thead><tbody><tr><td><code>WHERE substr(created,1,7) = '2024-03'</code></td><td><code>WHERE created &gt;= '2024-03-01' AND created &lt; '2024-04-01'</code></td><td>a date range is a contiguous slice of the sorted index</td></tr><tr><td><code>WHERE lower(email) = 'a@x.com'</code></td><td>expression index on <code>lower(email)</code>, same query</td><td>the index stores exactly what the query compares</td></tr><tr><td><code>WHERE customer_id + 1 = 43</code></td><td><code>WHERE customer_id = 42</code></td><td>move arithmetic to the constant side</td></tr><tr><td><code>WHERE name LIKE '%son'</code></td><td><code>WHERE name LIKE 'son%'</code>, or a trigram index (PostgreSQL <code>pg_trgm</code>)</td><td>a B-tree can only follow a known prefix</td></tr><tr><td><code>WHERE a = 1 OR b = 2</code></td><td><code>UNION ALL</code> of two queries, or one index on each column (PostgreSQL combines them with a bitmap OR)</td><td>a single B-tree cannot answer two different columns at once</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 10.5.1</span> Run the first three rewrites on a 50,000-row table and compare steps. Predict first: the slow forms touch all 50,000 rows (about 200,000 steps, four per row), the fast forms touch a small slice.</p>
+<pre class="code lang-python"><code>import sqlite3, random
+random.seed(7)
+db = sqlite3.connect(":memory:", isolation_level=None)
+db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, customer_id INT, created TEXT, email TEXT, amount INT)")
+rows = [(i, random.randint(1, 2000), "2024-%02d-%02d" % (random.randint(1, 12), random.randint(1, 28)),
+         "user%d@Mail.com" % i, random.randint(10, 999)) for i in range(1, 50001)]
+db.executemany("INSERT INTO big VALUES (?,?,?,?,?)", rows)
+
+def cost(q, args=()):
+    """count SQLite virtual-machine steps: a stable stand-in for 'work done'"""
+    n = [0]
+    def tick():
+        n[0] += 1
+        return 0
+    db.set_progress_handler(tick, 1)
+    db.execute(q, args).fetchall()
+    db.set_progress_handler(None, 0)
+    return n[0]
+
+def plan(q):
+    return db.execute("EXPLAIN QUERY PLAN " + q).fetchall()[0][3]
+
+tests = [
+  ("function on column", "SELECT count(*) FROM big WHERE substr(created, 1, 7) = '2024-03'",
+                         "SELECT count(*) FROM big WHERE created &gt;= '2024-03-01' AND created &lt; '2024-04-01'", None),
+  ("lower() on column",  "SELECT count(*) FROM big WHERE lower(email) = 'user77@mail.com'",
+                         "SELECT count(*) FROM big WHERE lower(email) = 'user77@mail.com'",
+                         "CREATE INDEX i_lemail ON big(lower(email))"),
+  ("arithmetic on column", "SELECT count(*) FROM big WHERE customer_id + 1 = 43",
+                         "SELECT count(*) FROM big WHERE customer_id = 42", None),
+]
+db.execute("CREATE INDEX i_created ON big(created)")
+db.execute("CREATE INDEX i_cust ON big(customer_id)")
+for name, bad, good, new_index in tests:
+    print(name)
+    print("  slow :", cost(bad), "steps |", plan(bad))
+    if new_index:
+        db.execute(new_index)
+        print("  (created the expression index)")
+    print("  fast :", cost(good), "steps |", plan(good))</code></pre>
+<pre class="code lang-text"><code>function on column
+  slow : 204116 steps | SCAN big USING COVERING INDEX i_created
+  fast : 12322 steps | SEARCH big USING COVERING INDEX i_created (created&gt;? AND created&lt;?)
+lower() on column
+  slow : 200013 steps | SCAN big
+  (created the expression index)
+  fast : 18 steps | SEARCH big USING COVERING INDEX i_lemail (&lt;expr&gt;=?)
+arithmetic on column
+  slow : 200031 steps | SCAN big USING COVERING INDEX i_cust
+  fast : 64 steps | SEARCH big USING COVERING INDEX i_cust (customer_id=?)</code></pre>
+<table class="steps"><tr><th>Step 1</th><td>The first pair filters by month. <code>substr(created,1,7)</code> is a function of the column, so the plan says <code>SCAN</code> and every row is read. The range form says <code>SEARCH ... (created&gt;? AND created&lt;?)</code>: the index jumps to 2024-03-01 and stops at 2024-04-01. Steps fall from 204,116 to 12,322, about 17 times fewer.</td></tr><tr><th>Step 2</th><td>The second pair uses the same query text. The only change is the new expression index on <code>lower(email)</code>, which stores the lowercase value. The scan (200,013 steps) becomes a search (18 steps). You changed the index, not the query.</td></tr><tr><th>Step 3</th><td>The third pair moves <code>+ 1</code> to the other side of the equals sign: 200,030 steps become 64.</td></tr><tr><th>Answer</th><td>Keep the column bare on one side of the comparison. If you cannot, index the expression.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Writing a date filter as <code>WHERE DATE(created_at) = '2024-03-15'</code> or <code>WHERE EXTRACT(YEAR FROM created_at) = 2024</code> on a large table. It works and returns correct rows, so nothing warns you, yet it reads every row. Right: <code>WHERE created_at &gt;= '2024-03-15' AND created_at &lt; '2024-03-16'</code>. A second trap is a type mismatch, such as comparing a text column to a number (<code>WHERE phone = 5551234</code>): the database may convert every stored value and skip the index.</div></div>
+<p class="problem"><span class="pl">Problem 10.5.2</span> (find the slow part) A teammate reports that <code>SELECT * FROM big WHERE amount * 1.1 &gt; 500</code> is slow even though <code>amount</code> is indexed. Fix it. Predict first: the multiplication is on the column side.</p>
+<table class="steps"><tr><th>Idea</th><td>Divide the constant instead: <code>amount * 1.1 &gt; 500</code> is the same as <code>amount &gt; 500 / 1.1</code>.</td></tr><tr><th>Rewrite</th><td><code>WHERE amount &gt; 454.55</code> (500 / 1.1 = 454.545..., so use 454.55 for integers: <code>amount &gt;= 455</code> because 455 x 1.1 = 500.5 is above 500 and 454 x 1.1 = 499.4 is not).</td></tr><tr><th>Check</th><td>Integer amounts 455 and up pass the original test, 454 and below fail. Both forms return the same rows, and the second can use an index on <code>amount</code>.</td></tr></table>
+<h3>Pagination: OFFSET gets slower with every page, keyset does not</h3>
+<p>A web page shows 20 rows at a time. The obvious query is <code>ORDER BY created, id LIMIT 20 OFFSET 9980</code>. The database cannot skip 9,980 rows without walking past them, so page 500 costs 500 times what page 1 costs. <strong>Keyset pagination</strong> (also called the seek method) remembers the last row of the previous page and asks for rows after it, so the index jumps straight there.</p>
+<p class="problem"><span class="pl">Problem 10.5.3</span> Fetch page 1, page 100 and page 500 both ways. Predict first: OFFSET cost grows in proportion to the page number, keyset cost stays about the same.</p>
+<pre class="code lang-python"><code>import sqlite3, random
+random.seed(7)
+db = sqlite3.connect(":memory:", isolation_level=None)
+db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, customer_id INT, created TEXT, email TEXT, amount INT)")
+rows = [(i, random.randint(1, 2000), "2024-%02d-%02d" % (random.randint(1, 12), random.randint(1, 28)),
+         "user%d@Mail.com" % i, random.randint(10, 999)) for i in range(1, 50001)]
+db.executemany("INSERT INTO big VALUES (?,?,?,?,?)", rows)
+
+def cost(q, args=()):
+    """count SQLite virtual-machine steps: a stable stand-in for 'work done'"""
+    n = [0]
+    def tick():
+        n[0] += 1
+        return 0
+    db.set_progress_handler(tick, 1)
+    db.execute(q, args).fetchall()
+    db.set_progress_handler(None, 0)
+    return n[0]
+
+def plan(q):
+    return db.execute("EXPLAIN QUERY PLAN " + q).fetchall()[0][3]
+
+db.execute("CREATE INDEX i_ci ON big(created, id)")
+for page in (1, 100, 500):
+    off = (page - 1) * 20
+    a = cost("SELECT id, created FROM big ORDER BY created, id LIMIT 20 OFFSET ?", (off,))
+    last = db.execute("SELECT created, id FROM big ORDER BY created, id LIMIT 1 OFFSET ?", (max(off - 1, 0),)).fetchone()
+    k = cost("SELECT id, created FROM big WHERE (created, id) &gt; (?, ?) ORDER BY created, id LIMIT 20", last)
+    print("page %3d  OFFSET: %6d steps   keyset: %5d steps" % (page, a, k))</code></pre>
+<pre class="code lang-text"><code>page   1  OFFSET:    130 steps   keyset:   263 steps
+page 100  OFFSET:   4090 steps   keyset:   765 steps
+page 500  OFFSET:  20090 steps   keyset:   738 steps</code></pre>
+<table class="steps"><tr><th>Step 1</th><td>OFFSET steps grow by about 4,000 per 100 pages: 130, 4,090, 20,090. That is 200 steps per page of skipped rows.</td></tr><tr><th>Step 2</th><td>The keyset form uses <code>WHERE (created, id) &gt; (last_created, last_id)</code>, a row-value comparison that the index on <code>(created, id)</code> answers by seeking. Its cost stays under about 1,400 steps whatever the page (it is not perfectly flat here because many rows share one date). On page 1 it is slightly more expensive, since there is no previous row to seek from.</td></tr><tr><th>Answer</th><td>Use keyset for feeds and infinite scroll. Keep OFFSET for small tables or when users must jump to page 37.</td></tr></table>
+<figure><img src="images/ch10_pagination.png" alt="Line chart of SQLite virtual machine steps against page number, OFFSET rising linearly and keyset staying low" loading="lazy"/><figcaption>Work needed to fetch one page of 20 rows from a 50,000-row table, measured on SQLite 3.50.4.</figcaption></figure>
+<p><strong>How to read it:</strong> the orange line is OFFSET paging: it climbs in a straight line because each deeper page skips more rows. The blue line is keyset paging: it wobbles but never climbs. The vertical gap at page 500 is the price of skipping 9,980 rows.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Keyset pagination on a column that is not unique. If you page by <code>created</code> alone and ten rows share one timestamp, rows can be skipped or repeated at the page boundary. Always add a unique tie-breaker (<code>created, id</code>) to both the <code>ORDER BY</code> and the <code>WHERE</code>. Also, row-value comparison <code>(a, b) &gt; (x, y)</code> works in PostgreSQL, MySQL and SQLite but not in SQL Server, where you write <code>a &gt; x OR (a = x AND b &gt; y)</code>.</div></div>
+<h3>Statistics: why the planner sometimes guesses wrong</h3>
+<p>Before running a query the planner estimates how many rows each step returns, using <strong>statistics</strong> collected by <code>ANALYZE</code>. If the estimate is far from reality, it picks a bad plan: it scans when it should seek, or the other way round. The classic cause is <strong>skew</strong>: 99 percent of rows share one value, and statistics that only keep an average cannot see that.</p>
+<p class="problem"><span class="pl">Problem 10.5.4</span> A table has 50,000 events, 99 percent with status <code>done</code> and 1 percent <code>failed</code>, with an index on <code>status</code>. Compare the plans for both values before and after <code>ANALYZE</code>. Predict first: both look the same to a planner that only knows the average.</p>
+<pre class="code lang-python"><code>import sqlite3
+db = sqlite3.connect(":memory:", isolation_level=None)
+db.execute("CREATE TABLE ev (id INTEGER PRIMARY KEY, status TEXT, v INT)")
+db.executemany("INSERT INTO ev VALUES (?,?,?)", [(i, 'done' if i % 100 else 'failed', i) for i in range(1, 50001)])
+db.execute("CREATE INDEX i_status ON ev(status)")
+
+def run(label):
+    for st in ("done", "failed"):
+        q = "SELECT count(*), sum(v) FROM ev WHERE status = '%s'" % st
+        n = [0]
+        def tick():
+            n[0] += 1
+            return 0
+        db.set_progress_handler(tick, 1)
+        db.execute(q).fetchall()
+        db.set_progress_handler(None, 0)
+        p = db.execute("EXPLAIN QUERY PLAN " + q).fetchall()[0][3]
+        print(label, st.ljust(6), str(n[0]).rjust(7), "steps |", p)
+
+run("before ANALYZE:")
+db.execute("ANALYZE")
+print(db.execute("SELECT tbl, idx, stat FROM sqlite_stat1").fetchall())
+run("after  ANALYZE:")</code></pre>
+<pre class="code lang-text"><code>before ANALYZE: done    297014 steps | SEARCH ev USING INDEX i_status (status=?)
+before ANALYZE: failed    3013 steps | SEARCH ev USING INDEX i_status (status=?)
+[('ev', 'i_status', '50000 25000')]
+after  ANALYZE: done    298513 steps | SCAN ev
+after  ANALYZE: failed  151513 steps | SCAN ev</code></pre>
+<table class="steps"><tr><th>Step 1</th><td>Before <code>ANALYZE</code> SQLite has no statistics and uses the index for both values. For <code>failed</code> (500 rows) that is right: 3,013 steps. For <code>done</code> (49,500 rows) it is wasteful, 297,014 steps, because it hops from index to table 49,500 times.</td></tr><tr><th>Step 2</th><td><code>ANALYZE</code> stores <code>'50000 25000'</code>: 50,000 rows, on average 25,000 rows per status value. Two values, so the average is exactly half the table.</td></tr><tr><th>Step 3</th><td>With that average the planner decides an index is not worth it and scans for <em>both</em>. That helps <code>done</code> slightly (298,513 steps, about the same) but makes <code>failed</code> 50 times worse (151,513 vs 3,013).</td></tr><tr><th>Answer</th><td>Statistics are summaries, and summaries hide skew. PostgreSQL keeps a list of most common values and a histogram, so it knows that <code>failed</code> is rare; SQLite builds with STAT4 do something similar. Always compare estimated and actual row counts in <code>EXPLAIN ANALYZE</code> (not run here); a 10x gap is your signal.</td></tr></table>
+<div class="callout green"><div class="lab">GOING DEEPER</div><div class="txt">PostgreSQL fixes a bad estimate in this order: (1) run <code>ANALYZE table</code> because statistics may simply be old, (2) raise the detail with <code>ALTER TABLE t ALTER COLUMN c SET STATISTICS 1000</code>, (3) add extended statistics for correlated columns (<code>CREATE STATISTICS s (dependencies) ON city, zip FROM t</code>), because the planner multiplies the selectivities of two columns as if they were independent, and city and zip are not, (4) as a last resort rewrite the query. The <em>autovacuum</em> daemon runs <code>ANALYZE</code> automatically, but after a bulk load you should run it yourself. None of these commands were run here.</div></div>
+<h2 id="s6-10-6-index-types-join-algorithms-and-partitioning">10.6 Index Types, Join Algorithms and Partitioning</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">So far an index meant a B-tree: a sorted tree. Think of it as the index at the back of a textbook, sorted alphabetically. Other books need other indexes: a map index (find everything near this place), a keyword index for chapters that mention several words, a table of contents that only says which <em>block of pages</em> to look in. PostgreSQL offers each of these as an index type.</div></div>
+<figure><img src="images/ch10_btree.png" alt="Diagram of a B-tree with a root, three branch nodes and four linked leaf pages, with a lookup of key 44 highlighted" loading="lazy"/><figcaption>A B-tree lookup of key 44 in a tiny tree: root, branch, leaf.</figcaption></figure>
+<p><strong>How to read it:</strong> start at the root and follow the arrow whose range contains 44 (between 30 and 60). The branch sends you between 40 and 50, and the leaf holds 44 with a pointer to the table row. That is three page reads. A real tree holds hundreds of keys per page, so even a billion-row table is only four or five levels deep. The dotted arrows between leaves are why range queries (<code>BETWEEN</code>, <code>ORDER BY</code>) are fast: after finding the start, walk sideways.</p>
+<h3>Index types at a glance (PostgreSQL, not run here)</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Type</th><th>Best for</th><th>Does not help with</th></tr></thead><tbody><tr><td>B-tree (default)</td><td>equality, ranges, <code>ORDER BY</code>, prefix <code>LIKE 'abc%'</code></td><td>searching inside arrays or text, or the last letters of a string</td></tr><tr><td>Hash</td><td>equality only, small and fast keys</td><td>ranges, sorting (rarely better than B-tree)</td></tr><tr><td>GIN</td><td>many values per row: arrays, <code>jsonb</code>, full-text search, trigrams</td><td>range sorting; writes are slower</td></tr><tr><td>GiST</td><td>geometry, nearest-neighbour, ranges overlap (<code>&amp;&amp;</code>), exclusion constraints</td><td>exact equality on plain numbers</td></tr><tr><td>BRIN</td><td>huge tables whose physical order follows the column (logs by timestamp); the index is tiny</td><td>randomly ordered columns</td></tr><tr><td>Partial / expression</td><td>only some rows, or a computed value (Section 10.2)</td><td>queries that do not repeat the same condition</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 10.6.1</span> Pick the index for each: (a) <code>WHERE tags @&gt; ARRAY['sale']</code> on a text-array column, (b) 2 billion sensor rows appended in time order, queried by time window, (c) <code>WHERE email = ?</code>, (d) find the 10 nearest shops to a point. Predict first: four different answers.</p>
+<table class="steps"><tr><th>(a)</th><td>GIN: it stores one entry per array element, so containment search is direct.</td></tr><tr><th>(b)</th><td>BRIN: it stores the min and max timestamp per block of pages, a few megabytes for terabytes of data. It only works because rows arrive in time order.</td></tr><tr><th>(c)</th><td>B-tree (hash would work for pure equality, but B-tree is the safe default and supports uniqueness).</td></tr><tr><th>(d)</th><td>GiST (or SP-GiST): it supports distance ordering with <code>ORDER BY location &lt;-&gt; point LIMIT 10</code>.</td></tr></table>
+<h3>Join algorithms, measured</h3>
+<p>Section 10.3 listed the three join algorithms. SQLite uses nested loops, so we can measure one. We join 2,000 customers to 50,000 orders and keep customers 1 to 50:</p>
+<pre class="code lang-python"><code>import sqlite3, random
+random.seed(7)
+db = sqlite3.connect(":memory:", isolation_level=None)
+db.execute("CREATE TABLE cust (customer_id INTEGER PRIMARY KEY, name TEXT)")
+db.executemany("INSERT INTO cust VALUES (?,?)", [(i, "c%d" % i) for i in range(1, 2001)])
+db.execute("CREATE TABLE big (id INTEGER PRIMARY KEY, customer_id INT, created TEXT, email TEXT, amount INT)")
+rows = [(i, random.randint(1, 2000), "2024-%02d-%02d" % (random.randint(1, 12), random.randint(1, 28)),
+         "user%d@Mail.com" % i, random.randint(10, 999)) for i in range(1, 50001)]
+db.executemany("INSERT INTO big VALUES (?,?,?,?,?)", rows)
+
+
+def cost(q):
+    n = [0]
+    def tick():
+        n[0] += 1
+        return 0
+    db.set_progress_handler(tick, 1)
+    db.execute(q).fetchall()
+    db.set_progress_handler(None, 0)
+    return n[0]
+
+q = "SELECT count(*) FROM cust c JOIN big b ON b.customer_id = c.customer_id WHERE c.customer_id &lt;= 50"
+def plans(q):
+    return " ; ".join(r[3] for r in db.execute("EXPLAIN QUERY PLAN " + q).fetchall())
+print("no index   :", cost(q), "steps |", plans(q))
+db.execute("CREATE INDEX i_cust ON big(customer_id)")
+print("with index :", cost(q), "steps |", plans(q))</code></pre>
+<pre class="code lang-text"><code>no index   : 251242 steps | SCAN b ; SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
+with index : 8613 steps | SEARCH b USING COVERING INDEX i_cust (customer_id&lt;?) ; SEARCH c USING INTEGER PRIMARY KEY (rowid=?)</code></pre>
+<table class="steps"><tr><th>Step 1</th><td>Without an index on <code>big.customer_id</code> the plan reads: <code>SCAN b</code> (all 50,000 orders, outer loop) then <code>SEARCH c</code> by primary key for each one. SQLite picked the big table as the outer loop because that is the cheapest order it could find. Cost: 251,242 steps.</td></tr><tr><th>Step 2</th><td>With the index, the plan flips: <code>SEARCH b USING COVERING INDEX i_cust (customer_id&lt;?)</code> reads only the orders of customers 1 to 50, then looks each customer up. Cost: 8,613 steps, about 29 times less.</td></tr><tr><th>Step 3</th><td>Notice that the planner also chose a different join <em>order</em>. Join order is part of the plan and it changes when indexes change.</td></tr><tr><th>Answer</th><td>A nested loop is fast exactly when the inner side can be probed with an index (here the primary key of <code>c</code>). A hash join (PostgreSQL) instead builds a hash table of the smaller input once and probes it, which is why it wins for big unindexed equality joins. A merge join wins when both inputs already arrive sorted. You rarely choose the algorithm; you make the right index or statistics exist and read the plan.</td></tr></table>
+<h3>Partitioning: splitting one big table into many</h3>
+<p><strong>Partitioning</strong> splits a table into physical pieces by a rule, usually a date range, while queries still address one table name. The pay-off is <strong>partition pruning</strong>: when the <code>WHERE</code> clause fixes the date, the planner skips whole pieces. A second pay-off is housekeeping: dropping an old month is <code>DROP TABLE orders_2023_01</code>, instant, instead of a huge <code>DELETE</code> that leaves dead rows.</p>
+<pre class="code lang-sql"><code>-- PostgreSQL (not run here)
+CREATE TABLE orders (
+  order_id   bigint,
+  order_date date NOT NULL,
+  amount     numeric
+) PARTITION BY RANGE (order_date);
+
+CREATE TABLE orders_2024_03 PARTITION OF orders
+  FOR VALUES FROM ('2024-03-01') TO ('2024-04-01');
+CREATE TABLE orders_2024_04 PARTITION OF orders
+  FOR VALUES FROM ('2024-04-01') TO ('2024-05-01');
+
+-- retire old data without a giant DELETE
+ALTER TABLE orders DETACH PARTITION orders_2024_03;</code></pre>
+<figure><img src="images/ch10_partition.png" alt="Six monthly partitions of an orders table with only the March partition highlighted as read" loading="lazy"/><figcaption>Partition pruning for a query that filters on March 2024.</figcaption></figure>
+<p><strong>How to read it:</strong> the filter at the top matches only the March box, so only that partition is opened. The other five are proven irrelevant from their boundaries, which is why <code>EXPLAIN</code> lists a single partition. If the filter did not mention <code>order_date</code>, every box would be read.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Partitioning a table of 5 million rows 'for speed'. Partitioning helps when the table is large (hundreds of millions of rows, or too big to maintain) <em>and</em> most queries filter on the partition key. Otherwise it adds planning time and complexity. In PostgreSQL a primary key or unique index on a partitioned table must include the partition key, so <code>order_id</code> alone cannot be unique across partitions. Never partition just because the table is big; first check indexes and statistics.</div></div>
+<h3>N+1 and the slow-query log</h3>
+<p>The N+1 problem (Section 10.4) is the most common reason an application is slow with a fast database: one query lists 100 orders, then the code runs 100 more queries, one per order. The cure is one join or one <code>WHERE id IN (...)</code> query. To find such patterns in PostgreSQL, enable the <code>pg_stat_statements</code> extension (not run here): it adds up calls, total time and mean time per query shape, so a cheap query called 2 million times shows up at the top. Sort by <code>total_exec_time</code>, not by the slowest single query, because the biggest cost is often a million quick calls.</p>
+<h3>Practice with answers</h3>
+<p class="problem"><span class="pl">Problem 10.6.2</span> A <code>WHERE status = 'open'</code> query is slow on a 300 million row table where 0.2 percent of rows are open. What index? <em>(medium)</em></p>
+<p><strong>Answer:</strong> A partial index: <code>CREATE INDEX ON t (id) WHERE status = 'open'</code>. It holds only 0.2 percent of rows (600,000 entries), so it is tiny and fast to maintain. The query must repeat <code>status = 'open'</code> for the planner to use it.</p>
+<p class="problem"><span class="pl">Problem 10.6.3</span> What is wrong with <code>SELECT * FROM t ORDER BY created DESC LIMIT 20 OFFSET 100000</code> and what is the fix? <em>(medium)</em></p>
+<p><strong>Answer:</strong> The database reads and discards 100,000 rows before returning 20. Fix: keyset pagination, <code>WHERE (created, id) &lt; (:last_created, :last_id) ORDER BY created DESC, id DESC LIMIT 20</code>, backed by an index on <code>(created, id)</code>.</p>
+<p class="problem"><span class="pl">Problem 10.6.4</span> A query that was fast last month now takes minutes, and no code changed. List three causes in the order you would check them. <em>(interview)</em></p>
+<p><strong>Answer:</strong> (1) Stale statistics after data growth or a bulk load: run <code>ANALYZE</code> and compare estimated with actual rows. (2) A plan that flipped because the data distribution changed (skew), seen by comparing old and new <code>EXPLAIN ANALYZE</code>. (3) Table or index bloat from many updates without vacuum, or a lock wait: check <code>pg_stat_activity</code> for blocked sessions before blaming the plan. Others: a missing index on a new join column, or the data growing beyond memory so a hash join spills to disk.</p>
+<p class="problem"><span class="pl">Problem 10.6.5</span> Why can a covering index make a query faster than any other index, and what is its cost? <em>(expert)</em></p>
+<p><strong>Answer:</strong> If the index contains every column the query needs, the database never visits the table (an index-only scan), which avoids one random read per row. The costs are a larger index, slower writes (every insert and update of those columns also updates the index), and in PostgreSQL index-only scans still check the visibility map, so they work best on well-vacuumed, mostly static tables.</p>
+<!-- /gen:lab10 -->
+<h2 id="s7-chapter-recap">Chapter recap</h2>
 <ul><li>An index is a sorted structure (usually a B-tree) that lets the database jump to rows instead of scanning the table.</li><li>Indexes speed reads and slow writes: in my test, four indexes made a 100,000-row load about 4 times slower.</li><li>Do not index tiny tables, low-selectivity columns, or write-heavy tables with rare reads.</li><li>Composite indexes follow the leftmost prefix rule: equality columns first, range last.</li><li>A covering index (or <code>INCLUDE</code>) answers a query without reading the table; <code>SELECT *</code> prevents this.</li><li>Partial and expression indexes keep the index small or support <code>lower(col)</code> style filters.</li><li><code>EXPLAIN</code> shows the plan; <code>EXPLAIN ANALYZE</code> runs it and shows real times. Compare estimated and actual rows, and watch for large "Rows Removed by Filter."</li><li>Keep indexed columns bare in <code>WHERE</code> (sargable). Rewrite functions on columns into ranges.</li><li>Fix N+1 loops with set-based queries; run <code>ANALYZE</code> after big changes.</li><li>Measure first: baseline, one change, re-measure, check the side effects.</li></ul>
 <h3>Cheat-sheet</h3>
 <div class="tablewrap"><table class="data"><thead><tr><th>Task</th><th>Pattern</th></tr></thead><tbody><tr><td>Create index</td><td><code>CREATE INDEX idx ON t(a, b);</code></td></tr><tr><td>Partial index</td><td><code>CREATE INDEX idx ON t(a) WHERE status = 'x';</code></td></tr><tr><td>Expression index</td><td><code>CREATE INDEX idx ON t(lower(email));</code></td></tr><tr><td>Covering (PostgreSQL)</td><td><code>CREATE INDEX idx ON t(a) INCLUDE (b);</code></td></tr><tr><td>See plan</td><td><code>EXPLAIN SELECT ...</code> / <code>EXPLAIN QUERY PLAN</code> (SQLite)</td></tr><tr><td>Real timing (PostgreSQL)</td><td><code>EXPLAIN (ANALYZE, BUFFERS) SELECT ...</code></td></tr><tr><td>Refresh statistics</td><td><code>ANALYZE t;</code></td></tr><tr><td>Sargable date filter</td><td><code>col &gt;= '2024-03-01' AND col &lt; '2024-03-02'</code></td></tr><tr><td>Keyset paging</td><td><code>WHERE id &gt; :last ORDER BY id LIMIT 20</code></td></tr></tbody></table></div>
-<h2 id="s6-practice-set">Practice set</h2>
+<h2 id="s8-practice-set">Practice set</h2>
 <p class="problem"><span class="pl">Problem 10.P.1</span> (easy) Which is more selective: <code>WHERE gender = 'F'</code> or <code>WHERE email = 'a@x.com'</code>? Which deserves an index? <strong>Answer:</strong> The email filter (about one row). Index <code>email</code>. A two-value column has low selectivity.</p>
 <p class="problem"><span class="pl">Problem 10.P.2</span> (easy) What does <code>SEARCH big USING COVERING INDEX ...</code> tell you? <strong>Answer:</strong> The query was answered from the index alone, without reading the table.</p>
 <p class="problem"><span class="pl">Problem 10.P.3</span> (what is the output?) Table <code>t</code> has an index on <code>(a, b)</code>. Which queries can use it fully: <code>WHERE a=1 AND b=2</code>, <code>WHERE b=2</code>, <code>WHERE a=1</code>? <strong>Answer:</strong> The first and the third. The second (<code>b</code> alone) cannot.</p>
@@ -224,9 +429,9 @@ SELECT sum(amount) FROM big WHERE customer_id &lt; 5000;</code></pre>
 <p class="problem"><span class="pl">Problem 10.P.9</span> (scenario) Page 1 of a list loads in 5 ms. Page 5,000 (<code>OFFSET 100000 LIMIT 20</code>) takes 800 ms. Why, and what is the fix? <strong>Answer:</strong> <code>OFFSET</code> reads and discards the first 100,000 rows each time. Use keyset pagination: <code>WHERE id &gt; :last_seen_id ORDER BY id LIMIT 20</code>, with an index on <code>id</code>.</p>
 <p class="problem"><span class="pl">Problem 10.P.10</span> (interview) How do you debug a query that was fast last month and is slow today? <strong>Answer:</strong> Run <code>EXPLAIN (ANALYZE, BUFFERS)</code>. Compare estimated and actual rows (stale statistics, then <code>ANALYZE</code>). Check whether the plan flipped from an index to a scan because the table grew. Check lock waits and bloat (<code>VACUUM</code>). Check for a new code path with a non-sargable filter or an N+1 loop. Change one thing at a time and measure.</p>
 <p class="problem"><span class="pl">Problem 10.P.11</span> (interview) You added an index and one query got faster but the nightly load got slower. What do you do? <strong>Answer:</strong> Each index adds write cost. Measure both sides. Options: drop unused indexes (look at index usage statistics), make the index partial, drop and recreate it around the bulk load, or accept the trade if the read gain is larger.</p>
-<h2 id="s7-prompt-pack">Prompt pack</h2>
+<h2 id="s9-prompt-pack">Prompt pack</h2>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning SQL for data roles. Teach me how a B-tree index works and what it costs: full table scan versus index search, selectivity, and when NOT to index. Use a 200,000-row orders table with real numbers, explain each step in simple English, and after each idea ask me one question to check my understanding before continuing.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data engineering. Explain composite indexes, the leftmost prefix rule, covering indexes, partial indexes and expression indexes in PostgreSQL. Then give me 8 graded exercises where I must choose the right index for a given query, without solutions. Wait for my answers and correct them kindly, explaining the reasoning.</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional who reads business reports well but has never read a database plan. Teach me to read PostgreSQL EXPLAIN and EXPLAIN ANALYZE output node by node: scan types, cost, estimated versus actual rows, loops, Rows Removed by Filter, and join algorithms. I will paste a plan next; interpret it for me line by line: [PASTE HERE]</pre></div>
 <div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning SQL query optimization. Review the slow query below. Find non-sargable filters, SELECT *, N+1 patterns, missing indexes and bad pagination. For each problem give a rewrite, the index you would create, and how I should measure before and after, with a baseline measurement. My query and table sizes: [PASTE HERE]</pre></div>
-<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for data analyst and data engineer interviews. Run a mock interview on indexes, EXPLAIN and query tuning: ask me 8 questions one at a time, from easy to hard, and wait for my answer each time. After each answer, score it out of 5, show what I missed, and give a short model answer in simple English.</pre></div><div class="readbtn"><button class="btn" data-read="study:sql:ch10">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch09.html">← Chapter 9: DDL, DML, Constraints, Upserts and Trans</a><a class="btn" href="ch11.html">Chapter 11: Schema Design, Normalization and Data Wa →</a></div></div><script src="../../assets/study.js"></script></body></html>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for data analyst and data engineer interviews. Run a mock interview on indexes, EXPLAIN and query tuning: ask me 8 questions one at a time, from easy to hard, and wait for my answer each time. After each answer, score it out of 5, show what I missed, and give a short model answer in simple English.</pre></div><div class="readbtn"><button class="btn" data-read="study:sql:ch10">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch09.html">← Chapter 9: DDL, DML, Constraints, Upserts and Transactions</a><a class="btn" href="ch11.html">Chapter 11: Schema Design, Normalization and Data Warehouse Modeling →</a></div></div><script src="../../assets/study.js"></script></body></html>

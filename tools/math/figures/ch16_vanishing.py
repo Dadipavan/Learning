@@ -1,0 +1,15 @@
+import numpy as np, matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+x = np.linspace(-6, 6, 400); s = 1/(1+np.exp(-x))
+fig, axes = plt.subplots(1, 2, figsize=(8, 4.2))
+axes[0].plot(x, s, color="#2b4fd6", label="sigmoid(x)")
+axes[0].plot(x, s*(1-s), color="#b84a22", label="derivative s(1-s), max 0.25")
+axes[0].axhline(0.25, color="k", lw=0.8, ls="--"); axes[0].legend(fontsize=8); axes[0].grid(alpha=0.3)
+axes[0].set_xlabel("x"); axes[0].set_title("Sigmoid and its derivative")
+L = np.arange(1, 21)
+axes[1].semilogy(L, 0.25**L, "o-", color="#aa2d26", ms=3, label="sigmoid: 0.25^L (upper bound)")
+axes[1].semilogy(L, 0.9**L, "s-", color="#357a70", ms=3, label="factor 0.9 per layer")
+axes[1].semilogy(L, np.ones_like(L, dtype=float), "^-", color="#2b4fd6", ms=3, label="factor 1 (ReLU active / residual)")
+axes[1].set_xlabel("number of layers L"); axes[1].set_title("Gradient size after L layers"); axes[1].legend(fontsize=8); axes[1].grid(alpha=0.3, which="both")
+fig.tight_layout(); fig.savefig("ch16_vanishing.png", dpi=110)
