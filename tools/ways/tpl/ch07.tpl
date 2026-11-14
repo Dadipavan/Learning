@@ -65,6 +65,8 @@ print("logistic regression :", round(roc_auc_score(yte, lr_model.predict_proba(X
 <figure><img src="images/ch07_nn_embed.png" alt="Left: training loss curve of the numpy network falling from 0.41 to 0.30. Right: two-dimensional map of product descriptions coloured by category" loading="lazy"/><figcaption>Left: the loss of our hand-written network falls quickly and flattens. Right: product descriptions mapped to two dimensions with TF-IDF and SVD (Section 7.3).</figcaption></figure>
 <p>How to read the left panel: the loss drops fast in the first 100 epochs (the network learns the big effects such as the promise) and then flattens, because nothing more can be learned from these seven fields. The three AUCs are within about 0.01 of one another. The neural network does not beat logistic regression here: the relationship is simple and the data small. A fair summary for the director: "A network costs more to train, explain and maintain and gave no gain on this table; boosting and logistic regression stay."</p>
 <div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Reaching for deep learning because it sounds modern.</strong> Wrong: replacing a working logistic regression with a network and calling the 0.002 AUC difference an improvement. Right: define the gain that would justify extra cost (say +0.02 AUC or a measurable saving), compare on the same time-based split, and keep the simpler model if it does not clear the bar.</div></div>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Deep learning uses neural networks with many layers to learn patterns from data. On tabular data it is used when there is enough data and non-linear structure, and it is compared with simpler models.</div></div>
+
 @@blue
 A neural network is a very flexible curve-fitter. Flexibility helps when the true pattern is complicated and you have lots of data to pin it down. When the true pattern is simple, flexibility has nothing to add and only costs you training time and clarity.
 @@
@@ -249,6 +251,8 @@ print("matrix:", M.shape, "| Earbuds co-purchase neighbours:", [(names[j], round
 print("spread of similarities between all product pairs:", round(float(np.min(S[np.triu_indices(len(S), 1)])), 3), "to", round(float(np.max(S[np.triu_indices(len(S), 1)])), 3))
 @@
 <p>All similarities lie in a narrow band (0.16 to 0.39) because in this synthetic data customers pick products independently of each other (the generator draws the product at random within category), so heavy buyers buy everything and activity dominates the cosine. Real baskets contain structure (cameras with memory cards), and the same code then finds it. If your neighbours are all just "popular items", normalise for popularity before trusting a recommender.</p>
+
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Co-purchase similarity measures how often two products are bought by the same customers. It is used to recommend products that are similar to what a customer has already bought.</div></div>
 
 @@blue
 Think of retrieval as a librarian and the LLM as a writer. A brilliant writer with the wrong books on the desk writes confident nonsense; a mediocre writer with the right books is useful. Spend your effort on getting the right books to the desk.

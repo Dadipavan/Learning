@@ -13,6 +13,7 @@ Mart | Tables shaped for questions | <code>daily_city_sales</code>
 Orchestration | Scheduling and ordering of steps | Run every night at 02:00
 Idempotent | Running twice gives the same result as once | Reloading the same file adds no rows
 @@
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Data engineering is the work of moving data from files into well-organised tables with typed columns and keys. It is used to make data reliable and easy to query.</div></div>
 <div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of three shelves in a kitchen. The delivery box on the floor is raw (never throw it away until you are sure). The shelf of washed, labelled jars is clean. The plated dish is the mart, ready for the guest. Each step reads only from the shelf below.</div></div>
 
 <h2>2.2 Designing the schema</h2>
@@ -253,6 +254,7 @@ small = df.assign(city=df.city.astype("category"), channel=df.channel.astype("ca
 print("after category dtypes :", round(small.memory_usage(deep=True).sum() / 1024), "KB")
 @@
 <p>Choosing smaller types (<code>category</code> for repeated text, <code>int8</code> for hours) cuts memory in pandas by a large factor at no loss of information. Writing Parquet would be <code>df.to_parquet("orders.parquet")</code>, which needs the <code>pyarrow</code> package (not installed here, so not run here).</p>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">A file format defines how data is stored on disk, for example CSV (text rows) or Parquet (compressed columns). The choice affects file size, read speed and what types are kept.</div></div>
 <div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Rows are good for "fetch one order" (databases for transactions). Columns are good for "sum revenue over a million orders" (warehouses for analysis). Storage layout follows the question you ask most.</div></div>
 
 <h2>2.8 Choosing the right tool for engineering tasks</h2>

@@ -15,6 +15,7 @@ Stage | Chapter | Main question | What you produce | Main roles
 7 Deep and GenAI | 7 | Do richer models or language models add value? | Neural net, text search, QA prototype | ML and GenAI engineers
 8 Deliver | 8 | How do we ship it and keep it healthy? | Packaged model, monitoring, decision memo | ML engineer, analyst
 @@
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">The data-analysis path is the ordered set of stages that takes raw data to a decision: frame the question, get and clean the data, analyse it, check it, model it and act on it. It is used to plan work so that each stage has a clear output.</div></div>
 <div class="callout blue"><div class="lab">INTUITION</div><div class="txt">The stages are a loop, not a line. A surprise in Stage 4 (a city with 3 percent returns and another with 30) sends you back to Stage 3 (is that a spelling problem?). Good teams expect to revisit earlier stages and keep notes so that a revisit costs minutes, not days.</div></div>
 
 <h3>Going deeper: why one dataset?</h3>

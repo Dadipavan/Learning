@@ -11,6 +11,7 @@ Validation | What if the input is wrong? | Reject unknown city, negative quantit
 Monitoring | Is it still right? | PSI on inputs and scores, monthly AUC once labels arrive
 Lifecycle | When do we retrain, who approves? | Triggers, review, rollback to previous version
 @@
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Deploying a model means packaging it as a service with data input, model, serving, monitoring and an owner for each. It is used to turn a notebook experiment into a system that others can use.</div></div>
 <div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Imagine a vending machine. The recipe (training code) is one thing. The machine (serving), the sensor that notices an empty slot (monitoring), the person who refills it (retraining) and the manual on its side (model card) are the rest. A great recipe in a broken machine sells nothing.</div></div>
 
 <h2>8.2 Package: save the pipeline and its record</h2>
@@ -200,6 +201,8 @@ print(t.round(4).to_string(index=False))
 print("mean AUC frozen:", round(t.auc_frozen.mean(), 4), "| retrained monthly:", round(t.auc_retrained_monthly.mean(), 4))
 @@
 <p>With a stable world the frozen model stays as good as the monthly retrained one; retraining every month would have cost effort and bought nothing. Month-to-month AUC wanders between 0.82 and 0.86 for both versions just from sampling noise (a month has only 1,300 to 1,700 labelled orders), so a one- or two-point dip is noise, not drift, and July's 0.8155 would have been a false alarm. Set alert thresholds with that noise in mind.</p>
+
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Monitoring is the regular checking of a deployed model's inputs, predictions and accuracy over time. It is used to detect drift, which means the data has changed and the model may need retraining.</div></div>
 
 @@blue
 Monitoring is a smoke detector, not a fire brigade. It tells you when to look. Because every metric has noise, a good alert needs a threshold wider than the noise and a rule such as "two periods in a row" so that you are not woken up by chance.
