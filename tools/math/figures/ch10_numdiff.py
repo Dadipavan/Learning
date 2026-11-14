@@ -1,0 +1,16 @@
+import numpy as np, matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+h = np.logspace(-15, 0, 200); x = 1.0; true = np.exp(1.0)
+fwd = np.abs((np.exp(x + h) - np.exp(x)) / h - true)
+cen = np.abs((np.exp(x + h) - np.exp(x - h)) / (2 * h) - true)
+fig, ax = plt.subplots(figsize=(8, 4.2))
+ax.loglog(h, fwd, color="#b84a22", lw=1.8, label="forward difference")
+ax.loglog(h, cen, color="#2b4fd6", lw=1.8, label="central difference")
+ax.loglog(h, h, color="#aa2d26", ls=":", label="slope +1 (error ∝ h)")
+ax.loglog(h, h**2, color="#357a70", ls=":", label="slope +2 (error ∝ h²)")
+ax.loglog(h, 1e-16 / h, color="#6a2fd0", ls=":", label="round-off ∝ 1/h")
+ax.set_ylim(1e-12, 10); ax.set_xlabel("step size h"); ax.set_ylabel("absolute error")
+ax.set_title("Derivative of eˣ at x = 1: the V-shaped error curve", fontsize=12)
+ax.legend(fontsize=9); ax.grid(alpha=0.3, which="both")
+fig.tight_layout(); fig.savefig("ch10_numdiff.png", dpi=110)

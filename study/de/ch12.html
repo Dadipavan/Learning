@@ -1,0 +1,337 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 12: Infrastructure and DataOps</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#b02d5e"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Engineering &amp; Big Data</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 12</div><h1>Infrastructure and DataOps</h1><p>Packaging, deploying, securing, watching and governing data pipelines like real software.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-12-1-docker-and-kubernetes-basics">12.1 Docker and Kubernetes Basics</a></li><li><a href="#s2-12-2-infrastructure-as-code-ci-cd-and-secrets">12.2 Infrastructure as Code, CI/CD and Secrets</a></li><li><a href="#s3-12-3-monitoring-alerting-runbooks-and-cost">12.3 Monitoring, Alerting, Runbooks and Cost</a></li><li><a href="#s4-12-4-governance-privacy-pii-lineage-and-catalogs">12.4 Governance, Privacy, PII, Lineage and Catalogs</a></li><li><a href="#s5-12-5-security-and-privacy-in-depth-access-policies-tokenization-and-er">12.5 Security and Privacy in Depth: Access Policies, Tokenization and Erasure</a></li><li><a href="#s6-chapter-recap">Chapter recap</a></li><li><a href="#s7-practice-set">Practice set</a></li><li><a href="#s8-prompt-pack">Prompt pack</a></li></ol></details><p>Your pipeline works on your laptop. Now it must run every night on a server that you do not touch, be changed safely by five engineers, keep its passwords secret, tell you when it breaks, not cost a fortune, and not leak customers' phone numbers. That is what this chapter is about. <strong>DataOps</strong> means applying the habits of software engineering (version control, automated tests, automated deployment, monitoring) to data work. By the end you will be able to put a pipeline in a Docker container, explain what Kubernetes and Terraform do, read a CI/CD file, store secrets safely, write the alerts that matter for data (freshness and volume), estimate cost, and handle personal data properly.</p>
+<p>Honest note: Docker, Kubernetes, Terraform, GitHub Actions and cloud tools are not available in this sandbox. Their code is labelled "not run here" and is minimal and standard; check flags against your tool version. The Python checks (masking, freshness, volume alert, cost arithmetic) were really run (<code>/tmp/de_lab2/ops.py</code>).</p>
+<h2 id="s1-12-1-docker-and-kubernetes-basics">12.1 Docker and Kubernetes Basics</h2>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Docker packages an application and its dependencies into a container image that runs the same everywhere. Kubernetes is a system that runs and manages many containers across a cluster of machines.</div></div>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You cook a perfect biryani at home and give the recipe to a friend. It tastes different: other rice, other stove. A <strong>container</strong> is like sending a sealed lunch box with the food already cooked: the program, its libraries, and its settings travel together, so it runs the same everywhere. <strong>Kubernetes</strong> is the canteen manager: it decides on which table (machine) each lunch box sits, replaces a spoiled one, and adds more boxes when the queue grows.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th><th>ShopKart example</th></tr></thead><tbody><tr><td>Image</td><td>A read-only package: OS pieces, Python, libraries, your code</td><td><code>shopkart/orders-loader:1.4.0</code></td></tr><tr><td>Container</td><td>A running copy of an image, isolated from others</td><td>one nightly loader process</td></tr><tr><td>Dockerfile</td><td>The recipe to build an image</td><td>list of steps starting <code>FROM python:3.12-slim</code></td></tr><tr><td>Registry</td><td>A store for images</td><td>a cloud container registry</td></tr><tr><td>Volume</td><td>Disk that outlives the container</td><td>Postgres data folder</td></tr><tr><td>Docker Compose</td><td>One file to run several containers together</td><td>Airflow + Postgres + your app on a laptop</td></tr><tr><td>Pod</td><td>Smallest Kubernetes unit: one or more containers together</td><td>one loader pod</td></tr><tr><td>Deployment</td><td>Keeps N copies of a pod running, rolls out updates</td><td>3 consumer pods</td></tr><tr><td>Service</td><td>A stable address in front of pods</td><td><code>orders-api:8080</code></td></tr><tr><td>Job / CronJob</td><td>A pod that runs to completion / on a schedule</td><td>nightly backfill</td></tr><tr><td>ConfigMap / Secret</td><td>Settings / sensitive settings given to pods</td><td>database host / password</td></tr><tr><td>Helm</td><td>A package manager for Kubernetes files (charts)</td><td>install Airflow with one command</td></tr></tbody></table></div>
+<h3>A Dockerfile for a data job (not run here)</h3>
+<pre class="code lang-dockerfile"><code># not run here
+FROM python:3.12-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY src/ ./src/
+USER 10001
+CMD ["python", "-m", "src.load_orders"]</code></pre>
+<p>Line by line: <code>FROM</code> chooses a small base image. <code>WORKDIR</code> sets the folder. We copy <code>requirements.txt</code> and install <strong>before</strong> copying the code, because Docker caches each step: if only your code changes, the slow <code>pip install</code> layer is reused, and a rebuild takes seconds instead of minutes. <code>USER 10001</code> runs as a non-root user (safer). <code>CMD</code> is the default command.</p>
+<p>Best practices to remember: pin versions (<code>pandas==2.2.2</code>, a specific base image tag, never <code>latest</code>), keep images small (slim base, multi-stage builds), one process per container, never put secrets in the image (anyone who can pull the image can read them), use a <code>.dockerignore</code> file, log to the standard output.</p>
+<p>Commands (not run here):</p>
+<pre class="code lang-bash"><code># not run here
+docker build -t shopkart/orders-loader:1.4.0 .
+docker run --rm --env-file .env shopkart/orders-loader:1.4.0
+docker compose up -d        # start all services in docker-compose.yml
+docker logs -f &lt;container&gt;  # follow logs</code></pre>
+<h3>Kubernetes in one picture</h3>
+<pre class="code lang-text"><code>              kubectl apply -f deployment.yaml
+                          |
+                  [ API server ]  &lt;- you talk only to this
+                          |
+       [ scheduler ] chooses a node for each pod
+                          |
+   Node A                 Node B                 Node C
+ [pod consumer-1]      [pod consumer-2]      [pod consumer-3]
+        ^------------ Deployment keeps 3 pods alive ---------^
+ CronJob "nightly-backfill" -&gt; creates a Job -&gt; a pod that runs and exits</code></pre>
+<p>How to read it: you describe the <strong>desired state</strong> ("3 copies of this image, 500 MB memory each") in a YAML file. Kubernetes keeps comparing desired and actual state and fixes differences: a pod dies, it starts another. This "reconciliation" idea is the heart of Kubernetes.</p>
+<p>A minimal Deployment, not run here:</p>
+<pre class="code lang-yaml"><code># not run here
+apiVersion: apps/v1
+kind: Deployment
+metadata: {name: orders-consumer}
+spec:
+  replicas: 3
+  selector: {matchLabels: {app: orders-consumer}}
+  template:
+    metadata: {labels: {app: orders-consumer}}
+    spec:
+      containers:
+        - name: consumer
+          image: shopkart/orders-consumer:1.4.0
+          resources:
+            requests: {cpu: "500m", memory: "512Mi"}
+            limits:   {cpu: "1",    memory: "1Gi"}
+          envFrom:
+            - secretRef: {name: orders-db-credentials}</code></pre>
+<p><code>requests</code> is what the scheduler reserves; <code>limits</code> is the ceiling (going over the memory limit kills the pod: "OOMKilled"). <code>500m</code> means 500 millicores, half a CPU core. <code>replicas: 3</code> ties to the Kafka rule in Chapter 11: 3 consumers share the partitions.</p>
+<p class="problem"><span class="pl">Problem 12.1.1</span> Each consumer pod requests 500m CPU and 512 MiB. You run 3 replicas. How much CPU and memory does the Deployment reserve? How many nodes of 4 CPU and 16 GiB are needed, ignoring system overhead?</p>
+<table class="steps"><tr><th>Formula</th><td>total = replicas × per-pod request</td></tr><tr><th>Plug in</th><td>CPU: 3 × 500m; memory: 3 × 512 MiB</td></tr><tr><th>Compute</th><td>CPU = 1,500m = 1.5 cores; memory = 1,536 MiB = 1.5 GiB. One node has 4 cores and 16 GiB, so both fit in one node.</td></tr><tr><th>Answer</th><td>1.5 cores and 1.5 GiB. One node is enough for capacity, but use at least 2 nodes so a node failure does not stop the service.</td></tr><tr><th>Check</th><td>1.5 / 4 = 37.5% of CPU, 1.5 / 16 = 9.4% of memory. CPU is the tighter resource.</td></tr><tr><th>Why it matters</th><td>Requests drive cost and scheduling. Too high wastes money; too low causes noisy neighbours and throttling.</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.1.2</span> A container limit is 1 GiB, and the job loads a 1.4 GiB CSV with pandas. What happens, and what are two fixes?</p>
+<table class="steps"><tr><th>Step 1</th><td>Memory use passes 1 GiB, so the kernel kills the process; Kubernetes shows <code>OOMKilled</code>, and the pod restarts (a crash loop).</td></tr><tr><th>Step 2</th><td>Fix by reading in chunks or using a columnar engine (DuckDB, Chapter 3) so memory stays low; or raise the limit after measuring the real peak.</td></tr><tr><th>Answer</th><td>The pod is OOMKilled; stream the data in chunks, or raise the limit based on a measured peak.</td></tr><tr><th>Check</th><td>Chunk size 100 MB uses about 0.1 GiB for the data plus overhead, far below 1 GiB.</td></tr><tr><th>Why it matters</th><td>The first Kubernetes incident of most data engineers is an OOMKill.</td></tr></table>
+<h3>Connection to the real job</h3>
+<ul><li>Airflow, dbt runs, Kafka consumers and Spark jobs all run as containers, often on Kubernetes (Chapter 6 mentioned <code>KubernetesExecutor</code> and Argo). Managed services hide Kubernetes but the ideas stay.</li><li>Docker Compose gives you a full practice stack (Postgres + Airflow + your loader) on a laptop: project 1 of the skill map.</li><li>You do not need to administer clusters as a data engineer. You need to read YAML, set resources, read logs, and know what a pod restart means.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> pipeline images, Airflow on Kubernetes, Spark on Kubernetes, Kafka Connect workers.</li><li><strong>MLOps:</strong> model-serving images, scheduled retraining Jobs, GPU node pools.</li><li><strong>Capacity testing:</strong> distributed load generators (for example k6 or Locust) as pods that you scale up for a test.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using the tag <code>latest</code> or unpinned libraries. The pipeline passes today and breaks next week because a library updated. Pin versions.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Running a stateful database in a container without a volume. When the container is removed, the data is gone.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why copy <code>requirements.txt</code> before the source code in a Dockerfile? Answer: so the slow dependency layer is cached when only code changes.</li><li>What does <code>OOMKilled</code> mean? Answer: the container used more memory than its limit and was killed.</li><li>What is the difference between a Deployment and a CronJob? Answer: a Deployment keeps pods running continuously; a CronJob starts a pod on a schedule that runs to completion.</li></ol>
+<h2 id="s2-12-2-infrastructure-as-code-ci-cd-and-secrets">12.2 Infrastructure as Code, CI/CD and Secrets</h2>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Infrastructure as code (IaC) defines cloud resources in files, with tools such as Terraform, so they can be reviewed and repeated. CI/CD automatically tests and deploys changes, and secrets such as passwords are kept in a secure store, not in code.</div></div>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Building a cloud setup by clicking in a web console is like cooking from memory: nobody can repeat it, and nobody knows what changed. <strong>Infrastructure as Code (IaC)</strong> is writing the recipe down as files in Git: "one bucket, one warehouse, one queue, these permissions". You can review it, repeat it for dev and prod, and undo it. <strong>CI/CD</strong> is the kitchen's quality line: every change is automatically tested (Continuous Integration) and, if good, delivered (Continuous Delivery/Deployment).</div></div>
+<h3>Terraform</h3>
+<p>Terraform describes infrastructure in a language called HCL. Key words: <strong>provider</strong> (a plugin for a cloud, such as AWS, Azure, GCP, Snowflake), <strong>resource</strong> (a thing to create), <strong>state</strong> (a file where Terraform records what it created; the single most precious file), <strong>module</strong> (a reusable group of resources), <code>plan</code> (show what would change), <code>apply</code> (make the change), <code>destroy</code>. Not run here:</p>
+<pre class="code lang-hcl"><code># not run here
+terraform {
+  required_providers { aws = { source = "hashicorp/aws", version = "~&gt; 5.0" } }
+  backend "s3" { bucket = "shopkart-tf-state", key = "data-platform/terraform.tfstate", region = "ap-south-1" }
+}
+provider "aws" { region = "ap-south-1" }
+
+resource "aws_s3_bucket" "raw" {
+  bucket = "shopkart-raw-${var.env}"
+}
+resource "aws_s3_bucket_versioning" "raw" {
+  bucket = aws_s3_bucket.raw.id
+  versioning_configuration { status = "Enabled" }
+}</code></pre>
+<p>Explanation: the <code>backend</code> keeps the state in a shared bucket (never in Git, because it can contain secrets; add locking so two people cannot apply at once). <code>var.env</code> lets the same code create <code>shopkart-raw-dev</code> and <code>shopkart-raw-prod</code>. The reference <code>aws_s3_bucket.raw.id</code> creates a dependency, so Terraform builds the bucket first.</p>
+<p>The workflow is <code>terraform init</code>, <code>terraform plan</code>, review the plan like a code diff, then <code>terraform apply</code>. The idea behind the plan is that Terraform compares your files with the state and the real world, and prints only the difference: "1 to add, 0 to change, 0 to destroy". <strong>Drift</strong> means someone changed the real thing by hand, so it no longer matches the code; <code>plan</code> shows it. Alternatives (awareness): CloudFormation (AWS), Bicep (Azure), Pulumi (real programming languages), and OpenTofu (an open-source fork of Terraform).</p>
+<h3>CI/CD for data</h3>
+<p>A CI pipeline runs on each pull request. For a data repository the steps are:</p>
+<ol><li><strong>Lint and format</strong> (<code>ruff</code>, <code>sqlfluff</code>).</li><li><strong>Unit tests</strong> of Python logic (Chapter 5).</li><li><strong>DAG import test</strong> (Chapter 6) and <code>dbt build</code> on a small slim CI schema (Chapter 7).</li><li><strong>Build the image</strong> and scan it.</li><li><strong>Deploy</strong> to dev automatically, to prod after approval, with a versioned release (a Git tag).</li></ol>
+<p>A GitHub Actions file, not run here:</p>
+<pre class="code lang-yaml"><code># not run here
+name: ci
+on: [pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: pip install -r requirements.txt
+      - run: ruff check .
+      - run: pytest -q</code></pre>
+<p>Environments: <strong>dev</strong> (free to break), <strong>staging</strong> (like prod, with a copy or sample of data), <strong>prod</strong>. Rules that save careers: never test against production tables; use a separate schema per pull request; promote the same built image from dev to prod instead of rebuilding; keep a way to roll back (previous image tag, <code>git revert</code>, table time travel from Chapter 3).</p>
+<p><strong>Git workflow:</strong> short-lived branches, pull requests with review, <code>main</code> always deployable, commit messages that say why.</p>
+<h3>Secrets, IAM and networking</h3>
+<p>A <strong>secret</strong> is a password, API key or token. Rules:</p>
+<ul><li>Never in Git, never in an image, never in a screenshot or a chat. Use a <strong>secret manager</strong> (HashiCorp Vault, AWS Secrets Manager, Azure Key Vault, GCP Secret Manager). Applications read them at runtime; Kubernetes <code>Secret</code> objects are only base64-encoded by default (not encrypted) unless the cluster adds encryption or an external secrets tool.</li><li><strong>Least privilege:</strong> give each job only the permissions it needs. The loader may write to <code>raw/</code> and nothing else. An <strong>IAM role</strong> (identity and access management) attached to the workload is better than long-lived keys, because there is nothing to leak.</li><li><strong>Rotate</strong> secrets on a schedule and after any suspected leak. Scan Git history with a secret scanner in CI.</li><li><strong>Networking basics:</strong> a <strong>VPC</strong> is your private network in the cloud; <strong>subnets</strong> split it (public vs private); <strong>security groups</strong> are firewall rules; <strong>private endpoints</strong> let a service reach the warehouse or storage without crossing the public internet. Databases should live in private subnets.</li></ul>
+<p class="problem"><span class="pl">Problem 12.2.1</span> A <code>terraform plan</code> prints "Plan: 2 to add, 1 to change, 1 to destroy." The destroy is <code>aws_s3_bucket.raw</code>. What do you do?</p>
+<table class="steps"><tr><th>Step 1</th><td>Stop. A destroy on a raw bucket may delete data permanently.</td></tr><tr><th>Step 2</th><td>Find why: a renamed resource (Terraform sees "old removed, new added") or a changed argument that forces replacement. Use <code>terraform state mv</code> or <code>moved</code> blocks for a rename. Turn on <code>prevent_destroy</code> and bucket versioning for important data.</td></tr><tr><th>Answer</th><td>Do not apply until the destroy is explained and prevented; plan review is the safety net.</td></tr><tr><th>Check</th><td>After the fix the plan should say "0 to destroy" for the bucket.</td></tr><tr><th>Why it matters</th><td><code>apply</code> without reading the plan is how production data gets deleted.</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.2.2</span> A secret was committed to Git and removed in the next commit. Is it safe?</p>
+<table class="steps"><tr><th>Step 1</th><td>Git keeps history, so the secret is still readable in the old commit, in forks and in clones.</td></tr><tr><th>Step 2</th><td>Treat the secret as leaked: revoke and rotate it first. Rewriting history is secondary.</td></tr><tr><th>Answer</th><td>Not safe. Rotate immediately, then clean up and add a pre-commit scanner.</td></tr><tr><th>Check</th><td>After rotating, the old value is useless, even if someone copied it.</td></tr><tr><th>Why it matters</th><td>Speed matters: bots scan public repositories within minutes.</td></tr></table>
+<h3>Connection to the real job</h3>
+<ul><li>A data platform team writes Terraform for buckets, warehouses, roles, Kafka topics and Airflow; you may only edit a module's variables, but you must read the plan.</li><li>A pull request that changes a SQL model should run tests automatically and block merge on failure. That is the DataOps promise.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> reproducible dev, stage and prod platforms; dbt in CI; DAG deployment.</li><li><strong>MLOps:</strong> pipelines that test, build and deploy models; infrastructure for training and serving.</li><li><strong>Security:</strong> least privilege roles per pipeline; audit trails from Git history.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Editing cloud resources in the console "just once". The code and reality drift apart, and the next <code>apply</code> undoes your fix or breaks something.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Committing the Terraform state file or a <code>.env</code> file. Add them to <code>.gitignore</code> on day one.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is Terraform state for? Answer: it records which real resources Terraform created, so it can compute the difference to your code.</li><li>Name three CI steps for a data repository. Answer: lint, unit tests, DAG import test (or dbt build on a CI schema).</li><li>Why is an IAM role better than an access key stored in a file? Answer: nothing long-lived exists to leak or rotate by hand.</li></ol>
+<h2 id="s3-12-3-monitoring-alerting-runbooks-and-cost">12.3 Monitoring, Alerting, Runbooks and Cost</h2>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Monitoring collects metrics and logs from a system, and alerting notifies people when something goes wrong. A runbook is a written set of steps for handling a known problem, and cost monitoring tracks cloud spending.</div></div>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A car dashboard has a few lights, not a thousand. It shows speed, fuel and engine warning. A data pipeline can "succeed" (exit code 0) and still be wrong: yesterday's data is missing, or half the rows are gone. So besides "did it run?" we watch "is the data fresh?" and "is the volume normal?". In a restaurant it is the difference between "the kitchen sent out a plate" and "the plate was correct and hot".</div></div>
+<h3>The four signals for pipelines</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Signal</th><th>Question</th><th>Example rule</th><th>Where from</th></tr></thead><tbody><tr><td>Freshness</td><td>How old is the newest data?</td><td>newest order older than 2 h = alert</td><td><code>MAX(order_ts)</code> in the table</td></tr><tr><td>Volume</td><td>Is the row count normal?</td><td>today below 3 standard deviations of the last 7 days</td><td>row counts per load</td></tr><tr><td>Quality</td><td>Do the checks pass?</td><td>null rate, duplicates (Chapter 5)</td><td>test results</td></tr><tr><td>Health and cost</td><td>Did jobs run, how long, how much did they use?</td><td>runtime above 2 x the median; lag rising</td><td>scheduler, Prometheus, billing</td></tr></tbody></table></div>
+<p>Plus the classic <strong>logs, metrics, traces</strong> (the three pillars of observability). Metrics are numbers over time (Prometheus stores them, Grafana draws them). Logs are event lines (the ELK/OpenSearch stack stores them; use structured JSON logs). Traces follow one request across services (OpenTelemetry is the common standard). Cloud equivalents: CloudWatch, Azure Monitor, Cloud Monitoring. Application performance tools (Dynatrace, AppDynamics, Datadog) are familiar to you.</p>
+<h3>Worked checks (real run)</h3>
+<pre class="code lang-python"><code>import datetime, statistics as st
+now=datetime.datetime(2026,1,10,9,0)
+last=datetime.datetime(2026,1,10,6,30); sla=datetime.timedelta(hours=2)
+print("freshness lag:",now-last,"breach:",now-last&gt;sla)
+hist=[10200,9900,10100,10050,9950,10150,10000]; today=6100
+m=st.mean(hist); s=st.stdev(hist); z=(today-m)/s
+print(f"volume mean={m:.0f} sd={s:.1f} today={today} z={z:.1f} alert={abs(z)&gt;3}")</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>freshness lag: 2:30:00 breach: True
+volume mean=10050 sd=108.0 today=6100 z=-36.6 alert=True</code></pre>
+<p>Read it: the newest data is 2 h 30 min old and the SLA is 2 h, so alert. The last 7 days average 10,050 rows with a standard deviation of 108 (<code>stdev</code> is the sample standard deviation). Today's 6,100 is 36.6 standard deviations below the mean: <code>z = (x − mean) / sd = (6100 − 10050) / 108 = −36.6</code>. A value beyond 3 is already rare, so this is a certain alert (most likely a partial load). A caveat: a weekly pattern (weekends are lower) breaks this simple rule. Compare Sunday with other Sundays, or use a forecast (Chapter 14).</p>
+<p class="problem"><span class="pl">Problem 12.3.1</span> The nightly job normally lands 10,000 rows, with standard deviation 150. Tonight it lands 9,700. Do you alert at the 3-sigma rule?</p>
+<table class="steps"><tr><th>Formula</th><td>z = (x − mean) / sd</td></tr><tr><th>Plug in</th><td>(9700 − 10000) / 150</td></tr><tr><th>Compute</th><td>−300 / 150 = −2</td></tr><tr><th>Answer</th><td>z = −2, which is inside 3 sigma: no alert, but worth a note on a trend chart. A 6% drop is small for random noise at this spread.</td></tr><tr><th>Check</th><td>3 sigma would be 450 rows, so the alert line is 9,550 rows.</td></tr><tr><th>Why it matters</th><td>Alerts that fire on normal noise cause <strong>alert fatigue</strong>: people stop reading them. Set thresholds from real history.</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.3.2</span> An alert fires 12 times a day, and 11 are ignored. How do you improve it?</p>
+<table class="steps"><tr><th>Step 1</th><td>Count real incidents versus alerts: precision = 1 / 12 = 8%.</td></tr><tr><th>Step 2</th><td>Page only on user-visible problems (freshness SLA at risk), send the rest to a channel or a daily digest, add a "for 10 minutes" delay to ignore blips, group duplicates, and link a runbook in every alert.</td></tr><tr><th>Answer</th><td>Raise precision by alerting on symptoms (data late, data wrong), not causes (CPU 80%), with a delay and a runbook link.</td></tr><tr><th>Check</th><td>If 11 noisy alerts move to the digest, pages drop from 12 to 1 per day with the same real incident caught.</td></tr><tr><th>Why it matters</th><td>On-call quality depends on alert quality.</td></tr></table>
+<h3>Runbooks, on-call and postmortems</h3>
+<p>A <strong>runbook</strong> is a short page per alert: what it means, how to check, how to fix, who to ask. An <strong>SLA/SLO</strong> (service level agreement/objective) is the promise, for example "the orders table is fresh within 2 hours, 99% of days". After an incident write a <strong>blameless postmortem</strong>: timeline, cause, what detected it, what fixes will prevent it. It asks "how did the system allow this?", not "who did this?".</p>
+<h3>Cost</h3>
+<p>Cloud cost has three parts: compute (machines, warehouse credits, Spark), storage, and data movement (leaving a region or cloud). <strong>FinOps</strong> is the habit of watching and managing it. Prices change often, so do not memorize them. The method is stable:</p>
+<pre class="code lang-python"><code>tb_scanned=2.5; price=6.25  # illustrative price per TB scanned, NOT a quote
+print("query cost:",tb_scanned*price,"per run; 30 runs:",tb_scanned*price*30)
+with_part=tb_scanned*0.1; print("after partition pruning (10% scanned):",with_part*price*30)</code></pre>
+<pre class="code lang-text"><code>query cost: 15.625 per run; 30 runs: 468.75
+after partition pruning (10% scanned): 46.875</code></pre>
+<p>The price per TB here is made-up. The lesson is the multiplication: cost = bytes scanned × price × runs, so reading 10% of the data (partition pruning, Chapter 3) cuts the bill by 90%. Other levers: auto-suspend warehouses; right-size clusters; use spot or preemptible instances for fault-tolerant batch jobs; use cheaper storage tiers for cold data; delete temp tables; set budgets and alerts; tag every resource with team and project so costs can be assigned; track <strong>cost per run</strong> and <strong>cost per 1,000 events</strong> as pipeline metrics.</p>
+<p class="problem"><span class="pl">Problem 12.3.3</span> A daily job uses a cluster of 8 workers at an illustrative 0.40 per worker-hour for 1.5 hours. What is the monthly cost (30 days), and what if spot instances give a 60% discount?</p>
+<table class="steps"><tr><th>Formula</th><td>cost = workers × price × hours × days</td></tr><tr><th>Plug in</th><td>8 × 0.40 × 1.5 × 30</td></tr><tr><th>Compute</th><td>8 × 0.40 = 3.20; 3.20 × 1.5 = 4.80 per day; 4.80 × 30 = 144.00. With the discount: 144 × (1 − 0.60) = 57.60.</td></tr><tr><th>Answer</th><td>144 per month on demand, 57.60 with spot. (Prices here are made-up for the arithmetic.)</td></tr><tr><th>Check</th><td>144 × 0.4 = 57.6. Yes.</td></tr><tr><th>Why it matters</th><td>Spot nodes can disappear mid-job, so use them only if tasks are retried safely (idempotent, Chapter 6).</td></tr></table>
+<h3>Connection to the real job</h3>
+<ul><li>Freshness and volume alerts are the first thing a new data team adds after an angry stakeholder phone call.</li><li>Cost reviews are monthly meetings in real companies; a candidate who can say "I cut the daily job from 2.5 TB scanned to 0.25 TB" is remembered.</li><li>Pipeline monitoring tools: Airflow SLAs and callbacks, dbt source freshness, Great Expectations/Soda checks, data observability tools (Monte Carlo, Elementary), and your own SQL checks.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> freshness and volume monitors, DLQ size alerts, lag dashboards.</li><li><strong>MLOps:</strong> model latency, data drift and prediction distribution monitoring.</li><li><strong>AIOps (your niche):</strong> anomaly detection on metrics, alert noise reduction.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Alerting on "job failed" only. The job that succeeds with zero rows is the dangerous one.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Averages in dashboards. Track percentiles (p95, p99) for durations, the way a train operator reports "95% of trains within 5 minutes of the timetable".</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Name two data-specific alerts that are not about job failure. Answer: freshness and volume (also quality check failures).</li><li>What does 3-sigma mean as an alert rule? Answer: alert when a value is more than 3 standard deviations from the mean of recent history.</li><li>Why tag cloud resources? Answer: to assign cost to teams and projects.</li></ol>
+<h2 id="s4-12-4-governance-privacy-pii-lineage-and-catalogs">12.4 Governance, Privacy, PII, Lineage and Catalogs</h2>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Data governance is the set of rules for how data is managed and used. It covers privacy and PII (personally identifiable information), lineage (where data came from), and catalogs, which are searchable inventories of datasets.</div></div>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A library has books everybody may read, a reference section where books stay inside, and a locked room with rare manuscripts. It also has a catalogue to find books and a record of who borrowed what. <strong>Data governance</strong> is the same for data: who may see what, what each dataset means, where it came from, and how long we keep it.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th><th>ShopKart example</th></tr></thead><tbody><tr><td>PII</td><td>Personally identifiable information: data that can identify a person</td><td>name, phone, email, address, Aadhaar-like ID</td></tr><tr><td>Sensitive data</td><td>PII plus data that can harm if leaked</td><td>health, finances, passwords</td></tr><tr><td>Masking</td><td>Hide part of a value</td><td><code>98******10</code></td></tr><tr><td>Pseudonymization</td><td>Replace an identifier with a token; a key or table can reverse it</td><td><code>tok_e841b43a3067</code> for an email</td></tr><tr><td>Anonymization</td><td>Irreversibly remove the link to a person (hard to do properly)</td><td>aggregated counts only</td></tr><tr><td>Encryption at rest / in transit</td><td>Data scrambled on disk / on the network (TLS)</td><td>encrypted bucket; HTTPS to the warehouse</td></tr><tr><td>Row / column level security</td><td>Rules that hide some rows or columns by user role</td><td>regional managers see only their region; analysts do not see phone</td></tr><tr><td>Retention</td><td>How long data is kept, then deleted</td><td>3 years for orders</td></tr><tr><td>Data catalog</td><td>A searchable inventory of datasets, owners, descriptions</td><td>DataHub, Amundsen, Unity Catalog, cloud-native catalogs</td></tr><tr><td>Lineage</td><td>The map of where data came from and what depends on it</td><td><code>raw.orders</code> to <code>stg_orders</code> to <code>fct_orders</code> to the revenue dashboard</td></tr></tbody></table></div>
+<h3>Masking and pseudonymizing (real run)</h3>
+<pre class="code lang-python"><code>import hashlib
+phone="9876543210"; email="asha.rao@example.com"
+print("masked phone:",phone[:2]+"*"*6+phone[-2:])
+user,dom=email.split("@"); print("masked email:",user[0]+"***@"+dom)
+salt="demo-salt-not-a-secret"
+tok=lambda s: hashlib.sha256((salt+s).encode()).hexdigest()[:12]
+print("token:",tok(email),"same input same token:",tok(email)==tok(email))</code></pre>
+<pre class="code lang-text"><code>masked phone: 98******10
+masked email: a***@example.com
+token: e841b43a3067 same input same token: True</code></pre>
+<p>Read it: masking keeps the shape for support staff. The token is a salted hash: the same email always gives the same token, so analysts can still count unique customers and join tables, without seeing the email. Important limits: a hash of a low-entropy value (a 10-digit phone number has only 10 billion possibilities) can be reversed by trying all values, so use a secret key (an HMAC) kept in a secret manager, or a token vault, and never publish the salt. The salt in the demo is fake. Pseudonymized data is <strong>still personal data</strong> under most laws, because it can be re-linked.</p>
+<h3>Law and policy, at awareness level</h3>
+<p>India's <strong>DPDP Act 2023</strong> (Digital Personal Data Protection) and the <strong>GDPR</strong> (Europe) give people rights over their data and put duties on companies: collect only what you need (<strong>data minimization</strong>), state the purpose, get consent where needed, keep it secure, delete it when the purpose ends, report breaches, and honour requests to access or erase data. Details and rules change; ask your company's privacy team and do not rely on a textbook for legal advice. For engineers, the practical consequences are:</p>
+<ul><li>Know where PII lives: tag columns in the catalog (<code>pii: true</code>).</li><li>Separate PII from analytics tables; join through tokens.</li><li>Make <strong>deletion</strong> possible: a person's data may be in the lake, backups, ML training sets and logs. Table formats with row-level delete (Delta, Iceberg, Chapter 3) help.</li><li>Limit access with roles; review access every quarter ("access reviews"); log who read sensitive tables.</li><li>Data localization: some data must stay in a country; choose the cloud region on purpose.</li></ul>
+<p class="problem"><span class="pl">Problem 12.4.1</span> The orders table has columns: <code>order_id</code>, <code>customer_name</code>, <code>phone</code>, <code>email</code>, <code>city</code>, <code>amount</code>, <code>order_ts</code>. Classify each as PII or not, and say what an analyst's view should show.</p>
+<table class="steps"><tr><th>Step 1</th><td>Direct identifiers: <code>customer_name</code>, <code>phone</code>, <code>email</code>. These identify a person alone.</td></tr><tr><th>Step 2</th><td><code>city</code> alone is not identifying, but combined with other fields it can be (quasi-identifier). <code>order_id</code>, <code>amount</code>, <code>order_ts</code> are business data, though <code>order_id</code> can link back to a person through other tables.</td></tr><tr><th>Answer</th><td>PII: name, phone, email. The analyst view drops them or replaces email with a token, and keeps <code>city</code>, <code>amount</code>, <code>order_ts</code>.</td></tr><tr><th>Check</th><td>The analyst can still count unique customers via the token and compute revenue by city: the business question is answered without PII.</td></tr><tr><th>Why it matters</th><td>Designing the safe view first is cheaper than cleaning a leak later.</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.4.2</span> Policy: delete order rows older than 3 years. Today is 2026-01-10. What is the cutoff date, and how would you do it safely in a pipeline?</p>
+<table class="steps"><tr><th>Formula</th><td>cutoff = today minus 3 years</td></tr><tr><th>Compute</th><td>2023-01-10 (the real run printed <code>cutoff 2023-01-10</code>)</td></tr><tr><th>Answer</th><td>Delete rows with <code>order_ts</code> before 2023-01-10, run as a scheduled, logged, idempotent job (a partition drop for date-partitioned tables is cheapest), and first count the rows to be deleted and compare with an expectation.</td></tr><tr><th>Check</th><td>Re-running the delete deletes nothing new: idempotent.</td></tr><tr><th>Why it matters</th><td>Retention is a legal duty and also cuts storage cost.</td></tr></table>
+<h3>Lineage and catalogs</h3>
+<p><strong>Lineage</strong> answers two questions that everyone asks: "this dashboard number looks wrong, where does it come from?" (upstream) and "if I change this column, what breaks?" (downstream, called <strong>impact analysis</strong>). Sources: dbt's <code>ref</code> graph (Chapter 7), Airflow with <strong>OpenLineage</strong>, and warehouse query logs. A <strong>catalog</strong> holds descriptions, owners, tags (PII), quality status and usage. A good catalog makes "ask the one person who knows" unnecessary. <strong>Data contracts</strong> (Chapter 5) and <strong>data products</strong> (a dataset with an owner, a promise and documentation) connect with catalogs. Governance does not mean saying no; it means making the safe path the easy path.</p>
+<h3>Connection to the real job</h3>
+<ul><li>Every company with customers has a privacy review for new pipelines. You will be asked "does this table contain PII, and who can read it?".</li><li>Warehouse features to know by name: column masking policies, row access policies, and role-based access control (Chapter 8).</li><li>Incident: a column with email addresses was copied to a public bucket. The fixes combine this chapter: least privilege, catalog tags, scanner in CI, encryption, alert on public buckets.</li></ul>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> masked views, tokenization, retention jobs, lineage in the catalog.</li><li><strong>Data Science and ML:</strong> training on pseudonymized data; deleting a person's data from feature stores.</li><li><strong>GenAI:</strong> do not send PII to external AI services; redact before prompts.</li><li><strong>BFSI and healthcare:</strong> strict regulation (RBI, health data rules), audit logs.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Calling hashed emails "anonymous". They are pseudonymous, and they can be reversed by guessing or linked by matching.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Protecting the warehouse and forgetting logs, backups, notebooks and exports where the same PII was copied.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Is a masked phone number the same as an anonymized one? Answer: no; masking hides display, and other copies of the data may still exist; anonymization must remove the link permanently.</li><li>What is impact analysis? Answer: finding all downstream tables and dashboards that depend on a column before you change it.</li><li>Give one reason to separate PII from analytics tables. Answer: fewer people need access to PII, and deletion requests touch only one place.</li></ol>
+<h2 id="s5-12-5-security-and-privacy-in-depth-access-policies-tokenization-and-er">12.5 Security and Privacy in Depth: Access Policies, Tokenization and Erasure</h2>
+<p>Section 12.4 introduced PII, lineage and catalogs. This section goes one level deeper into the three things a data engineer is actually asked to build: control who sees what, make personal data safe to use, and delete a person's data when the law says so. All code here runs. The cloud-specific syntax (Snowflake masking policies, BigQuery row access policies, Unity Catalog grants) differs by vendor, so we model the logic and tell you where to look up the syntax.</p>
+<figure><img src="images/de_cicd_flow.png" alt="Seven boxes from pull request to production with failure gates" loading="lazy"/><figcaption>A pipeline CI/CD line: tests run on every change, and only a change that passes every gate reaches production.</figcaption></figure>
+<p><strong>How to read it:</strong> follow the arrows left to right. Blue steps are about code, teal is about data (a dbt build on a throw-away CI schema, selecting only changed models and what depends on them), orange steps are in staging, purple is production. The red dashed arrows say that any failing step stops everything. Security checks (secret scanning, permission diffs) belong in the early gates because a leaked secret is cheapest to catch before merge.</p>
+<h3>Access control: RBAC, ABAC, row and column policies</h3>
+<p><strong>RBAC</strong> (role-based access control) gives permissions to roles ("analyst", "support"), and people get roles. It is simple and auditable but coarse: "analyst" sees the whole table. <strong>ABAC</strong> (attribute-based) decides using attributes of the user, the data and the context: "a user whose <code>region</code> attribute is IN may read rows tagged region IN". In practice you combine them: RBAC for "may query this table at all", then <strong>row-level policies</strong> (hide rows) and <strong>column masking</strong> (hide or scramble values) for the details. Predict: with the three roles in the code, what does the Indian analyst see for order 1's email?</p>
+<pre class="code lang-python"><code># RBAC says WHO may read a table. Row and column policies say WHAT they see inside it.
+rows = [
+  {"order_id": 1, "region": "IN", "email": "asha@example.com", "card_last4": "4242", "amount": 120},
+  {"order_id": 2, "region": "IN", "email": "ravi@example.com", "card_last4": "1111", "amount": 80},
+  {"order_id": 3, "region": "DE", "email": "jana@example.com", "card_last4": "0005", "amount": 200},
+]
+roles = {
+  "analyst_in": {"regions": {"IN"}, "see_pii": False},
+  "support_de": {"regions": {"DE"}, "see_pii": True},
+  "admin":      {"regions": {"IN", "DE"}, "see_pii": True},
+}
+def mask_email(e):
+    user, domain = e.split("@")
+    return user[0] + "***@" + domain
+def read(role):
+    p = roles[role]
+    out = []
+    for r in rows:
+        if r["region"] not in p["regions"]:           # row-level policy
+            continue
+        r = dict(r)
+        if not p["see_pii"]:                          # column masking policy
+            r["email"] = mask_email(r["email"]); r["card_last4"] = "****"
+        out.append(r)
+    return out
+for role in roles:
+    print(role, "-&gt;", [(r["order_id"], r["email"], r["card_last4"]) for r in read(role)])</code></pre>
+<pre class="code lang-text"><code>analyst_in -&gt; [(1, 'a***@example.com', '****'), (2, 'r***@example.com', '****')]
+support_de -&gt; [(3, 'jana@example.com', '0005')]
+admin -&gt; [(1, 'asha@example.com', '4242'), (2, 'ravi@example.com', '1111'), (3, 'jana@example.com', '0005')]</code></pre>
+<table class="steps"><tr><th>analyst_in</th><td>Row policy keeps region IN (orders 1 and 2). Masking is on, so <code>asha@example.com</code> becomes <code>a***@example.com</code> and the card digits become <code>****</code>.</td></tr><tr><th>support_de</th><td>Row policy keeps DE only (order 3). PII is allowed, so the real values show.</td></tr><tr><th>admin</th><td>All rows, all values. Also the role whose use you should audit most closely.</td></tr><tr><th>Principle</th><td>Least privilege: start with nothing, add what a role needs. Enforce in the warehouse (policies), not in the dashboard, because dashboards can be bypassed.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Masking in a view that people can bypass. <strong>Wrong:</strong> create <code>orders_masked</code>, then leave the base <code>orders</code> readable by the same role. <strong>Right:</strong> apply the policy to the base table (or revoke access to it) so there is only one door. Also test with the real role: log in as an analyst and run <code>SELECT *</code>.</div></div>
+<h3>Tokenization and pseudonymisation</h3>
+<p>Often analysts do not need to read the email, they only need to know that two orders belong to the same person. <strong>Pseudonymisation</strong> replaces the identifier with a stable token so joins and counts still work. A plain hash is not enough, because emails come from a small guessable space, so an attacker hashes a list of candidates and compares. A <strong>keyed hash</strong> (HMAC) with a secret fixes this: without the key, guessing does not work. Predict: do <code>asha@example.com</code> and <code>Asha@Example.com</code> get the same token?</p>
+<pre class="code lang-python"><code># Tokenization and pseudonymisation: keep joins working without keeping the raw value.
+import hmac, hashlib
+SECRET = b"demo-secret-kept-in-a-secrets-manager"   # never in code in real life
+def token(value: str) -&gt; str:
+    return hmac.new(SECRET, value.lower().encode(), hashlib.sha256).hexdigest()[:12]
+orders = [("asha@example.com", 120), ("ravi@example.com", 80), ("Asha@Example.com", 45)]
+tok = [(token(e), a) for e, a in orders]
+print(tok)
+totals = {}
+for t, a in tok: totals[t] = totals.get(t, 0) + a
+print("spend per customer token:", totals)
+# plain unsalted hash is guessable: an attacker hashes a list of known emails and compares.
+plain = hashlib.sha256(b"asha@example.com").hexdigest()[:12]
+guess = {hashlib.sha256(e.encode()).hexdigest()[:12]: e for e in ["ravi@example.com", "asha@example.com"]}
+print("plain sha256 reversed by guessing:", guess.get(plain))
+guess2 = {hashlib.sha256(e.encode()).hexdigest()[:12]: e for e in ["ravi@example.com", "asha@example.com"]}
+print("keyed token reversed by guessing:", guess2.get(token("asha@example.com")))</code></pre>
+<pre class="code lang-text"><code>[('aa9265b6289e', 120), ('6932565bea37', 80), ('aa9265b6289e', 45)]
+spend per customer token: {'aa9265b6289e': 165, '6932565bea37': 80}
+plain sha256 reversed by guessing: asha@example.com
+keyed token reversed by guessing: None</code></pre>
+<ul><li>Yes. We lowercase before hashing, so both orders map to token <code>aa9265b6289e</code> and the customer's spend is 120 + 45 = 165. Normalise (trim, lowercase) before any hash, or the same person gets two tokens.</li><li>The plain SHA-256 was reversed by trying known emails. The keyed token was not.</li><li>The key lives in a secrets manager (Section 12.2), not in code or a notebook. Rotating the key changes every token, so plan joins accordingly.</li></ul>
+<div class="callout blue"><div class="lab">KEY IDEA</div><div class="txt">Pseudonymised data is still personal data under GDPR if you hold the key or can re-identify it. It lowers risk; it does not remove the legal duties. True anonymisation is much harder than hashing a column: combinations such as postcode, birth date and gender can re-identify a person. Ask your privacy team, not your intuition.</div></div>
+<h3>Right to erasure across the pipeline</h3>
+<p>A user asks you to delete their data. The personal data is not in one table: it sits in raw (bronze) events, cleaned (silver) orders, features, backups, and maybe logs. A good process: look up which tables carry the person key (lineage and the catalog tell you), delete in every table, record what you deleted, and rebuild aggregates that included them. Predict: after erasing user <code>u7</code>, does the gold table still show the old revenue?</p>
+<pre class="code lang-python"><code># Right to erasure across a medallion pipeline, using sqlite as the stand-in for tables.
+import sqlite3
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE bronze_events(id INTEGER, user_id TEXT, payload TEXT);
+CREATE TABLE silver_orders(order_id INTEGER, user_id TEXT, amount REAL);
+CREATE TABLE gold_daily(day TEXT, revenue REAL, orders INTEGER);
+CREATE TABLE erasure_log(user_id TEXT, table_name TEXT, rows_deleted INTEGER);
+INSERT INTO bronze_events VALUES (1,'u7','{"page":"home"}'),(2,'u7','{"page":"cart"}'),(3,'u8','{"page":"home"}');
+INSERT INTO silver_orders VALUES (10,'u7',50),(11,'u8',70),(12,'u7',30);
+INSERT INTO gold_daily VALUES ('2025-01-01',150,3);
+""")
+def erase(user):
+    for table in ("bronze_events", "silver_orders"):
+        n = db.execute(f"DELETE FROM {table} WHERE user_id=?", (user,)).rowcount
+        db.execute("INSERT INTO erasure_log VALUES (?,?,?)", (user, table, n))
+    db.commit()
+erase("u7")
+print("bronze left:", db.execute("SELECT COUNT(*) FROM bronze_events").fetchone()[0])
+print("silver left:", db.execute("SELECT order_id, user_id FROM silver_orders").fetchall())
+print("log:", db.execute("SELECT * FROM erasure_log").fetchall())
+print("gold still says:", db.execute("SELECT revenue, orders FROM gold_daily").fetchone(), "(aggregated, not personal, but stale)")
+rerun = db.execute("SELECT SUM(amount), COUNT(*) FROM silver_orders").fetchone()
+print("after rebuild gold would be:", rerun)</code></pre>
+<pre class="code lang-text"><code>bronze left: 1
+silver left: [(11, 'u8')]
+log: [('u7', 'bronze_events', 2), ('u7', 'silver_orders', 2)]
+gold still says: (150.0, 3) (aggregated, not personal, but stale)
+after rebuild gold would be: (70.0, 1)</code></pre>
+<table class="steps"><tr><th>Step 1</th><td>Find where <code>user_id</code> appears: bronze and silver. Gold is an aggregate with no user key.</td></tr><tr><th>Step 2</th><td>Delete in both, and log counts (2 bronze rows, 2 silver rows) as the audit trail. The log holds no personal data, only the user id or its token and counts.</td></tr><tr><th>Step 3</th><td>Gold still says revenue 150 and 3 orders. It is stale: u7's two orders (50 + 30) are still counted.</td></tr><tr><th>Step 4</th><td>Rebuild gold from silver: 70 revenue over 1 order. Whether you must rebuild depends on legal advice; for small groups an aggregate can still identify a person, so many teams rebuild.</td></tr><tr><th>Step 5 (lakehouse)</th><td>In Delta or Iceberg the DELETE only hides rows. Rewrite the affected files (compaction), expire old snapshots, then vacuum, and only then the bytes are gone (Section 3.5). Backups age out on their own retention schedule, which you must document.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> "I ran DELETE FROM users, so we complied." <strong>Right:</strong> deletion has to reach every copy: raw files, derived tables, caches, exports and ML training sets, within the legal time limit (GDPR says without undue delay and within one month in general). Keep an inventory of where each personal field lives so the answer takes minutes, not weeks.</div></div>
+<h3>Going deeper</h3>
+<ul><li><strong>Encryption.</strong> At rest (disk and object-store encryption, usually on by default, with keys held in a KMS) and in transit (TLS). Envelope encryption means a data key encrypts the data and a master key encrypts the data key, so rotating the master key does not require re-encrypting petabytes. Column-level encryption protects fields even from people with table access.</li><li><strong>Retention.</strong> Data you do not keep cannot leak. Set explicit retention per table (raw logs 30 days, orders 7 years for finance). Automate deletion with partition drops.</li><li><strong>Lineage with OpenLineage.</strong> Jobs emit events saying "this run read dataset A and wrote dataset B", so a tool such as Marquez or a catalog draws the graph. Use it to answer "which dashboards break if I change this column" and "where did this PII field flow".</li><li><strong>Audit.</strong> Log who read PII, and alert on unusual volume. Most breaches are noticed late.</li></ul>
+<p class="problem"><span class="pl">Problem 12.5.1</span> A table has 3 roles and 4 regions. You write one row policy per role. A new region is added. In which design do you edit policies: RBAC with one role per region, or ABAC with a region attribute?</p>
+<table class="steps"><tr><th>RBAC</th><td>Create a new role, grant it, assign users, update every policy that lists regions. Role count grows with regions x functions.</td></tr><tr><th>ABAC</th><td>Add the region tag to the data and the attribute to the users. The single policy "row region in user regions" needs no edit.</td></tr><tr><th>Answer</th><td>ABAC needs no policy edit; RBAC needs new roles and edits. The price of ABAC is harder reasoning about who can see what, so test and audit it.</td></tr></table>
+<p class="problem"><span class="pl">Problem 12.5.2</span> An email space of 10 million plausible addresses is hashed with plain SHA-256. An attacker's machine hashes 1 billion values per second. How long to reverse every hash? With HMAC and an unknown 256-bit key?</p>
+<table class="steps"><tr><th>Plain</th><td>10,000,000 / 1,000,000,000 = 0.01 seconds for the whole list.</td></tr><tr><th>HMAC</th><td>The attacker needs the key. Guessing 2<sup>256</sup> keys is impossible (more than 10<sup>77</sup>), so the practical risk becomes the key leaking.</td></tr><tr><th>Answer</th><td>0.01 seconds versus infeasible. Protect the key.</td></tr></table>
+<p><strong>Practice (with answers)</strong></p>
+<ol><li>Which tool is for "who may query the table", RBAC or a masking policy? <strong>Answer:</strong> RBAC. Masking decides what values they see inside.</li><li>Why lowercase and trim before tokenizing? <strong>Answer:</strong> otherwise the same person gets different tokens and joins break.</li><li>A user is deleted from silver. The gold daily table holds revenue only. Do you need to touch gold? <strong>Answer:</strong> not for personal data strictly, but rebuild if the aggregate becomes wrong or identifies someone.</li><li>What makes a lakehouse delete physical? <strong>Answer:</strong> rewrite the files, expire old snapshots, vacuum.</li><li>Name two things that must never be in a git repository. <strong>Answer:</strong> secrets (passwords, API keys, tokens) and raw personal data.</li></ol>
+<p><em>Not run here:</em> vendor policy syntax (Snowflake <code>CREATE MASKING POLICY</code>, BigQuery row access policies, Unity Catalog grants) and KMS calls. They need accounts. The logic above is plain Python and sqlite3 and was run here. Laws differ by country: this is engineering guidance, not legal advice.</p>
+<h2 id="s6-chapter-recap">Chapter recap</h2>
+<ul><li>Containers package code and dependencies; Docker builds images; pin versions, keep secrets out, run as non-root, and order Dockerfile steps for caching.</li><li>Kubernetes keeps the desired state: Deployments for always-on consumers, CronJobs for schedules; set resource requests and limits; OOMKilled means memory limit exceeded.</li><li>Terraform writes infrastructure as code; read the plan before apply; the state file is precious; avoid console edits (drift).</li><li>CI/CD: lint, test, import-test, build, deploy through dev, staging and prod; promote the same image; keep rollback ready.</li><li>Secrets live in a secret manager, never in Git or images; use least privilege IAM roles; rotate after leaks.</li><li>Monitor freshness, volume, quality and health, not only job success; use thresholds from history; fight alert fatigue; keep runbooks and blameless postmortems.</li><li>Cost = quantity × price × runs; reduce bytes scanned and idle compute; tag resources; track cost per run.</li><li>Governance: classify PII, mask and tokenize, support deletion and retention, restrict access, and keep lineage and a catalog.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Item</th><th>Rule or command</th></tr></thead><tbody><tr><td>Build / run image</td><td><code>docker build -t name:tag .</code> / <code>docker run --rm name:tag</code></td></tr><tr><td>Kubernetes resources</td><td><code>requests</code> (reserved), <code>limits</code> (ceiling); <code>500m</code> = 0.5 core</td></tr><tr><td>Terraform flow</td><td><code>init</code>, <code>plan</code>, review, <code>apply</code></td></tr><tr><td>Alert z-score</td><td><code>z = (x − mean) / sd</code>, alert if `</td></tr><tr><td>Freshness alert</td><td><code>now − MAX(event_ts) &gt; SLA</code></td></tr><tr><td>Cost</td><td><code>bytes scanned × price per byte × runs</code></td></tr><tr><td>Pseudonymize</td><td>HMAC with a secret key, not a bare hash</td></tr><tr><td>Retention cutoff</td><td><code>today − retention period</code></td></tr></tbody></table></div>
+<h2 id="s7-practice-set">Practice set</h2>
+<p><strong>1.</strong> (easy) A pod requests 250m CPU and runs 8 replicas. How many cores are reserved?</p>
+<p><strong>Answer:</strong> 8 × 250m = 2,000m = 2 cores.</p>
+<p><strong>2.</strong> (easy) Which Docker line gives better caching: <code>COPY . .</code> then <code>pip install</code>, or <code>COPY requirements.txt .</code>, <code>pip install</code>, then <code>COPY . .</code>?</p>
+<p><strong>Answer:</strong> The second one; dependencies are reinstalled only when <code>requirements.txt</code> changes.</p>
+<p><strong>3.</strong> (easy) Is it safe to put the database password in the Dockerfile as <code>ENV DB_PASS=...</code>?</p>
+<p><strong>Answer:</strong> No. It is stored in the image layers and visible to anyone who can pull the image. Inject it at run time from a secret manager.</p>
+<p><strong>4.</strong> (medium) History: 9,900, 10,100, 10,000, 10,000, 10,000 (mean 10,000, standard deviation about 70.7). Today 9,700. z-score, and alert at 3-sigma?</p>
+<p><strong>Answer:</strong> The sample standard deviation: squared differences 10,000 + 10,000 each (100² = 10,000 twice) and 0 three times: sum 20,000, divided by 4 = 5,000, square root 70.7. z = −300 / 70.7 = −4.2, beyond 3: alert. (Computed by hand: 300/70.7 = 4.24.)</p>
+<p>Note: with small samples the standard deviation is unreliable; use at least 14 to 30 days of history.</p>
+<p><strong>5.</strong> (medium) Freshness SLA is 2 hours. The newest row is from 07:10 and it is now 09:15. Alert?</p>
+<p><strong>Answer:</strong> Lag is 2 h 5 min, above 2 h: yes, alert.</p>
+<p><strong>6.</strong> (medium, find the bug) A Terraform user hardcodes the AWS access key in <code>main.tf</code> and commits it. List what is wrong and the fix order.</p>
+<p><strong>Answer:</strong> Secret in Git. Fix order: revoke and rotate the key; switch to IAM roles or environment-provided credentials; remove it from the code; add a secret scanner in CI.</p>
+<p><strong>7.</strong> (medium) A job reads 4 TB per run, 20 runs a month, at an illustrative 5 per TB. Partitioning lets it read 0.5 TB. Savings per month?</p>
+<p><strong>Answer:</strong> Before: 4 × 5 × 20 = 400. After: 0.5 × 5 × 20 = 50. Savings = 350 (87.5%).</p>
+<p><strong>8.</strong> (medium) A container with a 512 MiB limit is OOMKilled every night at 02:00, when a 600 MB file arrives. Give two fixes.</p>
+<p><strong>Answer:</strong> Process the file in chunks or with a streaming/columnar reader so memory stays small; or raise the limit above the measured peak (for example 1 GiB). The first is better because the file will grow.</p>
+<p><strong>9.</strong> (hard, scenario) A new engineer joins and needs access to <code>orders</code> including phone numbers for a one-time analysis. What is a good process?</p>
+<p><strong>Answer:</strong> Ask for the business purpose; give access to the masked or tokenized view first; if phone is really needed, time-boxed, role-based access with approval and logging, and remove it afterwards; record it in the access review.</p>
+<p><strong>10.</strong> (interview) Explain the difference between CI and CD in a data team.</p>
+<p><strong>Answer:</strong> CI means every change is automatically linted and tested (unit tests, DAG import, dbt build on a CI schema) before merge. CD means a change that passed is automatically released to dev, and to prod after approval, as a versioned artifact with a rollback path.</p>
+<p><strong>11.</strong> (interview) Your pipeline succeeded but the dashboard is empty. What monitoring would have caught it?</p>
+<p><strong>Answer:</strong> A volume check (row count versus history), a freshness check on the final table, and a not-null/row-count test in the pipeline. Job-status monitoring alone cannot see a "successful" empty load.</p>
+<h2 id="s8-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me Docker for data pipelines: images, Dockerfile layers and caching, volumes, Compose, and best practices. Use a small Python loader as the example. Then give me 6 graded exercises (including a Dockerfile with 3 bugs to find) without solutions, and I will paste my answers: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am learning data engineering. Explain Kubernetes basics for a data engineer: pod, Deployment, Service, Job, CronJob, ConfigMap, Secret, resource requests and limits, OOMKilled, Helm. Use a canteen-manager analogy and a Kafka consumer Deployment as the example. Then quiz me one question at a time on reading a YAML file.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: Terraform and CI/CD for a data platform: providers, state, plan and apply, modules, drift, GitHub Actions steps for dbt and Python repos, dev/stage/prod, rollback. Give me a realistic scenario with a dangerous plan output and ask me what I would do. Then critique my answer.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am applying for data engineer roles. Teach me monitoring and alerting for data pipelines: freshness, volume, quality, runbooks, SLAs and SLOs, alert fatigue, blameless postmortems, and FinOps cost per run. Use real numbers and z-scores. Then give me 8 exercises with numbers, one at a time, and check my answers.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am applying for data engineer roles in India. Teach me data governance basics: PII classification, masking versus pseudonymization versus anonymization, retention, row and column security, lineage, catalogs, and the main ideas of DPDP and GDPR (awareness only). Then run a mock interview with 6 questions, one at a time, with a score, a model answer and a follow-up after each. My answers: [PASTE HERE]</pre></div><div class="readbtn"><button class="btn" data-read="study:de:ch12">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch11.html">← Chapter 11: Streaming and Kafka</a><a class="btn" href="ch13.html">Chapter 13: System Design for Data →</a></div></div><script src="../../assets/study.js"></script></body></html>

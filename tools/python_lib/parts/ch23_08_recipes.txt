@@ -1,0 +1,284 @@
+
+<h2>23.7 Four Complete Recipes</h2>
+<p>Now the pieces work together. Each recipe is a complete, runnable solution to a task you will really meet.</p>
+<h3>Recipe A: a CSV-processing command-line tool, with tests</h3>
+<p><strong>Task:</strong> "Give me a command that reads a sales CSV, groups by a column, sums another column and prints the top N groups. It must fail politely on bad input." The design rule that makes it testable: <code>main(argv)</code> takes the argument list and returns an exit code, so tests call it directly instead of starting a process.</p>
+@@py
+import argparse
+import io
+import sys
+import tempfile
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from pathlib import Path
+
+import pandas as pd
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="csvtool", description="Sum a value column by group")
+    p.add_argument("csv", type=Path)
+    p.add_argument("--group", required=True)
+    p.add_argument("--value", required=True)
+    p.add_argument("--top", type=int, default=3)
+    return p
+
+def top_groups(df, group, value, top):
+    for col in (group, value):
+        if col not in df.columns:
+            raise KeyError(f"column {col!r} not found; have {list(df.columns)}")
+    return df.groupby(group)[value].sum().sort_values(ascending=False).head(top)
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if not args.csv.is_file():
+        print(f"error: file not found: {args.csv}", file=sys.stderr)
+        return 2
+    try:
+        result = top_groups(pd.read_csv(args.csv), args.group, args.value, args.top)
+    except KeyError as exc:
+        print(f"error: {exc.args[0]}", file=sys.stderr)
+        return 2
+    print(result.to_string())
+    return 0
+
+class TestCsvTool(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.csv = Path(tmp.name) / "sales.csv"
+        self.csv.write_text("region,sales\nnorth,10\nsouth,30\nnorth,25\neast,5\nsouth,1\n")
+
+    def run_main(self, *argv):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = main([str(a) for a in argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_happy_path(self):
+        code, out, _ = self.run_main(self.csv, "--group", "region", "--value", "sales", "--top", 2)
+        self.assertEqual(code, 0)
+        self.assertEqual(out.split(), ["region", "north", "35", "south", "31"])
+
+    def test_unknown_column(self):
+        code, _, err = self.run_main(self.csv, "--group", "city", "--value", "sales")
+        self.assertEqual(code, 2)
+        self.assertIn("column 'city' not found", err)
+
+    def test_missing_file(self):
+        code, _, err = self.run_main("nope.csv", "--group", "a", "--value", "b")
+        self.assertEqual(code, 2)
+        self.assertIn("file not found", err)
+
+    def test_pure_function(self):
+        df = pd.DataFrame({"g": ["a", "b", "a"], "v": [1, 5, 2]})
+        self.assertEqual(top_groups(df, "g", "v", 1).to_dict(), {"b": 5})
+
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(TestCsvTool)
+res = unittest.TextTestRunner(stream=io.StringIO()).run(suite)
+print(res.testsRun, "tests, ok:", res.wasSuccessful())
+
+with tempfile.TemporaryDirectory() as tmp:
+    f = Path(tmp) / "sales.csv"
+    f.write_text("region,sales\nnorth,10\nsouth,30\nnorth,25\neast,5\nsouth,1\n")
+    print("exit code:", main([str(f), "--group", "region", "--value", "sales", "--top", "2"]))
+@@end
+<ol><li><code>build_parser</code> declares the interface. <code>type=Path</code> turns the text into a <code>Path</code>, so the code can call <code>is_file()</code>.</li>
+<li><code>top_groups</code> holds the logic and knows nothing about the command line, so it can be tested with a tiny DataFrame. It raises <code>KeyError</code> with a helpful message listing the available columns.</li>
+<li><code>main</code> converts problems into messages on stderr and exit code 2 (the convention: 0 success, non-zero failure). It returns the code instead of calling <code>sys.exit</code>; the real entry point is <code>sys.exit(main())</code>.</li>
+<li>The tests build a fresh CSV in <code>setUp</code>, call <code>main</code> with an argument list and capture stdout and stderr with <code>redirect_stdout</code> and <code>redirect_stderr</code>. They cover the happy path, a bad column, a missing file and the pure function. In pytest you would use the <code>tmp_path</code> and <code>capsys</code> fixtures instead.</li>
+<li>The first output line says 4 tests ran and all passed. The final lines are the real tool output for <code>--top 2</code>: north (10 + 25 = 35) and south (30 + 1 = 31), then <code>exit code: 0</code>.</li></ol>
+@@np
+# test_csvtool.py -- NOT RUN HERE: the same tests in pytest style
+from csvtool import main
+
+def test_happy_path(tmp_path, capsys):
+    f = tmp_path / "sales.csv"
+    f.write_text("region,sales\nnorth,10\nsouth,30\nnorth,25\n")
+    assert main([str(f), "--group", "region", "--value", "sales", "--top", "1"]) == 0
+    assert "north" in capsys.readouterr().out
+
+def test_unknown_column(tmp_path, capsys):
+    f = tmp_path / "s.csv"
+    f.write_text("a,b\n1,2\n")
+    assert main([str(f), "--group", "zzz", "--value", "b"]) == 2
+    assert "not found" in capsys.readouterr().err
+@@end
+<h3>Recipe B: serving a scikit-learn model safely</h3>
+<p><strong>Task:</strong> "Save the model so a different process can serve it, and make it impossible to use it with the wrong features or the wrong library version." A bare <code>.joblib</code> file has no memory of which columns, in which order, or which version made it. Save a small <em>bundle</em> with the model plus a metadata file, and check on load.</p>
+@@py
+import json
+import tempfile
+from pathlib import Path
+
+import joblib
+import numpy as np
+import pandas as pd
+import sklearn
+from sklearn.linear_model import LogisticRegression
+
+FEATURES = ["age", "tenure_months", "monthly_spend"]
+
+def save_bundle(model, folder, metrics):
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    joblib.dump(model, folder / "model.joblib")
+    meta = {"features": FEATURES, "sklearn": sklearn.__version__, "metrics": metrics}
+    (folder / "meta.json").write_text(json.dumps(meta, indent=2))
+
+def load_bundle(folder):
+    folder = Path(folder)
+    meta = json.loads((folder / "meta.json").read_text())
+    if meta["sklearn"] != sklearn.__version__:
+        raise RuntimeError(f"model built with scikit-learn {meta['sklearn']}, running {sklearn.__version__}")
+    return joblib.load(folder / "model.joblib"), meta
+
+def predict(model, meta, rows):
+    df = pd.DataFrame(rows)
+    missing = set(meta["features"]) - set(df.columns)
+    if missing:
+        raise ValueError(f"missing features: {sorted(missing)}")
+    return model.predict_proba(df[meta["features"]].to_numpy())[:, 1]     # enforce order
+
+rng = np.random.default_rng(0)
+X = pd.DataFrame({"age": rng.integers(18, 80, 300), "tenure_months": rng.uniform(0, 60, 300),
+                  "monthly_spend": rng.uniform(5, 100, 300)})
+y = ((X["tenure_months"] < 12) & (X["monthly_spend"] > 40)).astype(int)
+model = LogisticRegression(max_iter=2000).fit(X[FEATURES].to_numpy() / [100, 60, 100], y)
+
+with tempfile.TemporaryDirectory() as tmp:
+    save_bundle(model, Path(tmp) / "v1", {"train_acc": round(model.score(X[FEATURES].to_numpy() / [100, 60, 100], y), 3)})
+    loaded, meta = load_bundle(Path(tmp) / "v1")
+    print(sorted(p.name for p in (Path(tmp) / "v1").iterdir()))
+    print(meta["features"], meta["metrics"])
+    meta_bad = json.loads((Path(tmp) / "v1" / "meta.json").read_text())
+    meta_bad["sklearn"] = "0.0.1"
+    (Path(tmp) / "v1" / "meta.json").write_text(json.dumps(meta_bad))
+    try:
+        load_bundle(Path(tmp) / "v1")
+    except RuntimeError as exc:
+        print("blocked:", str(exc)[:42])
+
+try:
+    predict(loaded, meta, [{"age": 30, "tenure_months": 2}])
+except ValueError as exc:
+    print(exc)
+@@end
+<ol><li>The bundle is a folder: <code>model.joblib</code> (the fitted object) and <code>meta.json</code> (feature names in training order, the scikit-learn version, the headline metric). Both are small and diffable in review.</li>
+<li><code>load_bundle</code> refuses to load a model built with a different scikit-learn version. Pickled models are tied to the library version, so a silent mismatch can give wrong answers or crash later.</li>
+<li><code>predict</code> builds a DataFrame from request rows, checks every required feature is present, then selects columns <em>in the stored order</em>. This makes input column order irrelevant to the caller, which removes a very common serving bug.</li>
+<li>The scaling by <code>[100, 60, 100]</code> is part of how the model was trained; a more robust design puts the scaler and model in one <code>sklearn.pipeline.Pipeline</code> so they are saved together (see the pitfalls).</li>
+<li>Output: the folder holds the two files; the metadata shows the feature list and a training accuracy; after we tamper with the stored version, loading is blocked with a message starting <code>model built with scikit-learn 0.0.1, runni</code>; and a request missing <code>monthly_spend</code> raises <code>missing features: ['monthly_spend']</code>.</li></ol>
+<p>Put <code>load_bundle</code> inside the FastAPI <code>lifespan</code> from Example 18 and call <code>predict</code> in the endpoint; the validation, serving and loading each live in one place.</p>
+<h3>Recipe C: a reproducible training script that logs parameters and metrics</h3>
+<p><strong>Task:</strong> "Anyone should be able to run <code>python train.py --C 0.1 --seed 3</code> and get the same numbers, and every run must append a record of what it did." Reproducibility needs four things pinned: random seeds, the data (fingerprint it), the code and library versions (record them), and the parameters (log them).</p>
+@@py
+import argparse
+import hashlib
+import json
+import platform
+import tempfile
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+import numpy as np
+import sklearn
+from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, roc_auc_score
+from sklearn.model_selection import train_test_split
+
+@dataclass(frozen=True)
+class Config:
+    C: float = 1.0
+    seed: int = 0
+    n_samples: int = 800
+
+def fingerprint(*arrays):
+    h = hashlib.sha256()
+    for a in arrays:
+        h.update(np.ascontiguousarray(a).tobytes())
+    return h.hexdigest()[:12]
+
+def train(cfg):
+    X, y = make_classification(n_samples=cfg.n_samples, n_features=12, n_informative=5,
+                               flip_y=0.05, random_state=cfg.seed)
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.25, random_state=cfg.seed, stratify=y)
+    model = LogisticRegression(C=cfg.C, max_iter=1000, random_state=cfg.seed).fit(Xtr, ytr)
+    proba = model.predict_proba(Xte)[:, 1]
+    return {
+        "params": asdict(cfg),
+        "data_hash": fingerprint(X, y),
+        "metrics": {"accuracy": round(accuracy_score(yte, proba > 0.5), 4),
+                    "roc_auc": round(roc_auc_score(yte, proba), 4)},
+        "env": {"python": platform.python_version(), "sklearn": sklearn.__version__, "numpy": np.__version__},
+    }
+
+def main(argv=None, out_dir="."):
+    p = argparse.ArgumentParser()
+    p.add_argument("--C", type=float, default=1.0)
+    p.add_argument("--seed", type=int, default=0)
+    a = p.parse_args(argv)
+    record = train(Config(C=a.C, seed=a.seed))
+    path = Path(out_dir) / "runs.jsonl"
+    with path.open("a") as f:
+        f.write(json.dumps(record, sort_keys=True) + "\n")
+    return record
+
+with tempfile.TemporaryDirectory() as tmp:
+    r1 = main(["--C", "0.1", "--seed", "3"], tmp)
+    r2 = main(["--C", "0.1", "--seed", "3"], tmp)
+    r3 = main(["--C", "0.1", "--seed", "4"], tmp)
+    lines = (Path(tmp) / "runs.jsonl").read_text().splitlines()
+
+print(len(lines), "records appended")
+print(r1["metrics"], r1["data_hash"])
+print("same seed identical:", r1 == r2)
+print("other seed differs:", r1["metrics"] != r3["metrics"], r1["data_hash"] != r3["data_hash"])
+print(sorted(json.loads(lines[0])))
+@@end
+<ol><li><code>Config</code> is a frozen dataclass: the complete list of knobs of one run. Everything random derives from <code>seed</code>: the dataset generator, the train/test split and the model.</li>
+<li><code>fingerprint</code> hashes the raw bytes of the arrays with SHA-256 and keeps 12 hex characters. If someone changes the data, the hash changes; two records with the same hash saw the same data.</li>
+<li><code>train</code> returns one dictionary: the parameters, the data hash, the metrics (rounded) and the environment (Python, scikit-learn and numpy versions). Comparing metrics from different library versions is a common source of "irreproducible" results, so they are recorded.</li>
+<li><code>main</code> parses the command line and appends one JSON line to <code>runs.jsonl</code>. Appending JSON lines never corrupts earlier records and loads straight into pandas with <code>pd.read_json(path, lines=True)</code>. The timestamp is deliberately omitted so records can be compared; add one in real use.</li>
+<li>Output: three records were appended; the metrics dictionary and data hash of the first run; running the same seed twice gives identical records (<code>True</code>); a different seed changes both the metrics and the data hash (<code>True True</code>); and the stored keys are <code>['data_hash', 'env', 'metrics', 'params']</code>.</li></ol>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Reproducible means "same inputs give the same outputs", so write down all the inputs: parameters, seed, data fingerprint and library versions. The code version (the git commit hash) belongs in the record too, for example by reading <code>git rev-parse HEAD</code> with <code>subprocess</code>. Equal results across different machines or different scikit-learn versions are not guaranteed, only on the same environment.</div></div>
+<h3>Recipe D: a project skeleton</h3>
+<p><strong>Task:</strong> "Create a layout another person can clone, install and test in two commands." The accepted modern layout puts the package under <code>src/</code>, so tests import the installed package, not the folder you happen to be standing in. The script below builds the skeleton in a temporary folder, prints the tree and runs the skeleton's own test.</p>
+@@py
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+FILES = {
+    "pyproject.toml": '[project]\nname = "churn-tools"\nversion = "0.1.0"\nrequires-python = ">=3.11"\n'
+                      'dependencies = ["pandas"]\n\n[project.scripts]\nchurn = "churn_tools.cli:main"\n',
+    "README.md": "# churn-tools\n\nInstall: `uv sync` or `pip install -e .[dev]`. Test: `pytest`.\n",
+    ".gitignore": ".venv/\n.env\n__pycache__/\n*.pkl\nmlruns/\ndata/raw/\n",
+    "src/churn_tools/__init__.py": '__version__ = "0.1.0"\n',
+    "src/churn_tools/cli.py": 'def add(a, b):\n    return a + b\n\ndef main():\n    print(add(2, 3))\n',
+    "tests/test_cli.py": "import unittest\nfrom churn_tools.cli import add\n\nclass T(unittest.TestCase):\n"
+                         "    def test_add(self):\n        self.assertEqual(add(2, 3), 5)\n",
+    "data/.gitkeep": "",
+}
+
+with tempfile.TemporaryDirectory() as tmp:
+    root = Path(tmp) / "churn-tools"
+    for rel, text in FILES.items():
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+    for p in sorted(root.rglob("*")):
+        depth = len(p.relative_to(root).parts) - 1
+        print("  " * depth + p.name + ("/" if p.is_dir() else ""))
+    env = {**os.environ, "PYTHONPATH": str(root / "src")}
+    r = subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests"],
+                       cwd=root, env=env, capture_output=True, text=True)
+    print(r.returncode, r.stderr.strip().splitlines()[-1])
+@@end
+<ol><li><code>FILES</code> maps each relative path to its content: a <code>pyproject.toml</code> with a script entry point, a README that states the two commands, a <code>.gitignore</code>, the package under <code>src/churn_tools/</code>, a <code>tests/</code> folder, and an empty <code>data/.gitkeep</code> so git keeps the otherwise empty folder.</li>
+<li>For each path, <code>parent.mkdir(parents=True, exist_ok=True)</code> then <code>write_text</code> creates the folder tree and the file.</li>
+<li>The printing loop uses <code>rglob("*")</code>, sorted, and indents by depth; a trailing slash marks folders. The tree is the layout you should aim for.</li>
+<li>The test run uses a subprocess with <code>PYTHONPATH</code> pointing at <code>src</code>; with a real install (<code>pip install -e .</code>) you would not need that. The result <code>0 OK</code> means the process exited with status 0 and unittest printed <code>OK</code>.</li>
+<li>Add <code>[tool.pytest.ini_options]</code>, <code>[tool.mypy]</code> and the pre-commit file from section 23.4, a <code>Dockerfile</code> from 23.6 and you have the whole toolkit in one repository.</li></ol>

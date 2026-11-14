@@ -1,0 +1,251 @@
+
+<h2>Chapter recap</h2>
+<ul>
+<li>Every scikit-learn object follows one contract: construct with settings, <code>fit</code> to learn (state ends with an underscore), then <code>predict</code> or <code>transform</code>. <code>X</code> is 2-D, <code>y</code> is 1-D.</li>
+<li>Split first, with <code>stratify</code> for classes, <code>GroupKFold</code> for repeated entities and <code>TimeSeriesSplit</code> for time. The test set is opened once.</li>
+<li>All learned preprocessing (imputers, scalers, encoders, selectors, vectorisers) belongs in a <code>Pipeline</code>; a <code>ColumnTransformer</code> routes columns. That prevents leakage and ships training and serving together.</li>
+<li>Always run a dummy baseline and a scaled linear model before anything fancy. For tables, <code>HistGradientBoosting</code> is the strong default; forests are the robust one.</li>
+<li>Cross-validate with the same folds for every model, report mean and spread, and tune with <code>RandomizedSearchCV</code> on training data only. Use nested CV for an honest estimate of the whole procedure.</li>
+<li>Match the metric to the cost of errors. On rare positives use precision, recall, average precision and a chosen threshold, not accuracy.</li>
+<li>Probabilities from many models are not calibrated. Check <code>calibration_curve</code> and wrap with <code>CalibratedClassifierCV</code> when probabilities are used as numbers.</li>
+<li>Inspect models with permutation importance (on held-out data) and partial dependence; impurity importances and raw coefficients mislead.</li>
+<li>Save the whole pipeline with <code>joblib</code>, with versions. Never load files from untrusted sources.</li>
+<li>When a score looks too good, suspect leakage first: target-derived features, selection before splitting, duplicates, group or time structure.</li>
+</ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / pattern</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>m.fit(X_tr, y_tr).predict(X_te)</code></td><td>Learn on train, apply on unseen rows</td></tr>
+<tr><td><code>sc.fit(X_tr); sc.transform(X_te)</code></td><td>Learn statistics on train only</td></tr>
+<tr><td><code>make_pipeline(prep, model)</code></td><td>One object, leak-free CV, easy to save</td></tr>
+<tr><td><code>ColumnTransformer([(name, step, cols)])</code></td><td>Different preprocessing per column group</td></tr>
+<tr><td><code>pipe.set_params(step__param=v)</code></td><td>Double underscore reaches inside a pipeline</td></tr>
+<tr><td><code>cross_val_score(pipe, X, y, cv=cv, scoring=s)</code></td><td>k honest scores; report mean and std</td></tr>
+<tr><td><code>RandomizedSearchCV(pipe, dist, n_iter=n, cv=k)</code></td><td>Fixed-budget tuning; fits = n × k + 1</td></tr>
+<tr><td>precision = TP / (TP + FP); recall = TP / (TP + FN)</td><td>Trust in alarms; share of real cases caught</td></tr>
+<tr><td>F1 = 2PR / (P + R)</td><td>Harmonic mean of precision and recall</td></tr>
+<tr><td>class weight = n / (k × count)</td><td>What <code>class_weight="balanced"</code> applies</td></tr>
+<tr><td>AUC = share of (positive, negative) pairs ranked correctly</td><td>Threshold-free ranking quality</td></tr>
+<tr><td><code>permutation_importance(m, X_te, y_te)</code></td><td>Drop in score when a column is shuffled on held-out data</td></tr>
+<tr><td><code>joblib.dump(pipe, path)</code> / <code>joblib.load(path)</code></td><td>Persist the whole fitted pipeline</td></tr>
+</tbody></table></div>
+
+<h2>Practice set</h2>
+<p>Twenty-three problems, easy to expert. Try each before reading the answer. Where a problem shows code, the printed output is given in the answer, and it was produced by running the code.</p>
+
+<p class="problem"><span class="pl">Problem 19.P.1</span> (Easy) What does <code>fit</code> return, and how can you tell from the attribute names that a model has been fitted?</p>
+<p><strong>Answer:</strong> <code>fit</code> returns the estimator itself (<code>self</code>), which allows chaining such as <code>model.fit(X, y).predict(X)</code>. Attributes learned from data end with an underscore (<code>coef_</code>, <code>classes_</code>, <code>mean_</code>), and they exist only after <code>fit</code>. <code>check_is_fitted(model)</code> tests for them and raises <code>NotFittedError</code> if there are none.</p>
+
+<p class="problem"><span class="pl">Problem 19.P.2</span> (Easy) <code>model.fit(df["age"], y)</code> raises <code>Expected 2D array, got 1D array instead</code>. Fix it, and say why scikit-learn insists on 2-D.</p>
+<p><strong>Answer:</strong> use double brackets: <code>model.fit(df[["age"]], y)</code>, which keeps a one-column DataFrame (with a NumPy array, <code>X.reshape(-1, 1)</code>). Scikit-learn treats X as rows by features, and a flat vector is ambiguous: it could be one sample with many features or many samples with one feature. Requiring 2-D removes the ambiguity.</p>
+
+<p class="problem"><span class="pl">Problem 19.P.3</span> (Easy) A spam filter flags 40 emails: 30 are spam and 10 are not. There were 50 spam emails in total. Compute precision, recall and F1.</p>
+<p><strong>Answer:</strong> TP = 30, FP = 10, FN = 50 - 30 = 20. Precision = 30 / 40 = 0.75. Recall = 30 / 50 = 0.60. F1 = 2 × 0.75 × 0.60 / (0.75 + 0.60) = 0.90 / 1.35 = 0.667. The filter is trustworthy when it fires but misses 40% of the spam.</p>
+
+<p class="problem"><span class="pl">Problem 19.P.4</span> (Easy) Which of these need feature scaling to work well: decision tree, random forest, kNN, RBF SVM, logistic regression with the default penalty, k-means, PCA?</p>
+<p><strong>Answer:</strong> needing scaling: kNN, RBF SVM, regularised logistic regression, k-means and PCA, because they depend on distances, variances or a penalty on weights. Not needing scaling: decision tree and random forest, which only compare each feature to thresholds, so any monotonic rescaling gives the same splits.</p>
+
+<p class="problem"><span class="pl">Problem 19.P.5</span> (Easy) What does this print?</p>
+@@QPY
+from sklearn.preprocessing import OneHotEncoder
+
+enc = OneHotEncoder(handle_unknown="ignore", sparse_output=False).fit([["a"], ["b"]])
+print(enc.transform([["a"], ["c"]]))
+@@END
+<p><strong>Answer:</strong> the encoder learned two categories, <code>a</code> and <code>b</code>, so it outputs two columns. The known value <code>a</code> becomes <code>[1, 0]</code>. The unseen value <code>c</code> becomes all zeros because of <code>handle_unknown="ignore"</code> (the default would raise an error).</p>
+[[OUT]]
+
+<p class="problem"><span class="pl">Problem 19.P.6</span> (Medium) What does this print, and why is the last number not between -2 and 2?</p>
+@@QPY
+import numpy as np
+from sklearn.preprocessing import StandardScaler
+
+sc = StandardScaler().fit(np.array([[1.0], [2.0], [3.0]]))
+print(sc.mean_, sc.scale_.round(4))
+print(sc.transform(np.array([[3.0], [4.0], [10.0]])).ravel().round(3))
+@@END
+<p><strong>Answer:</strong> the training data has mean 2 and population standard deviation √(2/3) = 0.8165. New values are scaled with those numbers: (3 - 2)/0.8165 = 1.225, (4 - 2)/0.8165 = 2.449, (10 - 2)/0.8165 = 9.798. Scaling does not clip, so values outside the training range land far from zero. That is useful information about drift, not an error.</p>
+[[OUT]]
+
+<p class="problem"><span class="pl">Problem 19.P.7</span> (Medium) Find the bug and fix it.</p>
+<pre class="code lang-python norun"><code>from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+
+X_scaled = StandardScaler().fit_transform(X)
+print(cross_val_score(LogisticRegression(), X_scaled, y, cv=5).mean())</code></pre>
+<p><strong>Answer:</strong> the scaler is fitted on all rows, so every validation fold has influenced the mean and spread used on the training folds. For a scaler the effect is usually small; for a selector, imputer or encoder it can be large. Fix: <code>pipe = make_pipeline(StandardScaler(), LogisticRegression()); cross_val_score(pipe, X, y, cv=5)</code>, which refits the scaler inside each fold.</p>
+
+<p class="problem"><span class="pl">Problem 19.P.8</span> (Medium) Find the bug: <code>GridSearchCV(make_pipeline(StandardScaler(), SVC()), {"C": [0.1, 1, 10]}, cv=5).fit(X, y)</code> raises <code>ValueError: Invalid parameter 'C'</code>.</p>
+<p><strong>Answer:</strong> the grid names a parameter of the pipeline, which has none called <code>C</code>. Parameters of a step are addressed as <code>stepname__param</code>, and <code>make_pipeline</code> names steps by lowercase class name, so the key is <code>svc__C</code>. Use <code>{"svc__C": [0.1, 1, 10]}</code>. If unsure, print <code>pipe.get_params().keys()</code>.</p>
+
+<p class="problem"><span class="pl">Problem 19.P.9</span> (Medium) A grid has 3 values for one setting and 2 for another. You use 4-fold CV with the default <code>refit=True</code>. How many model fits happen?</p>
+<p><strong>Answer:</strong> 3 × 2 = 6 candidates; 6 × 4 = 24 fits during the search; plus 1 final refit of the best candidate on all training rows: 25 fits.</p>
+
+<p class="problem"><span class="pl">Problem 19.P.10</span> (Medium) What does this print? Say which cell is which.</p>
+@@QPY
+from sklearn.metrics import confusion_matrix
+
+print(confusion_matrix([0, 1, 1, 1], [0, 0, 1, 1]))
+@@END
+<p><strong>Answer:</strong> rows are true classes, columns are predicted classes. Row 0 (true 0): one predicted 0, none predicted 1. Row 1 (true 1): one predicted 0 (a false negative), two predicted 1 (true positives). So tn = 1, fp = 0, fn = 1, tp = 2.</p>
+[[OUT]]
+
+<p class="problem"><span class="pl">Problem 19.P.11</span> (Medium) A tuned model has CV train accuracy 0.99 and CV validation accuracy 0.71. Diagnose it and give three fixes.</p>
+<p><strong>Answer:</strong> large gap with high train score is overfitting (high variance). Fixes: (1) simplify the model: limit tree depth, raise <code>min_samples_leaf</code>, increase the regularisation penalty (smaller <code>C</code>, larger <code>alpha</code>); (2) average more (a forest instead of one tree, bagging); (3) get more rows or remove noisy features, and check that the CV scheme is not leaking (a leak would inflate validation, so the real situation is not better than 0.71). Confirm with a validation curve or learning curve.</p>
+
+<p class="problem"><span class="pl">Problem 19.P.12</span> (Medium) Fraud occurs in 0.2% of transactions. Pick a primary metric and explain how you would set the decision rule.</p>
+<p><strong>Answer:</strong> accuracy is useless (99.8% by never flagging). Use average precision (area under the precision-recall curve) to compare models, and report recall and precision at the operating point. Choose the threshold from costs: if reviewers can check 500 alerts a day, set the threshold to give about that many alerts and read off the recall; or maximise expected value using the cost of a missed fraud versus a false alert. Use <code>stratify</code>, <code>class_weight</code> if helpful, and check calibration if probabilities feed other decisions.</p>
+
+<p class="problem"><span class="pl">Problem 19.P.13</span> (Medium) What does this print?</p>
+@@QPY
+import numpy as np
+from sklearn.linear_model import LogisticRegression
+
+a = LogisticRegression()
+b = a
+b.set_params(C=5)
+print(a.C)
+
+from sklearn.base import clone
+c = clone(a)
+c.set_params(C=9)
+print(a.C, c.C)
+@@END
+<p><strong>Answer:</strong> <code>b = a</code> does not copy; both names refer to one object, so changing <code>b</code> changes <code>a</code> and the first line prints 5. <code>clone(a)</code> builds a new unfitted object with the same settings (including C=5); changing <code>c</code> leaves <code>a</code> alone, so the second line prints <code>5 9</code>.</p>
+[[OUT]]
+
+<p class="problem"><span class="pl">Problem 19.P.14</span> (Medium) Write a pipeline for a table with numeric columns <code>age</code> and <code>income</code> (some missing) and a text column <code>city</code>, ending in logistic regression, and report 3-fold CV accuracy on the small table below.</p>
+<p><strong>Answer:</strong> impute and scale the numbers, one-hot encode the text, route each with a <code>ColumnTransformer</code>, and put the model last. Running it prints the three fold accuracies (1.0, 0.75 and 1.0). The table has only 12 rows, so these numbers are only a demonstration.</p>
+@@PY
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+df = pd.DataFrame({
+    "age": [25, 32, np.nan, 41, 29, 55, 38, np.nan, 47, 23, 36, 60],
+    "income": [30, 45, 52, np.nan, 38, 80, 61, 58, 72, 28, 49, 90],
+    "city": ["A", "B", "A", "C", "B", "C", "A", "B", "C", "A", "B", "C"],
+})
+y = [0, 0, 0, 1, 0, 1, 1, 0, 1, 0, 0, 1]
+
+prep = ColumnTransformer([
+    ("num", make_pipeline(SimpleImputer(strategy="median"), StandardScaler()), ["age", "income"]),
+    ("cat", OneHotEncoder(handle_unknown="ignore"), ["city"])])
+pipe = make_pipeline(prep, LogisticRegression())
+print(cross_val_score(pipe, df, y, cv=3).round(3))
+@@END
+
+<p class="problem"><span class="pl">Problem 19.P.15</span> (Hard) Find the bug: <code>cross_val_score(model, X, y, cv=GroupKFold(5))</code> raises <code>ValueError: The 'groups' parameter should not be None</code>. Then explain when you need it.</p>
+<p><strong>Answer:</strong> <code>GroupKFold</code> needs to know which rows belong together, so pass them: <code>cross_val_score(model, X, y, groups=patient_ids, cv=GroupKFold(5))</code>. Needed whenever several rows come from the same entity (patient, customer, device, document) and new data will bring new entities; otherwise random folds put near-copies of one entity in both train and validation, inflating the score (section 19.5: 0.992 versus 0.515).</p>
+
+<p class="problem"><span class="pl">Problem 19.P.16</span> (Hard) What does this print?</p>
+@@QPY
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+X = pd.DataFrame({"n": [1.0, 2.0, 3.0, 4.0], "c": ["x", "y", "z", "x"]})
+y = [0, 1, 0, 1]
+pipe = make_pipeline(
+    ColumnTransformer([("s", StandardScaler(), ["n"]), ("o", OneHotEncoder(), ["c"])]),
+    LogisticRegression()).fit(X, y)
+print(pipe[:-1].transform(X).shape, pipe[-1].coef_.shape)
+print(pipe.steps[0][0])
+@@END
+<p><strong>Answer:</strong> the transformed matrix has 4 rows and 1 + 3 columns (one scaled number plus a one-hot column for each of x, y, z), so the shape is (4, 4); the model has one weight per transformed column, shape (1, 4). <code>make_pipeline</code> names the first step after the lowercase class name, <code>columntransformer</code>. Slicing <code>pipe[:-1]</code> is the pipeline without its final model.</p>
+[[OUT]]
+
+<p class="problem"><span class="pl">Problem 19.P.17</span> (Hard) A model says "90% likely to default" for a group of customers, but only 60% of that group defaulted. What is wrong, how do you confirm it, and what do you do?</p>
+<p><strong>Answer:</strong> the probabilities are overconfident, meaning they are not calibrated. Confirm with <code>calibration_curve(y_true, p, n_bins=10)</code> on held-out data (points far below the diagonal at high predicted values) and with Brier score and log loss. Fix with <code>CalibratedClassifierCV(model, method="isotonic", cv=5)</code> (or <code>"sigmoid"</code> on small data), then re-check the curve on data the calibrator did not see. The ranking (AUC) is not changed much by calibration; the meaning of the numbers is.</p>
+
+<p class="problem"><span class="pl">Problem 19.P.18</span> (Hard) Compute by hand the ROC AUC for labels [0, 0, 1, 1, 1] and scores [0.1, 0.6, 0.4, 0.8, 0.7], then verify with code.</p>
+@@QPY
+from sklearn.metrics import roc_auc_score
+
+print(roc_auc_score([0, 0, 1, 1, 1], [0.1, 0.6, 0.4, 0.8, 0.7]))
+@@END
+<p><strong>Answer:</strong> AUC is the share of (positive, negative) pairs where the positive scores higher. Positives: 0.4, 0.8, 0.7. Negatives: 0.1, 0.6. That is 3 × 2 = 6 pairs. 0.4 beats 0.1 but not 0.6 (1 of 2). 0.8 beats both (2 of 2). 0.7 beats both (2 of 2). Total 5 of 6 = 0.8333.</p>
+[[OUT]]
+
+<p class="problem"><span class="pl">Problem 19.P.19</span> (Hard) Write a custom transformer <code>TopK</code> that keeps the <code>k</code> most frequent categories of a single column seen in training and maps everything else to <code>"other"</code>. Show it on a small column, including an unseen value.</p>
+<p><strong>Answer:</strong> learn the vocabulary in <code>fit</code> (state ends in an underscore) and apply it in <code>transform</code>. The constructor stores <code>k</code> unchanged. Output: the two most frequent training cities are Rome (3 rows) and Oslo (2), so Paris and the unseen Berlin both become <code>other</code>.</p>
+@@PY
+import numpy as np
+import pandas as pd
+from collections import Counter
+from sklearn.base import BaseEstimator, TransformerMixin
+from sklearn.utils.validation import check_is_fitted
+
+
+class TopK(TransformerMixin, BaseEstimator):
+    def __init__(self, k=2):
+        self.k = k
+
+    def fit(self, X, y=None):
+        values = np.asarray(X).ravel()
+        self.keep_ = [v for v, _ in Counter(values).most_common(self.k)]
+        return self
+
+    def transform(self, X):
+        check_is_fitted(self)
+        values = np.asarray(X).ravel()
+        return np.array([[v if v in self.keep_ else "other"] for v in values], dtype=object)
+
+
+train = pd.DataFrame({"city": ["Oslo", "Oslo", "Rome", "Rome", "Rome", "Paris", "Lima"]})
+t = TopK(k=2).fit(train[["city"]])
+print(t.keep_)
+print(t.transform(pd.DataFrame({"city": ["Rome", "Paris", "Berlin"]})).ravel())
+@@END
+
+<p class="problem"><span class="pl">Problem 19.P.20</span> (Hard) Find the leak: a colleague adds the average churn rate per city to the table with <code>df["city_rate"] = df.groupby("city")["churn"].transform("mean")</code> before splitting. Why is the CV score inflated, and what is the correct tool?</p>
+<p><strong>Answer:</strong> the new column is computed from the target of every row, including each row's own label and every validation row's label. For a rare city with two customers, the city rate is almost the row's own label. The model reads the answer from a feature that will not be available at prediction time for new rows. Correct tool: <code>TargetEncoder</code> inside the pipeline. It computes smoothed means from training data only, and during <code>fit_transform</code> uses internal cross-fitting so a row's encoding never uses its own label. Then the whole thing is evaluated by outer cross-validation.</p>
+
+<p class="problem"><span class="pl">Problem 19.P.21</span> (Expert) What does this print, and what does it teach about permutation importance?</p>
+@@QPY
+import numpy as np
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(0)
+x = rng.normal(size=(1500, 1))
+y = (x[:, 0] + rng.normal(scale=0.5, size=1500) > 0).astype(int)
+X_single = np.c_[x, rng.normal(size=1500)]                    # [signal, noise]
+X_dup = np.c_[x, x + rng.normal(scale=0.01, size=(1500, 1)), rng.normal(size=1500)]  # signal twice
+
+for name, X in (("one copy", X_single), ("two copies", X_dup)):
+    X_tr, X_te, y_tr, y_te = train_test_split(X, y, random_state=0)
+    m = RandomForestClassifier(200, random_state=0).fit(X_tr, y_tr)
+    pi = permutation_importance(m, X_te, y_te, n_repeats=10, random_state=0)
+    print(name, pi.importances_mean.round(3))
+@@END
+<p><strong>Answer:</strong> with one copy the signal column has a large importance and the noise column about zero. With two near-identical copies, the forest splits its reliance between them (0.204 and 0.079), so shuffling one copy hurts far less because the other still carries the signal, and the first copy's importance falls from 0.345 to 0.204 although the information is exactly as valuable. Lesson: correlated features hide each other. Cluster correlated columns and permute them as a group, or drop duplicates before interpreting.</p>
+[[OUT]]
+
+<p class="problem"><span class="pl">Problem 19.P.22</span> (Expert, interview) Design the validation for a model that predicts, at the start of each month, whether a customer will cancel during that month. You have monthly snapshots for three years.</p>
+<p><strong>Answer:</strong> time and entity both matter. (1) Features for a snapshot may only use information available on that date; labels are the cancellations in the following month. (2) Split by time, not randomly: train on months up to T, validate on a later block, test on the latest months, using <code>TimeSeriesSplit</code> for CV (or an expanding-window scheme with a gap of one month so label windows do not overlap). (3) The same customer appears in many months; within the training period it is fine, but never let a customer's later months leak into a fold that is validated on earlier months. (4) Use average precision and recall at the number of customers the retention team can contact. (5) Monitor drift after launch and re-train on a schedule. Everything learned (encoders, imputers) goes in the pipeline, fitted per fold.</p>
+
+<p class="problem"><span class="pl">Problem 19.P.23</span> (Expert) Without running it, say what this prints, then explain what would change if <code>refit=False</code>.</p>
+@@QPY
+from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV
+
+X, y = make_classification(300, 8, random_state=0)
+gs = GridSearchCV(LogisticRegression(max_iter=500), {"C": [0.01, 1.0]}, cv=3, refit=True).fit(X, y)
+print([int(r) for r in sorted(gs.cv_results_["rank_test_score"])], hasattr(gs, "best_estimator_"), gs.n_features_in_)
+@@END
+<p><strong>Answer:</strong> there are two candidates, so the ranks are [1, 2] (ties would repeat a rank). <code>refit=True</code> creates <code>best_estimator_</code>, so <code>hasattr</code> is True, and the search exposes <code>n_features_in_</code> (8). With <code>refit=False</code> there is no <code>best_estimator_</code>; <code>gs.predict</code> and <code>gs.score</code> would raise an error and you would have to refit the best parameters yourself. You keep only <code>best_params_</code> and <code>cv_results_</code>. A refit is also required when you use a list of metrics as <code>scoring</code> (you must name the metric to refit on).</p>
+[[OUT]]
+
+<h2>Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical machine-learning professor. I am a working professional moving into data roles and I just studied scikit-learn: the estimator API (fit, predict, transform, score), train_test_split, preprocessing with ColumnTransformer, Pipeline and why it prevents leakage, linear/tree/forest/boosting/SVM/kNN/naive Bayes models, cross-validation with GridSearchCV and RandomizedSearchCV, metrics for imbalanced classes, calibration, permutation importance and joblib. Quiz me one question at a time, starting easy and getting harder: mix "what does this print", "find the bug", and "which metric or splitter should I use and why". Wait for my answer before revealing yours. After each answer tell me what I got right, what I missed, and give a one-line rule I can remember. After 10 questions, summarise my weak areas and suggest three exercises.</pre></div>
+<div class="prompt"><div class="ph"><span>AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>Act as a senior data scientist doing a code review of my scikit-learn project. I will paste my code and a short description of the data and goal. Check, in order: (1) data leakage (any fitting of scalers, imputers, encoders, selectors or target statistics outside a Pipeline or before the split; features that would not be available at prediction time; repeated entities or time order handled with random folds); (2) the splitting scheme; (3) whether the metric matches the cost of errors, and whether a dummy baseline is reported; (4) hyper-parameter tuning hygiene (was the test set touched? is there a CV-optimism problem?); (5) calibration if probabilities are used as numbers; (6) reproducibility (random_state, saved versions); (7) deployment risks (column order, unseen categories, missing values). For each problem quote the exact line, explain the symptom it would cause, and show the corrected code. End with a ranked list of the three changes that matter most.</pre></div>
+<div class="prompt"><div class="ph"><span>AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>Run a mock technical interview for a data scientist role focused on scikit-learn and classical machine learning. Ask me one question at a time, from basic to expert, covering: Pipeline versus manual preprocessing and leakage; bias and variance with trees, forests and boosting; imbalanced classification (metrics, class_weight, thresholds, PR versus ROC curves); cross-validation design for grouped and time-ordered data; hyper-parameter search and nested CV; calibration; model interpretation (permutation importance versus impurity importance, partial dependence); writing a custom transformer; saving and serving a model safely. After each of my answers, score it from 1 to 5, point out gaps, and give a model answer in under 120 words. Occasionally give me a short code snippet containing a subtle bug and ask me to find it. At the end give an overall assessment and a study plan for the weakest topics.</pre></div>

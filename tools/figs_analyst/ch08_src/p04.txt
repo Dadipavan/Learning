@@ -1,0 +1,281 @@
+
+@@H2 8.4 Chart Cookbook II: Change Over Time
+@@CALL blue|INTUITION|Time has a direction, so a chart of time should have a direction too: left to right, earlier to later. The eye follows a line like a finger tracing a road. That is why a line chart wins whenever the x-axis is time, and why the only question left is how many roads you can draw before the picture becomes a plate of spaghetti.
+<h3>Line chart: how does one number change over time?</h3>
+<p><strong>Answers:</strong> "What is the trend, the seasonality, the spike?" <strong>Do not use when:</strong> the x values are unordered categories (use bars), or the time points are so few (3 or fewer) that a slope chart or bars are clearer. A line's baseline need not be zero, because position, not length, carries the value; but if you cut the axis, make the cut obvious.</p>
+@@PY line
+#H
+#MONTHLY
+import matplotlib.dates as mdates
+peak = monthly.idxmax()
+baseline = monthly.loc["2024-01":"2024-10"].mean()
+print(f"peak {monthly.max()}k in {peak:%b %Y}; Jan to Oct 2024 average {baseline:.0f}k; peak / average = {monthly.max() / baseline:.2f}")
+fig, ax = plt.subplots()
+ax.plot(monthly.index, monthly.values, color=BLUE, lw=2.5, marker="o", ms=5)
+ax.annotate(f"{peak:%b %Y}: {monthly.max()}k", xy=(peak, monthly.max()), xytext=(pd.Timestamp("2024-04-15"), 630),
+            arrowprops=dict(arrowstyle="->", color="#333"), va="center")
+ax.axvspan(pd.Timestamp("2024-10-20"), pd.Timestamp("2024-12-31"), color=ORANGE, alpha=0.12)
+ax.text(pd.Timestamp("2024-11-25"), 80, "festive\nseason", ha="center", color=ORANGE)
+ax.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
+ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %Y"))
+ax.set_ylim(0, 700)
+ax.set_ylabel("Sales (Rs thousand)")
+ax.set_title("The festive season lifted sales to 620k in Dec 2024")
+fig.tight_layout()
+fig.savefig("ch08v_line.png", dpi=110)
+print("saved")
+@@END
+@@FIG line|Line chart of 18 monthly sales values with the December 2024 peak annotated and the festive months shaded|Monthly sales, Jan 2024 to Jun 2025. The shaded band marks the festive months.
+<p><strong>How to read it.</strong> The line rises slowly from 310k to 470k through October, jumps to 560k and 620k in November and December, then falls back to 350k in January 2025. The peak is 1.64 times the Jan to Oct 2024 average of 378k. The y-axis starts at zero, so the jump is shown at its true size.</p>
+<ol><li>The index of <code>monthly</code> is a <code>DatetimeIndex</code>, so <code>ax.plot(monthly.index, monthly.values)</code> puts real dates on the x-axis and matplotlib spaces them by calendar time.</li><li><code>monthly.loc["2024-01":"2024-10"]</code> slices by date label (both ends included), a pandas feature that makes time series code readable.</li><li><code>ax.axvspan(x_start, x_end, alpha=0.12)</code> shades a vertical band to mark a period. A very low <code>alpha</code> (opacity) keeps it behind the data.</li><li><code>mdates.MonthLocator(bymonth=[1, 4, 7, 10])</code> puts a tick every quarter; <code>DateFormatter("%b %Y")</code> prints "Jan 2024". Format codes: %b is the short month, %Y the 4-digit year, %d the day.</li><li>The headline is the finding; the annotation names the peak value and date, computed from the data so it cannot drift.</li></ol>
+@@PY line_sns
+#HS
+#MONTHLY
+df = monthly.rename_axis("month").reset_index()
+ax = sns.lineplot(data=df, x="month", y="sales_k", color=BLUE, linewidth=2.5, marker="o")
+ax.set(ylim=(0, 700), xlabel="", ylabel="Sales (Rs thousand)", title="The festive season lifted sales to 620k in Dec 2024")
+ax.figure.autofmt_xdate()
+ax.figure.tight_layout()
+ax.figure.savefig("ch08v_line_sns.png", dpi=110)
+print(df.tail(3).to_string(index=False))
+print("saved")
+@@END
+<p><code>sns.lineplot</code> needs a tidy table (a column for x and a column for y). If several rows share the same x it averages them and draws a 95% confidence band, which is why it is the tool for repeated measurements (see the second multi-line block below). With one value per month there is nothing to average, so the picture is the same as the matplotlib one. <code>autofmt_xdate()</code> rotates and aligns the date labels.</p>
+@@NORUN
+import pandas as pd
+import plotly.express as px
+
+months = pd.period_range("2024-01", "2025-06", freq="M").to_timestamp()
+sales = [310, 295, 340, 360, 385, 400, 380, 410, 430, 470, 560, 620, 350, 330, 375, 405, 430, 455]
+df = pd.DataFrame({"month": months, "sales_k": sales})
+fig = px.line(df, x="month", y="sales_k", markers=True, title="The festive season lifted sales to 620k in Dec 2024")
+fig.update_yaxes(range=[0, 700], title="Sales (Rs thousand)")
+fig.add_vrect(x0="2024-10-20", x1="2024-12-31", fillcolor="#b84a22", opacity=0.12, line_width=0)
+fig.update_xaxes(rangeslider_visible=True)       # a mini overview below the chart to zoom in time
+@@END
+<p><em>Not run here.</em> A line with markers; hovering shows the exact month and value. <code>add_vrect</code> is plotly's <code>axvspan</code>, and the optional range slider and the buttons to zoom time ranges are interactive features matplotlib cannot give you.</p>
+@@CALL red|COMMON MISTAKE|Letting matplotlib treat dates as text. If your x column is the string "2024-01", "2024-02", ... the points are equally spaced even when months are missing, and the ticks crowd together. Wrong: <code>ax.plot(df["month_str"], df["sales"])</code>. Right: <code>df["month"] = pd.to_datetime(df["month_str"])</code> first, so gaps look like gaps.
+
+<h3>Multi-line chart: several series over time</h3>
+<p><strong>Answers:</strong> "How do 2 to 5 groups move relative to each other?" <strong>Do not use when:</strong> more than about 5 lines (switch to small multiples), or the lines have wildly different scales (index them to 100, or use small multiples).</p>
+@@PY multiline
+#H
+#ORD
+orders["month"] = orders["date"].dt.to_period("M").dt.to_timestamp()
+city_m = orders.pivot_table(index="month", columns="city", values="amount", aggfunc="sum") / 1000
+city_m = city_m.round(1)
+print(city_m.to_string())
+colors = {"Delhi": BLUE, "Mumbai": ORANGE, "Pune": GREY}
+fig, ax = plt.subplots()
+for city in city_m.columns:
+    ax.plot(city_m.index, city_m[city], color=colors[city], lw=2.8, marker="o")
+    ax.text(city_m.index[-1] + pd.Timedelta(days=6), city_m[city].iloc[-1], city,
+            color="#666" if city == "Pune" else colors[city], va="center", fontweight="bold")
+ax.set_xticks(city_m.index, [d.strftime("%b") for d in city_m.index])
+ax.set_xlim(city_m.index[0] - pd.Timedelta(days=8), city_m.index[-1] + pd.Timedelta(days=30))
+ax.set_ylim(0, 35)
+ax.set_ylabel("Sales (Rs thousand)")
+ax.set_title("Delhi climbed to 30k in June while Mumbai fell")
+fig.tight_layout()
+fig.savefig("ch08v_multiline.png", dpi=110)
+print("saved")
+@@END
+@@FIG multiline|Three lines of monthly sales by city with end-of-line labels; Delhi rises, Mumbai falls, Pune stays low|Monthly sales by city, Jan to Jun 2025 (synthetic orders). Each line is labelled at its end, so no legend is needed.
+<p><strong>How to read it.</strong> Mumbai (orange) starts highest at 22.7k and ends at 10.3k; Delhi (blue) starts at 15.5k and ends at 30.0k, its highest month. Pune (grey) stays low and bumpy. Labelling each line at its right end saves the reader a trip to a legend. These are 300 synthetic orders, so single months are noisy; treat it as a drawing exercise, not a business fact.</p>
+<ol><li><code>dt.to_period("M").dt.to_timestamp()</code> maps each date to the first day of its month, so orders group by month.</li><li><code>pivot_table(index="month", columns="city", values="amount", aggfunc="sum")</code> gives one column per line: the shape <code>ax.plot</code> wants.</li><li>The loop draws one line per city and writes the city name just after the last point (<code>pd.Timedelta(days=6)</code> pushes the text a little right of it).</li><li><code>set_xticks(index, labels)</code> with <code>strftime("%b")</code> shows only the month name; the year is the same for all points (put it in the subtitle).</li><li><code>set_xlim(... + 30 days)</code> adds blank room on the right so the labels do not fall off the chart.</li></ol>
+@@PY multiline_sns
+#HS
+#ORD
+orders["month"] = orders["date"].dt.to_period("M").dt.to_timestamp()
+ax = sns.lineplot(data=orders, x="month", y="amount", hue="city", hue_order=["Delhi", "Mumbai", "Pune"],
+                  estimator="mean", errorbar=("ci", 95), seed=8, palette=[BLUE, ORANGE, GREY], linewidth=2.5)
+ax.set(xlabel="", ylabel="Average order value (Rs)", title="Average order value is noisy: the bands overlap")
+ax.set_xticks(sorted(orders["month"].unique()), [d.strftime("%b") for d in sorted(orders["month"].unique())])
+sns.move_legend(ax, "upper right", frameon=False, title=None)
+ax.figure.tight_layout()
+ax.figure.savefig("ch08v_multiline_sns.png", dpi=110)
+print(orders.groupby(["month", "city"])["amount"].mean().round(0).unstack().to_string())
+print("saved")
+@@END
+@@FIG multiline_sns|seaborn line plot of average order value per month for three cities with shaded 95 percent confidence bands|What seaborn adds: the shaded band is a 95% confidence interval around each monthly mean.
+<p>Here the same call shows a different quantity: the <em>average order value</em>, one point per month and city, built from many orders. Because each month has many rows, seaborn computes the mean and a 95% confidence band (<code>errorbar=("ci", 95)</code>). The bands overlap almost everywhere, so most of the month-to-month wiggles are noise. This is the honest way to draw a noisy average; one bare line would make small wiggles look like events. The band comes from bootstrapping (re-sampling the rows many times), so it is random; <code>seed=8</code> makes it repeat exactly. In seaborn 0.13 the old <code>ci=</code> argument is replaced by <code>errorbar=</code>.</p>
+@@NORUN
+import plotly.express as px
+
+# city_m is a long table: month, city, sales_k  (use city_m.reset_index().melt(...) from the pivot)
+fig = px.line(city_m, x="month", y="sales_k", color="city", markers=True,
+              color_discrete_map={"Delhi": "#2b4fd6", "Mumbai": "#b84a22", "Pune": "#9a9a9a"})
+fig.update_layout(hovermode="x unified")      # one tooltip shows all three cities for the month under the cursor
+fig.update_traces(line_width=3)
+@@END
+<p><em>Not run here.</em> <code>hovermode="x unified"</code> is the feature to remember: with several lines, a single tooltip lists every series at the same x. Long format means one row per month and city; <code>pivot.reset_index().melt(id_vars="month", var_name="city", value_name="sales_k")</code> makes that from the wide table above.</p>
+
+<h3>Area chart: a total and what it is made of</h3>
+<p><strong>Answers:</strong> "How does the total change, and who contributes?" <strong>Do not use when:</strong> you need to compare the individual series precisely (only the bottom layer has a flat baseline; use lines or small multiples), or with negative values.</p>
+@@PY area
+#H
+#ORD
+orders["month"] = orders["date"].dt.to_period("M").dt.to_timestamp()
+cat_m = orders.pivot_table(index="month", columns="category", values="amount", aggfunc="sum") / 1000
+cat_m = cat_m[["Electronics", "Home", "Fashion", "Grocery"]].round(1)
+print(cat_m.to_string())
+fig, ax = plt.subplots()
+ax.stackplot(cat_m.index, cat_m.T.values, labels=cat_m.columns, colors=[BLUE, TEAL, ORANGE, PURPLE], alpha=0.95)
+totals = cat_m.sum(axis=1)
+for d, t in totals.items():
+    ax.text(d, t + 1.2, f"{t:.0f}", ha="center", fontsize=11)
+ax.set_xticks(cat_m.index, [d.strftime("%b") for d in cat_m.index])
+ax.set_ylim(0, 62)
+ax.set_ylabel("Sales (Rs thousand)")
+ax.legend(frameon=False, loc="lower left", ncol=4, bbox_to_anchor=(0, 1.0), columnspacing=1.2)
+ax.set_title("Electronics hit 31k in June while the rest shrank", pad=34)
+fig.tight_layout()
+fig.savefig("ch08v_area.png", dpi=110)
+print("saved")
+@@END
+@@FIG area|Stacked area chart of monthly sales split into Electronics, Home, Fashion and Grocery with monthly totals labelled|Stacked area of monthly sales by category (synthetic orders). The labels are monthly totals in Rs thousand.
+<p><strong>How to read it.</strong> The top edge is the monthly total (labelled). The blue bottom layer is Electronics; because it sits on the flat baseline we can read its size directly, and it jumps in June to 31.1k while the other three layers shrink, so the June total (47) is actually lower than May (50). The upper layers float, so their exact size is hard to read, which is the main weakness of the area chart.</p>
+<ol><li><code>ax.stackplot(x, y_matrix, labels=, colors=)</code> draws stacked areas from a 2D array whose rows are series. <code>cat_m.T.values</code> transposes the table so each row is a category.</li><li>The column order sets the stacking order: put the series you care about most at the bottom, where it has a flat baseline.</li><li><code>cat_m.sum(axis=1)</code> adds across categories for each month; the loop writes those totals above the stack.</li><li>The legend sits above the plot in one row (<code>ncol=4</code>, <code>bbox_to_anchor</code>) so it does not cover any data.</li></ol>
+@@NORUN
+import plotly.express as px
+
+# cat_m_long: columns month, category, sales_k
+fig = px.area(cat_m_long, x="month", y="sales_k", color="category",
+              color_discrete_sequence=["#2b4fd6", "#357a70", "#b84a22", "#6a2fd0"])
+fig.update_layout(legend_orientation="h", legend_y=1.1)
+@@END
+<p><em>Not run here.</em> <code>px.area</code> stacks by default. Use <code>groupnorm="percent"</code> to turn it into a 100% area chart of shares. seaborn has no stacked area; <code>sns.histplot(..., multiple="fill")</code> does shares for distributions, not for time totals. Use matplotlib's <code>stackplot</code>.</p>
+
+<h3>Sparkline: a trend inside a table</h3>
+<p><strong>Answers:</strong> "Is each row going up, down or flat?" A sparkline is a tiny line chart without axes, drawn at word size. <strong>Do not use when:</strong> exact values matter or the scale differs a lot between rows (add the number next to it).</p>
+@@PY sparkline
+#H
+#ORD
+orders["month"] = orders["date"].dt.to_period("M").dt.to_timestamp()
+cat_m = (orders.pivot_table(index="month", columns="category", values="amount", aggfunc="sum") / 1000).round(1)
+rows = cat_m.columns.tolist()
+fig, axs = plt.subplots(len(rows), 1, figsize=(8, 3.6))
+for ax, name in zip(axs, rows):
+    s = cat_m[name]
+    ax.plot(range(len(s)), s.values, color=GREY, lw=2)
+    ax.scatter([s.values.argmax(), len(s) - 1], [s.max(), s.iloc[-1]], color=[BLUE, RED], zorder=3, s=30)
+    ax.axis("off")
+    change = (s.iloc[-1] / s.iloc[0] - 1) * 100
+    ax.text(-0.9, s.mean(), name, ha="right", va="center", fontweight="bold")
+    ax.text(len(s) - 0.4, s.mean(), f"Jun {s.iloc[-1]:.1f}k   ({change:+.0f}% vs Jan)", va="center")
+    ax.set_xlim(-0.2, len(s) + 3.5)
+    ax.margins(y=0.3)
+fig.suptitle("Monthly sales by category, Jan to Jun (blue = best month, red = latest)", x=0.02, ha="left", fontweight="bold", fontsize=13)
+fig.subplots_adjust(left=0.2, right=0.98, top=0.86, bottom=0.02, hspace=0.35)
+fig.savefig("ch08v_sparkline.png", dpi=110)
+print(cat_m.iloc[[0, -1]].to_string())
+print("saved")
+@@END
+@@FIG sparkline|Four sparklines, one per category, with the best month in blue, the latest in red and the June value and change since January in text|Sparklines: a dense table of trends. Each row has its own vertical scale.
+<p><strong>How to read it.</strong> Each row is a category's six months. Blue marks the best month, red the latest. Electronics is the only one finishing at its high point (the blue and red dots coincide). Because each row has its own scale, the text on the right gives the true June value and the change from January. Sparklines in a spreadsheet or Power BI table work the same way.</p>
+<ol><li><code>plt.subplots(len(rows), 1)</code> makes one small axes per category stacked vertically; <code>zip(axs, rows)</code> pairs each axes with its data.</li><li><code>ax.axis("off")</code> removes all frames, ticks and labels: the sparkline's defining trait.</li><li><code>s.values.argmax()</code> is the position of the best month; two scatter points mark it and the last value.</li><li>The two <code>ax.text</code> calls place the row name on the left and the numbers on the right, using data coordinates just outside the line.</li><li><code>fig.suptitle(..., x=0.02, ha="left")</code> sets a left-aligned figure title; <code>subplots_adjust</code> sets the margins by hand.</li></ol>
+@@NORUN
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+
+fig = make_subplots(rows=4, cols=1, shared_xaxes=False, vertical_spacing=0.04,
+                    subplot_titles=["Electronics", "Home", "Fashion", "Grocery"])
+for i, name in enumerate(["Electronics", "Home", "Fashion", "Grocery"], start=1):
+    fig.add_trace(go.Scatter(y=cat_m[name], mode="lines", line_color="#9a9a9a", showlegend=False), row=i, col=1)
+fig.update_xaxes(visible=False); fig.update_yaxes(visible=False)
+@@END
+<p><em>Not run here.</em> In plotly you build sparklines with one tiny subplot per row and the axes hidden. For tables, spreadsheets and Power BI, a native sparkline column is simpler; use the picture version only in reports and slides.</p>
+
+<h3>Dual-axis chart: why to avoid it</h3>
+<p><strong>Answers:</strong> nothing you cannot answer better. Two y-axes let the author choose each axis range freely, so the author, not the data, decides whether two lines look linked. <strong>Alternatives:</strong> two stacked panels sharing the x-axis, or both series indexed to 100 at the start.</p>
+@@PY dual_axis
+#H
+sales = np.array([350, 330, 375, 405, 430, 455])
+returns = np.array([52, 55, 49, 58, 54, 57])
+months = ["Jan", "Feb", "Mar", "Apr", "May", "Jun"]
+print(f"sales change Jan to Jun: {sales[-1] / sales[0] - 1:+.1%}; returns change: {returns[-1] / returns[0] - 1:+.1%}")
+
+def dual(ax, lim, title):
+    ax.plot(months, sales, color=BLUE, lw=2.5, marker="o")
+    ax.set_ylim(0, 500); ax.set_ylabel("Sales (Rs thousand)", color=BLUE)
+    ax2 = ax.twinx()
+    ax2.plot(months, returns, color=RED, lw=2.5, marker="s")
+    ax2.set_ylim(*lim); ax2.set_ylabel("Returns (count)", color=RED)
+    ax2.spines["right"].set_visible(True)
+    ax.set_title(title, fontsize=12)
+
+fig = plt.figure(figsize=(11, 4.4), layout="constrained")
+gs = fig.add_gridspec(2, 3, width_ratios=[1.3, 1.3, 1])
+dual(fig.add_subplot(gs[:, 0]), (0, 100), "A: returns look flat")
+dual(fig.add_subplot(gs[:, 1]), (45, 60), "B: returns 'chase' sales")
+top = fig.add_subplot(gs[0, 2]); bot = fig.add_subplot(gs[1, 2], sharex=top)
+top.plot(months, sales, color=BLUE, lw=2.5, marker="o"); top.set_ylim(0, 500); top.set_title("C: separate panels", fontsize=12)
+top.set_ylabel("Sales (k)"); top.tick_params(labelbottom=False)
+bot.plot(months, returns, color=RED, lw=2.5, marker="s"); bot.set_ylim(0, 100); bot.set_ylabel("Returns")
+fig.savefig("ch08v_dual_axis.png", dpi=110)
+print("saved")
+@@END
+@@FIG dual_axis|Three panels showing the same sales and returns data: two dual-axis versions with different right axis ranges giving different stories, and a two-panel stacked version|Panels A and B draw identical numbers with different right-hand axis limits. Panel C is the honest alternative.
+<p><strong>How to read it.</strong> Sales and returns are the same in A and B. In A the right axis runs 0 to 100, so returns look flat, which is right: they moved from 52 to 57 (+9.6%) while sales rose 30.0%. In B the right axis runs 45 to 60, so returns seem to zoom upward in step with sales, a story invented by the axis range. Panel C puts each series on its own panel with its own honest scale and lets the reader judge.</p>
+<ol><li>The helper function <code>dual(ax, lim, title)</code> draws both lines; only <code>lim</code> (the right-hand y-limits) changes between A and B. That one argument changes the story, which is the whole point.</li><li><code>ax.twinx()</code> adds the second y-axis; colour the axis labels like their lines so the reader knows which is which.</li><li><code>layout="constrained"</code> asks matplotlib to fit all labels, including the second y-axis labels, without overlap. <code>fig.add_gridspec(2, 3, width_ratios=[...])</code> makes a 2 by 3 grid; <code>gs[:, 0]</code> means "all rows, column 0", so A and B each take a full column while C uses two rows of column 2 (GridSpec is covered in 8.7).</li><li><code>sharex=top</code> links the x-axes; <code>tick_params(labelbottom=False)</code> hides the duplicate month labels on the top panel.</li></ol>
+@@CALL red|COMMON MISTAKE|Using a secondary axis to put "two things on one chart" for convenience. Wrong: sales on the left, returns on the right with ranges that make the lines touch. Right: stacked panels, or index both to 100 at the first month (<code>series / series.iloc[0] * 100</code>: in June sales are at 130.0 and returns at 109.6), which shows relative growth on one honest axis. The Pareto chart in 8.3 is the exception because the right axis is the running percent of the same bars.
+
+<h3>Calendar and time heat: when does activity happen?</h3>
+<p><strong>Answers:</strong> "Which days and hours are busy?" It lays time out as a grid (day of week by week, or hour by day of week) and colours each cell by volume. <strong>Do not use when:</strong> you need exact values (add numbers in the cells) or the grid has fewer than about 20 cells.</p>
+@@PY calendar
+#H
+rng = np.random.default_rng(8)
+days = pd.date_range("2025-01-01", "2025-06-30")
+base = np.where(days.dayofweek >= 5, 15, 9.5)                      # weekends are busier
+orders_per_day = rng.poisson(base)
+daily = pd.Series(orders_per_day, index=days, name="orders")
+print(daily.groupby(daily.index.dayofweek).mean().round(1).rename(index=dict(enumerate(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]))).to_string())
+first_monday = days[0] - pd.Timedelta(days=days[0].dayofweek)
+week = ((days - first_monday).days // 7).to_numpy()
+grid = np.full((7, week.max() + 1), np.nan)
+grid[days.dayofweek, week] = daily.values
+fig, ax = plt.subplots(figsize=(9, 3.4))
+im = ax.imshow(grid, cmap="Blues", aspect="equal", vmin=0)
+ax.set_yticks(range(7), ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"])
+month_start = [(d - first_monday).days // 7 for d in pd.date_range("2025-01-01", "2025-06-01", freq="MS")]
+ax.set_xticks(month_start, ["Jan", "Feb", "Mar", "Apr", "May", "Jun"])
+ax.tick_params(length=0)
+for s in ax.spines.values(): s.set_visible(False)
+cb = fig.colorbar(im, ax=ax, shrink=0.8, pad=0.02); cb.set_label("Orders per day")
+ax.set_title("Saturdays and Sundays are the busiest days")
+fig.tight_layout()
+fig.savefig("ch08v_calendar.png", dpi=110)
+print("saved")
+@@END
+@@FIG calendar|Calendar heat grid with rows for weekdays and columns for weeks from January to June, darker blue meaning more orders|Calendar heat map of daily orders (synthetic). Rows are weekdays, columns are weeks.
+<p><strong>How to read it.</strong> Each small square is one day. Darker blue means more orders. The two bottom rows (Saturday and Sunday) are darker than the rest. The printed weekday averages confirm the picture: about 9 to 10 orders on weekdays and 13 to 14.5 on Saturday and Sunday.</p>
+<ol><li><code>rng.poisson(lam)</code> draws counts of events with a given mean; it models "orders per day" well. The seeded generator makes the data identical on every run.</li><li>We need a grid with 7 rows (weekdays) and one column per week. <code>first_monday</code> is the Monday of the week containing 1 January, so the week number is <code>(date - first_monday).days // 7</code>.</li><li><code>grid[days.dayofweek, week] = daily.values</code> fills the cells by pairing each day's weekday row with its week column (fancy indexing); cells outside the date range stay NaN and are left blank.</li><li><code>ax.imshow(grid, cmap="Blues", vmin=0)</code> colours the grid; <code>vmin=0</code> keeps a day with zero orders at the lightest shade so the scale is honest.</li><li>The colour bar (<code>fig.colorbar</code>) is the legend for colour; always include one when colour carries numbers.</li></ol>
+@@PY timeheat_sns
+#HS
+rng = np.random.default_rng(8)
+n = 2500
+hours = np.arange(8, 24)
+w = np.exp(-0.5 * ((hours - 20) / 3.0) ** 2)                             # evening peak around 8 pm
+hour = rng.choice(hours, n, p=w / w.sum())
+weekday = rng.choice(7, n, p=[0.12, 0.12, 0.12, 0.13, 0.14, 0.19, 0.18])
+tbl = pd.crosstab(weekday, hour).reindex(index=range(7), columns=range(8, 24), fill_value=0)
+tbl.index = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+print("busiest cell:", tbl.stack().idxmax(), "with", tbl.stack().max(), "orders")
+ax = sns.heatmap(tbl, cmap="Blues", cbar_kws={"label": "Orders"}, linewidths=0.5, linecolor="white")
+ax.set(xlabel="Hour of day (24-hour clock)", ylabel="", title="Orders peak around 8 pm, strongest on Saturday")
+ax.tick_params(length=0)
+ax.figure.tight_layout()
+ax.figure.savefig("ch08v_timeheat_sns.png", dpi=110)
+print("saved")
+@@END
+@@FIG timeheat_sns|seaborn heat map of order counts for each weekday and hour of day with a strong evening band|Hour by weekday heat map of 2,500 synthetic orders. The dark band is the evening peak.
+<p><code>pd.crosstab(weekday, hour)</code> counts how many rows fall in each weekday and hour pair, which is exactly the grid <code>sns.heatmap</code> draws. <code>reindex(columns=range(8, 24), fill_value=0)</code> forces one column for every hour from 8 to 23 (8 am to 11 pm) and fills any hour with no orders with 0, so no column is skipped. The hours are drawn with <code>rng.choice</code> using bell-shaped weights centred on 20. <code>linewidths</code> and <code>linecolor</code> draw the thin white gaps between cells. This hour-by-weekday heat map is the standard answer to "when should we send the notification" or "when should we staff the call centre".</p>
+@@NORUN
+import plotly.express as px
+
+# tbl: rows = weekday, columns = hour (as built above)
+fig = px.imshow(tbl, color_continuous_scale="Blues", aspect="auto",
+                labels=dict(x="Hour of day", y="", color="Orders"), text_auto=True)
+fig.update_xaxes(side="bottom")
+@@END
+<p><em>Not run here.</em> <code>px.imshow</code> draws any 2D table as a heat map; <code>text_auto=True</code> prints the value in each cell, and hovering gives "hour, weekday, orders".</p>

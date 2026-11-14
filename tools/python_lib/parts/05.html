@@ -1,0 +1,241 @@
+<h2>22.5 DuckDB: SQL straight on files and DataFrames</h2>
+<h3>Beginner: what DuckDB is</h3>
+<p><strong>DuckDB</strong> is a database that lives inside your Python process, like SQLite, but built for analytics instead of transactions. There is no server to install or start. You point SQL at a CSV or Parquet file, or at a pandas DataFrame sitting in a variable, and it answers using a columnar, multi-threaded engine that can spill to disk when a query is larger than memory. If you already know SQL (and the SQL document in this library teaches it), DuckDB lets you use that knowledge on files that do not fit in pandas.</p>
+<p>The mental model: <em>files are tables</em>. <code>SELECT ... FROM 'orders.csv'</code> or <code>FROM read_parquet('sales/*/*.parquet')</code> works with no loading step. Results come back as a DataFrame with <code>.df()</code> (pandas) or <code>.pl()</code> (Polars). The comparison with SQLite is useful: SQLite stores rows and is excellent for many small reads and writes; DuckDB stores columns and is excellent for scanning, grouping and joining many rows.</p>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of DuckDB as "SQLite for analysis". Same lightweight feel (one import, no server), opposite design (columns, vectors, parallel scans). It is a poor fit for an app that writes one row at a time from many users; for that, use PostgreSQL or SQLite.</div></div>
+
+<h3>Reference table: the 28 most useful DuckDB names</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example (not run here)</th></tr></thead><tbody>
+<tr><td><code>duckdb.sql(q)</code></td><td>Run SQL on the default in-memory database; returns a lazy relation</td><td><code>duckdb.sql("SELECT 42 AS x")</code></td></tr>
+<tr><td><code>duckdb.connect(path)</code></td><td>Open a connection; give a file name for a persistent database</td><td><code>con = duckdb.connect("shop.duckdb")</code></td></tr>
+<tr><td><code>con.execute(q, params)</code></td><td>Run SQL with <code>?</code> placeholders</td><td><code>con.execute("SELECT * FROM t WHERE a = ?", [5])</code></td></tr>
+<tr><td><code>.fetchall() / .fetchone()</code></td><td>Get Python tuples</td><td><code>rel.fetchall()</code></td></tr>
+<tr><td><code>.df() / .pl() / .arrow()</code></td><td>Get a pandas / Polars / Arrow result (Arrow accessor name varies by version)</td><td><code>duckdb.sql(q).df()</code></td></tr>
+<tr><td><code>FROM 'file.csv'</code></td><td>Query a CSV or Parquet by file name</td><td><code>SELECT * FROM 'orders.csv' LIMIT 5</code></td></tr>
+<tr><td><code>read_csv(path, ...)</code></td><td>CSV reader with options (header, delim, types, sample size)</td><td><code>read_csv('e.csv', header = true, types = {'amount': 'DOUBLE'})</code></td></tr>
+<tr><td><code>read_parquet(glob)</code></td><td>Read one or many Parquet files</td><td><code>read_parquet('sales/**/*.parquet')</code></td></tr>
+<tr><td><code>hive_partitioning = true</code></td><td>Folder names <code>k=v</code> become columns (enables pruning)</td><td><code>read_parquet('s/*/*.parquet', hive_partitioning = true)</code></td></tr>
+<tr><td>Replacement scan</td><td>A pandas/Polars/Arrow variable can be used as a table by its name</td><td><code>duckdb.sql("SELECT region, SUM(amount) FROM df GROUP BY region")</code></td></tr>
+<tr><td><code>con.register(name, df)</code></td><td>Explicitly expose a DataFrame as a view</td><td><code>con.register("orders", df)</code></td></tr>
+<tr><td><code>CREATE TABLE t AS SELECT</code></td><td>Materialize a result inside the database</td><td><code>CREATE TABLE rev AS SELECT ...</code></td></tr>
+<tr><td><code>COPY (q) TO file</code></td><td>Write a result as Parquet, CSV or JSON</td><td><code>COPY (SELECT ...) TO 'o.parquet' (FORMAT PARQUET)</code></td></tr>
+<tr><td><code>PARTITION_BY</code></td><td>Write Hive-partitioned folders</td><td><code>COPY t TO 'out' (FORMAT PARQUET, PARTITION_BY (year))</code></td></tr>
+<tr><td><code>GROUP BY ALL</code></td><td>Group by every non-aggregated select column</td><td><code>SELECT region, SUM(a) FROM t GROUP BY ALL</code></td></tr>
+<tr><td><code>SELECT * EXCLUDE (c)</code></td><td>All columns except some</td><td><code>SELECT * EXCLUDE (note) FROM t</code></td></tr>
+<tr><td><code>COLUMNS('regex')</code></td><td>Apply an expression to all matching columns</td><td><code>SELECT MAX(COLUMNS('amt_.*')) FROM t</code></td></tr>
+<tr><td><code>QUALIFY</code></td><td>Filter on a window function result without a subquery</td><td><code>... QUALIFY ROW_NUMBER() OVER (...) = 1</code></td></tr>
+<tr><td><code>OVER (PARTITION BY .. ORDER BY ..)</code></td><td>Window functions: rank, running total, lag, lead</td><td><code>SUM(a) OVER (PARTITION BY r ORDER BY d)</code></td></tr>
+<tr><td><code>arg_max(x, y)</code></td><td>The value of x on the row where y is largest (latest-row-per-key)</td><td><code>arg_max(status, ts)</code></td></tr>
+<tr><td><code>approx_count_distinct(c)</code></td><td>Fast, memory-light distinct count (small error)</td><td><code>SELECT approx_count_distinct(user_id)</code></td></tr>
+<tr><td><code>quantile_cont(c, p)</code></td><td>Percentile / median</td><td><code>quantile_cont(amount, 0.5)</code></td></tr>
+<tr><td><code>USING SAMPLE</code></td><td>Random sample of a table or query</td><td><code>SELECT * FROM t USING SAMPLE 1%</code></td></tr>
+<tr><td><code>ASOF JOIN</code></td><td>Join each row to the nearest earlier row (prices, sessions)</td><td><code>a ASOF JOIN b ON a.k = b.k AND a.ts &gt;= b.ts</code></td></tr>
+<tr><td><code>PIVOT / UNPIVOT</code></td><td>Reshape in SQL</td><td><code>PIVOT t ON region USING SUM(amount)</code></td></tr>
+<tr><td><code>DESCRIBE / SUMMARIZE</code></td><td>Schema / per-column statistics for a table or query</td><td><code>SUMMARIZE SELECT * FROM 'e.csv'</code></td></tr>
+<tr><td><code>EXPLAIN / EXPLAIN ANALYZE</code></td><td>Show the plan / the plan with measured times</td><td><code>EXPLAIN ANALYZE SELECT ...</code></td></tr>
+<tr><td><code>SET memory_limit / threads</code></td><td>Resource limits; larger queries spill to <code>temp_directory</code></td><td><code>SET memory_limit = '8GB'</code></td></tr>
+<tr><td><code>duckdb.__version__</code></td><td>Version check</td><td><code>print(duckdb.__version__)</code></td></tr>
+</tbody></table></div>
+
+<h3>Worked example 1 (trivial): SQL on a file and on a DataFrame</h3>
+<np>
+import duckdb
+import pandas as pd
+
+print(duckdb.__version__)
+
+# 1. Query a CSV file by name. No loading step.
+print(duckdb.sql("SELECT region, SUM(amount) AS revenue FROM 'orders.csv' GROUP BY region ORDER BY region").fetchall())
+
+# 2. Query a pandas DataFrame by its variable name (a "replacement scan").
+df = pd.read_csv("orders.csv")
+print(duckdb.sql("SELECT region, SUM(amount) AS revenue FROM df GROUP BY region ORDER BY region").df())
+</np>
+<ol>
+<li><code>duckdb.sql(...)</code> parses and plans the query. The data is not read until you ask for results with <code>fetchall()</code> or <code>.df()</code>.</li>
+<li><code>FROM 'orders.csv'</code>: DuckDB sees a file name in the table position, detects the delimiter, header and column types by sampling, and scans the file.</li>
+<li>In the second query <code>df</code> is not a table in any database. DuckDB looks up the Python variable named <code>df</code> in the calling code and scans it directly in memory with no copy of the data into a database.</li>
+<li><code>ORDER BY region</code> makes the order reproducible; without it SQL gives no order guarantee.</li>
+<li>Expected values: APAC 75, EU 115, US 85 (hand check: APAC 40 + 30 + 5, EU 20 + 35 + 15 + 45, US 50 + 10 + 25). The runnable SQLite twin below returns exactly these.</li>
+</ol>
+<p>The SQL text is standard enough to run in SQLite. This runnable block is the twin of both DuckDB queries: we load the same ten rows into SQLite from a DataFrame (the manual version of a replacement scan) and run the same SQL.</p>
+<py>
+import io, sqlite3
+import pandas as pd
+
+csv = """order_id,customer_id,region,category,amount
+1,c1,EU,book,20
+2,c2,EU,toy,35
+3,c1,EU,toy,15
+4,c3,US,book,50
+5,c4,US,toy,10
+6,c3,US,toy,25
+7,c5,APAC,book,40
+8,c5,APAC,book,30
+9,c6,APAC,toy,5
+10,c2,EU,book,45"""
+df = pd.read_csv(io.StringIO(csv))
+con = sqlite3.connect(":memory:")
+df.to_sql("df", con, index=False)
+rows = con.execute("SELECT region, SUM(amount) AS revenue FROM df GROUP BY region ORDER BY region").fetchall()
+print(rows)
+print(pd.read_sql("SELECT category, COUNT(*) AS n, AVG(amount) AS avg_amount FROM df GROUP BY category ORDER BY category", con))
+</py>
+<ol>
+<li>The CSV text becomes a DataFrame; <code>to_sql("df", con)</code> copies it into an SQLite table named <code>df</code>, the table name the DuckDB version found by variable name.</li>
+<li>The first query is character-for-character the DuckDB query. The three revenues match the hand check.</li>
+<li><code>pd.read_sql</code> runs a query and returns a DataFrame: pandas and SQL together, which DuckDB makes much faster for large inputs.</li>
+<li>Category stats: books are orders 1, 4, 7, 8, 10 (20 + 50 + 40 + 30 + 45 = 185 over 5 = 37.0), toys are orders 2, 3, 5, 6, 9 (35 + 15 + 10 + 25 + 5 = 90 over 5 = 18.0).</li>
+</ol>
+
+<h3>Worked example 2 (intermediate): window functions, the part SQL does best</h3>
+<p>A <strong>window function</strong> computes a value for each row using a "window" of related rows, without collapsing the rows the way <code>GROUP BY</code> does. The three clauses: <code>PARTITION BY</code> (which rows belong together), <code>ORDER BY</code> (their order inside the window) and optionally a frame such as <code>ROWS BETWEEN 1 PRECEDING AND CURRENT ROW</code> (which neighbours to include). SQLite 3.25 and later, and DuckDB, share this syntax.</p>
+<p class="problem"><span class="pl">Problem 22.5.1</span> Daily sales per region: compute the running total, the change from the previous day, a 2-day moving average, and the rank of each day by sales inside its region (with ties). Run it in SQLite; the same SQL runs in DuckDB.</p>
+<py>
+import sqlite3
+
+con = sqlite3.connect(":memory:")
+con.execute("CREATE TABLE sales(day INTEGER, region TEXT, amount INTEGER)")
+con.executemany("INSERT INTO sales VALUES (?, ?, ?)", [
+    (1, "EU", 10), (2, "EU", 30), (3, "EU", 30), (4, "EU", 20),
+    (1, "US", 5), (2, "US", 15), (3, "US", 10),
+])
+q = """
+SELECT region, day, amount,
+  SUM(amount) OVER (PARTITION BY region ORDER BY day)                  AS running,
+  amount - LAG(amount) OVER (PARTITION BY region ORDER BY day)         AS change,
+  AVG(amount) OVER (PARTITION BY region ORDER BY day
+                    ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)          AS avg2,
+  RANK()       OVER (PARTITION BY region ORDER BY amount DESC)         AS rnk,
+  DENSE_RANK() OVER (PARTITION BY region ORDER BY amount DESC)         AS drnk
+FROM sales ORDER BY region, day
+"""
+print("region day amount running change avg2 rnk drnk")
+for r in con.execute(q):
+    print(*r)
+</py>
+<ol>
+<li>The table holds four EU days (with a tie: days 2 and 3 both sold 30) and three US days.</li>
+<li><code>SUM(amount) OVER (PARTITION BY region ORDER BY day)</code> is a running total: with an <code>ORDER BY</code> and no frame, the default frame runs from the first row to the current one. EU runs 10, 40, 70, 90.</li>
+<li><code>LAG(amount)</code> reads the previous row's amount inside the partition; the first day has no previous row, so the subtraction gives <code>None</code> (SQL NULL).</li>
+<li>The frame <code>ROWS BETWEEN 1 PRECEDING AND CURRENT ROW</code> averages the current and previous row: EU day 2 is (10 + 30) / 2 = 20.0. The first row has only itself, so its average is 10.0.</li>
+<li><code>RANK</code> gives tied rows the same rank and then skips: EU amounts 30, 30, 20, 10 get ranks 1, 1, 3, 4. <code>DENSE_RANK</code> does not skip: 1, 1, 2, 3.</li>
+<li>Remember this about ties for the Practice set: <code>ROW_NUMBER</code> never ties, <code>RANK</code> skips after a tie, <code>DENSE_RANK</code> does not.</li>
+</ol>
+
+<h3>Worked example 3 (realistic): the running task in DuckDB, with QUALIFY</h3>
+<np>
+import duckdb
+
+duckdb.sql("""
+    CREATE OR REPLACE TABLE rev AS
+    SELECT o.region, o.customer_id, SUM(o.amount) AS revenue
+    FROM 'orders.csv' o
+    GROUP BY o.region, o.customer_id
+""")
+
+tiers = duckdb.sql("""
+    SELECT * FROM (VALUES ('c1','gold'),('c2','silver'),('c3','gold'),
+                          ('c4','bronze'),('c5','silver'),('c6','bronze')) AS t(customer_id, tier)
+""")
+duckdb.register("tiers", tiers)
+
+# All ranks, same SQL text as the SQLite block in Section 22.1:
+print(duckdb.sql("""
+    SELECT r.region, r.customer_id, r.revenue, t.tier,
+           ROW_NUMBER() OVER (PARTITION BY r.region ORDER BY r.revenue DESC) AS rnk
+    FROM rev r LEFT JOIN tiers t USING (customer_id)
+    ORDER BY r.region, rnk
+""").fetchall())
+
+# Only the top customer per region, using QUALIFY (DuckDB; SQLite does not have it):
+print(duckdb.sql("""
+    SELECT r.region, r.customer_id, r.revenue
+    FROM rev r
+    QUALIFY ROW_NUMBER() OVER (PARTITION BY r.region ORDER BY r.revenue DESC) = 1
+    ORDER BY r.region
+""").fetchall())
+</np>
+<ol>
+<li>The first statement reads the CSV and groups. <code>CREATE OR REPLACE TABLE ... AS</code> stores the small result inside DuckDB for reuse.</li>
+<li>The tiers are a literal <code>VALUES</code> list; <code>AS t(customer_id, tier)</code> names the columns.</li>
+<li>The first query is the same logic as the SQLite window query: six rows, ranks 1 and 2 in each region. <code>USING (customer_id)</code> is shorthand for <code>ON r.customer_id = t.customer_id</code> that also merges the key column.</li>
+<li><code>QUALIFY</code> filters on a window function directly. Without it you need a subquery: <code>SELECT * FROM (SELECT ..., ROW_NUMBER() OVER (...) AS rn FROM rev) WHERE rn = 1</code>. The runnable block below uses that portable form.</li>
+<li>Expected: the first query returns the six rows already shown in Section 22.1; the second returns <code>('APAC', 'c5', 70)</code>, <code>('EU', 'c2', 80)</code>, <code>('US', 'c3', 75)</code>.</li>
+</ol>
+<py>
+import io, sqlite3
+import pandas as pd
+
+csv = """order_id,customer_id,region,category,amount
+1,c1,EU,book,20
+2,c2,EU,toy,35
+3,c1,EU,toy,15
+4,c3,US,book,50
+5,c4,US,toy,10
+6,c3,US,toy,25
+7,c5,APAC,book,40
+8,c5,APAC,book,30
+9,c6,APAC,toy,5
+10,c2,EU,book,45"""
+con = sqlite3.connect(":memory:")
+pd.read_csv(io.StringIO(csv)).to_sql("orders", con, index=False)
+q = """
+SELECT region, customer_id, revenue FROM (
+    SELECT region, customer_id, SUM(amount) AS revenue,
+           ROW_NUMBER() OVER (PARTITION BY region ORDER BY SUM(amount) DESC) AS rn
+    FROM orders GROUP BY region, customer_id
+) WHERE rn = 1 ORDER BY region
+"""
+print(con.execute(q).fetchall())
+</py>
+<ol>
+<li>This is the portable equivalent of QUALIFY: compute the window function in an inner query, filter it in the outer one.</li>
+<li>A window function can wrap an aggregate: <code>ROW_NUMBER() OVER (... ORDER BY SUM(amount) DESC)</code> works because windows are evaluated after <code>GROUP BY</code>.</li>
+<li>The result matches the DuckDB expectation above: APAC c5 70, EU c2 80, US c3 75.</li>
+</ol>
+
+<h3>Worked example 4 (expert): bigger than memory and Parquet output</h3>
+<np>
+import duckdb
+
+con = duckdb.connect("analytics.duckdb")          # a persistent database file
+con.execute("SET memory_limit = '6GB'")           # cap RAM; bigger operators spill to disk
+con.execute("SET temp_directory = '/tmp/duck_spill'")
+con.execute("SET threads = 4")
+
+# Convert a huge CSV into partitioned Parquet in one streaming query.
+con.execute("""
+    COPY (
+        SELECT *, year(CAST(ts AS TIMESTAMP)) AS year
+        FROM read_csv('events.csv', header = true)
+    ) TO 'events_pq' (FORMAT PARQUET, PARTITION_BY (year), COMPRESSION zstd)
+""")
+
+# Query it back; the WHERE prunes the year folders.
+top = con.execute("""
+    SELECT user_id, COUNT(*) AS n
+    FROM read_parquet('events_pq/*/*.parquet', hive_partitioning = true)
+    WHERE year = 2025
+    GROUP BY user_id
+    ORDER BY n DESC
+    LIMIT 10
+""").df()
+print(top)
+con.execute("EXPLAIN ANALYZE SELECT COUNT(*) FROM read_parquet('events_pq/*/*.parquet')").fetchall()
+</np>
+<ol>
+<li><code>connect("analytics.duckdb")</code> stores the database in a file you can reopen later. Only one process may write to it at a time.</li>
+<li><code>SET memory_limit</code> and <code>temp_directory</code> tell DuckDB how much RAM it may use and where to spill. Sorts, big joins and large aggregates then continue from disk instead of failing.</li>
+<li>The <code>COPY (SELECT ...) TO ... (FORMAT PARQUET, PARTITION_BY (year))</code> statement reads the CSV in a streaming fashion and writes one folder per year. This is the "convert once" step. The output folder must not already exist.</li>
+<li>The second query reads only the <code>year=2025</code> folder; only the <code>user_id</code> column is touched.</li>
+<li><code>EXPLAIN ANALYZE</code> runs the query and prints the plan with row counts and timings per operator; use it to see where time goes.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>SELECT * FROM 'events.csv'</code> followed by <code>.df()</code> on a 10 GB file. <strong>Symptom:</strong> DuckDB streams happily, then pandas runs out of memory building the result. <strong>Fix:</strong> do the filtering and aggregation in SQL and convert only the small result to pandas; or <code>COPY ... TO</code> a file. The engine can handle data larger than memory, but your Python variable cannot.</div></div>
+<h3>Going deeper: why DuckDB is fast</h3>
+<ul>
+<li><strong>Vectorized execution</strong>: operators process batches of values (around 2,000) at a time instead of one row, keeping data in CPU caches and avoiding per-row interpretation costs.</li>
+<li><strong>Morsel-driven parallelism</strong>: the input is cut into small work units that threads pick up, so all cores stay busy.</li>
+<li><strong>Pushdown into Parquet</strong>: projection and filters are applied while reading, using the footer statistics to skip row groups.</li>
+<li>Interview question: "When DuckDB and when Spark?" Answer with the data size, the number of machines, the existing platform, and the fact that one big machine with DuckDB beats a small cluster surprisingly often for datasets up to hundreds of GB, while data that must be written by many jobs concurrently belongs in a warehouse or lakehouse.</li>
+</ul>

@@ -1,0 +1,110 @@
+<h2>Practice set</h2>
+<p>Twenty-three problems, easy first. Try each before reading the answer. Code in the problems that is marked as a block was run, and the printed results quoted in the answers are real.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.1</span> (Easy) Name the three ideas behind Parquet, Polars, DuckDB, Dask and Spark, and give one sentence on what each buys you.</p>
+<p><strong>Answer:</strong> Columnar storage (a query reads only the columns it needs), lazy execution (the whole plan is optimized before it runs: pushdown, reordering) and partitioning (independent pieces are processed in parallel or one at a time, then combined).</p>
+
+<p class="problem"><span class="pl">Problem 22.P.2</span> (Easy) A column holds 10 million integers between 0 and 200. How many MB does it take as <code>int64</code>, and as the smallest safe unsigned type?</p>
+<p><strong>Answer:</strong> <code>int64</code> is 8 bytes: 10,000,000 times 8 = 80,000,000 bytes = 80 MB. Values up to 200 fit in <code>uint8</code> (0 to 255): 10,000,000 bytes = 10 MB. Eight times smaller.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.3</span> (Easy) Classify as narrow or wide in Spark: <code>filter</code>, <code>groupBy().sum()</code>, <code>select</code>, a sort-merge <code>join</code>, <code>distinct</code>, <code>withColumn</code>.</p>
+<p><strong>Answer:</strong> Narrow: <code>filter</code>, <code>select</code>, <code>withColumn</code> (each partition is processed alone). Wide (shuffle): <code>groupBy().sum()</code>, the sort-merge <code>join</code> (a broadcast join of a small side avoids shuffling the big side), and <code>distinct</code>.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.4</span> (Easy) A 10 GB CSV is read by Spark with the default of 128 MB per input partition. Roughly how many partitions, and why does the number matter?</p>
+<p><strong>Answer:</strong> 10 GB is about 10,240 MB, divided by 128 MB gives about 80 partitions (80 tasks that can run in parallel). Too few partitions waste cores and risk memory errors, too many cost scheduling overhead.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.5</span> (Easy) What does this print?</p>
+<py quiet>
+import io
+import pandas as pd
+
+csv = "k,v\na,1\nb,2\na,3\nb,4\na,5"
+tot = None
+for ch in pd.read_csv(io.StringIO(csv), chunksize=2):
+    s = ch.groupby("k")["v"].sum()
+    tot = s if tot is None else tot.add(s, fill_value=0)
+print(tot.to_dict())
+</py>
+<p><strong>Answer:</strong> <code>{'a': 9.0, 'b': 6.0}</code>. The chunks are rows 1 to 2, 3 to 4 and row 5. Partial sums: a=1, b=2, then a=3, b=4, then a=5. Totals: a = 1 + 3 + 5 = 9 and b = 2 + 4 = 6. They print as floats because <code>add(..., fill_value=0)</code> aligns on labels and returns floating-point values.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.6</span> (Easy) Values 30, 30, 20 sorted descending. Give <code>ROW_NUMBER</code>, <code>RANK</code> and <code>DENSE_RANK</code> for each.</p>
+<p><strong>Answer:</strong> ROW_NUMBER: 1, 2, 3 (never ties; which 30 gets 1 is arbitrary unless you add a tie-breaker). RANK: 1, 1, 3 (a gap after the tie). DENSE_RANK: 1, 1, 2 (no gap). Running it in SQLite gives <code>(30, 1, 1, 1)</code>, <code>(30, 2, 1, 1)</code>, <code>(20, 3, 3, 2)</code> in that column order.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.7</span> (Medium) Which lines of this PySpark script are actions, and which only build a plan?
+<br/><code>df = spark.read.parquet("e")</code> / <code>f = df.filter("price &gt; 0")</code> / <code>g = f.groupBy("k").count()</code> / <code>g.show()</code> / <code>n = f.count()</code></p>
+<p><strong>Answer:</strong> <code>g.show()</code> and <code>f.count()</code> are actions and each runs a job (the second re-reads and re-filters the data unless <code>f</code> was cached). The filter and the group-by are lazy transformations. The read normally touches only file metadata (to find the schema) until an action runs.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.8</span> (Medium) What does this print?</p>
+<py quiet>
+import numpy as np
+
+keys = np.array([0, 0, 0, 0, 1, 2, 3, 4, 8])
+sizes = np.bincount(keys % 4, minlength=4)
+print(sizes.tolist(), round(sizes.max() / sizes.mean(), 2))
+</py>
+<p><strong>Answer:</strong> <code>[6, 1, 1, 1] 2.67</code>. Remainders modulo 4: key 0 gives 0 (four rows), key 4 gives 0, key 8 gives 0, so partition 0 has 4 + 1 + 1 = 6 rows; keys 1, 2, 3 give one row each. The mean is 9/4 = 2.25 and 6 / 2.25 = 2.67. That is a skew ratio well above 1.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.9</span> (Medium, find the bug) A Dask user computes the average order value like this and finds it differs from the pandas answer. Partition A has one order of 10; partition B has three orders of 20 each. Their code averages the two partition means. What do they get, what is correct, and what is the fix?</p>
+<p><strong>Answer:</strong> They compute (10 + 20) / 2 = 15. Correct: total = 10 + 60 = 70 over 4 orders = 17.5. The unweighted average gives partition A (one order) the same weight as B (three orders). Fix: keep (sum, count) per partition, add them (70 and 4) and divide at the end, which is what <code>ddf.amount.mean()</code> does for you.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.10</span> (Medium, find the bug) A teammate downcasts with <code>s.astype("uint8")</code> on a column that sometimes holds 300. What does <code>pd.Series([100, 300]).astype("uint8").tolist()</code> print and what is the lesson?</p>
+<p><strong>Answer:</strong> <code>[100, 44]</code>. 300 does not fit in 8 bits and wraps around (300 - 256 = 44), silently. Lesson: choose dtypes from the real minimum and maximum (<code>pd.to_numeric(downcast="unsigned")</code> does) and assert the range yourself (<code>s.max() &lt;= 255</code>) before a forced <code>astype</code>.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.11</span> (Medium, find the bug) After enriching 3 orders with a customer table, the result has 4 rows and the revenue total is too high. The code is <code>orders.merge(tiers, on="k", how="left")</code>, with <code>orders.k = [1, 2, 3]</code> and <code>tiers.k = [1, 1, 2]</code>. Explain and fix.</p>
+<p><strong>Answer:</strong> The key 1 appears twice in <code>tiers</code>, so the order with k = 1 matches two rows and is duplicated: the merge returns 4 rows (this is a many-to-one join that turned into many-to-many). Orders with k = 3 get a missing tier. Fix: deduplicate the dimension first (<code>tiers.drop_duplicates("k")</code> with a rule for which row to keep), and validate with <code>merge(..., validate="many_to_one")</code>, which raises an error if the right side has duplicate keys. Also assert that the row count is unchanged after a left join.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.12</span> (Medium) Choose pandas, DuckDB, Polars, Dask or Spark, with a one-line reason: (a) an 800 MB CSV on a 16 GB laptop; (b) 200 GB of Parquet on one 128 GB server, with SQL-fluent analysts; (c) 5 TB in object storage, and the company already runs Databricks.</p>
+<p><strong>Answer:</strong> (a) pandas with <code>usecols</code> and dtypes: the data fits, no new tool needed. (b) DuckDB: SQL straight on Parquet, spills to disk, no cluster; Polars lazy is a good second choice for a code-first team. (c) PySpark: the data is beyond one machine and the platform and skills exist.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.13</span> (Medium) Write portable SQL (it should run in SQLite and DuckDB) for "the single highest order per region" on the orders table of this chapter, and give the answer.</p>
+<p><strong>Answer:</strong> Rank in an inner query and filter in the outer query (QUALIFY is DuckDB-only):<br/><code>SELECT region, order_id, amount FROM (SELECT region, order_id, amount, ROW_NUMBER() OVER (PARTITION BY region ORDER BY amount DESC) AS rn FROM orders) WHERE rn = 1 ORDER BY region</code><br/>Largest orders: APAC order 7 (40), EU order 10 (45), US order 4 (50). So the rows are (APAC, 7, 40), (EU, 10, 45), (US, 4, 50).</p>
+
+<p class="problem"><span class="pl">Problem 22.P.14</span> (Medium) Write a function that keeps an exact running mean over a stream of chunks using constant memory, and test it on the chunks [1, 2, 3] and [4, 5].</p>
+<py quiet>
+def update(state, chunk):
+    total, count = state
+    return total + sum(chunk), count + len(chunk)
+
+state = (0, 0)
+for chunk in ([1, 2, 3], [4, 5]):
+    state = update(state, chunk)
+print(state, state[0] / state[1])
+</py>
+<p><strong>Answer:</strong> It prints <code>(15, 5) 3.0</code>. The state is two numbers however long the stream is. Do not store the mean itself: a mean cannot be merged without the count behind it. The same state design extends to variance (keep the count, the sum and the sum of squares, or use Welford's update for numerical stability).</p>
+
+<p class="problem"><span class="pl">Problem 22.P.15</span> (Hard) The Spark UI shows, for one stage: median task duration 8 s, max 190 s, shuffle spill 0, 200 tasks. Diagnose it and list three things to try in order.</p>
+<p><strong>Answer:</strong> 190 / 8 is about 24 times the median, with no spill: one partition is far larger than the others, so this is data skew (or one bad node, but a node problem would not be tied to a stage's data). Try: (1) look at the key distribution of the shuffle key (<code>groupBy(key).count().orderBy(desc)</code>) and filter or isolate null or bot keys; (2) make sure AQE skew handling is on (<code>spark.sql.adaptive.skewJoin.enabled</code>); (3) salt the hot keys with a two-stage aggregation or a replicated small side. Re-check the task summary after each change.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.16</span> (Hard) Translate to Polars: for each row add the region total and the row's share of it, then the rank of the row within its region (largest first). Pandas: <code>t = df.groupby("region")["amount"].transform("sum"); share = df["amount"] / t; rk = df.groupby("region")["amount"].rank(method="first", ascending=False)</code>.</p>
+<p><strong>Answer (not run here):</strong><br/><code>df.with_columns(region_total=pl.col("amount").sum().over("region")).with_columns(share=pl.col("amount") / pl.col("region_total"), rk=pl.col("amount").rank("ordinal", descending=True).over("region"))</code><br/>The first <code>with_columns</code> creates the total; a second one is needed for the share because expressions in one call cannot see each other's new columns. <code>over("region")</code> is the transform: compute within groups, keep all rows.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.17</span> (Hard) Design the storage layout for 2 TB of web logs per month (columns: ts, user_id, country, url, status, bytes), queried mostly by date range and country.</p>
+<p><strong>Answer:</strong> Parquet, compressed with zstd or snappy. Partition by date (<code>date=2025-06-01</code>), and country only if its cardinality is small and queries filter on it. Do not partition by <code>user_id</code> (millions of folders). Target files of 128 MB to 1 GB (so about 20 to 100 files per day, not 100,000). Sort within files by <code>country</code> then <code>ts</code> so row-group statistics skip well. Write dates as timestamps and ids as strings or 64-bit integers, consistently. Add a compaction job for late data.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.18</span> (Hard) Hash-bucket dedupe of 2 billion order ids (8 bytes each) with 1 GB of memory available per bucket. How many buckets at least, and why add a safety margin?</p>
+<p><strong>Answer:</strong> 2,000,000,000 times 8 bytes = 16 GB of raw keys, so at least 16 buckets of 1 GB each; in practice more (32 or 64) because hashing is only roughly even, Python or pandas structures need several times the raw key bytes, and rows carry other columns too. Choose the bucket count so one bucket comfortably fits, and test the largest bucket size.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.19</span> (Hard) A join key has one value holding 40 percent of all rows, the shuffle uses 100 partitions, and you want no partition above twice the mean. What is the least number of salts S for that key (ignore other keys)?</p>
+<p><strong>Answer:</strong> The mean share per partition is 1 percent. After salting, the hot key's 40 percent is divided into S pieces of 40/S percent. We need 40 / S &lt;= 2, so S &gt;= 20. The small side of the join is then replicated 20 times for that key (or only for hot keys, if you salt selectively).</p>
+
+<p class="problem"><span class="pl">Problem 22.P.20</span> (Hard) Why can a Spark filter written as <code>df.filter(my_udf(F.col("name")) == "x")</code> be much slower than <code>df.filter(F.col("name") == "x")</code> on Parquet, even when the UDF is trivial?</p>
+<p><strong>Answer:</strong> The built-in comparison on a raw column can be pushed into the Parquet scan, so row groups whose statistics rule out "x" are skipped and the rows never leave the JVM. The optimizer cannot see inside the UDF: the filter cannot be pushed down, every row of the column is read, serialized to a Python process, evaluated and sent back. Fix: express it with built-ins (<code>F.lower</code>, <code>F.regexp_extract</code>), or filter on the raw column first.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.21</span> (Hard) A Spark job does <code>df.repartition(200, "customer_id").write.partitionBy("date").parquet(out)</code> and produces a huge number of small files for a 30-day dataset. Why, and what is the fix?</p>
+<p><strong>Answer:</strong> Each of the 200 tasks holds customers from all 30 days, so each task writes one file per date it contains: up to 200 x 30 = 6,000 files, each small. Fix: repartition by the same column you partition by, so each date is written by few tasks: <code>df.repartition("date").write.partitionBy("date")...</code>, or <code>repartition(n, "date", salt)</code> to control files per date, or coalesce before writing; compaction afterwards is the fallback.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.22</span> (Expert) The same dataset summed in two orders gives different float totals. Show it with three numbers, then say how to design checks between a pandas and a Spark pipeline.</p>
+<py quiet>
+a = (1e16 + 1.0) - 1e16
+b = (1e16 - 1e16) + 1.0
+print(a, b)
+</py>
+<p><strong>Answer:</strong> It prints <code>0.0 1.0</code>. In 64-bit floating point, 1e16 + 1.0 rounds back to 1e16, so the first order loses the 1.0. Floating-point addition is not associative, and a distributed engine adds partial sums in a data-dependent order. Therefore: compare floats with a relative tolerance (<code>np.isclose</code>), compare counts and integer columns exactly, store money as integer cents so sums are exact, and compare many cheap invariants (row counts, distinct keys, null counts, min and max, a checksum of an integer column) instead of just one total.</p>
+
+<p class="problem"><span class="pl">Problem 22.P.23</span> (Expert, interview) "Count distinct users per day over 3 billion rows is slow in Spark. Why, and what are your options?" Give an answer you would defend.</p>
+<p><strong>Answer:</strong> An exact distinct count needs every distinct (day, user) pair to be brought together: it shuffles by the pair or by the day, deduplicates, then counts, which is memory- and network-heavy, and a few busy days create skew. Options: (1) <code>F.approx_count_distinct</code> (HyperLogLog sketch, mergeable across partitions so it needs a tiny partial state; the default relative standard deviation is about 5 percent and can be tightened at higher memory cost) when a small error is acceptable; (2) first deduplicate (day, user) with a narrower row (select only those two columns) and then count, to reduce shuffle bytes; (3) pre-aggregate hourly to daily distinct sets in a table, or sketches stored in a table and merged; (4) fix skew with salting if one day dominates. State the accuracy trade-off explicitly.</p>
+
+<h2>Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language, so use simple English. Teach me when pandas stops being enough and how to choose between Parquet, Polars, DuckDB, Dask and PySpark. Use small Python examples that I can run with only pandas, numpy and sqlite3, show real output, and relate each idea to a story about a 10 GB CSV on a laptop. Cover: dtype downcasting, categories, chunked reading, partial aggregates (sum and count, never mean of means), columnar storage, lazy execution, partitions, shuffles and skew. After each part, ask me one check question and wait for my answer before continuing.</pre></div>
+<div class="prompt"><div class="ph"><span>AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning big-data tools. Below I will paste a pandas, Polars, DuckDB SQL, Dask or PySpark script that I wrote for a large dataset. Review it like a senior data engineer: find memory and speed risks (reading everything, row-by-row functions, UDFs, collect or toPandas on big results, unneeded sorts, tiny files, skewed keys, null join keys, float sums), explain each problem in simple English with the symptom I would see, and show the fixed code. Tell me which library you would choose for my data size and why, and how I can verify the fixed pipeline gives the same result as the old one on a small sample.</pre></div>
+<div class="prompt"><div class="ph"><span>AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are a hiring manager for a data engineering or data science role. Run a 30-minute mock interview on scaling data processing: pandas memory limits, Parquet versus CSV, lazy versus eager evaluation, Polars expressions, DuckDB window functions, Dask partitions, Spark shuffles, broadcast joins, data skew and salting, caching, UDFs versus built-ins, and reading the Spark UI. Ask one question at a time, starting easy and getting harder, and include two find-the-bug code questions and one design question (storage layout for 2 TB of logs per month). After each of my answers, score it out of 10, say what a strong answer would include, then continue. At the end give me a summary of my weak spots and a three-day study plan.</pre></div>

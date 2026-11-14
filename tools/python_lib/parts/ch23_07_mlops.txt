@@ -1,0 +1,285 @@
+
+<h2>23.6 Tracking, Versioning, Shipping and Scheduling: MLflow, DVC, Docker, Airflow and Prefect</h2>
+<p>This section is about <strong>awareness</strong>: what each tool does, the five lines you need to start, and a runnable stand-in built from the standard library so you understand the idea even without installing the tool. MLflow, DVC, Docker, Airflow and Prefect are all <strong>not run here</strong>.</p>
+<h3>Experiment tracking: the idea, runnable first</h3>
+<p>Every training run has inputs (parameters, data version, code version) and outputs (metrics, model file). A tracker stores both side by side so that in three weeks you can answer "which settings gave the 0.84?". The smallest possible tracker is a context manager that writes one JSON file per run. MLflow is this idea with a database, a web UI and a model registry.</p>
+@@py
+import json
+import tempfile
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+
+import pandas as pd
+from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+
+@contextmanager
+def start_run(folder, name):
+    record = {"run_id": uuid.uuid4().hex[:8], "name": name, "params": {}, "metrics": {}}
+    started = time.time()
+    try:
+        yield record
+        record["status"] = "FINISHED"
+    except Exception:
+        record["status"] = "FAILED"
+        raise
+    finally:
+        record["seconds"] = round(time.time() - started, 3)
+        (Path(folder) / f"{record['run_id']}.json").write_text(json.dumps(record))
+
+X, y = make_classification(n_samples=600, n_features=10, n_informative=4, flip_y=0.1, random_state=0)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0)
+
+with tempfile.TemporaryDirectory() as tmp:
+    for C in (0.001, 0.01, 0.1, 1, 10):
+        with start_run(tmp, f"logreg-C{C}") as run:
+            run["params"]["C"] = C
+            m = LogisticRegression(C=C, max_iter=1000).fit(Xtr, ytr)
+            run["metrics"]["train_acc"] = round(m.score(Xtr, ytr), 4)
+            run["metrics"]["test_acc"] = round(m.score(Xte, yte), 4)
+    runs = [json.loads(p.read_text()) for p in Path(tmp).glob("*.json")]
+
+df = pd.json_normalize(runs).sort_values("params.C")
+print(df[["name", "params.C", "metrics.train_acc", "metrics.test_acc", "status"]].to_string(index=False))
+best = df.loc[df["metrics.test_acc"].idxmax()]
+print("best:", best["name"])
+@@end
+<ol><li><code>start_run</code> is a context manager: code before <code>yield</code> prepares an empty record, the <code>with</code> body fills it, and <code>finally</code> always saves the record, even when training crashes (status <code>FAILED</code>). MLflow's <code>with mlflow.start_run():</code> works the same way.</li>
+<li>The data come from <code>make_classification</code> with fixed seeds, so every run sees identical train and test sets. Only the parameter <code>C</code> (inverse regularisation strength) changes.</li>
+<li>Inside the loop, <code>run["params"]</code> receives inputs and <code>run["metrics"]</code> receives results, like <code>log_param</code> and <code>log_metric</code>.</li>
+<li><code>pd.json_normalize</code> flattens nested dictionaries into columns named <code>params.C</code> and <code>metrics.test_acc</code>; this is also what <code>mlflow.search_runs()</code> returns.</li>
+<li>The table lists five runs sorted by <code>C</code>; <code>idxmax</code> finds the run with the best test accuracy, printed last (here <code>logreg-C0.01</code>). The run ids are random and are not printed.</li></ol>
+<figure><img src="images/lib23_tracking_sweep.png" alt="Line chart of train and test accuracy versus the parameter C on a log axis, with an arrow marking the run with best test accuracy" loading="lazy"/><figcaption>Six logged runs plotted: the picture an experiment tracker builds for you.</figcaption></figure>
+<p><strong>How to read it:</strong> each point is one logged run. Blue is accuracy on the data the model trained on, orange is accuracy on unseen data. With very small C the model is over-restricted and both are low. The red arrow marks the best test score; this is the run you would promote. The gap between the lines is a quick overfitting signal.</p>
+<h3>MLflow</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>mlflow.set_tracking_uri</code></td><td>Where runs are stored (folder, database or server)</td><td><code>mlflow.set_tracking_uri("http://localhost:5000")</code></td></tr>
+<tr><td><code>mlflow.set_experiment</code></td><td>Groups runs under a name</td><td><code>mlflow.set_experiment("churn")</code></td></tr>
+<tr><td><code>mlflow.start_run</code></td><td>Opens a run (use as a context manager)</td><td><code>with mlflow.start_run(run_name="C=0.1"):</code></td></tr>
+<tr><td><code>log_param / log_params</code></td><td>Record inputs (once per run)</td><td><code>mlflow.log_param("C", 0.1)</code></td></tr>
+<tr><td><code>log_metric / log_metrics</code></td><td>Record results; <code>step=</code> gives a curve</td><td><code>mlflow.log_metric("loss", 0.4, step=3)</code></td></tr>
+<tr><td><code>set_tag</code></td><td>Free labels such as git commit or dataset version</td><td><code>mlflow.set_tag("data_version", "v3")</code></td></tr>
+<tr><td><code>log_artifact</code></td><td>Attach a file (plot, report)</td><td><code>mlflow.log_artifact("confusion.png")</code></td></tr>
+<tr><td><code>mlflow.sklearn.log_model</code></td><td>Save the fitted model with its environment</td><td><code>mlflow.sklearn.log_model(model, name="model")</code></td></tr>
+<tr><td><code>mlflow.autolog()</code></td><td>Automatic logging for supported libraries</td><td><code>mlflow.sklearn.autolog()</code></td></tr>
+<tr><td><code>mlflow.search_runs</code></td><td>Query runs into a DataFrame</td><td><code>mlflow.search_runs(order_by=["metrics.test_acc DESC"])</code></td></tr>
+<tr><td><code>mlflow.pyfunc.load_model</code></td><td>Load a logged model by URI</td><td><code>mlflow.pyfunc.load_model("runs:/&lt;run_id&gt;/model")</code></td></tr>
+<tr><td><code>mlflow ui</code></td><td>Browse runs in a browser</td><td>shell command</td></tr>
+</tbody></table></div>
+@@np
+# NOT RUN HERE: mlflow is not installed. Check the docs for your version
+# (older releases used log_model(model, artifact_path="model")).
+import mlflow
+from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+
+X, y = make_classification(n_samples=600, n_features=10, random_state=0)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0)
+
+mlflow.set_experiment("churn")
+for C in (0.01, 0.1, 1):
+    with mlflow.start_run(run_name=f"logreg-C{C}"):
+        mlflow.log_params({"model": "logreg", "C": C, "seed": 0})
+        model = LogisticRegression(C=C, max_iter=1000).fit(Xtr, ytr)
+        mlflow.log_metric("test_acc", model.score(Xte, yte))
+        mlflow.sklearn.log_model(model, name="model")
+@@end
+<p>The structure is identical to the stand-in above: one <code>with</code> block per run, parameters first, metrics after training. Launch the browser UI with <code>mlflow ui</code> and compare the runs side by side. When there is only one person and a handful of runs, the JSON approach is enough; adopt MLflow when you need a shared server, a model registry or many comparable runs.</p>
+<h3>DVC: version control for data and pipelines</h3>
+<p>Git is poor at large files. <strong>DVC</strong> (Data Version Control) stores a small text pointer (<code>data.csv.dvc</code>) in git, and the real file in a cache or remote storage (S3, a shared drive). It can also describe the pipeline as stages in <code>dvc.yaml</code>, so <code>dvc repro</code> re-runs only the stages whose inputs changed.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Command / file</th><th>What it does</th></tr></thead><tbody>
+<tr><td><code>dvc init</code></td><td>Sets up DVC inside a git repository</td></tr>
+<tr><td><code>dvc add data/raw.csv</code></td><td>Tracks a file: moves it to the cache, writes <code>raw.csv.dvc</code>, adds it to <code>.gitignore</code></td></tr>
+<tr><td><code>dvc remote add -d store s3://bucket/path</code></td><td>Defines the default shared storage</td></tr>
+<tr><td><code>dvc push</code> / <code>dvc pull</code></td><td>Upload / download data for the current git commit</td></tr>
+<tr><td><code>dvc.yaml</code></td><td>Pipeline stages: <code>cmd</code>, <code>deps</code>, <code>params</code>, <code>outs</code>, <code>metrics</code></td></tr>
+<tr><td><code>params.yaml</code></td><td>Default parameter file read by stages</td></tr>
+<tr><td><code>dvc repro</code></td><td>Runs stages whose dependencies changed</td></tr>
+<tr><td><code>dvc.lock</code></td><td>Exact hashes of the last run (commit it)</td></tr>
+<tr><td><code>dvc status</code>, <code>dvc dag</code></td><td>What is out of date; draw the stage graph</td></tr>
+<tr><td><code>dvc metrics show</code>, <code>dvc metrics diff</code></td><td>Print or compare metrics files across commits</td></tr>
+<tr><td><code>dvc exp run</code>, <code>dvc exp show</code></td><td>Try experiments with changed params without committing each</td></tr>
+</tbody></table></div>
+@@file yaml
+# dvc.yaml  -- NOT RUN HERE: dvc is not installed
+stages:
+  prepare:
+    cmd: python src/prepare.py data/raw.csv data/clean.csv
+    deps:
+      - src/prepare.py
+      - data/raw.csv
+    outs:
+      - data/clean.csv
+  train:
+    cmd: python src/train.py data/clean.csv models/model.joblib metrics.json
+    deps:
+      - src/train.py
+      - data/clean.csv
+    params:
+      - train.C
+      - train.seed
+    outs:
+      - models/model.joblib
+    metrics:
+      - metrics.json:
+          cache: false
+@@end
+@@file yaml
+# params.yaml
+train:
+  C: 0.1
+  seed: 0
+@@end
+<p>Here <code>train</code> depends on the clean data, the script and two parameters. Change <code>train.C</code> in <code>params.yaml</code> and <code>dvc repro</code> re-runs only <code>train</code>; change the raw data and it re-runs both. Because <code>metrics.json</code> is a metrics file, <code>dvc metrics diff</code> compares it between git commits.</p>
+<h3>Docker for a Python service</h3>
+<p>A <strong>Docker image</strong> is a frozen filesystem with your code, Python and libraries; a <strong>container</strong> is a running copy. The same image runs on your laptop, a server and a cloud service. Docker is not installed here, so the files and commands are <strong>not run here</strong>.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Instruction / command</th><th>What it does</th></tr></thead><tbody>
+<tr><td><code>FROM python:3.12-slim</code></td><td>Starting image (pick a tag you chose on purpose, not <code>latest</code>)</td></tr>
+<tr><td><code>WORKDIR /app</code></td><td>Folder for following instructions</td></tr>
+<tr><td><code>COPY requirements.txt .</code></td><td>Copy files from your project into the image</td></tr>
+<tr><td><code>RUN pip install --no-cache-dir -r requirements.txt</code></td><td>Run a command at build time; makes a layer</td></tr>
+<tr><td><code>ENV PYTHONUNBUFFERED=1</code></td><td>Set an environment variable (logs appear immediately)</td></tr>
+<tr><td><code>EXPOSE 8000</code></td><td>Documents the port (does not publish it)</td></tr>
+<tr><td><code>USER app</code></td><td>Do not run as root</td></tr>
+<tr><td><code>CMD [...]</code> vs <code>ENTRYPOINT [...]</code></td><td>Default command; fixed program that <code>CMD</code> passes arguments to</td></tr>
+<tr><td><code>.dockerignore</code></td><td>Files that must never enter the build (<code>.venv</code>, <code>.git</code>, <code>.env</code>, data)</td></tr>
+<tr><td><code>docker build -t churn-api:1.0 .</code></td><td>Build an image from the Dockerfile in this folder</td></tr>
+<tr><td><code>docker run -p 8000:8000 --env-file .env churn-api:1.0</code></td><td>Start a container, publish the port, pass secrets at run time</td></tr>
+<tr><td><code>docker logs</code>, <code>docker exec -it ... sh</code>, <code>docker ps</code></td><td>Inspect running containers</td></tr>
+</tbody></table></div>
+@@file dockerfile
+# Dockerfile  -- NOT RUN HERE: docker is not installed
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 PIP_NO_CACHE_DIR=1
+WORKDIR /app
+
+# 1. dependencies first: this layer is rebuilt only when requirements change
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+# 2. code and model next: these change often
+COPY app.py .
+COPY model.joblib .
+
+RUN useradd --create-home app
+USER app
+EXPOSE 8000
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+@@end
+@@file ignore
+# .dockerignore
+.venv
+.git
+.env
+__pycache__
+data/
+mlruns/
+@@end
+<figure><img src="images/lib23_docker_layers.png" alt="Four stacked Dockerfile layers from top to bottom: base image, pip install, copy source, CMD, with notes on how often each changes and an arrow showing a changed layer rebuilds everything below" loading="lazy"/><figcaption>Docker caches each instruction as a layer. Put what changes least at the top.</figcaption></figure>
+<p><strong>How to read it:</strong> each bar is one Dockerfile instruction. Docker reuses a layer if its instruction and inputs are unchanged, but once one layer changes, every layer after it is rebuilt. Because you edit source code all day and change dependencies rarely, copying <code>requirements.txt</code> and installing before copying the code makes most rebuilds take seconds instead of minutes. Binding to <code>0.0.0.0</code> is required inside a container, otherwise the published port cannot reach the server.</p>
+<h3>Orchestration: Airflow and Prefect</h3>
+<p>An <strong>orchestrator</strong> runs a pipeline as a <strong>DAG</strong> (directed acyclic graph): tasks plus "B after A" arrows, with no loops. It schedules runs, retries failures, keeps history and sends alerts. <strong>Airflow</strong> is the long-established choice (dags defined in Python files, a scheduler and web UI). <strong>Prefect</strong> lets you turn ordinary functions into tasks with decorators. Neither is installed here.</p>
+<figure><img src="images/lib23_dag.png" alt="A directed graph: extract goes to validate, validate goes to features and baseline, both go to evaluate, evaluate goes to report" loading="lazy"/><figcaption>A DAG: tasks and the order constraints between them.</figcaption></figure>
+<p><strong>How to read it:</strong> an arrow from A to B means B may start only after A succeeded. <code>features</code> and <code>baseline</code> have no arrow between them, so the orchestrator may run them at the same time. There are no loops, which is what lets the scheduler always find a valid order.</p>
+@@np
+# NOT RUN HERE: apache-airflow is not installed. Airflow 3 style; in Airflow 2 import from airflow.decorators.
+from datetime import datetime
+from airflow.sdk import dag, task
+
+@dag(schedule="0 6 * * 1", start_date=datetime(2026, 1, 1), catchup=False, tags=["churn"])
+def weekly_churn():
+    @task(retries=2)
+    def extract() -> str:
+        return "data/raw.csv"
+
+    @task
+    def validate(path: str) -> str:
+        return path
+
+    @task
+    def train(path: str) -> float:
+        return 0.81
+
+    @task
+    def report(score: float):
+        print(f"score={score}")
+
+    report(train(validate(extract())))
+
+weekly_churn()
+@@end
+@@np
+# NOT RUN HERE: prefect is not installed (Prefect 3 style)
+from prefect import flow, task
+
+@task(retries=3, retry_delay_seconds=60)
+def extract() -> str:
+    return "data/raw.csv"
+
+@task
+def train(path: str) -> float:
+    return 0.81
+
+@flow(log_prints=True)
+def weekly_churn():
+    path = extract()
+    score = train(path)
+    print(f"score={score}")
+
+if __name__ == "__main__":
+    weekly_churn()                                  # run once now
+    # weekly_churn.serve(name="weekly", cron="0 6 * * 1")   # or run on a schedule
+@@end
+<p>In both, the function calls define the arrows: <code>train(validate(extract()))</code> means train waits for validate which waits for extract. <code>catchup=False</code> in Airflow stops it from running every missed week since the start date when you first switch the DAG on. The cron string <code>0 6 * * 1</code> means 06:00 every Monday. Keep tasks <strong>idempotent</strong>: running one twice with the same input must give the same result and not duplicate rows.</p>
+<p>The idea behind the scheduler, runnable with the standard library: <code>graphlib.TopologicalSorter</code> orders tasks by their dependencies, and a loop adds retries.</p>
+@@py
+from graphlib import TopologicalSorter
+
+deps = {                       # task: the tasks it depends on
+    "extract": set(),
+    "validate": {"extract"},
+    "features": {"validate"},
+    "baseline": {"validate"},
+    "evaluate": {"features", "baseline"},
+    "report": {"evaluate"},
+}
+attempts = {"baseline": 0}
+
+def run_task(name):
+    if name == "baseline":
+        attempts["baseline"] += 1
+        if attempts["baseline"] < 3:
+            raise RuntimeError("flaky source")
+    return f"{name} ok"
+
+ts = TopologicalSorter(deps)
+ts.prepare()
+wave = 0
+while ts.is_active():
+    ready = list(ts.get_ready())
+    print(f"wave {wave}: {sorted(ready)}")
+    for name in sorted(ready):
+        for attempt in range(1, 4):
+            try:
+                run_task(name)
+                break
+            except RuntimeError:
+                print(f"  {name} failed on attempt {attempt}")
+        ts.done(name)
+    wave += 1
+
+try:
+    TopologicalSorter({"a": {"b"}, "b": {"a"}}).prepare()
+except Exception as exc:
+    print(type(exc).__name__)
+@@end
+<ol><li><code>deps</code> maps each task to the set of tasks that must finish first. This is the dictionary form of the figure.</li>
+<li><code>prepare()</code> freezes the graph (and detects cycles); <code>get_ready()</code> returns all tasks whose dependencies are done; <code>done(name)</code> marks one finished, which may unlock others.</li>
+<li>Each loop iteration is a "wave" of tasks that could run in parallel: extract, then validate, then features and baseline together, then evaluate, then report. The output prints the five waves.</li>
+<li><code>baseline</code> raises twice (a flaky source), so the retry loop prints two failed attempts and the third succeeds. Real orchestrators add a delay between attempts.</li>
+<li>A graph with a loop (a needs b, b needs a) can never be ordered; <code>prepare</code> raises <code>CycleError</code>, which is why the graphs are called acyclic.</li></ol>

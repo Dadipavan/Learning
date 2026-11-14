@@ -1,0 +1,10 @@
+import numpy as np, matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+plt.rcParams.update({"font.size": 11, "axes.spines.top": False, "axes.spines.right": False})
+phi, sigma, mu = 0.8, 2.0, 50.0; h = np.arange(1, 31)
+ar = 1.96 * sigma * np.sqrt(np.array([sum(phi ** (2 * j) for j in range(k)) for k in h])); rw = 1.96 * sigma * np.sqrt(h)
+fig, ax = plt.subplots(figsize=(8, 4.2))
+ax.fill_between(h, mu - rw, mu + rw, color="#b84a22", alpha=.25, label="random walk: grows like sqrt(h)")
+ax.fill_between(h, mu - ar, mu + ar, color="#2b4fd6", alpha=.4, label="AR(1), phi = 0.8: levels off")
+ax.axhline(mu, color="k", lw=.8); ax.set_xlabel("forecast horizon h"); ax.set_ylabel("95% prediction interval"); ax.set_title("Same one-step error, very different long-run uncertainty")
+ax.legend(frameon=False, loc="upper left", fontsize=9); plt.tight_layout(); plt.savefig("ch10_pi.png", dpi=110)

@@ -1,0 +1,108 @@
+<h2>16.12 Vectorisation vs Loops, with Timings</h2>
+<p>Vectorising means replacing a Python <code>for</code> loop with array operations. The loop is slow not because Python is careless but because for each element it must look up types, create a Python float object and call the interpreter. A NumPy operation does that bookkeeping once, then runs a tight compiled loop over raw numbers.</p>
+<figure><img src="images/lib16_speed.png" alt="Log-log chart of time against array length for a Python loop and a NumPy dot product; the NumPy line sits far below the loop line" loading="lazy"/><figcaption>Time to compute a sum of squares as the array grows (measured on one laptop, best of 3; your numbers will differ). Both axes are logarithmic.</figcaption></figure>
+<p><strong>How to read it:</strong> each dot is one measurement. The horizontal axis is how many numbers; the vertical axis is seconds, and each gridline is ten times bigger than the last. The loop line climbs steadily because its work is proportional to <code>n</code>. The NumPy line starts flat, because for small arrays the fixed cost of one call dominates, and then rises. The gap is the constant factor you buy by vectorising: for a million numbers it was more than a hundredfold in these measurements.</p>
+<p class="problem"><span class="pl">Problem 16.12.1</span> Time a loop against a vectorised version of the same job, on three tasks, and confirm the answers match. The code prints only facts that do not change between runs; the measured numbers are given in the text below.</p>
+<table class="steps"><tr><th>Setup</th><td>One million random floats. Tasks: scale-and-shift every value, sum of squares, and growing an array one item at a time.</td></tr><tr><th>Method</th><td>Use <code>time.perf_counter</code> and keep the best of several repeats to reduce noise.</td></tr></table>
+<py>
+import time
+import numpy as np
+
+def best(f, repeats=3):
+    t = float("inf")
+    for _ in range(repeats):
+        start = time.perf_counter()
+        f()
+        t = min(t, time.perf_counter() - start)
+    return t
+
+rng = np.random.default_rng(0)
+x = rng.random(1_000_000)
+xl = x.tolist()
+
+def loop_scale():
+    out = []
+    for v in xl:
+        out.append(v * 2 + 1)
+    return out
+
+t_loop = best(loop_scale)
+t_vec = best(lambda: x * 2 + 1)
+print("same result:", np.allclose(loop_scale(), x * 2 + 1))
+print("vectorised at least 10x faster:", t_loop / t_vec > 10)
+
+t_sum_loop = best(lambda: sum(v * v for v in xl))
+t_sum_vec = best(lambda: x @ x)
+print("sum of squares equal:", np.isclose(sum(v * v for v in xl), x @ x))
+print("at least 10x faster:", t_sum_loop / t_sum_vec > 10)
+
+def grow():
+    a = np.array([])
+    for i in range(10000):
+        a = np.append(a, i)
+    return a
+
+def preallocate():
+    a = np.empty(10000)
+    for i in range(10000):
+        a[i] = i
+    return a
+
+print("growing is slower than preallocating:", best(grow) > best(preallocate))
+</py>
+<p><strong>Line by line.</strong></p>
+<ol><li><code>best</code> runs a function a few times and keeps the fastest run. The minimum is the best estimate of the cost, because noise from other programs only ever slows a run down.</li><li>The scaling task: a loop with <code>append</code> against <code>x * 2 + 1</code>. The results agree, and the vector form is more than ten times faster.</li><li>Growing an array with <code>np.append</code> copies the whole array every time, so 10,000 appends do about 50 million copies of items.</li></ol>
+<p>Measured on the laptop used for this chapter (they vary): scale-and-shift 46 ms in the loop against 0.7 ms vectorised; sum of squares 20 ms against 0.1 ms; 10,000 appends 19 ms against 0.35 ms preallocated; a 300-point pairwise distance table 92 ms with nested loops against 1.1 ms vectorised.</p>
+
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>np.sum(my_list)</code> or <code>np.array(my_list).sum()</code> for a one-off sum of a small Python list. <strong>Symptom:</strong> slower than the built-in <code>sum</code>, because NumPy first converts the whole list to an array (measured here: about 17 ms against 2.7 ms for a million floats). <strong>Fix:</strong> convert once and keep the data as an array, or use <code>sum</code> for a single pass over a list.</div></div>
+
+<h2>16.13 Views, Copies and Memory Pitfalls</h2>
+<p>Because arrays share buffers, the question "does this change my original?" matters. The answer follows a simple rule.</p>
+<figure><img src="images/lib16_viewcopy.png" alt="Left: a slice shares the original memory through arrows. Right: fancy indexing makes a new separate buffer" loading="lazy"/><figcaption>A slice is a window onto the original numbers. Fancy or boolean indexing copies the chosen numbers into new memory.</figcaption></figure>
+<p><strong>How to read it:</strong> on the left the arrows mean the red array points into the blue one: no new numbers exist, so writing through the red array edits the blue one. On the right there are no arrows: the teal array owns separate memory and edits stay private.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Operation</th><th>View or copy?</th><th>How to check</th></tr></thead><tbody>
+<tr><td>Basic slice <code>a[1:5]</code>, <code>a[::2]</code>, <code>a[:, 0]</code></td><td>View</td><td><code>np.shares_memory(a, b)</code></td></tr>
+<tr><td><code>reshape</code>, <code>ravel</code>, <code>T</code>, <code>swapaxes</code>, <code>squeeze</code>, <code>a[:, None]</code></td><td>View when possible</td><td><code>b.base is a</code></td></tr>
+<tr><td>Boolean mask <code>a[a &gt; 0]</code></td><td>Copy</td><td><code>b.base is None</code></td></tr>
+<tr><td>Fancy index <code>a[[1, 3]]</code>, <code>np.take</code></td><td>Copy</td><td><code>np.shares_memory</code></td></tr>
+<tr><td><code>flatten</code>, <code>copy</code>, <code>astype</code>, <code>np.sort</code>, <code>np.unique</code>, <code>np.concatenate</code></td><td>Copy</td><td>always new</td></tr>
+<tr><td>Arithmetic <code>a + 1</code>, <code>a * b</code></td><td>New array</td><td>always new</td></tr>
+<tr><td><code>a += 1</code>, <code>a[...] = v</code>, <code>np.add(a, 1, out=a)</code></td><td>In place: no new array</td><td>same <code>id</code></td></tr>
+</tbody></table></div>
+<p class="problem"><span class="pl">Problem 16.13.1</span> A function normalises an array and unexpectedly alters the caller's data. Find out why and fix it.</p>
+<table class="steps"><tr><th>Cause</th><td>Passing an array to a function passes a reference to the same buffer. In-place operators such as <code>-=</code> and <code>/=</code> then change the caller's array.</td></tr><tr><th>Fix</th><td>Do not use in-place operators on arguments, or take a copy first.</td></tr></table>
+<py>
+import numpy as np
+
+def centre_bad(x):
+    x -= x.mean()
+    return x
+
+def centre_good(x):
+    return x - x.mean()
+
+data = np.array([2.0, 4.0, 6.0])
+out = centre_bad(data)
+print(data, out, out is data)
+
+data = np.array([2.0, 4.0, 6.0])
+out = centre_good(data)
+print(data, out)
+
+ints = np.array([1, 2, 3])
+try:
+    ints /= 2
+except Exception as e:
+    print(type(e).__name__)
+ints = ints / 2
+print(ints, ints.dtype)
+
+a = np.arange(6)
+row = a[:3]
+row *= 10
+print(a)
+print(np.shares_memory(a, a[:3]), np.shares_memory(a, a[[0, 1, 2]]))
+</py>
+<p><strong>Line by line.</strong></p>
+<ol><li><code>centre_bad</code> uses <code>-=</code>, which writes into the buffer it was given. After the call, <code>data</code> itself holds <code>[-2. 0. 2.]</code>, and <code>out is data</code> is <code>True</code>: the "result" is the same object.</li><li><code>ints /= 2</code> on an integer array tries to store floats back into integer memory and NumPy refuses, raising <code>UFuncTypeError</code>.</li><li>Multiplying the slice <code>row</code> in place changes <code>a</code> as well: <code>[0 10 20 3 4 5]</code>.</li><li><code>shares_memory</code> is <code>True</code> for the slice and <code>False</code> for the fancy selection of the same three cells.</li></ol>
+<p>Views also save memory: a slice of a 1 GB array costs almost nothing. The flip side is that a small view keeps the whole big buffer alive. If you keep only a tiny slice of a huge array for a long time, <code>.copy()</code> it so the big buffer can be freed.</p>

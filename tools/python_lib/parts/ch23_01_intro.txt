@@ -1,0 +1,61 @@
+<p>Priya is a data analyst at an online grocer. Last month she built a churn model in a notebook. It works: 81% of the customers it flags really do leave. Now her manager says: "Great. Run it every Monday on the new export, keep the numbers somewhere we can compare, and let the web team call it from the app." Priya looks at her notebook. It has a hard-coded file path, a password pasted in cell 3, no tests, cells that only work when run in a certain order, and a model that nobody can rebuild if her laptop dies.</p>
+<p>Nothing in that notebook is a modelling problem. Every problem is an engineering problem, and the Python world has a standard answer to each: <strong>tests</strong> (pytest) to know a change did not break anything, <strong>logging</strong> to see what a job did at 3 a.m., <strong>argparse or Typer</strong> to turn a script into a command, <strong>pathlib</strong> for paths that work on every machine, <strong>dataclasses and type hints</strong> for configuration that cannot silently be wrong, <strong>venv, uv and pyproject.toml</strong> for an environment you can recreate, <strong>FastAPI</strong> to serve predictions, <strong>joblib</strong> to cache and parallelise, <strong>MLflow and DVC</strong> to remember which data and parameters produced which model, <strong>Docker</strong> to ship it, and <strong>Airflow or Prefect</strong> to run it on a schedule.</p>
+<p>This chapter is part of the Library Handbook, so it is practical and point by point. By the end you will be able to write and run tests, build a command-line tool and an API, train a model in a reproducible script that records its parameters and metrics, lay out a project that another person can install in two commands, and recognise the standard fixes for the problems that appear again and again. Only the standard library, numpy, pandas, scikit-learn, matplotlib, joblib, httpx and pyyaml are installed on the study machine, so some tools are shown as code marked <strong>not run here</strong>. Wherever possible, a runnable equivalent built on the standard library is shown beside them, and every printed output in the chapter was produced by running the code with Python 3.14.</p>
+
+<h2>23.1 The Engineering Toolkit: What, When, Install, Import and the Mental Model</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A model is a recipe. Engineering is the kitchen: labelled shelves (project layout), a thermometer (tests), a logbook (logging, tracking), a delivery van (Docker, API) and a rota (scheduler). A great recipe in a messy kitchen produces a different dish every day.</div></div>
+<h3>What each tool is for, and when NOT to use it</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Tool</th><th>Use it for</th><th>Do NOT reach for it when</th></tr></thead><tbody>
+<tr><td>pytest / unittest</td><td>Checking that functions behave as promised, every time you change code</td><td>You only need to explore data once; a throw-away notebook does not need tests</td></tr>
+<tr><td>logging</td><td>A timestamped record of what a job did, with levels</td><td>You want to show the user a result; use <code>print</code> or the return value</td></tr>
+<tr><td>argparse, Typer, Click</td><td>Turning a script into a command with options and help</td><td>The script has no inputs; a constant is simpler</td></tr>
+<tr><td>pathlib</td><td>Building and inspecting file paths, reading and writing small files</td><td>You need to read millions of rows; use pandas or pyarrow after pathlib finds the file</td></tr>
+<tr><td>dataclasses, typing, mypy</td><td>Typed config and records, static checking of mistakes</td><td>Data arrives from outside and must be validated at run time; use pydantic for that</td></tr>
+<tr><td>venv, pip, uv, pyproject.toml</td><td>A recreatable environment and an installable package</td><td>Your system needs non-Python libraries pinned too; use Docker or conda</td></tr>
+<tr><td>FastAPI</td><td>A typed web API with validation and automatic docs</td><td>A nightly batch job; write a CLI and a scheduler instead</td></tr>
+<tr><td>joblib</td><td>Caching slow function results on disk, parallel loops, saving sklearn models</td><td>The work is tiny (overhead dominates) or already vectorised in numpy</td></tr>
+<tr><td>MLflow, DVC</td><td>Comparing many experiments; versioning big data files</td><td>One model, one dataset, one person; a JSON file of metrics is enough</td></tr>
+<tr><td>Docker</td><td>Shipping the same environment everywhere</td><td>You only run on your laptop</td></tr>
+<tr><td>Airflow, Prefect</td><td>Scheduled, retried, monitored multi-step pipelines</td><td>One script run by cron is enough</td></tr>
+<tr><td>pre-commit</td><td>Running formatters and checks before every commit</td><td>You work alone on a one-file script</td></tr>
+</tbody></table></div>
+<h3>Install and version check</h3>
+<p>Not run here: these commands need network access.</p>
+@@file bash
+# create and activate an environment, then install what the chapter uses
+python3 -m venv .venv
+source .venv/bin/activate            # Windows: .venv\Scripts\activate
+python -m pip install pytest typer fastapi uvicorn mypy mlflow pre-commit
+# or, with uv (a fast installer and project manager):
+uv venv && uv pip install pytest typer fastapi uvicorn
+@@end
+<p>Whatever you install, always ask the interpreter which versions it actually sees. This block works for every library, installed or not, and it is the first thing to run when something "should work".</p>
+@@py
+import importlib.util
+import importlib.metadata as md
+import sys
+
+print("python", sys.version.split()[0])
+libs = {"numpy": "numpy", "pandas": "pandas", "sklearn": "scikit-learn", "joblib": "joblib",
+        "yaml": "pyyaml", "httpx": "httpx", "pytest": "pytest", "fastapi": "fastapi",
+        "typer": "typer", "mlflow": "mlflow"}
+for module, dist in libs.items():
+    if importlib.util.find_spec(module) is None:
+        print(f"{module:8s} not installed")
+    else:
+        print(f"{module:8s} {md.version(dist)}")
+@@end
+<ol><li><code>find_spec</code> asks Python whether an import would succeed, without importing (and without crashing).</li>
+<li>The dictionary maps the import name to the distribution name, because they differ: you <code>import sklearn</code> but <code>pip install scikit-learn</code>.</li>
+<li><code>importlib.metadata.version</code> reads the installed version from package metadata, the same number <code>pip list</code> shows.</li>
+<li>In the output, <code>pytest</code>, <code>fastapi</code>, <code>typer</code> and <code>mlflow</code> are missing on this machine. That is why they appear as "not run here" below.</li></ol>
+<h3>Import conventions</h3>
+<ul><li>Standard library first, then third party, then your own package, each group separated by a blank line (tools such as ruff and isort enforce this).</li>
+<li>Import the module, not every name: <code>from pathlib import Path</code> is the accepted exception for very common names.</li>
+<li>Conventional aliases: <code>import numpy as np</code>, <code>import pandas as pd</code>, <code>import typer</code>, <code>import pytest</code>, <code>import joblib</code>. Do not invent others.</li>
+<li>Never <code>from module import *</code> in real code. It hides where names come from.</li></ul>
+<h3>Mental model</h3>
+<p>Think of a project as a conveyor belt with five stations and a logbook underneath. You write typed, tidy code; you test it; you package it so it installs the same everywhere; you expose it as a command or an API; you ship it in a container. Underneath, logging and tracking record what happened, and a scheduler decides when the belt moves.</p>
+<figure><img src="images/lib23_toolkit_map.png" alt="Five boxes in a row: Write, Test, Package, Serve, Ship, each listing its tools, with a wide box underneath for tracking and orchestration" loading="lazy"/><figcaption>The engineering toolkit as a conveyor belt with a logbook underneath.</figcaption></figure>
+<p><strong>How to read it:</strong> move left to right to follow the life of a change. Every box answers one question: is the code tidy (Write), is it right (Test), can someone else install it (Package), how do people call it (Serve), where does it run (Ship). The wide bottom box answers "what happened, and when does it run again?". When you debug, find the box where the problem lives first.</p>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Each tool exists to remove one kind of surprise: wrong results (tests), unknown behaviour (logs), different machines (environments, Docker), unknown inputs (types, validation), and lost history (tracking, versioning). Pick tools by the surprise you want to remove, not by fashion.</div></div>

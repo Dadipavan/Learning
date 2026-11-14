@@ -1,0 +1,269 @@
+
+<h2 id="s17-19">17.19 Going Deeper: Internals, Memory, Speed and What Interviewers Probe</h2>
+<h3>How a DataFrame is really stored</h3>
+<p>A DataFrame is not a grid of Python objects. Each column is a typed array (a NumPy array for numbers, booleans and datetimes, an extension array for categories, nullable integers and strings). pandas keeps these arrays together with the Index objects that label the rows and columns. Operations on a column therefore run as loops over a contiguous typed array in compiled code, which is the whole source of pandas' speed. A Python-level function applied row by row throws that advantage away, because every cell must be boxed into a Python object again.</p>
+<div class="callout blue"><div class="lab">KEY IDEA</div><div class="txt">The Index is a typed, <strong>immutable</strong> array with a lookup structure that is built lazily on first use. Looking up a label in a unique index is a hash lookup, not a scan, which is why <code>df.loc[label]</code> on a set index is fast and why a non-unique index makes lookups slower and sometimes returns several rows instead of one.</div></div>
+@@CODE
+import numpy as np
+import pandas as pd
+
+codes, uniques = pd.factorize(pd.Series(["b", "a", "b", "c"]))
+print(codes.tolist(), list(uniques))
+
+df = pd.DataFrame({"a": [1, 2, 3]})
+shallow = df.copy(deep=False)
+print(np.shares_memory(df["a"].to_numpy(), shallow["a"].to_numpy()))
+shallow.loc[0, "a"] = 99
+print(np.shares_memory(df["a"].to_numpy(), shallow["a"].to_numpy()), df["a"].tolist())
+
+idx = pd.Index(["x", "y"])
+try:
+    idx[0] = "z"
+except TypeError as e:
+    print("Index is immutable:", type(e).__name__)
+@@END
+<ol>
+<li><code>factorize</code> converts labels to small integer codes (b=0, a=1, c=2) plus a table of unique values. This is exactly the first step <code>groupby</code> and <code>category</code> use: integers are cheap to compare, hash and count.</li>
+<li>A shallow copy shares the underlying memory with the original, so <code>shares_memory</code> is True: copying costs almost nothing.</li>
+<li>When we write to the shallow copy, copy-on-write notices that the data is shared, copies just that column first, and then writes. The memory is no longer shared, and the original is untouched. This is the mechanism behind "never a surprise write".</li>
+<li>Index objects refuse item assignment; to change labels you build a new Index (<code>rename</code>, <code>set_index</code>).</li>
+</ol>
+<h3>What the main operations do underneath</h3>
+<ul>
+<li><strong>groupby</strong> factorizes the key column(s) into integer group codes, then reduces each value column by those codes. Built-in reducers (<code>sum</code>, <code>mean</code>, <code>count</code>, <code>min</code>, <code>max</code>) are compiled loops. A lambda forces a Python call per group.</li>
+<li><strong>merge</strong> is a hash join: it builds a hash table of keys from one side and probes it with the other. Cost grows roughly with the sum of the two sizes, plus the size of the output, which is why a many-to-many join can explode memory.</li>
+<li><strong>sort_values</strong> sorts one or more keys; use <code>kind="stable"</code> when ties must keep their input order.</li>
+<li><strong>Boolean masks</strong> allocate a full-length mask and a new frame; <code>query</code> and <code>eval</code> can avoid temporaries for large frames when the optional <code>numexpr</code> package is installed (not run here).</li>
+<li><strong>String dtype:</strong> in pandas 3.0 the default <code>str</code> dtype stores text in a dedicated string array rather than as one Python object per cell. Missing values are NaN-like, and <code>.str</code> methods return typed results. With <code>pyarrow</code> installed it uses Arrow storage, which is smaller and faster; without it, a Python-backed storage is used. Check <code>pd.options.mode.string_storage</code>.</li>
+<li><strong>Datetime resolution:</strong> timestamps are no longer always nanoseconds; the unit is inferred (our examples show microseconds). Arithmetic between different units converts to the finer one. Dates far outside the nanosecond range (year 1500 or 3000) now work without special handling.</li>
+<li><strong>Nullable dtypes</strong> (<code>Int64</code>, <code>Float64</code>, <code>boolean</code>) keep a separate mask of missing values, so integers stay integers, at some cost in speed and memory compared with plain NumPy types.</li>
+</ul>
+<h3>Memory arithmetic you should be able to do in your head</h3>
+<p>An <code>int64</code> or <code>float64</code> column takes 8 bytes per row, so 10 million rows take 80 MB per column. A table with 20 numeric columns and 10 million rows is about 1.6 GB before any temporaries. A <code>groupby</code>, <code>merge</code> or <code>sort</code> can need an extra copy or two, so plan for two to three times the table size. That arithmetic tells you when to downcast, read fewer columns, process in chunks, or switch tools.</p>
+<div class="callout green"><div class="lab">INTERVIEW</div><div class="txt"><strong>What interviewers probe.</strong> (1) Difference between <code>loc</code> and <code>iloc</code> and what slice end points include. (2) Why <code>apply(axis=1)</code> is slow and what to use instead. (3) <code>merge</code> types, how to detect and prevent row multiplication. (4) <code>transform</code> vs <code>agg</code> vs <code>apply</code>. (5) What copy-on-write means and why chained assignment no longer works. (6) How to handle a file bigger than memory. (7) How to deduplicate keeping the latest record. (8) How <code>NaN</code> behaves in comparisons, sums and groupby keys. (9) Time series: <code>resample</code> vs <code>rolling</code>, time zones. (10) Reading code and predicting its output, which is why the practice set has many "what does this print" tasks.</div></div>
+<h3>Processing a file bigger than memory</h3>
+@@CODE
+import io
+import pandas as pd
+
+lines = ["user,amount"] + [f"u{i % 4},{i}" for i in range(1, 21)]
+text = "\n".join(lines)
+
+totals = {}
+for chunk in pd.read_csv(io.StringIO(text), chunksize=6):
+    part = chunk.groupby("user")["amount"].sum()
+    for user, value in part.items():
+        totals[user] = totals.get(user, 0) + int(value)
+print(totals)
+print(sum(totals.values()), sum(range(1, 21)))
+@@END
+<ol>
+<li>We fake a 20-row file; a real one might have billions of rows on disk.</li>
+<li><code>chunksize=6</code> turns <code>read_csv</code> into an iterator of small DataFrames, so only six rows are in memory at a time.</li>
+<li>For each chunk we compute the partial sum per user, then merge it into a running dictionary. This works for any aggregation that can be combined from partial results (sum, count, min, max). A mean needs a running sum and a running count; a median does not combine this way.</li>
+<li>The grand total matches the arithmetic series 1 + 2 + ... + 20 = 210, a cheap correctness check.</li>
+</ol>
+
+<h2>Chapter recap</h2>
+<ul>
+<li>A DataFrame is a dict of typed Series sharing one Index. Think in columns; operations align on labels.</li>
+<li>Read with explicit <code>dtype</code>, <code>parse_dates</code>, <code>na_values</code> and <code>usecols</code>; write with <code>index=False</code>.</li>
+<li>Inspect first: <code>shape</code>, <code>info</code>, <code>describe</code>, <code>value_counts</code>, <code>isna().sum()</code>, <code>duplicated().sum()</code>.</li>
+<li>Select with <code>loc</code> (labels, end included), <code>iloc</code> (positions, end excluded), Boolean masks with <code>&amp; | ~</code> and brackets, or <code>query</code>.</li>
+<li>Assign with <code>df.loc[mask, col] = v</code>, <code>assign</code>, <code>np.where</code>, <code>np.select</code>; never chain indexing in pandas 3.0.</li>
+<li>Pick dtypes on purpose: <code>category</code> for low-cardinality text, nullable integers for gaps, <code>str</code> for text, datetimes with <code>format=</code>.</li>
+<li>Decide what missing means before filling; flag it; remember <code>groupby</code> drops NaN keys unless <code>dropna=False</code>.</li>
+<li><code>groupby</code> is split-apply-combine: <code>agg</code> shrinks, <code>transform</code> keeps length, <code>filter</code> keeps groups. Use named aggregation.</li>
+<li>Joins: choose <code>how</code>, always <code>validate</code>, use <code>indicator</code> to see mismatches, and check the row count.</li>
+<li>Reshape with <code>melt</code>/<code>pivot</code>/<code>pivot_table</code>; windows with <code>rolling</code>, <code>expanding</code>, <code>resample</code>, <code>shift</code>.</li>
+<li>Vectorise, use built-in aggregations, shrink dtypes, build once, measure; leave pandas when data does not fit memory.</li>
+</ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / pattern</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>df.loc[mask, "c"] = v</code></td><td>Safe conditional assignment</td></tr>
+<tr><td><code>df.groupby("k").agg(n=("x","size"), s=("x","sum"))</code></td><td>One row per key, named results</td></tr>
+<tr><td><code>df["x"] / df.groupby("k")["x"].transform("sum")</code></td><td>Share of group total</td></tr>
+<tr><td><code>df.sort_values("t").drop_duplicates("k", keep="last")</code></td><td>Latest row per key</td></tr>
+<tr><td><code>a.merge(b, on="k", how="left", validate="m:1")</code></td><td>Lookup that cannot multiply rows</td></tr>
+<tr><td><code>a.merge(b, how="outer", indicator=True)</code></td><td>Reconciliation of two tables</td></tr>
+<tr><td><code>df.pivot_table(index=, columns=, values=, aggfunc=)</code></td><td>Cross-tab with aggregation</td></tr>
+<tr><td><code>gap = g["ts"].diff(); (gap &gt; lim).groupby(key).cumsum()</code></td><td>Sessions</td></tr>
+<tr><td><code>s.resample("ME").sum()</code></td><td>Monthly totals</td></tr>
+<tr><td><code>s.rolling(7).mean()</code></td><td>Seven-row moving average</td></tr>
+<tr><td><code>pd.qcut(s, 4)</code> / <code>pd.cut(s, bins)</code></td><td>Equal-count / chosen-edge bins</td></tr>
+<tr><td><code>df.pipe(f).assign(...).query(...)</code></td><td>Readable method chain</td></tr>
+</tbody></table></div>
+
+<h2>Practice set</h2>
+<p>Graded from easy to expert. Try each one before reading the answer. Outputs shown were produced by running the code.</p>
+<p class="problem"><span class="pl">Problem 17.P.1</span> (Easy, what does this print?) What do the two lines print?</p>
+@@PCODE q1
+import pandas as pd
+
+s = pd.Series([4, 8, 15], index=["a", "b", "c"])
+print(s["b"], s.iloc[2])
+print(s.loc["a":"b"].tolist())
+@@END
+<p><strong>Answer:</strong> <code>s["b"]</code> is a label lookup (8), <code>s.iloc[2]</code> is positional (15). The label slice <code>"a":"b"</code> includes both ends, giving two values.</p>
+{{q1}}
+<p class="problem"><span class="pl">Problem 17.P.2</span> (Easy) A DataFrame <code>df</code> has 1000 rows. Which line gives the number of missing values in each column, and which gives the number of fully repeated rows?</p>
+<p><strong>Answer:</strong> <code>df.isna().sum()</code> counts missing cells per column; <code>df.duplicated().sum()</code> counts rows identical to an earlier row. <code>len(df)</code> or <code>df.shape[0]</code> gives 1000.</p>
+<p class="problem"><span class="pl">Problem 17.P.3</span> (Easy, find the bug) This line raises an error. Explain and fix it.</p>
+@@PCODE q3
+import pandas as pd
+
+df = pd.DataFrame({"a": [1, 5, 9], "b": [2, 2, 8]})
+try:
+    print(df[(df["a"] > 2) and (df["b"] < 5)])
+except ValueError as e:
+    print("ValueError")
+print(df[(df["a"] > 2) & (df["b"] < 5)])
+@@END
+<p><strong>Answer:</strong> <code>and</code> asks Python for one truth value of a whole Series, which is ambiguous, so pandas raises <code>ValueError</code>. Use <code>&amp;</code> with brackets around each comparison. The fixed line keeps only row 1 (a=5, b=2).</p>
+{{q3}}
+<p class="problem"><span class="pl">Problem 17.P.4</span> (Easy) A column <code>age</code> has values 20, 30, NaN, 40. What is <code>df["age"].mean()</code>, and what is the mean after <code>fillna(0)</code>?</p>
+<p><strong>Answer:</strong> pandas skips NaN by default: (20+30+40)/3 = 30. After <code>fillna(0)</code> the four values sum to 90, and 90/4 = 22.5. Filling with 0 silently changed the mean, which is why the fill value must be chosen with care.</p>
+<p class="problem"><span class="pl">Problem 17.P.5</span> (Easy, what does this print?) What is printed?</p>
+@@PCODE q5
+import pandas as pd
+
+a = pd.Series([1, 2, 3], index=["x", "y", "z"])
+b = pd.Series([10, 20], index=["y", "z"])
+print((a + b).tolist())
+print(a.add(b, fill_value=0).tolist())
+@@END
+<p><strong>Answer:</strong> addition aligns on labels. <code>x</code> is missing from <code>b</code>, so <code>x</code> becomes NaN; y is 2+10 = 12 and z is 3+20 = 23. With <code>add(..., fill_value=0)</code> a missing side is treated as 0, so x stays 1.</p>
+{{q5}}
+<p class="problem"><span class="pl">Problem 17.P.6</span> (Medium) For orders <code>cust = [a, a, b]</code> and <code>amt = [10, 30, 20]</code>, write one expression that gives each row's amount divided by the customer's total, and compute it by hand.</p>
+<p><strong>Answer:</strong> <code>df["amt"] / df.groupby("cust")["amt"].transform("sum")</code>. Customer a total is 40, so the first two rows are 10/40 = 0.25 and 30/40 = 0.75; customer b is 20/20 = 1.0.</p>
+<p class="problem"><span class="pl">Problem 17.P.7</span> (Medium, compute by hand) Left table has keys [1, 2, 2, 3]. Right table has keys [2, 2, 3, 4]. How many rows result from an inner join, a left join and an outer join? Verify with code.</p>
+@@PCODE q7
+import pandas as pd
+
+L = pd.DataFrame({"k": [1, 2, 2, 3]})
+R = pd.DataFrame({"k": [2, 2, 3, 4]})
+print({how: len(L.merge(R, on="k", how=how)) for how in ["inner", "left", "outer"]})
+@@END
+<p><strong>Answer:</strong> key 2 appears twice on each side, so it produces 2 x 2 = 4 rows. Key 3 gives 1 x 1 = 1. Inner = 4 + 1 = 5. Left adds the unmatched left key 1: 6. Outer also adds the unmatched right key 4: 7. Many-to-many joins multiply.</p>
+{{q7}}
+<p class="problem"><span class="pl">Problem 17.P.8</span> (Medium) Why does <code>df.pivot(index="city", columns="year", values="sales")</code> fail when Oslo has two rows for 2025, and what do you use instead?</p>
+<p><strong>Answer:</strong> <code>pivot</code> only rearranges: each (city, year) pair must be unique, otherwise it does not know which value to put in the cell, and raises an error about duplicate entries. <code>pivot_table(..., aggfunc="sum")</code> first aggregates duplicates (or use <code>groupby</code> first, then <code>unstack</code>).</p>
+<p class="problem"><span class="pl">Problem 17.P.9</span> (Medium, find the bug) The programmer wants to cap negative values at zero in <code>df</code>. It does not work in pandas 3.0. Why? Fix it and show it works.</p>
+@@PCODE q9
+import pandas as pd
+
+df = pd.DataFrame({"v": [3, -2, 5, -7]})
+df["v"][df["v"] < 0] = 0
+print(df["v"].tolist())
+df.loc[df["v"] < 0, "v"] = 0
+print(df["v"].tolist())
+@@END
+<p><strong>Answer:</strong> <code>df["v"]</code> returns a lazy copy under copy-on-write, so assigning into it never reaches <code>df</code>. A single <code>df.loc[mask, "v"] = 0</code> writes to <code>df</code> directly. (An equivalent is <code>df["v"] = df["v"].clip(lower=0)</code>.)</p>
+{{q9}}
+<p class="problem"><span class="pl">Problem 17.P.10</span> (Medium, what does this print?) What does this print, and why?</p>
+@@PCODE q10
+import pandas as pd
+
+s = pd.Series([1, 2, 3, 4, 5])
+print(s.rolling(3).sum().tolist())
+print(s.shift(1).tolist())
+print(s.diff().tolist())
+print(s.expanding().mean().tolist())
+@@END
+<p><strong>Answer:</strong> rolling(3).sum() needs a full window of 3, so the first two are NaN, then 1+2+3 = 6, 9, 12. shift(1) moves values down: the first is NaN. diff() is today minus yesterday: NaN then 1 each time. expanding().mean() is the running average: 1, 1.5, 2, 2.5, 3.</p>
+{{q10}}
+<p class="problem"><span class="pl">Problem 17.P.11</span> (Medium) Keep only the most recent row per <code>id</code> from a table with columns <code>id, ts, val</code>. Write the code, then explain what goes wrong if you skip the sort.</p>
+<p><strong>Answer:</strong> <code>df.sort_values("ts").drop_duplicates("id", keep="last")</code>. Without the sort, "last" means last in file order, which may not be the latest timestamp; the answer would depend on how the file happened to be arranged.</p>
+<p class="problem"><span class="pl">Problem 17.P.12</span> (Medium, what does this print?) Where do 18, 64 and 65 fall?</p>
+@@PCODE q12
+import pandas as pd
+
+age = pd.Series([18, 64, 65])
+print(pd.cut(age, [0, 18, 64, 120]).astype(str).tolist())
+print(pd.cut(age, [0, 18, 64, 120], right=False).astype(str).tolist())
+@@END
+<p><strong>Answer:</strong> by default intervals include the right edge: 18 is in (0, 18], 64 in (18, 64], 65 in (64, 120]. With <code>right=False</code> intervals include the left edge: 18 moves to [18, 64), 64 to [64, 120), 65 stays in [64, 120). Always test boundary values.</p>
+{{q12}}
+<p class="problem"><span class="pl">Problem 17.P.13</span> (Hard, find the bug) Revenue per tier is overstated after this join. Find why, show the symptom, and fix with a validation that would have caught it.</p>
+@@PCODE q13
+import pandas as pd
+
+orders = pd.DataFrame({"cid": [1, 2, 3], "amt": [100, 200, 300]})
+tiers = pd.DataFrame({"cid": [1, 2, 2, 3], "tier": ["g", "s", "s", "b"]})
+bad = orders.merge(tiers, on="cid")
+print(bad.groupby("tier")["amt"].sum().to_dict())
+good = orders.merge(tiers.drop_duplicates("cid"), on="cid", validate="m:1")
+print(good.groupby("tier")["amt"].sum().to_dict())
+@@END
+<p><strong>Answer:</strong> customer 2 is repeated in <code>tiers</code>, so their 200 appears twice and silver shows 400 instead of 200. <code>validate="m:1"</code> would raise <code>MergeError</code> as soon as <code>tiers</code> had a duplicate key. Fix by de-duplicating (or fix the source) and keeping the validation.</p>
+{{q13}}
+<p class="problem"><span class="pl">Problem 17.P.14</span> (Hard) Return the two highest-paid employees in each department, and make the handling of ties explicit.</p>
+@@PCODE q14
+import pandas as pd
+
+df = pd.DataFrame({"dept": list("aaabbb"), "emp": ["u1", "u2", "u3", "u4", "u5", "u6"], "pay": [50, 80, 80, 90, 40, 70]})
+r = df.sort_values(["dept", "pay", "emp"], ascending=[True, False, True]).groupby("dept").head(2)
+print(r[["dept", "emp", "pay"]].to_dict("records"))
+@@END
+<p><strong>Answer:</strong> sort by department, pay descending and employee as a tie-breaker, then <code>head(2)</code> per group. Department a has a tie at 80 (u2 and u3), and the tie-breaker makes the result deterministic. If instead you wanted <em>all</em> tied employees, use <code>rank(method="min")</code> and keep rank at most 2.</p>
+{{q14}}
+<p class="problem"><span class="pl">Problem 17.P.15</span> (Hard) Sessionise with a 15-minute limit. User u1 has events at 09:00, 09:10, 09:30, 09:35. How many sessions, and what are their sizes?</p>
+@@PCODE q15
+import pandas as pd
+
+ts = pd.to_datetime(["2025-01-01 09:00", "2025-01-01 09:10", "2025-01-01 09:30", "2025-01-01 09:35"])
+ev = pd.DataFrame({"user": "u1", "ts": ts})
+gap = ev.groupby("user")["ts"].diff()
+ev["session"] = (gap.isna() | (gap > pd.Timedelta(minutes=15))).groupby(ev["user"]).cumsum()
+print(ev.groupby("session").size().to_dict())
+@@END
+<p><strong>Answer:</strong> gaps are NaT, 10, 20 and 5 minutes. Only the first event and the 20-minute gap start sessions, so there are two sessions of sizes 2 and 2. The test is "gap greater than the limit", so a gap of exactly 15 minutes stays in the session; decide the boundary rule explicitly.</p>
+{{q15}}
+<p class="problem"><span class="pl">Problem 17.P.16</span> (Hard) A text column <code>country</code> has 5 distinct values over 2 million rows, and <code>qty</code> holds integers from 1 to 40. Estimate memory and give the dtypes you choose.</p>
+<p><strong>Answer:</strong> <code>qty</code> as <code>int64</code> costs 8 bytes x 2,000,000 = 16 MB; as <code>uint8</code> (0 to 255) it is 2 MB. <code>country</code> as category costs about one byte per row (about 2 MB, five labels are negligible), against a much larger cost for 2 million separate text values. Verify with <code>memory_usage(deep=True)</code> and compare results before and after.</p>
+<p class="problem"><span class="pl">Problem 17.P.17</span> (Hard, find the bug) The group totals below do not add to the grand total. What is wrong, and what is the fix?</p>
+@@PCODE q17
+import pandas as pd
+
+df = pd.DataFrame({"region": ["n", "s", None, "n"], "rev": [10, 20, 30, 40]})
+print(df.groupby("region")["rev"].sum().sum(), df["rev"].sum())
+print(df.groupby("region", dropna=False)["rev"].sum().sum())
+@@END
+<p><strong>Answer:</strong> the row with a missing region is dropped from the groupby by default, so the totals add to 70, not 100. Use <code>dropna=False</code> (a NaN group appears), or fill the key with a label such as "unknown" first, and then reconcile the totals.</p>
+{{q17}}
+<p class="problem"><span class="pl">Problem 17.P.18</span> (Hard) Translate to pandas: <code>SELECT dept, AVG(pay) AS avg_pay FROM emp GROUP BY dept HAVING COUNT(*) &gt;= 2 ORDER BY avg_pay DESC</code>.</p>
+<p><strong>Answer:</strong></p>
+<pre class="code lang-text"><code>(emp.groupby("dept").agg(avg_pay=("pay", "mean"), n=("pay", "size"))
+    .query("n &gt;= 2")
+    .sort_values("avg_pay", ascending=False)[["avg_pay"]])</code></pre>
+<p>HAVING becomes a filter on the aggregated table, so it comes after <code>agg</code>; the extra column <code>n</code> is needed to apply it and is dropped at the end.</p>
+<p class="problem"><span class="pl">Problem 17.P.19</span> (Hard) Two payment files should have equal amounts per invoice. Floats differ in the 10th decimal. How do you list true mismatches?</p>
+<p><strong>Answer:</strong> outer-merge on invoice with <code>indicator=True</code> and <code>validate="1:1"</code>, take rows where both sides exist, and keep those where <code>(a - b).abs() &gt; 0.005</code> (half a cent) or compare after <code>round(2)</code>. Never use <code>==</code> on floats for money. See Recipe 6 for the full code.</p>
+<p class="problem"><span class="pl">Problem 17.P.20</span> (Expert, what does this print?) Predict the three lines, then explain the second.</p>
+@@PCODE q20
+import pandas as pd
+
+df = pd.DataFrame({"a": [1, 2, 3]})
+v = df["a"]
+w = df.copy(deep=False)
+v.iloc[0] = 10
+w.loc[1, "a"] = 20
+print(df["a"].tolist())
+print(v.tolist(), w["a"].tolist())
+s = pd.Series(["x", None, "y"])
+print(s.dtype, s.isna().sum(), s.str.upper().tolist())
+@@END
+<p><strong>Answer:</strong> with copy-on-write, neither write reaches <code>df</code>, so it stays [1, 2, 3]. <code>v</code> is [10, 2, 3] and <code>w</code> is [1, 20, 3]: each object copied on its own first write. The Series is the default <code>str</code> dtype with one missing value, and upper-casing keeps the missing value as NaN.</p>
+{{q20}}
+<p class="problem"><span class="pl">Problem 17.P.21</span> (Expert, interview) Explain why <code>df.apply(f, axis=1)</code> is slow, and give three ways to avoid it with a concrete example for each.</p>
+<p><strong>Answer:</strong> <code>apply(axis=1)</code> builds a Series object for every row and calls a Python function once per row, so the work is dominated by interpreter overhead and object creation, not arithmetic. Alternatives: (1) vectorised column arithmetic, <code>df["a"] * df["b"]</code>; (2) <code>np.where</code>/<code>np.select</code> for if/else logic, <code>np.where(df.x &gt; 0, "pos", "neg")</code>; (3) <code>map</code> with a dict for recoding, or the <code>.str</code>/<code>.dt</code> accessors for text and dates. If real per-row logic remains, a list comprehension over <code>zip</code> of columns, or <code>itertuples()</code>, is much cheaper than <code>apply</code>.</p>
+<p class="problem"><span class="pl">Problem 17.P.22</span> (Expert) A cohort table shows retention above 100 percent for one cell. Name two likely causes in the code of Recipe 2 and the fix for each.</p>
+<p><strong>Answer:</strong> (1) Counting rows (<code>size</code>) instead of distinct customers (<code>nunique</code>): a customer with several orders in the same month counts several times. Fix: <code>nunique</code>. (2) Dividing by the wrong denominator, for example the cohort size taken from a different filter, or computing the cohort from a table that was already filtered to repeat buyers. Fix: derive cohort size from the age-0 column of the same pivot, as the recipe does with <code>counts.div(counts[0], axis=0)</code>. Sanity check: age 0 must be exactly 100 percent and no cell can exceed it.</p>
+<p class="problem"><span class="pl">Problem 17.P.23</span> (Expert, design) You must deduplicate and sum a 40 GB CSV of events on a 16 GB laptop. Sketch the approach and its limits.</p>
+<p><strong>Answer:</strong> stream with <code>read_csv(chunksize=..., usecols=..., dtype=...)</code>, aggregate each chunk, and combine partial results, as in the "bigger than memory" example; this is exact for sums and counts. Exact global deduplication needs all keys at once: if the set of distinct keys fits in memory, keep a set of seen keys across chunks; if not, partition the data by a hash of the key into several files first, then deduplicate each partition separately. Better still, convert to Parquet once (not run here) and use a tool built for it, such as DuckDB or Polars lazy mode. State clearly that pandas holds everything it processes in memory.</p>
+<p class="problem"><span class="pl">Problem 17.P.24</span> (Expert, find the bug) A monthly report uses <code>df.resample("M").sum()</code> and <code>df.applymap(str.strip)</code> and fails after upgrading to pandas 3.0. What changed?</p>
+<p><strong>Answer:</strong> the month alias <code>"M"</code> was replaced by <code>"ME"</code> (month end) and the old <code>applymap</code> was removed in favour of <code>DataFrame.map</code>. Fix: <code>df.resample("ME").sum()</code> and <code>df.map(str.strip)</code> (on text-only columns). General lesson: pin your pandas version in <code>requirements.txt</code>, run the test suite after upgrades, and read the release notes.</p>
+
+<h2>Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>&#10024; AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical pandas tutor. I am a working professional moving into data roles and I already know basic Python. Quiz me on pandas one question at a time, starting easy and getting harder: loc vs iloc, Boolean masks, missing data, groupby agg/transform/filter, merge with validate, pivot/melt, resample/rolling, dtypes and memory, and pandas 3.0 copy-on-write. After each answer tell me whether it is right, explain the idea in plain words, show a tiny runnable example, and then ask a harder follow-up. Keep a running score and finish with the three topics I should revise.</pre></div>
+<div class="prompt"><div class="ph"><span>&#10024; AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are a senior data engineer doing a code review. Below is my pandas code (pandas 3.0, NumPy 2). Review it for: wrong results (chained assignment, row-multiplying joins, NaN group keys, float equality, ambiguous dates), slow patterns (apply axis=1, iterrows, growing a DataFrame in a loop), memory waste (object or int64 where smaller dtypes fit), and readability (method chaining, named aggregation). For each issue give the line, why it is a problem, and a corrected snippet. Then list the checks (row counts, totals, uniqueness) I should add to prove the output is right. My code: [PASTE CODE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>&#10024; AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>Act as an interviewer for a data analyst or data scientist role. Run a 30-minute pandas mock interview. Ask me to predict the output of short snippets, find the bug in snippets, translate SQL (GROUP BY, HAVING, window functions, LEFT JOIN) into pandas, and design a pipeline for a file too large for memory. Ask one question at a time, wait for my answer, then give a score out of 10, the model answer, and the common wrong answer candidates give. At the end summarise my strengths and a 7-day plan to improve.</pre></div>

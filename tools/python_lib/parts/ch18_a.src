@@ -1,0 +1,253 @@
+<p>It is Monday morning and Maya, an analyst at a food-delivery company, has four questions on her desk. The delivery-time column is skewed, so which distribution describes it, and what is the chance that an order takes more than two hours? The new route-planning app was tried on half the drivers: is it really faster, or is that luck? The support-call volume after a bad-weather day decays over time: how fast, with what error bars? And finally, 40 driver-hours must be shared between two zones to earn the most profit. None of this is machine learning. It is the older, steadier craft of scientific computing, and almost every data domain (finance, health, engineering, marketing, operations) leans on the same few libraries to do it.</p>
+<p>This chapter teaches those libraries point by point: <strong>SciPy</strong> (the scientific toolbox on top of NumPy) and <strong>statsmodels</strong> (statistical models with full inference tables), plus a quick matplotlib reference for showing results. By the end you will be able to fit and test distributions, run and interpret hypothesis tests, build confidence intervals by formula and by bootstrap, fit curves with uncertainty, solve small optimisation problems, integrate and interpolate, work with sparse matrices, find a frequency in a noisy signal, search neighbours quickly, and cluster points. Five recipes tie it together: fit a distribution, A/B test, curve fitting with uncertainty, a small optimisation, and resampling.</p>
+<div class="callout cream"><div class="lab">HONESTY NOTE</div><div class="txt">Everything marked with an output was executed on this study machine with Python 3, NumPy 2.x, SciPy 1.18, pandas 3.0 and matplotlib 3.11. <strong>statsmodels is not installed here</strong>, so every statsmodels block is labelled <em>not run here</em> and is paired with an equivalent computed in NumPy and SciPy that did run. Timings are measured on this machine and vary on yours. The full guide to charts is the Data Analytics document, Chapter 8; here you only get the matplotlib quick reference. For the ideas behind tests and confidence intervals see the Statistics document.</div></div>
+
+<h2>18.1 What SciPy and statsmodels Are, and the Mental Model</h2>
+<h3>What each library is</h3>
+<p><strong>NumPy</strong> gives you the array. <strong>SciPy</strong> is a collection of well-tested numerical routines that work on NumPy arrays: probability distributions and tests, optimisers, integrators, interpolators, linear algebra, sparse matrices, signal processing, Fourier transforms, spatial searches and clustering. Most of it wraps battle-tested C, C++ and Fortran code (LAPACK, ODEPACK, QHull and others), so you get decades of numerical care with a Python call. <strong>statsmodels</strong> is a separate package focused on statistical modelling: regression (OLS, GLM, logistic), time series (ARIMA, SARIMAX), and above all <em>inference output</em>: standard errors, p-values, confidence intervals and diagnostic tests in one summary table.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Use it when</th><th>Do NOT use it when</th></tr></thead><tbody>
+<tr><td>You need a distribution, a classical test, or a confidence interval</td><td>You want a predictive model with cross-validation and pipelines: use scikit-learn</td></tr>
+<tr><td>You need to fit a custom formula to measured points (<code>curve_fit</code>)</td><td>Your data has millions of rows and you need group-by logic: use pandas first, then call SciPy on the arrays</td></tr>
+<tr><td>You need a small constrained optimisation (a few hundred variables)</td><td>You are training a neural network: use a deep-learning framework with automatic differentiation</td></tr>
+<tr><td>You need a regression with standard errors and p-values (statsmodels)</td><td>You only need predictions from a regression: <code>numpy.linalg.lstsq</code> or scikit-learn is lighter</td></tr>
+<tr><td>You need fast nearest-neighbour search on low-dimensional points</td><td>You have 768-dimensional embeddings at scale: use an approximate nearest-neighbour index</td></tr>
+</tbody></table></div>
+<h3>Install, version check, import conventions</h3>
+<p>Install with <code>python3 -m pip install scipy statsmodels</code> (inside a virtual environment, see the Python document, Chapter 10). SciPy submodules are not imported automatically by <code>import scipy</code>, so import the pieces you need. The conventions below are what you will see in almost all code.</p>
+@@PY
+import numpy as np
+import scipy
+import pandas as pd
+import matplotlib
+from scipy import stats, optimize, integrate, interpolate, linalg, signal, spatial, fft
+from scipy import sparse
+from scipy.cluster import vq, hierarchy
+
+print("numpy ", np.__version__.split(".")[0] + ".x")
+print("scipy ", scipy.__version__)
+print("pandas", pd.__version__.split(".")[0] + ".x")
+print("matplotlib", matplotlib.__version__)
+print(stats.norm.cdf(0))
+@@END
+<ol><li>The <code>from scipy import ...</code> lines pull in the submodules. <code>import scipy</code> alone would not make <code>scipy.stats</code> usable in older versions, so always import the submodule you use.</li><li>Printing only the major version of NumPy and pandas keeps the output stable; the full version string is in <code>np.__version__</code>.</li><li><code>stats.norm.cdf(0)</code> is a first smoke test: half the standard normal lies below zero, so it prints 0.5.</li></ol>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Conventions: <code>np</code> for NumPy, <code>pd</code> for pandas, <code>plt</code> for <code>matplotlib.pyplot</code>, <code>sm</code> for <code>statsmodels.api</code>, <code>smf</code> for <code>statsmodels.formula.api</code>, and import SciPy as <code>from scipy import stats, optimize</code>. A statsmodels block (not run here) always starts <code>import statsmodels.api as sm</code>.</div></div>
+<h3>The mental model</h3>
+<p>Picture a stack. NumPy arrays are the floor: every SciPy function takes arrays in and returns arrays or small result objects out. Each SciPy submodule is a self-contained tool drawer. statsmodels, scikit-learn, pandas and matplotlib stand on the same floor, so data moves between them without copying or converting. Learning this chapter is mostly learning which drawer holds which tool and what shape of object each tool returns.</p>
+<figure><img src="images/lib18_stack.png" alt="Layered diagram: NumPy arrays at the bottom, ten SciPy submodules above, and statsmodels, scikit-learn, pandas and matplotlib at the top" loading="lazy"/><figcaption>The scientific stack: one array format shared by every layer.</figcaption></figure>
+<p><strong>How to read it:</strong> start at the bottom. Whatever the top layer is (a pandas column, a scikit-learn feature matrix), you can hand its values to a SciPy routine because they are NumPy arrays underneath. Results come back the same way, which is why a pipeline can mix all of these libraries in ten lines.</p>
+<p>Three habits make SciPy easy. First, <em>result objects</em>: modern SciPy functions return named results (<code>res.statistic</code>, <code>res.pvalue</code>, <code>res.x</code>, <code>res.success</code>) rather than anonymous tuples; read the attribute names. Second, <em>random state</em>: always pass a seeded generator, <code>rng = np.random.default_rng(0)</code>, and give it to <code>random_state=rng</code> or <code>rvs(..., random_state=rng)</code>. Third, <em>vectorise</em>: pass whole arrays, never loop over scalars.</p>
+
+<h2>18.2 scipy.stats I: Distributions</h2>
+<p>A <strong>probability distribution</strong> is a recipe that says how likely each value is. SciPy gives you about a hundred ready-made ones. Every continuous distribution is an object with the same methods, so once you learn <code>norm</code> you know <code>lognorm</code>, <code>gamma</code>, <code>expon</code> and the rest. A <em>discrete</em> distribution (<code>binom</code>, <code>poisson</code>) uses <code>pmf</code> (probability of exactly this value) instead of <code>pdf</code> (density).</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>norm</code></td><td>Bell curve with mean <code>loc</code> and spread <code>scale</code></td><td><code>stats.norm(loc=0, scale=1)</code></td></tr>
+<tr><td><code>expon</code></td><td>Waiting time between random events</td><td><code>stats.expon(scale=5)</code></td></tr>
+<tr><td><code>lognorm</code></td><td>Positive, right-skewed values (durations, prices)</td><td><code>stats.lognorm(s=0.5, scale=3)</code></td></tr>
+<tr><td><code>gamma</code></td><td>Positive skewed, sums of waiting times</td><td><code>stats.gamma(a=2, scale=1.5)</code></td></tr>
+<tr><td><code>beta</code></td><td>Values between 0 and 1 (rates, proportions)</td><td><code>stats.beta(2, 5)</code></td></tr>
+<tr><td><code>uniform</code></td><td>All values in an interval equally likely</td><td><code>stats.uniform(loc=2, scale=3)</code></td></tr>
+<tr><td><code>t</code>, <code>chi2</code></td><td>Reference curves used inside tests</td><td><code>stats.t(df=9)</code></td></tr>
+<tr><td><code>binom</code></td><td>Number of successes in n yes/no trials</td><td><code>stats.binom(n=10, p=0.3)</code></td></tr>
+<tr><td><code>poisson</code></td><td>Count of events in a fixed window</td><td><code>stats.poisson(mu=4)</code></td></tr>
+<tr><td><code>.pdf(x)</code> / <code>.pmf(k)</code></td><td>Density (or exact probability) at a point</td><td><code>stats.norm.pdf(0)</code></td></tr>
+<tr><td><code>.cdf(x)</code></td><td>Probability of being at or below x</td><td><code>stats.norm.cdf(1.96)</code></td></tr>
+<tr><td><code>.sf(x)</code></td><td>Survival function, 1 minus cdf, accurate in the tail</td><td><code>stats.norm.sf(5)</code></td></tr>
+<tr><td><code>.ppf(q)</code></td><td>Inverse cdf: the value below which q of the mass lies</td><td><code>stats.norm.ppf(0.975)</code></td></tr>
+<tr><td><code>.rvs(size, random_state)</code></td><td>Draw random samples</td><td><code>d.rvs(100, random_state=rng)</code></td></tr>
+<tr><td><code>.interval(conf)</code></td><td>Central interval holding a fraction of the mass</td><td><code>stats.norm.interval(0.95)</code></td></tr>
+<tr><td><code>.mean() .std() .var()</code></td><td>Moments of a frozen distribution</td><td><code>stats.expon(scale=5).mean()</code></td></tr>
+<tr><td><code>.logpdf(x)</code></td><td>Log density, stable for likelihoods</td><td><code>stats.norm.logpdf(x).sum()</code></td></tr>
+<tr><td><code>.fit(data)</code></td><td>Maximum-likelihood parameters from data</td><td><code>stats.lognorm.fit(x, floc=0)</code></td></tr>
+<tr><td>"Freezing"</td><td>Fix the parameters once, reuse the object</td><td><code>d = stats.gamma(2, scale=3)</code></td></tr>
+<tr><td><code>stats.describe(x)</code></td><td>Count, min/max, mean, variance, skewness, kurtosis</td><td><code>stats.describe(x).skewness</code></td></tr>
+<tr><td><code>stats.skew / kurtosis</code></td><td>Asymmetry and tail weight of a sample</td><td><code>stats.skew(x)</code></td></tr>
+<tr><td><code>stats.zscore(x)</code></td><td>Standardise: (x minus mean) / std</td><td><code>stats.zscore(x)</code></td></tr>
+<tr><td><code>stats.kstest(x, cdf)</code></td><td>Does the sample match a given distribution?</td><td><code>stats.kstest(x, "norm", args=(m, s))</code></td></tr>
+<tr><td><code>stats.probplot(x)</code></td><td>Data for a Q-Q plot (normality check)</td><td><code>stats.probplot(x, dist="norm")</code></td></tr>
+<tr><td><code>stats.scoreatpercentile / percentileofscore</code></td><td>Percentile of a value or value of a percentile</td><td><code>stats.percentileofscore(x, 3)</code></td></tr>
+<tr><td><code>stats.trim_mean(x, 0.1)</code></td><td>Mean after cutting 10% off each end</td><td><code>stats.trim_mean(x, 0.1)</code></td></tr>
+<tr><td><code>stats.iqr(x)</code></td><td>Interquartile range, a robust spread</td><td><code>stats.iqr(x)</code></td></tr>
+<tr><td><code>stats.mode(x)</code></td><td>Most frequent value</td><td><code>stats.mode([1, 2, 2]).mode</code></td></tr>
+<tr><td><code>stats.sem(x)</code></td><td>Standard error of the mean</td><td><code>stats.sem(x)</code></td></tr>
+<tr><td><code>stats.qmc.Sobol</code></td><td>Low-discrepancy points for simulation</td><td><code>stats.qmc.Sobol(2, seed=0)</code></td></tr>
+</tbody></table></div>
+<h3>Worked example 1: the four verbs on a normal curve</h3>
+<p class="problem"><span class="pl">Problem 18.2.1</span> Test scores follow a normal distribution with mean 70 and standard deviation 10. Find the density at 70, the share scoring below 85, the share above 90, the score that 90% of people stay under, and 5 random scores.</p>
+@@PY
+import numpy as np
+from scipy import stats
+
+scores = stats.norm(loc=70, scale=10)
+print("pdf at 70      :", round(scores.pdf(70), 4))
+print("P(score <= 85) :", round(scores.cdf(85), 4))
+print("P(score > 90)  :", round(scores.sf(90), 4))
+print("90th percentile:", round(scores.ppf(0.90), 2))
+rng = np.random.default_rng(0)
+print("5 draws        :", scores.rvs(5, random_state=rng).round(1))
+@@END
+<ol><li><code>stats.norm(loc=70, scale=10)</code> freezes the parameters into an object called <code>scores</code>. Every later call reuses them.</li><li><code>pdf(70)</code> is the height of the curve at its peak: 1 / (10 times the square root of 2π), about 0.0399. A density is <em>not</em> a probability, which is why it can exceed 1 for narrow curves.</li><li><code>cdf(85)</code> is the area to the left of 85, the chance of scoring 85 or less. That is 1.5 standard deviations above the mean, so about 0.93.</li><li><code>sf(90)</code> is "survival", the area to the right of 90, which is two standard deviations up: roughly 2.3%.</li><li><code>ppf(0.90)</code> goes the other way (percent point function): from a probability to a value. About 1.28 standard deviations above the mean gives 82.8.</li><li><code>rvs(5, random_state=rng)</code> draws five scores. The seeded generator makes the draws repeatable.</li></ol>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Remember the pair: <code>cdf</code> turns a <em>value</em> into a <em>probability</em>, <code>ppf</code> turns a <em>probability</em> into a <em>value</em>. They are inverses: <code>ppf(cdf(x))</code> returns x. A confidence interval is just two <code>ppf</code> calls.</div></div>
+<h3>Worked example 2: discrete distributions and the tail</h3>
+<p class="problem"><span class="pl">Problem 18.2.2</span> A call centre gets on average 4 complaints per hour (Poisson). What is the chance of exactly 7 in an hour, of 10 or more, and what is the smallest staffing level that covers 99% of hours?</p>
+@@PY
+from scipy import stats
+
+calls = stats.poisson(mu=4)
+print("P(exactly 7)  :", round(calls.pmf(7), 4))
+print("P(10 or more) :", round(calls.sf(9), 5))
+print("99% covered by:", int(calls.ppf(0.99)), "calls")
+print("mean, std     :", calls.mean(), round(calls.std(), 3))
+@@END
+<ol><li>A Poisson distribution needs one parameter, <code>mu</code>, its mean count.</li><li><code>pmf(7)</code> is the probability of exactly 7, a real probability because the variable is discrete.</li><li>"10 or more" is "more than 9", so we use <code>sf(9)</code>. A common slip is <code>sf(10)</code>, which would drop the case of exactly 10 (see the pitfalls section).</li><li><code>ppf(0.99)</code> returns the smallest integer k with <code>cdf(k)</code> at least 0.99.</li><li>For a Poisson the mean equals the variance, so the variance is also 4, so the standard deviation is the square root of 4, which is 2.0.</li></ol>
+<h3>Worked example 3: fit a distribution to real-looking data (Recipe 1)</h3>
+<p class="problem"><span class="pl">Problem 18.2.3</span> Maya has 800 delivery times (hours). Fit a lognormal and a normal, compare them, and compute the chance an order takes more than 6 hours.</p>
+@@PY
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(7)
+data = rng.lognormal(mean=1.2, sigma=0.5, size=800)
+
+s, loc, scale = stats.lognorm.fit(data, floc=0)
+mu, sd = stats.norm.fit(data)
+print("lognorm shape s=%.3f scale=%.3f" % (s, scale))
+print("normal  mu=%.3f sd=%.3f" % (mu, sd))
+
+ll_log = stats.lognorm.logpdf(data, s, loc, scale).sum()
+ll_nor = stats.norm.logpdf(data, mu, sd).sum()
+print("log-likelihood lognorm: %.1f  normal: %.1f" % (ll_log, ll_nor))
+print("AIC lognorm: %.1f  normal: %.1f" % (2 * 2 - 2 * ll_log, 2 * 2 - 2 * ll_nor))
+
+print("KS p-value lognorm: %.3f" % stats.kstest(data, "lognorm", args=(s, loc, scale)).pvalue)
+print("P(time > 6h):", round(stats.lognorm.sf(6, s, loc, scale), 4), "empirical:", (data > 6).mean())
+@@END
+<ol><li>We simulate data from a true lognormal so we know the right answer: shape 0.5 and scale e<sup>1.2</sup>, about 3.32. The fit lands close to both (sampling noise explains the gap).</li><li><code>lognorm.fit(data, floc=0)</code> estimates shape, location and scale. Fixing <code>floc=0</code> says "values start at zero", which is physically right for durations and makes the fit stable and faster.</li><li><code>norm.fit</code> returns the sample mean and standard deviation.</li><li>The log-likelihood adds <code>logpdf</code> over all points; larger is better. The AIC (2 times parameters minus 2 times log-likelihood, lower is better) penalises extra parameters. Both models have two free parameters here, so the comparison is fair.</li><li><code>kstest</code> compares the sample with the fitted cdf. Caution: because the parameters were estimated from the same data, the p-value is optimistic; treat it as a rough check, not proof.</li><li><code>sf(6, ...)</code> gives the tail probability, and we compare it with the plain empirical share as a sanity check.</li></ol>
+<figure><img src="images/lib18_dist_fit.png" alt="Histogram of delivery times with a lognormal curve hugging the bars and a normal curve that misses the skew" loading="lazy"/><figcaption>Delivery times with a lognormal fit (solid) and a normal fit (dashed).</figcaption></figure>
+<p><strong>How to read it:</strong> the bars are the data. The solid curve follows the sharp rise and long right tail. The dashed normal curve is symmetric, so it puts probability on negative hours and underestimates the peak. A good fit means the curve rides the tops of the bars everywhere, not just near the middle.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reading <code>pdf</code> as a probability. <code>stats.norm(0, 0.1).pdf(0)</code> is about 3.99, which is fine: density can exceed 1. Probabilities come from <em>areas</em>: use <code>cdf(b) - cdf(a)</code>.</div></div>
+
+<h2>18.3 scipy.stats II: Tests, Intervals, Bootstrap, Correlation</h2>
+<p>A <strong>hypothesis test</strong> asks "could this difference be just luck?". It starts from a boring assumption (the <em>null hypothesis</em>, for example "both groups have the same mean"), computes a <em>test statistic</em>, and reports a <strong>p-value</strong>: the probability of seeing a result at least this extreme if the boring assumption were true. A small p-value (below a threshold you chose in advance, often 0.05) is evidence against the null. It is <em>not</em> the probability that the null is true, and it says nothing about how large or important the effect is.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>ttest_1samp</code></td><td>Is the mean different from a fixed number?</td><td><code>stats.ttest_1samp(x, 50)</code></td></tr>
+<tr><td><code>ttest_ind</code></td><td>Do two independent groups have the same mean? (<code>equal_var=False</code> is Welch)</td><td><code>stats.ttest_ind(a, b, equal_var=False)</code></td></tr>
+<tr><td><code>ttest_rel</code></td><td>Paired before/after comparison</td><td><code>stats.ttest_rel(before, after)</code></td></tr>
+<tr><td><code>mannwhitneyu</code></td><td>Rank-based two-group test, no normality needed</td><td><code>stats.mannwhitneyu(a, b)</code></td></tr>
+<tr><td><code>wilcoxon</code></td><td>Rank-based paired test</td><td><code>stats.wilcoxon(before - after)</code></td></tr>
+<tr><td><code>shapiro</code></td><td>Is the sample plausibly normal?</td><td><code>stats.shapiro(x)</code></td></tr>
+<tr><td><code>normaltest</code></td><td>Normality test from skew and kurtosis</td><td><code>stats.normaltest(x)</code></td></tr>
+<tr><td><code>levene</code></td><td>Do groups have equal variance?</td><td><code>stats.levene(a, b)</code></td></tr>
+<tr><td><code>f_oneway</code></td><td>One-way ANOVA across 3+ groups</td><td><code>stats.f_oneway(a, b, c)</code></td></tr>
+<tr><td><code>kruskal</code></td><td>Rank-based ANOVA</td><td><code>stats.kruskal(a, b, c)</code></td></tr>
+<tr><td><code>chi2_contingency</code></td><td>Are two categorical variables related?</td><td><code>stats.chi2_contingency(table)</code></td></tr>
+<tr><td><code>chisquare</code></td><td>Do counts match expected counts?</td><td><code>stats.chisquare(obs, exp)</code></td></tr>
+<tr><td><code>fisher_exact</code></td><td>Exact test for a 2x2 table with small counts</td><td><code>stats.fisher_exact([[3, 1], [1, 3]])</code></td></tr>
+<tr><td><code>binomtest</code></td><td>Is an observed rate different from a target?</td><td><code>stats.binomtest(k, n, 0.5)</code></td></tr>
+<tr><td><code>ks_2samp</code></td><td>Do two samples share a distribution?</td><td><code>stats.ks_2samp(a, b)</code></td></tr>
+<tr><td><code>pearsonr</code></td><td>Linear correlation, with p-value</td><td><code>stats.pearsonr(x, y)</code></td></tr>
+<tr><td><code>spearmanr</code></td><td>Rank correlation, handles monotone curves and outliers</td><td><code>stats.spearmanr(x, y)</code></td></tr>
+<tr><td><code>kendalltau</code></td><td>Rank correlation for small samples and ties</td><td><code>stats.kendalltau(x, y)</code></td></tr>
+<tr><td><code>linregress</code></td><td>Straight-line fit with slope p-value</td><td><code>stats.linregress(x, y)</code></td></tr>
+<tr><td><code>bootstrap</code></td><td>Confidence interval by resampling</td><td><code>stats.bootstrap((x,), np.mean)</code></td></tr>
+<tr><td><code>permutation_test</code></td><td>Test by shuffling labels</td><td><code>stats.permutation_test((a, b), stat)</code></td></tr>
+<tr><td><code>t.interval</code></td><td>Confidence interval for a mean</td><td><code>stats.t.interval(0.95, n-1, m, se)</code></td></tr>
+<tr><td><code>stats.sem</code></td><td>Standard error of the mean</td><td><code>stats.sem(x)</code></td></tr>
+<tr><td><code>false_discovery_control</code></td><td>Adjust many p-values (Benjamini-Hochberg)</td><td><code>stats.false_discovery_control(p)</code></td></tr>
+<tr><td><code>power_divergence</code></td><td>Family behind chi-square and G-test</td><td><code>stats.power_divergence(o, e, lambda_=0)</code></td></tr>
+</tbody></table></div>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Every test returns a result object with <code>.statistic</code> and <code>.pvalue</code>, and many add <code>.confidence_interval()</code>. Choose by the data shape: two numeric groups (t-test or Mann-Whitney), paired numeric (paired t or Wilcoxon), two categories (chi-square or Fisher), many groups (ANOVA or Kruskal), two numeric columns (Pearson or Spearman).</div></div>
+<h3>Worked example 1: a one-sample and a two-sample t-test (Recipe 2, A/B test)</h3>
+<p class="problem"><span class="pl">Problem 18.3.1</span> Control drivers average about 38 minutes per delivery; drivers using the new route app are simulated at about 35. With 120 drivers in each group, is the app faster? Report the difference with a 95% interval.</p>
+@@PY
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(42)
+control = rng.normal(38, 8, 120)
+variant = rng.normal(35, 9, 120)
+
+res = stats.ttest_ind(variant, control, equal_var=False)
+print("t = %.3f  p = %.4f" % (res.statistic, res.pvalue))
+diff = variant.mean() - control.mean()
+ci = res.confidence_interval(0.95)
+print("mean diff = %.2f min, 95%% CI (%.2f, %.2f)" % (diff, ci.low, ci.high))
+
+pooled = np.sqrt((variant.var(ddof=1) + control.var(ddof=1)) / 2)
+print("Cohen d = %.2f" % (diff / pooled))
+@@END
+<ol><li>Two normal samples with different spreads imitate an A/B test. Seeding with 42 makes the numbers repeatable.</li><li><code>ttest_ind(variant, control, equal_var=False)</code> is Welch's t-test, the safe default because it does not assume equal variances. The first argument minus the second is the tested difference.</li><li>The statistic is negative because the variant mean is lower; the p-value is two-sided (the app could be slower or faster).</li><li><code>res.confidence_interval(0.95)</code> gives the range of plausible true differences. Report this, not just p: it shows size and uncertainty.</li><li>Cohen's d divides the difference by a pooled standard deviation. About 0.2 is small, 0.5 medium, 0.8 large (rules of thumb).</li></ol>
+<h3>Worked example 2: when the data is not normal</h3>
+<p class="problem"><span class="pl">Problem 18.3.2</span> Customer wait times are skewed. Check normality with Shapiro-Wilk, then compare two groups with Mann-Whitney U.</p>
+@@PY
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(1)
+a = rng.lognormal(1.0, 0.6, 80)
+b = rng.lognormal(1.3, 0.6, 80)
+
+print("shapiro a: p = %.5f" % stats.shapiro(a).pvalue)
+print("shapiro log(a): p = %.3f" % stats.shapiro(np.log(a)).pvalue)
+mw = stats.mannwhitneyu(a, b, alternative="two-sided")
+print("Mann-Whitney U = %.0f  p = %.5f" % (mw.statistic, mw.pvalue))
+auc = mw.statistic / (len(a) * len(b))
+print("P(random a beats random b) = %.3f" % auc)
+@@END
+<ol><li>Two lognormal samples whose log-means differ (1.0 against 1.3).</li><li>Shapiro-Wilk tests the null "the data is normal". A tiny p-value rejects normality for raw <code>a</code>; the log of a lognormal is normal, so the second p-value is large (we cannot reject).</li><li><code>mannwhitneyu</code> compares ranks, so skew and outliers matter far less. <code>alternative="two-sided"</code> is explicit.</li><li>The statistic U divided by the number of pairs is the probability that a random value from <code>a</code> beats a random value from <code>b</code>, a readable effect size (0.5 means no difference).</li></ol>
+<h3>Worked example 3: categorical data with chi-square</h3>
+<p class="problem"><span class="pl">Problem 18.3.3</span> Of 1000 visitors, 500 saw page A and 500 saw page B. A converted 60, B converted 85. Is the conversion rate different?</p>
+@@PY
+import numpy as np
+from scipy import stats
+
+table = np.array([[60, 440],
+                  [85, 415]])
+chi2, p, dof, expected = stats.chi2_contingency(table, correction=False)
+print("chi2 = %.3f  dof = %d  p = %.4f" % (chi2, dof, p))
+print("expected counts:\n", expected)
+print("fisher exact p = %.4f" % stats.fisher_exact(table).pvalue)
+print("rates:", table[:, 0] / table.sum(axis=1))
+@@END
+<ol><li>The table has one row per page and columns "converted" and "not converted". Always put counts in, never percentages.</li><li><code>chi2_contingency</code> computes the counts we would expect if page and conversion were unrelated (row total times column total divided by grand total), then measures the gap. <code>correction=False</code> switches off Yates' continuity correction so the number matches the textbook formula.</li><li>The returned <code>expected</code> table must have all cells of at least about 5 for the chi-square approximation to be trusted; here the smallest is 72.5.</li><li>Fisher's exact test needs no approximation; it reaches the same conclusion (a p-value a little higher).</li><li>The last line prints the raw rates (0.12 and 0.17) so you never report p without the effect.</li></ol>
+<h3>Worked example 4: confidence intervals and the bootstrap (Recipe 5, resampling)</h3>
+<p class="problem"><span class="pl">Problem 18.3.4</span> A small sample of 60 skewed delivery times. Get a 95% interval for the mean by formula, and for the <em>median</em> by bootstrap (no formula exists for it).</p>
+@@PY
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(3)
+data = rng.lognormal(1.2, 0.5, 60)
+
+m, se = data.mean(), stats.sem(data)
+lo, hi = stats.t.interval(0.95, df=len(data) - 1, loc=m, scale=se)
+print("mean %.3f, t interval (%.3f, %.3f)" % (m, lo, hi))
+
+res = stats.bootstrap((data,), np.median, n_resamples=5000,
+                      confidence_level=0.95, method="percentile", random_state=1)
+ci = res.confidence_interval
+print("median %.3f, bootstrap interval (%.3f, %.3f)" % (np.median(data), ci.low, ci.high))
+print("bootstrap std error: %.3f" % res.standard_error)
+@@END
+<ol><li>Formula route: the 95% interval of a mean is the mean plus or minus a t quantile times the standard error. <code>stats.t.interval</code> does that in one call, using <code>df = n - 1</code>.</li><li><code>stats.bootstrap</code> takes the data <em>as a tuple of samples</em> (note <code>(data,)</code>), a statistic function, and the number of resamples. It resamples with replacement, recomputes the median each time, and reads the interval from percentiles of those medians.</li><li><code>method="percentile"</code> is the simplest; the default <code>"BCa"</code> corrects bias and skew and is usually preferred for real work.</li><li><code>random_state=1</code> makes it repeatable, and <code>res.standard_error</code> is the spread of the resampled medians.</li></ol>
+<figure><img src="images/lib18_bootstrap.png" alt="Histogram of 5000 bootstrap medians with the sample median and the two interval ends marked" loading="lazy"/><figcaption>The bootstrap distribution of the median with its 95% interval.</figcaption></figure>
+<p><strong>How to read it:</strong> each bar counts how often a resample gave that median. The dashed lines cut off the outer 2.5% on each side. A narrow pile means the median is well pinned down; a wide one means more data is needed.</p>
+<h3>Worked example 5: correlation and many tests at once</h3>
+<p class="problem"><span class="pl">Problem 18.3.5</span> Compare Pearson and Spearman on a straight relationship with one wild reading, then correct 6 p-values for multiple testing.</p>
+@@PY
+import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(5)
+x = np.linspace(1, 10, 40)
+y = x + rng.normal(0, 0.5, 40)
+y[0] = 30                                # one broken sensor reading
+print("pearson  r = %.3f" % stats.pearsonr(x, y).statistic)
+print("spearman r = %.3f" % stats.spearmanr(x, y).statistic)
+
+p = np.array([0.001, 0.008, 0.039, 0.041, 0.20, 0.74])
+adj = stats.false_discovery_control(p)
+print("adjusted:", adj.round(3))
+print("significant at 5%:", adj < 0.05)
+@@END
+<ol><li>The relationship is a clean rising line, except that the first reading was replaced by a broken value of 30.</li><li>Pearson uses the actual values, so one extreme point drags it far down.</li><li>Spearman first converts values to ranks, so it captures any rising trend and shrugs off the single bad value.</li><li><code>false_discovery_control</code> applies the Benjamini-Hochberg procedure. Testing 6 hypotheses at 5% each would give a high chance of at least one false alarm, so the adjusted values are larger; only those under 0.05 count.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Testing many things and reporting only the p below 0.05. With 20 independent tests at 5%, the chance of at least one false positive is about 64%. Decide the tests in advance, or adjust with <code>false_discovery_control</code>.</div></div>

@@ -1,0 +1,42 @@
+<h2>16.15 Performance and Pitfalls</h2>
+<h3>Speed rules that hold up</h3>
+<ul><li><strong>Move loops into NumPy</strong> (16.12), <strong>preallocate</strong> instead of growing, and collect pieces in a list before one <code>np.concatenate</code>.</li><li><strong>Avoid needless copies.</strong> Slices and reshapes are free; fancy indexing, <code>astype</code> and temporaries are not. Use <code>out=</code> or in-place operators when you own the array.</li><li><strong>Pick the smallest sufficient dtype</strong> (float32, int32) and check precision. Prefer <code>@</code> to element loops, since it calls optimised BLAS code.</li><li><strong>Measure, do not guess.</strong> Use <code>time.perf_counter</code> or <code>timeit</code>, repeat, keep the best.</li></ul>
+<p class="problem"><span class="pl">Problem 16.15.1</span> Run five classic traps in one script so you can see the symptoms with your own eyes.</p>
+<table class="steps"><tr><th>Idea</th><td>Each line below reproduces one pitfall. The explanation after the output names the fix.</td></tr></table>
+<py>
+import numpy as np
+a = np.array([1, 2, 3])
+a[0] = 2.9
+print(a)
+f = np.float32(16777216)
+print(f + np.float32(1) == f)
+y = np.array([1.0, 2.0, 3.0])
+pred = np.array([[1.0], [2.0], [3.0]])
+print((y - pred).shape, ((y - pred) ** 2).mean())
+print(((y - pred.ravel()) ** 2).mean())
+b = a
+b[1] = 99
+print(a)
+data = np.array([3, 1, 2])
+result = data.sort()
+print(result, data)
+v = np.array([1.0, np.nan, 3.0])
+print(v.argmax(), np.nanargmax(v))
+M = np.arange(6).reshape(2, 3)
+print(sum(M), M.sum())
+</py>
+<p><strong>Line by line.</strong></p>
+<ol><li>Assigning 2.9 into an integer array silently truncates it to 2. The array keeps its dtype and does not upgrade.</li><li>float32 has only 24 bits of precision: 16,777,216 + 1 equals 16,777,216, so the addition is lost. Fix: accumulate in float64 (<code>dtype=np.float64</code>) when summing many values.</li><li>The shapes (3,) and (3, 1) broadcast to (3, 3). The "mean squared error" is computed over nine pairs, not three, and comes out as 1.333 instead of 0.</li><li><code>b = a</code> copies nothing; it adds a second name for the same array. Changing <code>b[1]</code> changes <code>a</code>. Fix: <code>b = a.copy()</code>.</li><li><code>data.sort()</code> sorts in place and returns <code>None</code>. Writing <code>result = data.sort()</code> leaves you with <code>None</code>. Fix: <code>np.sort(data)</code> for a new array.</li><li>The built-in <code>sum(M)</code> adds the rows as Python objects and returns an array <code>[3 5 7]</code>; <code>M.sum()</code> returns the grand total 15.</li></ol>
+<h3>Ten common mistakes, each with symptom and fix</h3>
+<div class="callout red"><div class="lab">COMMON MISTAKE 1: truth value of an array</div><div class="txt"><strong>Wrong:</strong> <code>if a == b:</code> or <code>if x &gt; 0:</code> where <code>x</code> is an array. <strong>Symptom:</strong> <code>ValueError: The truth value of an array with more than one element is ambiguous</code>. <strong>Fix:</strong> say what you mean: <code>(x &gt; 0).all()</code>, <code>(x &gt; 0).any()</code>, <code>np.array_equal(a, b)</code> or <code>np.allclose(a, b)</code>.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 2: and / or and operator precedence</div><div class="txt"><strong>Wrong:</strong> <code>x[(x &gt; 1) and (x &lt; 5)]</code> or <code>x[x &gt; 1 &amp; x &lt; 5]</code>. <strong>Symptom:</strong> the same ambiguous-truth error (Python's <code>and</code> wants one boolean), or for the second form a confusing error because <code>&amp;</code> binds tighter than <code>&gt;</code>. <strong>Fix:</strong> <code>x[(x &gt; 1) &amp; (x &lt; 5)]</code>, with brackets around every comparison.</div></div>
+
+<div class="callout red"><div class="lab">COMMON MISTAKE 3: integer wrap-around and truncation</div><div class="txt"><strong>Wrong:</strong> <code>np.uint8</code> or <code>int32</code> arithmetic that exceeds the range; <code>int_array / 2</code> assigned back with <code>[:] =</code>. <strong>Symptom:</strong> negative sales totals, 255 + 1 = 0, silent truncation. <strong>Fix:</strong> convert up first (<code>astype(np.int64)</code> or <code>float64</code>), and check ranges with <code>np.iinfo</code>.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 4: accidental (n, n) broadcasting</div><div class="txt"><strong>Wrong:</strong> <code>np.mean((y - pred) ** 2)</code> with <code>y</code> of shape (n,) and <code>pred</code> of shape (n, 1). <strong>Symptom:</strong> a wrong number and a sudden memory spike on large n (an n by n matrix), but no error. <strong>Fix:</strong> assert shapes (<code>assert y.shape == pred.shape</code>) at function boundaries.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 5: aliasing instead of copying</div><div class="txt"><strong>Wrong:</strong> <code>backup = arr</code>, <code>best = weights</code> inside a training loop. <strong>Symptom:</strong> your "backup" changes along with the original; your "best weights" always equal the latest weights. <strong>Fix:</strong> <code>backup = arr.copy()</code>.</div></div>
+
+<div class="callout red"><div class="lab">COMMON MISTAKE 6: growing arrays in a loop</div><div class="txt"><strong>Wrong:</strong> <code>for r in rows: arr = np.append(arr, r)</code> or <code>np.vstack([arr, r])</code> inside a loop. <strong>Symptom:</strong> time grows with the square of the data; a job that takes seconds for 10,000 rows takes hours for 10 million. <strong>Fix:</strong> collect results in a Python list and call <code>np.array(results)</code> once, or preallocate with <code>np.empty</code> and fill by index.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 7: shuffling or sorting that returns None</div><div class="txt"><strong>Wrong:</strong> <code>x = rng.shuffle(x)</code> or <code>x = x.sort()</code>. <strong>Symptom:</strong> <code>x</code> becomes <code>None</code> and the next line fails with <code>TypeError: 'NoneType' object is not subscriptable</code>. <strong>Fix:</strong> in-place methods return nothing; call them as statements, or use <code>rng.permutation(x)</code> and <code>np.sort(x)</code> to get a new array.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 8: same seed everywhere, or no seed</div><div class="txt"><strong>Wrong:</strong> calling <code>np.random.default_rng()</code> with no seed in a reported experiment, or reusing seed 0 for every parallel worker. <strong>Symptom:</strong> results nobody can reproduce, or workers producing identical "random" numbers. <strong>Fix:</strong> one seeded generator per run, and <code>rng.spawn(n)</code> to hand independent children to workers.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 9: float equality and accumulated error</div><div class="txt"><strong>Wrong:</strong> <code>if total == 0.3:</code> after adding 0.1 three times; summing a million float32 values in a plain loop. <strong>Symptom:</strong> <code>False</code> where you expect <code>True</code>; sums that are slightly off. <strong>Fix:</strong> <code>np.isclose</code> with a stated tolerance; use float64 for accumulation. NumPy's <code>sum</code> adds in pairs, which is more accurate than a naive left-to-right loop.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 10: object arrays from ragged data</div><div class="txt"><strong>Wrong:</strong> <code>np.array([[1, 2], [3]])</code>. <strong>Symptom:</strong> a <code>ValueError</code> about an inhomogeneous shape in NumPy 1.24 and later (older versions silently built a slow object array). <strong>Fix:</strong> pad to a common length (<code>np.pad</code> or NaN), or keep a list of arrays when lengths really differ.</div></div>

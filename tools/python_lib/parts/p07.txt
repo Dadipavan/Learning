@@ -1,0 +1,344 @@
+
+<h2 id="s17-15">17.15 Recipes: "How do I ...?"</h2>
+<p>Each recipe is a complete, runnable answer. Copy the pattern, then change the column names.</p>
+<h3>Recipe 1. How do I clean a messy table end to end?</h3>
+<p>The task: a CSV export with inconsistent headers, padded text, mixed number formats, repeated rows, impossible values and missing cells. Write the cleaning as one function so it can be tested and rerun.</p>
+@@CODE
+import io
+import numpy as np
+import pandas as pd
+
+text = """Order ID,Customer Name,Country,Amount,Order Date,Status
+1001, Ana Silva ,no,"1,250.50",2025-03-01,paid
+1002,bo chen,NO,80,2025-03-02,PAID
+1002,bo chen,NO,80,2025-03-02,PAID
+1003,Cy ONeil,it,-5,2025-03-03,refunded
+1004,,IT,,2025-03-04,paid
+1005,Di Park,pe,300,not a date,Paid
+"""
+
+def clean_orders(raw: pd.DataFrame) -> pd.DataFrame:
+    return (
+        raw
+        .rename(columns=lambda c: c.strip().lower().replace(" ", "_"))
+        .assign(
+            customer_name=lambda d: d["customer_name"].str.strip().str.title(),
+            country=lambda d: d["country"].str.upper(),
+            status=lambda d: d["status"].str.lower(),
+            amount=lambda d: pd.to_numeric(d["amount"].astype("str").str.replace(",", ""), errors="coerce"),
+            order_date=lambda d: pd.to_datetime(d["order_date"], errors="coerce"),
+        )
+        .drop_duplicates()
+        .assign(amount_ok=lambda d: d["amount"].ge(0))
+    )
+
+raw = pd.read_csv(io.StringIO(text), dtype={"Amount": "str"})
+out = clean_orders(raw)
+print(len(raw), "->", len(out))
+print(out)
+print(out.isna().sum().to_dict())
+print(out.loc[out["amount_ok"] & out["order_date"].notna(), "amount"].sum())
+@@END
+<ol>
+<li>Reading <code>Amount</code> as text (<code>dtype="str"</code>) is deliberate: "1,250.50" contains a thousands comma, so it must be cleaned before conversion.</li>
+<li>The function takes a raw frame and returns a cleaned one. Because it never modifies its input, you can call it twice safely and unit-test it on a tiny frame.</li>
+<li><code>rename</code> normalises headers. <code>str.strip().str.title()</code> fixes padding and case in names. Country codes are upper-cased, status lower-cased, so "PAID" and "paid" are the same value.</li>
+<li>Amounts: remove the comma, then <code>to_numeric(errors="coerce")</code> turns unparseable or empty cells into NaN. Dates: the bad date "not a date" becomes <code>NaT</code> (not-a-time) instead of crashing.</li>
+<li><code>drop_duplicates()</code> removes the repeated row 1002, so six rows become five. Duplicates are removed <em>after</em> normalising, so that rows that differ only by case or spaces are caught.</li>
+<li>Instead of deleting the impossible negative amount, we flag it with <code>amount_ok</code>. Flagging keeps evidence; you can decide later whether to drop.</li>
+<li>The last two lines count missing values and total the valid, dated amounts: 1250.5 + 80 = 1330.5. Order 1005 is excluded (bad date), as are the negative amount and the missing amount.</li>
+</ol>
+<h3>Recipe 2. How do I compute cohort retention?</h3>
+<p>The task: for each month of first purchase (the cohort), what percentage of customers buy again 1, 2, 3 months later?</p>
+@@CODE
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(5)
+rows = []
+for cust in range(300):
+    start = rng.integers(0, 4)
+    for m in range(start, 6):
+        if m == start or rng.random() < 0.5 ** (m - start) * 0.8 + 0.1:
+            rows.append((cust, pd.Timestamp("2025-01-01") + pd.DateOffset(months=int(m))))
+orders = pd.DataFrame(rows, columns=["customer", "order_month"])
+
+first = orders.groupby("customer")["order_month"].transform("min")
+orders["cohort"] = first.dt.to_period("M")
+orders["age"] = (orders["order_month"].dt.year - first.dt.year) * 12 + (orders["order_month"].dt.month - first.dt.month)
+
+counts = orders.pivot_table(index="cohort", columns="age", values="customer", aggfunc="nunique")
+retention = counts.div(counts[0], axis=0).round(2)
+print(retention)
+print(counts[0].tolist())
+@@END
+<ol>
+<li>We simulate 300 customers who start in one of four months and then return with a probability that falls with time. Real data would come from an orders table with a customer id and a date.</li>
+<li><code>transform("min")</code> gives each order row the customer's first order month, aligned to the original rows.</li>
+<li><code>to_period("M")</code> turns the date into a month label, the cohort.</li>
+<li><code>age</code> is the number of whole months between the order and the cohort start: years difference times 12 plus months difference.</li>
+<li><code>pivot_table(..., aggfunc="nunique")</code> counts distinct customers per cohort and age. Using <code>nunique</code> matters when a customer can place several orders in one month.</li>
+<li>Dividing every row by its age-0 column (<code>div(counts[0], axis=0)</code>) turns counts into retention rates. Age 0 is 1.00 by definition. Cells that lie in the future are NaN.</li>
+</ol>
+<figure><img src="images/lib17_cohort.png" alt="Heatmap of cohort retention percentages: rows are monthly cohorts, columns are months since first order" loading="lazy"/><figcaption>A cohort retention triangle (illustrative data). Darker means more customers came back.</figcaption></figure>
+<p><strong>How to read it:</strong> each row is a group of customers who started in the same month. Moving right shows what share of that group is still buying 1, 2, 3 months later. The empty bottom-right corner is the future: those months have not happened yet. Compare columns down a column to see whether newer cohorts retain better than older ones.</p>
+<h3>Recipe 3. How do I score customers with RFM?</h3>
+<p>RFM scores each customer by <strong>R</strong>ecency (days since last order), <strong>F</strong>requency (number of orders) and <strong>M</strong>onetary value (total spent).</p>
+@@CODE
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(11)
+n = 400
+orders = pd.DataFrame({
+    "customer": rng.integers(0, 60, n),
+    "date": pd.Timestamp("2025-01-01") + pd.to_timedelta(rng.integers(0, 180, n), unit="D"),
+    "amount": rng.gamma(2.0, 30.0, n).round(2),
+})
+today = orders["date"].max() + pd.Timedelta(days=1)
+
+rfm = orders.groupby("customer").agg(
+    recency=("date", lambda s: (today - s.max()).days),
+    frequency=("date", "size"),
+    monetary=("amount", "sum"),
+)
+rfm["r"] = pd.qcut(rfm["recency"], 4, labels=[4, 3, 2, 1]).astype(int)
+rfm["f"] = pd.qcut(rfm["frequency"].rank(method="first"), 4, labels=[1, 2, 3, 4]).astype(int)
+rfm["m"] = pd.qcut(rfm["monetary"], 4, labels=[1, 2, 3, 4]).astype(int)
+rfm["score"] = rfm["r"] + rfm["f"] + rfm["m"]
+print(rfm.sort_values("score", ascending=False).head(4).round(1))
+print(rfm["score"].describe().round(2)[["min", "max"]].tolist())
+print(rfm["r"].value_counts().sort_index().tolist())
+@@END
+<ol>
+<li>We fix "today" as the day after the latest order so results do not change with the calendar.</li>
+<li>Named aggregation computes three measures per customer in one pass. Recency uses a small lambda: days between today and the customer's latest order.</li>
+<li><code>qcut(..., 4)</code> splits customers into four equal-size groups. For recency, <em>smaller is better</em>, so labels are reversed (4 for the most recent quartile).</li>
+<li>Frequency has many ties (customers with the same count), and <code>qcut</code> fails when bin edges repeat. Ranking with <code>method="first"</code> first breaks ties so that the edges are unique.</li>
+<li>The score is the sum, from 3 (worst) to 12 (best). Sorting by it lists the best customers first. A segment such as "score 10 or more" is then a one-line filter.</li>
+</ol>
+<h3>Recipe 4. How do I get the top N rows per group?</h3>
+@@CODE
+import pandas as pd
+
+sales = pd.DataFrame({
+    "region": ["n", "n", "n", "s", "s", "s", "s"],
+    "product": ["a", "b", "c", "a", "b", "c", "d"],
+    "revenue": [100, 250, 80, 40, 40, 300, 90],
+})
+top2 = (sales.sort_values(["region", "revenue"], ascending=[True, False])
+             .groupby("region").head(2))
+print(top2)
+ranked = sales.assign(rk=sales.groupby("region")["revenue"].rank(method="dense", ascending=False))
+print(ranked[ranked["rk"] <= 2][["region", "product", "rk"]])
+best = sales.loc[sales.groupby("region")["revenue"].idxmax()]
+print(best[["region", "product"]].to_dict("records"))
+@@END
+<ol>
+<li>Option 1 sorts so the largest revenue is first within each region, then <code>head(2)</code> keeps two rows per region. Ties are broken by file order.</li>
+<li>Option 2 ranks within the group. <code>method="dense"</code> gives tied values the same rank without skipping numbers. In the south group, products a and b tie at 40 and share rank 3, so they are excluded. But if two products tied for rank 2, both would be kept and you would get <em>more than 2 rows</em>. Choose the tie rule deliberately.</li>
+<li>Option 3, <code>idxmax</code>, finds the row label of the largest value per group, and <code>loc</code> pulls those rows. This is the way to get exactly one row per group.</li>
+</ol>
+<h3>Recipe 5. How do I sessionise click events?</h3>
+<p>A <strong>session</strong> is a run of events by one user with no gap longer than 30 minutes. The trick: a new session starts whenever the gap is large, and a cumulative sum of those starts gives each event a session number.</p>
+@@CODE
+import pandas as pd
+
+ev = pd.DataFrame({
+    "user": ["u1", "u1", "u1", "u1", "u2", "u2"],
+    "ts": pd.to_datetime(["2025-03-01 09:00", "2025-03-01 09:10", "2025-03-01 10:00",
+                          "2025-03-01 10:05", "2025-03-01 09:00", "2025-03-01 09:29"]),
+}).sort_values(["user", "ts"])
+
+gap = ev.groupby("user")["ts"].diff()
+new_session = gap.isna() | (gap > pd.Timedelta(minutes=30))
+ev["session"] = new_session.groupby(ev["user"]).cumsum()
+print(ev)
+summary = ev.groupby(["user", "session"]).agg(start=("ts", "min"), end=("ts", "max"), events=("ts", "size"))
+summary["minutes"] = (summary["end"] - summary["start"]).dt.total_seconds() / 60
+print(summary)
+@@END
+<ol>
+<li>Sort by user and time first. Everything below assumes that order.</li>
+<li><code>groupby("user")["ts"].diff()</code> is the time since the previous event of the <em>same user</em>; each user's first event has NaT.</li>
+<li>An event starts a new session if there is no previous event (<code>isna()</code>) or the gap exceeds 30 minutes. Result: a True/False Series.</li>
+<li>Within each user, a cumulative sum of those flags numbers the sessions 1, 2, 3. For u1, events at 9:00 and 9:10 are session 1; 10:00 starts session 2 (50-minute gap) and 10:05 stays in it.</li>
+<li>Finally, an ordinary groupby on (user, session) gives start, end, event count and duration. User u2 has a 29-minute gap, so it stays one session.</li>
+</ol>
+<h3>Recipe 6. How do I reconcile two tables?</h3>
+<p>Finance wants to know: which invoices are in the ledger but not in the bank file, which are in the bank file but not the ledger, and which are in both with different amounts?</p>
+@@CODE
+import pandas as pd
+
+ledger = pd.DataFrame({"invoice": ["A1", "A2", "A3", "A4"], "amount": [100.0, 250.0, 75.0, 60.0]})
+bank = pd.DataFrame({"invoice": ["A2", "A3", "A5"], "amount": [250.0, 70.0, 40.0]})
+
+m = ledger.merge(bank, on="invoice", how="outer", suffixes=("_ledger", "_bank"), indicator=True, validate="1:1")
+only_ledger = m.loc[m["_merge"] == "left_only", "invoice"].tolist()
+only_bank = m.loc[m["_merge"] == "right_only", "invoice"].tolist()
+both = m[m["_merge"] == "both"].assign(diff=lambda d: d["amount_ledger"] - d["amount_bank"])
+mismatch = both[both["diff"].abs() > 0.005]
+print(only_ledger, only_bank)
+print(mismatch[["invoice", "amount_ledger", "amount_bank", "diff"]])
+print(m["_merge"].value_counts().to_dict())
+@@END
+<ol>
+<li>An <code>outer</code> join keeps invoices from either table. <code>suffixes</code> labels the two amount columns. <code>validate="1:1"</code> ensures neither file has repeated invoice numbers, which would otherwise corrupt the comparison.</li>
+<li><code>indicator=True</code> adds <code>_merge</code>, so we can split the result into three groups without any second join.</li>
+<li>A4 is <code>left_only</code> (in ledger, missing from the bank). A5 is <code>right_only</code> (bank money with no invoice).</li>
+<li>For invoices in both, compute the difference and compare its absolute value with a small tolerance. Never test float money with <code>==</code>; rounding noise makes equal amounts differ in the last digit.</li>
+<li>The value counts give the headline numbers for the report: 2 matched, 1 only in each.</li>
+</ol>
+<h3>Recipe 7. How do I translate SQL to pandas?</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>SQL</th><th>pandas</th></tr></thead><tbody>
+<tr><td><code>SELECT a, b FROM t</code></td><td><code>t[["a","b"]]</code></td></tr>
+<tr><td><code>SELECT * FROM t WHERE x &gt; 5 AND y = 'z'</code></td><td><code>t[(t.x &gt; 5) &amp; (t.y == "z")]</code> or <code>t.query("x &gt; 5 and y == 'z'")</code></td></tr>
+<tr><td><code>SELECT DISTINCT a FROM t</code></td><td><code>t["a"].drop_duplicates()</code></td></tr>
+<tr><td><code>SELECT a, SUM(x) AS s FROM t GROUP BY a</code></td><td><code>t.groupby("a", as_index=False).agg(s=("x","sum"))</code></td></tr>
+<tr><td><code>... HAVING SUM(x) &gt; 10</code></td><td><code>...agg(s=("x","sum")).query("s &gt; 10")</code></td></tr>
+<tr><td><code>ORDER BY x DESC LIMIT 5</code></td><td><code>t.nlargest(5, "x")</code> or <code>t.sort_values("x", ascending=False).head(5)</code></td></tr>
+<tr><td><code>a JOIN b ON a.k = b.k</code></td><td><code>a.merge(b, on="k")</code></td></tr>
+<tr><td><code>a LEFT JOIN b ON ...</code></td><td><code>a.merge(b, on="k", how="left")</code></td></tr>
+<tr><td><code>a UNION ALL b</code></td><td><code>pd.concat([a, b], ignore_index=True)</code></td></tr>
+<tr><td><code>UNION</code> (no duplicates)</td><td><code>pd.concat([a, b]).drop_duplicates()</code></td></tr>
+<tr><td><code>WHERE k IN (SELECT k FROM b)</code></td><td><code>a[a.k.isin(b.k)]</code></td></tr>
+<tr><td><code>WHERE k NOT IN (...)</code></td><td><code>a[~a.k.isin(b.k)]</code></td></tr>
+<tr><td><code>CASE WHEN x &gt; 0 THEN 'p' ELSE 'n' END</code></td><td><code>np.where(t.x &gt; 0, "p", "n")</code> or <code>np.select</code></td></tr>
+<tr><td><code>COALESCE(x, 0)</code></td><td><code>t["x"].fillna(0)</code></td></tr>
+<tr><td><code>COUNT(*)</code> / <code>COUNT(x)</code> / <code>COUNT(DISTINCT x)</code></td><td><code>len(t)</code> or <code>size()</code> / <code>count()</code> / <code>nunique()</code></td></tr>
+<tr><td><code>ROW_NUMBER() OVER (PARTITION BY k ORDER BY x)</code></td><td><code>t.sort_values("x").groupby("k").cumcount() + 1</code></td></tr>
+<tr><td><code>RANK() OVER (PARTITION BY k ORDER BY x DESC)</code></td><td><code>t.groupby("k")["x"].rank(method="min", ascending=False)</code></td></tr>
+<tr><td><code>SUM(x) OVER (PARTITION BY k)</code></td><td><code>t.groupby("k")["x"].transform("sum")</code></td></tr>
+<tr><td><code>LAG(x) OVER (PARTITION BY k ORDER BY d)</code></td><td><code>t.sort_values("d").groupby("k")["x"].shift(1)</code></td></tr>
+<tr><td><code>SUM(x) OVER (ORDER BY d ROWS 6 PRECEDING)</code></td><td><code>t.sort_values("d")["x"].rolling(7).sum()</code></td></tr>
+<tr><td><code>DATE_TRUNC('month', d)</code></td><td><code>t["d"].dt.to_period("M")</code> or <code>.dt.to_period("M").dt.to_timestamp()</code></td></tr>
+<tr><td><code>PIVOT</code> (conditional aggregation)</td><td><code>t.pivot_table(index=, columns=, values=, aggfunc=)</code></td></tr>
+</tbody></table></div>
+<p>The next block proves a few of these translations by running the same query in SQLite and in pandas and comparing.</p>
+@@CODE
+import sqlite3
+import pandas as pd
+
+t = pd.DataFrame({"k": ["a", "a", "b", "b", "b"], "x": [3, 9, 4, 4, 1], "d": [1, 2, 1, 2, 3]})
+con = sqlite3.connect(":memory:")
+t.to_sql("t", con, index=False)
+
+sql = pd.read_sql("""
+    SELECT k, SUM(x) AS s, COUNT(*) AS n
+    FROM t GROUP BY k HAVING SUM(x) > 8 ORDER BY s DESC""", con)
+pdf = (t.groupby("k", as_index=False).agg(s=("x", "sum"), n=("x", "size"))
+        .query("s > 8").sort_values("s", ascending=False).reset_index(drop=True))
+print(sql.equals(pdf))
+print(pdf)
+
+win = pd.read_sql("SELECT k, d, x, ROW_NUMBER() OVER (PARTITION BY k ORDER BY x DESC, d) AS rn FROM t ORDER BY k, rn", con)
+t2 = t.sort_values(["k", "x", "d"], ascending=[True, False, True])
+t2["rn"] = t2.groupby("k").cumcount() + 1
+print(win.equals(t2[["k", "d", "x", "rn"]].reset_index(drop=True)))
+@@END
+<ol>
+<li>The pandas table is written to an in-memory SQLite database with <code>to_sql</code>, so the same data lives on both sides.</li>
+<li>The SQL query groups, filters groups with <code>HAVING</code> and sorts. The pandas version chains <code>groupby/agg</code>, <code>query</code> (the HAVING step, applied after aggregation) and <code>sort_values</code>.</li>
+<li><code>equals</code> prints True: same rows, same order, same dtypes.</li>
+<li>For the window function, <code>ROW_NUMBER() OVER (PARTITION BY k ORDER BY x DESC, d)</code> becomes: sort by key, then x descending, then d; then <code>cumcount() + 1</code> inside each group. Including <code>d</code> as a tie-breaker in both versions makes the result deterministic.</li>
+</ol>
+<h3>Recipe 8. How do I find the biggest changes between two periods?</h3>
+@@CODE
+import pandas as pd
+
+sales = pd.DataFrame({
+    "product": ["a", "b", "c", "a", "b", "d"],
+    "month": ["jan", "jan", "jan", "feb", "feb", "feb"],
+    "units": [100, 50, 20, 130, 40, 10],
+})
+wide = sales.pivot(index="product", columns="month", values="units").fillna(0)
+wide["change"] = wide["feb"] - wide["jan"]
+wide["pct"] = ((wide["change"] / wide["jan"]).replace([float("inf"), -float("inf")], float("nan")) * 100).round(1)
+print(wide.sort_values("change", ascending=False))
+@@END
+<ol>
+<li>Pivot to one row per product and one column per month; products missing in a month get NaN, which we fill with 0 because "not sold" means zero units.</li>
+<li>Absolute change is February minus January.</li>
+<li>Percentage change divides by January. Product d did not exist in January, so the division gives infinity; replacing infinities by NaN avoids a meaningless number.</li>
+<li>Sorting by <code>change</code> shows the winners at the top (a: +30) and the biggest loser last (c: -20).</li>
+</ol>
+<h3>Recipe 9. How do I find outliers?</h3>
+@@CODE
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(1)
+s = pd.Series(np.append(rng.normal(100, 10, 200), [250, -40]), name="x")
+q1, q3 = s.quantile([0.25, 0.75])
+iqr = q3 - q1
+low, high = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+out = s[(s < low) | (s > high)]
+print(round(low, 1), round(high, 1))
+print(out.round(1).to_dict())
+z = (s - s.mean()) / s.std()
+print((z.abs() > 3).sum())
+clipped = s.clip(low, high)
+print(round(clipped.min(), 1), round(clipped.max(), 1))
+@@END
+<ol>
+<li>200 normal values around 100 plus two planted outliers (250 and -40).</li>
+<li>The IQR rule: the interquartile range is Q3 minus Q1; anything more than 1.5 IQRs beyond the quartiles is flagged. It is robust because quartiles ignore extreme values.</li>
+<li>The z-score rule flags values more than 3 standard deviations from the mean. It is less robust, since outliers inflate the mean and standard deviation themselves.</li>
+<li>The IQR rule flagged six points, four of them ordinary values near the fences, while the z-score rule flagged just the two planted ones (a normal sample always has a few points beyond 1.5 IQR). Neither rule is "right"; they answer different questions.</li>
+<li><code>clip(low, high)</code> winsorises: it limits values to the fences instead of deleting rows. Whether to remove, clip or keep an outlier is a business decision; investigate before you drop.</li>
+</ol>
+<h3>Recipe 10. How do I fill gaps in a time series and compute week-over-week growth?</h3>
+@@CODE
+import pandas as pd
+
+s = pd.Series([5, 8, 6], index=pd.to_datetime(["2025-03-03", "2025-03-05", "2025-03-10"]), name="orders")
+daily = s.asfreq("D", fill_value=0)
+print(daily.tolist())
+weekly = daily.resample("W-SUN").sum()
+print(weekly.to_dict())
+print(weekly.pct_change().round(3).tolist())
+@@END
+<ol>
+<li>The series has only three observed days. <code>asfreq("D", fill_value=0)</code> inserts every calendar day between the first and last, with 0 for days with no orders. Be sure that "no row" truly means zero, not "unknown".</li>
+<li><code>resample("W-SUN")</code> groups days into weeks that end on Sunday: the week of 3 to 9 March sums to 13, and 10 March starts the next week with 6.</li>
+<li><code>pct_change()</code> compares each week with the previous one: 6 / 13 - 1.</li>
+</ol>
+<h3>Recipe 11. How do I read many CSV files into one table?</h3>
+@@CODE
+import tempfile
+from pathlib import Path
+import pandas as pd
+
+folder = Path(tempfile.mkdtemp())
+for month in ["2025-01", "2025-02", "2025-03"]:
+    pd.DataFrame({"id": [1, 2], "v": [10, 20]}).to_csv(folder / f"sales_{month}.csv", index=False)
+
+parts = [pd.read_csv(p).assign(source=p.stem) for p in sorted(folder.glob("sales_*.csv"))]
+all_data = pd.concat(parts, ignore_index=True)
+print(all_data.shape)
+print(all_data["source"].unique().tolist())
+@@END
+<ol>
+<li><code>Path.glob("sales_*.csv")</code> lists matching files; <code>sorted</code> makes the order deterministic.</li>
+<li>A list comprehension reads each file and adds a <code>source</code> column with the file name (<code>p.stem</code>), so you can trace any row back to its file.</li>
+<li>One <code>concat</code> at the end is much faster than appending inside a loop, because each append copies all earlier rows.</li>
+</ol>
+<h3>Recipe 12. How do I flag rows that changed between two snapshots?</h3>
+@@CODE
+import pandas as pd
+
+old = pd.DataFrame({"id": [1, 2, 3], "price": [10.0, 20.0, 30.0], "stock": [5, 0, 7]}).set_index("id")
+new = pd.DataFrame({"id": [1, 2, 4], "price": [10.0, 22.0, 15.0], "stock": [5, 0, 3]}).set_index("id")
+
+added = new.index.difference(old.index).tolist()
+removed = old.index.difference(new.index).tolist()
+common = old.index.intersection(new.index)
+diff = old.loc[common].compare(new.loc[common])
+print(added, removed)
+print(diff)
+@@END
+<ol>
+<li>With <code>id</code> as the index, set operations on the indexes find rows that were added (4) and removed (3).</li>
+<li>For ids present in both, restrict both frames to the same labels; <code>compare</code> needs identically labelled frames.</li>
+<li><code>DataFrame.compare</code> returns only the cells that differ, with <code>self</code> and <code>other</code> columns: price of id 2 went from 20 to 22. Unchanged columns (stock) do not appear at all.</li>
+</ol>

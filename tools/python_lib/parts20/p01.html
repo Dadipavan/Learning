@@ -1,0 +1,102 @@
+<p>Priya has a Monday deadline. Finance sent a sales export as a CSV that opens with strange characters where the accented names should be. Operations keeps order history in a small SQLite file. The partner's shipping data sits behind a web API that returns 50 rows per page and sometimes answers "too many requests". The competitor's price list exists only as an HTML table on a web page. And her manager wants all four in one table, checked for bad values, loaded again every night without duplicates.</p>
+<p>None of this is modelling. It is plumbing, and plumbing decides whether a data project works at all. A model trained on half-read files is worse than no model. In this chapter you learn the libraries that move data in and out of Python: <code>pathlib</code>, <code>csv</code>, <code>json</code>, PyYAML, <code>openpyxl</code>, <code>sqlite3</code>, SQLAlchemy, <code>requests</code>, <code>httpx</code>, BeautifulSoup, validation with dataclasses and pydantic, Parquet and Arrow, plus <code>logging</code>, progress bars and chunked reading. By the end you can open any common source, read it safely, check it, and write it somewhere else, and you have a playbook for when something goes wrong.</p>
+<p><em>How this chapter is labelled.</em> Every code block marked as a normal Python block was run for this document with Python 3.14, pandas 3.0, NumPy 2.x, requests, httpx, BeautifulSoup 4, openpyxl and PyYAML, and the output under it is the real output. SQLAlchemy, pydantic, pyarrow and tqdm were <strong>not installed</strong> on the study machine, so their code appears in plain text blocks that start with <code># NOT RUN HERE</code>, and wherever possible a runnable equivalent is given next to it. Web examples never touch the internet: each one starts its own tiny server on <code>127.0.0.1</code> inside the script, so everything works offline. Timings in this chapter were measured once and vary between machines.</p>
+
+<h2>20.1 The data-access toolbox: what, when, and the mental model</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Every data source is a different kind of door into the same house. A file is a door you open yourself, a database is a door with a receptionist (SQL), a web API is a door on another building, and a web page is a window you can only look through. Your job is to pick the right door, carry things out in manageable boxes, and check the contents before they enter the house (your DataFrame).</div></div>
+<h3>What each library is for, and when not to use it</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Library</th><th>Use it when</th><th>Do NOT use it when</th></tr></thead><tbody>
+<tr><td><code>pathlib</code>, <code>glob</code></td><td>Building paths, finding many files, safe file operations</td><td>You need remote storage such as S3 (use that provider's SDK or <code>fsspec</code>)</td></tr>
+<tr><td><code>csv</code></td><td>Small to medium text tables, streaming row by row, odd dialects</td><td>You need fast analysis (use <code>pandas.read_csv</code>)</td></tr>
+<tr><td><code>json</code>, PyYAML</td><td>Nested data, configs, API payloads</td><td>Huge tabular data (JSON repeats every key on every row)</td></tr>
+<tr><td><code>openpyxl</code></td><td>Reading and writing <code>.xlsx</code>, formatting, formulas</td><td>Old <code>.xls</code> files, or millions of rows</td></tr>
+<tr><td><code>sqlite3</code></td><td>Local single-file database, tests, small ETL state</td><td>Many concurrent writers or a shared server database</td></tr>
+<tr><td>SQLAlchemy</td><td>One code base for several databases, ORM models, safe query building</td><td>A five-line script on SQLite (plain <code>sqlite3</code> is enough)</td></tr>
+<tr><td><code>requests</code></td><td>Simple synchronous HTTP calls</td><td>Hundreds of parallel calls (use <code>httpx.AsyncClient</code>)</td></tr>
+<tr><td><code>httpx</code></td><td>Same style as requests plus async, HTTP/2 option, strict timeouts</td><td>You need a browser to run JavaScript</td></tr>
+<tr><td>BeautifulSoup</td><td>Pulling facts out of static HTML</td><td>The site offers an API or a download (use that), or the page is built by JavaScript</td></tr>
+<tr><td>pydantic / dataclasses</td><td>Checking that incoming records have the right shape</td><td>Checking statistical quality of a whole table (use DataFrame checks)</td></tr>
+<tr><td>Parquet / Arrow</td><td>Large analytic tables, fast column reads, typed storage</td><td>Files people must open in a text editor</td></tr>
+</tbody></table></div>
+<h3>Install and version check</h3>
+<p>Install with <code>python3 -m pip install pandas requests httpx beautifulsoup4 openpyxl pyyaml</code>, and add <code>sqlalchemy pydantic pyarrow tqdm</code> for the optional parts. Always print versions when something behaves oddly, because behaviour changes between releases (pandas 3.0 and requests 2.x differ from older tutorials).</p>
+<pre class="code lang-python"><code>import sys, sqlite3, importlib.util
+import pandas as pd, requests, httpx, bs4, openpyxl, yaml
+
+print("python", sys.version.split()[0])
+print("sqlite library", sqlite3.sqlite_version)
+for mod in (pd, requests, httpx, bs4, openpyxl, yaml):
+    print(mod.__name__, mod.__version__)
+for name in ("sqlalchemy", "pydantic", "pyarrow", "tqdm"):
+    found = importlib.util.find_spec(name) is not None
+    print(name, "installed" if found else "missing")</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>Line 1 imports the standard-library helpers: <code>sys</code> for the Python version, <code>sqlite3</code> for the engine version, <code>importlib.util</code> to test for a package without importing it.</li><li>Line 2 imports the five third-party libraries under their standard names (<code>pd</code> is the universal alias for pandas).</li><li>Lines 4 and 5 print the Python version (only the number, before the first space) and the version of the SQLite C library bundled with Python.</li><li>The <code>for</code> loop prints each module's own name and <code>__version__</code>. Every well-behaved package has that attribute.</li><li><code>find_spec</code> returns <code>None</code> when a package cannot be imported, so the last loop reports which optional packages are missing. Your output will differ; the point is to know what you have.</li></ol>
+<h3>Import conventions</h3>
+<ul><li><code>import pandas as pd</code>, <code>import numpy as np</code>, <code>import requests</code>, <code>import httpx</code>, <code>import sqlite3</code>, <code>import yaml</code> (the PyPI name is <code>pyyaml</code>, the import name is <code>yaml</code>), <code>from bs4 import BeautifulSoup</code> (PyPI <code>beautifulsoup4</code>), <code>from pathlib import Path</code>, <code>import openpyxl</code> or <code>from openpyxl import load_workbook</code>.</li><li>Create one logger per module with <code>logger = logging.getLogger(__name__)</code>, never <code>print</code> in library code.</li></ul>
+<h3>The mental model</h3>
+<p>Every data-access script, from ten lines to ten thousand, has the same four stages: <strong>extract</strong> (open the door), <strong>validate</strong> (check the shape), <strong>transform</strong> (clean and combine) and <strong>load</strong> (write somewhere durable). Libraries differ, the stages do not. Most bugs are stage confusion: loading before validating, or re-extracting everything when only new rows were needed.</p>
+<figure><img src="images/lib20_pipeline.png" alt="Diagram: four sources (files, database, web API, HTML pages) flow into a validate-and-clean step, then out to a DataFrame, Parquet files or a SQL database" loading="lazy"/><figcaption>Sources on the left, one validation gate in the middle, destinations on the right.</figcaption></figure>
+<p><strong>How to read it:</strong> follow the arrows left to right. All four blue sources pass through the single orange gate. That is deliberate: put your checks in one place, so bad data from any door is stopped the same way. The note under the diagram reminds you that logging and chunking apply to every arrow.</p>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Prefer the structured door. If a source offers a database, an API or a file download, use that before scraping HTML. Structured sources have types, versions and documented limits; HTML has layout that changes without notice.</div></div>
+
+<h2>20.2 Paths and files: pathlib and glob</h2>
+<p>Before any parser can run, you must find the file. <code>pathlib.Path</code> treats a path as an object with methods instead of a string you glue with <code>+</code>. It works the same on Windows (backslashes) and macOS or Linux (slashes), which is why it replaced <code>os.path</code> in modern code.</p>
+<h3>Reference: the most useful pathlib, glob and file helpers</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>Path(...)</code></td><td>Make a path object</td><td><code>Path("data") / "a.csv"</code></td></tr>
+<tr><td><code>/</code> operator</td><td>Join parts with the right separator</td><td><code>root / "raw" / "x.csv"</code></td></tr>
+<tr><td><code>.name</code>, <code>.stem</code>, <code>.suffix</code></td><td>File name, name without extension, extension with dot</td><td><code>Path("a/b.csv").stem</code> gives <code>b</code></td></tr>
+<tr><td><code>.parent</code>, <code>.parents</code></td><td>Folder containing it, all ancestors</td><td><code>p.parent.parent</code></td></tr>
+<tr><td><code>.parts</code></td><td>Tuple of path pieces</td><td><code>Path("a/b").parts</code></td></tr>
+<tr><td><code>.with_suffix(s)</code>, <code>.with_name(n)</code></td><td>Same path, new extension or file name</td><td><code>p.with_suffix(".parquet")</code></td></tr>
+<tr><td><code>.exists()</code>, <code>.is_file()</code>, <code>.is_dir()</code></td><td>Check what is there</td><td><code>if not p.is_file(): ...</code></td></tr>
+<tr><td><code>.mkdir(parents=True, exist_ok=True)</code></td><td>Create a folder and any missing parents, no error if present</td><td><code>out.mkdir(parents=True, exist_ok=True)</code></td></tr>
+<tr><td><code>.iterdir()</code></td><td>Items directly inside a folder (any order)</td><td><code>sorted(d.iterdir())</code></td></tr>
+<tr><td><code>.glob(pattern)</code></td><td>Items matching a pattern in one folder</td><td><code>d.glob("*.csv")</code></td></tr>
+<tr><td><code>.rglob(pattern)</code></td><td>Same, searching all sub-folders</td><td><code>d.rglob("*.json")</code></td></tr>
+<tr><td><code>.read_text(encoding=...)</code></td><td>Whole file as one string</td><td><code>p.read_text(encoding="utf-8")</code></td></tr>
+<tr><td><code>.write_text(s, encoding=...)</code></td><td>Write a string, replacing the file</td><td><code>p.write_text("hi", encoding="utf-8")</code></td></tr>
+<tr><td><code>.open(mode, encoding=...)</code></td><td>File handle for streaming</td><td><code>with p.open() as f: ...</code></td></tr>
+<tr><td><code>.stat()</code></td><td>Size, modified time</td><td><code>p.stat().st_size</code></td></tr>
+<tr><td><code>.replace(target)</code>, <code>.rename(target)</code></td><td>Move a file; <code>replace</code> overwrites atomically</td><td><code>tmp.replace(final)</code></td></tr>
+<tr><td><code>.relative_to(base)</code></td><td>Path seen from another folder</td><td><code>p.relative_to(root)</code></td></tr>
+<tr><td><code>glob.glob(pattern)</code>, <code>glob.iglob</code></td><td>String-based matching, list or lazy iterator</td><td><code>glob.glob("data/*_2025.csv")</code></td></tr>
+</tbody></table></div>
+<p><strong>Glob patterns:</strong> <code>*</code> matches any characters except a slash, <code>?</code> matches one character, <code>[12]</code> matches one of the listed characters, and <code>**</code> (with <code>rglob</code> or <code>recursive=True</code>) crosses folders.</p>
+<h3>Example 1: take a path apart</h3>
+<pre class="code lang-python"><code>from pathlib import Path
+
+p = Path("data") / "raw" / "sales_2025.csv"
+print(p)
+print(p.name, p.stem, p.suffix, p.parent)
+print(p.with_suffix(".parquet"))
+print(p.parts)
+print(p.is_absolute())</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>The <code>/</code> operator joins three pieces into one path, so you never type a separator.</li><li><code>print(p)</code> shows the path with forward slashes (on Windows you would see backslashes).</li><li>The three attributes split the file name: <code>sales_2025.csv</code>, its stem <code>sales_2025</code> and the suffix <code>.csv</code>. <code>.parent</code> is the folder part.</li><li><code>with_suffix</code> returns a new path; <code>p</code> itself is unchanged because paths are immutable.</li><li><code>.parts</code> is a tuple, and <code>is_absolute()</code> is <code>False</code> because the path starts relative to the current folder.</li></ol>
+<h3>Example 2: search a tree, then write safely</h3>
+<p>A nightly job that crashes half way through writing a report leaves a broken file that the next job happily reads. The fix is to write to a temporary name in the same folder and then <code>replace</code> it in one step.</p>
+<pre class="code lang-python"><code>import glob, os, tempfile
+from pathlib import Path
+
+root = Path(tempfile.mkdtemp())
+for month in ("2025-01", "2025-02"):
+    (root / "raw" / month).mkdir(parents=True, exist_ok=True)
+    for day in (1, 2):
+        (root / "raw" / month / f"orders_{day:02d}.csv").write_text("id,total\n1,9.5\n")
+(root / "raw" / "notes.txt").write_text("hello")
+
+found = sorted(p.relative_to(root).as_posix() for p in root.rglob("*.csv"))
+print(len(found), found[0])
+print([p.name for p in sorted((root / "raw").glob("*"))])
+print(sorted(os.path.basename(f) for f in glob.glob(str(root / "raw" / "*" / "orders_01.csv"))))
+
+target = root / "report.txt"
+tmp = target.with_suffix(".tmp")
+tmp.write_text("final content")
+tmp.replace(target)
+print(target.read_text(), tmp.exists())</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li><code>mkdir(parents=True, exist_ok=True)</code> builds <code>raw/2025-01</code> and its parent, and is safe to re-run. The <code>:02d</code> pads days so names sort correctly.</li><li><code>rglob("*.csv")</code> searches every sub-folder and finds 4 files; <code>sorted</code> is needed because file systems return any order; <code>relative_to</code> drops the temporary prefix.</li><li><code>glob("*")</code> lists only direct children of <code>raw</code> (two folders and a text file). <code>glob.glob</code> works on strings, hence <code>str()</code>.</li><li>The write goes to <code>report.tmp</code> first; <code>replace</code> swaps it in atomically. Readers see the old report or the new one, never half of it.</li></ol>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">Data teams name files by date (<code>orders_2025-03-01.csv</code>) and use <code>glob</code> to pick up "everything not yet processed". Sort the matches, because lexical order of ISO dates equals time order, and your pipeline becomes deterministic.</div></div>

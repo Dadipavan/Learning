@@ -1,0 +1,286 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 5: Data Quality and Testing</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#aa2d26"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Engineering &amp; Big Data</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 5</div><h1>Data Quality and Testing</h1><p>How to know, with evidence, that the data is right, fresh, complete and in the shape you expect.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-5-1-the-dimensions-of-quality-and-basic-checks">5.1 The Dimensions of Quality and Basic Checks</a></li><li><a href="#s2-5-2-data-contracts-schema-drift-and-quarantine">5.2 Data Contracts, Schema Drift and Quarantine</a></li><li><a href="#s3-5-3-testing-transformations-and-tools-of-the-trade">5.3 Testing Transformations and Tools of the Trade</a></li><li><a href="#s4-5-4-observability-slos-anomaly-detection-and-incident-reports">5.4 Observability: SLOs, Anomaly Detection and Incident Reports</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>A dashboard that is fast and wrong is worse than no dashboard, because people make decisions from it. The classic story: revenue drops 40% on Monday morning, the CFO panics, and three hours later someone finds that an upstream job ran empty over the weekend. Nobody tested the data. In this chapter you will learn the dimensions of data quality, how to write checks (uniqueness, nulls, ranges, allowed values, freshness, volume, schema), how to write a data contract, how to separate "stop the pipeline" from "warn and continue", how to unit-test transformations, and how tools such as Great Expectations, pandera, Soda and dbt tests express the same ideas. You will write and run real checks and see them fail on purpose.</p>
+<p>Remember the ShopKart <code>orders</code> table from Chapter 4. We use it again here.</p>
+<h2 id="s1-5-1-the-dimensions-of-quality-and-basic-checks">5.1 The Dimensions of Quality and Basic Checks</h2>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Data quality describes how well data fits its use. Its main dimensions are completeness, accuracy, validity, uniqueness, consistency and freshness, and basic checks test for them, such as null counts and duplicate keys.</div></div>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A restaurant kitchen has inspections: is the food fresh (freshness), is the order complete (completeness), did we cook the dish that was asked (accuracy), is the same dish not served twice (uniqueness), does the plate look as the menu says (validity/schema). Data quality checks are the kitchen's inspections, done automatically before the food goes out.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Dimension</th><th>Question it asks</th><th>Example check</th></tr></thead><tbody><tr><td>Completeness</td><td>Is anything missing?</td><td><code>customer_id</code> not null; row count near normal</td></tr><tr><td>Uniqueness</td><td>Are there duplicates?</td><td><code>order_id</code> unique</td></tr><tr><td>Validity</td><td>Do values follow the rules?</td><td><code>amount &gt;= 0</code>; <code>status</code> in an allowed list</td></tr><tr><td>Consistency</td><td>Do tables agree?</td><td>order totals equal the sum of order lines</td></tr><tr><td>Accuracy</td><td>Does it match reality?</td><td>revenue equals finance's number (needs an external reference)</td></tr><tr><td>Timeliness / freshness</td><td>Is it recent enough?</td><td>newest row is under 24 hours old</td></tr><tr><td>Schema</td><td>Are names and types as expected?</td><td>no missing or new columns</td></tr></tbody></table></div>
+<p>A <strong>check</strong> (or test, or expectation) is a query or function that returns pass or fail. A <strong>severity</strong> says what to do on failure: <strong>error</strong> stops the pipeline (do not publish bad data) and <strong>warn</strong> only alerts.</p>
+<h3>Predict, Run, Explain: seven checks on a small table</h3>
+<p>The table has five rows, and we hid a few problems in it. Before you run it: which checks do you think will fail? How many bad rows will each report?</p>
+<pre class="code lang-python"><code>import sqlite3, datetime
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE orders(order_id TEXT, customer_id TEXT, amount REAL, status TEXT, created_at TEXT);
+INSERT INTO orders VALUES
+('O1','C1',250.0,'PAID','2024-06-01T10:00:00'),
+('O2','C2',-5.0,'PAID','2024-06-01T11:00:00'),
+('O2','C2',80.0,'PAID','2024-06-01T11:05:00'),
+('O3',NULL,120.0,'SHIPPED','2024-06-01T12:00:00'),
+('O4','C9',99.0,'UNKNOWN','2024-05-20T12:00:00');
+""")
+def check(name, sql):
+    bad = db.execute(sql).fetchone()[0]
+    print(f"{'PASS' if bad == 0 else 'FAIL'}  {name:28s} bad_rows={bad}")
+    return bad == 0
+results = [
+ check("unique order_id",        "SELECT COUNT(*)-COUNT(DISTINCT order_id) FROM orders"),
+ check("customer_id not null",   "SELECT COUNT(*) FROM orders WHERE customer_id IS NULL"),
+ check("amount &gt;= 0",            "SELECT COUNT(*) FROM orders WHERE amount&lt;0"),
+ check("status in allowed set",  "SELECT COUNT(*) FROM orders WHERE status NOT IN ('PAID','SHIPPED','REFUNDED')"),
+]
+now = datetime.datetime(2024, 6, 2, 9, 0, 0)
+newest = datetime.datetime.fromisoformat(db.execute("SELECT MAX(created_at) FROM orders").fetchone()[0])
+age = (now - newest).total_seconds() / 3600
+print(f"{'PASS' if age &lt; 24 else 'FAIL'}  freshness (&lt;24h)             age_hours={age:.1f}")
+history = [1000, 980, 1020, 1010, 990]; today = 612
+avg = sum(history) / len(history); ratio = today / avg
+print(f"{'PASS' if 0.7 &lt;= ratio &lt;= 1.3 else 'FAIL'}  volume within 70-130% of avg  ratio={ratio:.2f}")
+expected = {"order_id":"TEXT","customer_id":"TEXT","amount":"REAL","status":"TEXT","created_at":"TEXT"}
+actual = {r[1]: r[2] for r in db.execute("PRAGMA table_info(orders)")}
+print("PASS  schema matches" if actual == expected else f"FAIL  schema diff {set(expected.items()) ^ set(actual.items())}")
+print("overall:", "OK" if all(results) else "BLOCK the pipeline (fail loudly)")</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>FAIL  unique order_id              bad_rows=1
+FAIL  customer_id not null         bad_rows=1
+FAIL  amount &gt;= 0                  bad_rows=1
+FAIL  status in allowed set        bad_rows=1
+PASS  freshness (&lt;24h)             age_hours=21.0
+FAIL  volume within 70-130% of avg  ratio=0.61
+PASS  schema matches
+overall: BLOCK the pipeline (fail loudly)</code></pre>
+<p><strong>Explain, check by check.</strong></p>
+<ul><li><em>Unique:</em> 5 rows but 4 distinct <code>order_id</code> values (O2 twice), so <code>5 − 4 = 1</code> duplicate.</li><li><em>Not null:</em> O3 has no customer: 1 row.</li><li><em>Range:</em> O2's first row has amount −5: 1 row.</li><li><em>Allowed set:</em> O4 has status <code>UNKNOWN</code>: 1 row.</li><li><em>Freshness:</em> the newest row is <code>2024-06-01T12:00:00</code> and "now" is <code>2024-06-02T09:00:00</code>. The difference is 21 hours, under the 24-hour limit: PASS. (We fixed "now" so that the output is repeatable.)</li><li><em>Volume:</em> the average of the last five days is (1000 + 980 + 1020 + 1010 + 990) / 5 = 1000. Today has 612, a ratio of 0.612, below the 0.7 floor: FAIL. This is the "empty weekend" bug caught.</li><li><em>Schema:</em> the table has exactly the expected columns and types.</li><li><strong>Check:</strong> 5 of 7 checks failed; the final <code>all(results)</code> covers only the four SQL checks (all FAIL), so the pipeline is blocked.</li><li><em>Interpretation:</em> a single dirty table can fail many checks. Checks are cheap (one query each) compared with a wrong decision.</li></ul>
+<p>Note that SQLite is loose about types; in a real warehouse the schema check compares the information schema.</p>
+<div class="callout cream"><div class="lab">KEY INSIGHT</div><div class="txt">Freshness and volume checks catch the failures that no row-level rule can: the data that never arrived. A table with zero rows passes every "no bad rows" test.</div></div>
+<p class="problem"><span class="pl">Problem 5.1.1</span> A table normally receives about 50,000 rows a day, with a daily standard deviation of 2,000. Today it received 41,000. Is that an anomaly under a "mean ± 3 standard deviations" rule?</p>
+<table class="steps"><tr><th>Formula</th><td>z = (x − mean) / standard deviation</td></tr><tr><th>Plug in</th><td>(41,000 − 50,000) / 2,000</td></tr><tr><th>Compute</th><td>−9,000 / 2,000 = −4.5</td></tr><tr><th>Answer</th><td>z = −4.5, beyond ±3, so flag it. (Under a normal assumption, about 0.3% of days fall outside ±3.)</td></tr><tr><th>Check</th><td>The 3-sigma band is 50,000 ± 6,000 = 44,000 to 56,000; 41,000 is outside it.</td></tr><tr><th>Why it matters</th><td>A fixed "at least 1,000 rows" check would pass; a statistical band catches a drop of 18%. (See the learner's Math PDF on standard deviation.)</td></tr></table>
+<p class="problem"><span class="pl">Problem 5.1.2</span> Build a row-count reconciliation: source has 1,204,500 rows, bronze 1,204,500, silver 1,199,100, gold has 1,199,100. Where were 5,400 rows lost, is it acceptable, and what do you do?</p>
+<table class="steps"><tr><th>Step 1</th><td>Compare neighbours: source to bronze: 0 lost. Bronze to silver: 1,204,500 − 1,199,100 = 5,400 lost. Silver to gold: 0 lost.</td></tr><tr><th>Step 2</th><td>The silver step removes duplicates and bad rows. Percentage: 5,400 / 1,204,500 = 0.448%.</td></tr><tr><th>Answer</th><td>Silver dropped 5,400 rows (0.45%). Acceptable only if the dropped rows are accounted for: duplicates plus quarantined rows must add up to 5,400. Write them to a quarantine table and assert <code>silver + quarantine + duplicates = bronze</code>.</td></tr><tr><th>Check</th><td>If duplicates are 5,000 and quarantined bad rows are 400, then 1,199,100 + 5,000 + 400 = 1,204,500. </td></tr><tr><th>Why it matters</th><td>"Rows removed silently" is a quality bug; "rows removed and explained" is a feature.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>You will add checks at every layer: raw (freshness, volume, schema), silver (uniqueness, not null, valid values), gold (reconciliation with finance, business rules).</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> gates in the pipeline before publish.</li><li><strong>Data Analytics:</strong> trust in dashboards; "data last updated" badges.</li><li><strong>Machine Learning:</strong> drift checks on training and serving data; a silent null spike can wreck a model.</li><li><strong>Operations:</strong> verifying that measurement results loaded completely (every record counted).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Writing only "no bad rows" tests. A job that loads zero rows passes. Always add volume and freshness checks.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which dimension does "newest row under 24 hours old" test? Answer: freshness (timeliness).</li><li>Why does an empty table pass a not-null test? Answer: there are no rows that violate it, so you need a volume check.</li><li>What should an error-severity failure do? Answer: stop the pipeline before publishing.</li></ol>
+<h2 id="s2-5-2-data-contracts-schema-drift-and-quarantine">5.2 Data Contracts, Schema Drift and Quarantine</h2>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">A data contract is an agreement on the schema, meaning and delivery of data between producer and consumer. Schema drift is an unplanned change in structure, and quarantine means setting aside bad records for review instead of loading them.</div></div>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A contract between a restaurant and its supplier says: tomatoes, grade A, delivered by 7 a.m., invoice in rupees. If the supplier sends potatoes, you refuse the delivery instead of cooking with them. A <strong>data contract</strong> is the same agreement between the team that produces data and the teams that consume it.</div></div>
+<p>A data contract states: the <strong>schema</strong> (fields, types, nullability), <strong>semantics</strong> (what <code>amount_paise</code> means, its unit), <strong>quality rules</strong>, <strong>freshness and volume expectations (SLAs)</strong>, an <strong>owner</strong>, and how <strong>changes</strong> are announced. It is checked automatically when data is produced or ingested.</p>
+<p><strong>Schema drift</strong> is when the source changes shape without telling you: a column is added, a type changes, a field disappears. <strong>Schema evolution</strong> is the planned, compatible way to change. Safe changes: add a nullable column. Breaking changes: rename, remove, change a type, change a unit (rupees to paise).</p>
+<h3>Predict, Run, Explain: a contract validator with a quarantine</h3>
+<p>Before you run it: five records arrive. Which fail and for what reasons? With a 95% pass-rate rule, what happens to the load?</p>
+<pre class="code lang-python"><code>CONTRACT = {"order_id": {"type": str, "required": True},
+            "amount_paise": {"type": int, "required": True, "min": 0},
+            "status": {"type": str, "required": True, "allowed": {"PAID", "SHIPPED", "REFUNDED"}},
+            "coupon": {"type": str, "required": False}}
+def validate(rec):
+    errs = []
+    for f, rule in CONTRACT.items():
+        if f not in rec or rec[f] is None:
+            if rule["required"]: errs.append(f"{f}: missing")
+            continue
+        v = rec[f]
+        if not isinstance(v, rule["type"]): errs.append(f"{f}: expected {rule['type'].__name__}, got {type(v).__name__}")
+        elif "min" in rule and v &lt; rule["min"]: errs.append(f"{f}: {v} &lt; {rule['min']}")
+        elif "allowed" in rule and v not in rule["allowed"]: errs.append(f"{f}: {v!r} not allowed")
+    extra = set(rec) - set(CONTRACT)
+    if extra: errs.append(f"unexpected fields (schema drift): {sorted(extra)}")
+    return errs
+batch = [{"order_id": "O1", "amount_paise": 25000, "status": "PAID"},
+         {"order_id": "O2", "amount_paise": "1,250.50", "status": "PAID"},
+         {"order_id": "O3", "amount_paise": -5, "status": "LOST"},
+         {"order_id": "O4", "amount_paise": 900, "status": "SHIPPED", "gift_wrap": True},
+         {"amount_paise": 100, "status": "PAID"}]
+ok = 0
+for r in batch:
+    e = validate(r); ok += not e
+    print("OK  " if not e else "FAIL", r.get("order_id", "&lt;none&gt;"), e)
+print(f"valid {ok}/{len(batch)} = {ok/len(batch):.0%}; threshold 95% -&gt; {'PASS' if ok/len(batch) &gt;= 0.95 else 'FAIL the load'}")</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>OK   O1 []
+FAIL O2 ['amount_paise: expected int, got str']
+FAIL O3 ['amount_paise: -5 &lt; 0', "status: 'LOST' not allowed"]
+FAIL O4 ["unexpected fields (schema drift): ['gift_wrap']"]
+FAIL &lt;none&gt; ['order_id: missing']
+valid 1/5 = 20%; threshold 95% -&gt; FAIL the load</code></pre>
+<p><strong>Explain.</strong></p>
+<ul><li>O2: the partner sent <code>"1,250.50"</code> as text, a type break (also a unit change from paise to rupees; this one change is hard to see in data, which is why a contract documents units).</li><li>O3 has two errors at once; the validator lists all, which helps debugging.</li><li>O4 is valid for the known fields but has a new field <code>gift_wrap</code>: drift. Many teams treat unknown fields as a <em>warning</em> and keep the rest, but must tell the producer.</li><li>The last record has no <code>order_id</code>.</li><li>1 of 5 passes: 20%. <strong>Check:</strong> 1 / 5 = 0.20. <em>Interpretation:</em> with a threshold, a few bad rows go to quarantine and the job continues, but 80% bad (or a sudden jump from the usual 0.1%) means something upstream broke, so stop and page a human.</li></ul>
+<p><strong>Quarantine pattern (dead-letter table):</strong> write failing records, with the reasons and the run id, to a <code>quarantine_orders</code> table. Continue with the good rows. A person (or a later job) fixes the rule or the data, and the rows are replayed. This is the batch version of a dead-letter queue.</p>
+<p>Schema registries (Chapter 11) enforce contracts for Kafka producers. For tables, dbt supports model contracts (<code>contract: enforced: true</code>), and tools such as Soda and Great Expectations compare against declared schemas.</p>
+<p class="problem"><span class="pl">Problem 5.2.1</span> Classify each source change as safe or breaking: (a) a new nullable column <code>coupon</code>; (b) <code>amount</code> changes from rupees to paise; (c) <code>status</code> gets a new allowed value <code>PARTIAL</code>; (d) column <code>cust_id</code> renamed to <code>customer_id</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td>(a) Old readers ignore it: safe.</td></tr><tr><th>Step 2</th><td>(b) The name and type are the same, but the numbers are 100 times larger: breaking (a silent semantic break).</td></tr><tr><th>Step 3</th><td>(c) Readers with strict allowed lists will fail: breaking for them; announce it.</td></tr><tr><th>Step 4</th><td>(d) Old queries fail with "column not found": breaking.</td></tr><tr><th>Answer</th><td>(a) safe; (b), (c), (d) breaking.</td></tr><tr><th>Check</th><td>A change is safe only if every existing reader keeps working and keeps the same meaning.</td></tr><tr><th>Why it matters</th><td>(b) is the dangerous one: nothing crashes, the revenue just becomes 100 times larger.</td></tr></table>
+<p class="problem"><span class="pl">Problem 5.2.2</span> A batch of 2,000 records has 3 invalid. The rule: quarantine if under 1% invalid, fail the load otherwise. What happens?</p>
+<table class="steps"><tr><th>Formula</th><td>invalid rate = invalid / total</td></tr><tr><th>Plug in</th><td>3 / 2,000</td></tr><tr><th>Compute</th><td>0.0015 = 0.15%</td></tr><tr><th>Answer</th><td>0.15% is under 1%: quarantine the 3 records and load the other 1,997.</td></tr><tr><th>Check</th><td>1,997 + 3 = 2,000: no record is lost or hidden.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Contracts reduce the "upstream broke us" incidents. When you join a team, ask: "Is there a schema, who owns it, and who is told when it changes?"</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> schema checks on ingest; quarantine tables.</li><li><strong>Data Science:</strong> documented units and null meanings prevent wrong analyses.</li><li><strong>MLOps:</strong> feature contracts between the feature pipeline and the model server.</li><li><strong>API teams:</strong> OpenAPI and JSON Schema are contracts for services.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Treating quality as the data team's problem alone. If the producer is not part of the contract, you will chase the same breakage forever.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Give one safe and one breaking schema change. Answer: safe: add a nullable column; breaking: rename a column or change a unit.</li><li>What is a quarantine table for? Answer: to keep failing records and reasons so the job can continue and the rows can be fixed and replayed.</li><li>Why list all errors per record? Answer: so you fix them in one go.</li></ol>
+<h2 id="s3-5-3-testing-transformations-and-tools-of-the-trade">5.3 Testing Transformations and Tools of the Trade</h2>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Testing transformations means checking that data code gives correct results. Data tests check the data itself, such as not-null and unique rules, and unit tests check the code with small known inputs. Tools such as dbt tests and Great Expectations run these checks.</div></div>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A <strong>data test</strong> checks the data that arrived today (like checking each delivery). A <strong>unit test</strong> checks the code with a tiny, known input and a known expected output (like testing a recipe with one egg). You need both: the recipe may be right while the eggs are rotten, or the other way around.</div></div>
+<h3>Unit tests for transformation code</h3>
+<p>Keep transformation logic in small functions that take data and return data, with no hidden reads of "now" or of a database. Then tests are simple. Here is a function that converts paise to rupees and a splitter that separates good rows from rows to quarantine, with five tests using Python's built-in <code>unittest</code> (we use it here because <code>pytest</code> is not installed in this sandbox; <code>pytest</code> is the more common choice in real projects and the test bodies would be plain <code>assert</code> statements).</p>
+<pre class="code lang-python"><code>import unittest
+def clean_amount(raw):
+    """paise string -&gt; rupees float, or None if invalid"""
+    try: v = int(raw)
+    except (TypeError, ValueError): return None
+    return None if v &lt; 0 else v / 100
+def split_valid(rows):
+    good, bad = [], []
+    for r in rows:
+        a = clean_amount(r.get("amount_paise"))
+        (bad if a is None or not r.get("order_id") else good).append(
+            {**r, "amount": a} if a is not None else {**r, "reason": "bad amount or id"})
+    return good, bad
+class T(unittest.TestCase):
+    def test_ok(self): self.assertEqual(clean_amount("25050"), 250.5)
+    def test_negative(self): self.assertIsNone(clean_amount("-5"))
+    def test_text(self): self.assertIsNone(clean_amount("abc"))
+    def test_none(self): self.assertIsNone(clean_amount(None))
+    def test_split(self):
+        g, b = split_valid([{"order_id": "1", "amount_paise": "100"}, {"order_id": "2", "amount_paise": "x"},
+                            {"order_id": "", "amount_paise": "5"}])
+        self.assertEqual((len(g), len(b)), (1, 2))
+if __name__ == "__main__": unittest.main(verbosity=2)</code></pre>
+<p>Before you run it: do you expect all five to pass?</p>
+<pre class="code lang-text"><code>test_negative (__main__.T.test_negative) ... ok
+test_none (__main__.T.test_none) ... ok
+test_ok (__main__.T.test_ok) ... ok
+test_split (__main__.T.test_split) ... ok
+test_text (__main__.T.test_text) ... ok
+
+----------------------------------------------------------------------
+Ran 5 tests in 0.000s
+
+OK</code></pre>
+<p><strong>Explain.</strong> <code>25050</code> paise is 250.50 rupees (25050 / 100). Negative and non-numeric inputs return <code>None</code>, and <code>None</code> itself (a missing field) also returns <code>None</code> because <code>int(None)</code> raises <code>TypeError</code>, which we catch. In <code>test_split</code>, the first row is good, the second has amount "x" (bad), the third has an empty <code>order_id</code> (bad): 1 good, 2 bad. <strong>Check:</strong> 1 + 2 = 3 rows in, 3 rows out. <em>Interpretation:</em> tests also document the rules. When someone changes <code>clean_amount</code>, a failing test tells them which rule they broke. Note the test order is alphabetical, not the order written.</p>
+<p>Small but important test habits for pipelines:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Test type</th><th>What it protects</th><th>Example</th></tr></thead><tbody><tr><td>Unit test</td><td>transformation logic</td><td><code>clean_amount</code> cases, edge cases (null, empty, zero, huge)</td></tr><tr><td>Data test</td><td>today's data</td><td>unique, not null, accepted values</td></tr><tr><td>Integration test</td><td>the pipeline end to end on a small sample</td><td>run on 100 rows in a test schema, compare to expected</td></tr><tr><td>Reconciliation</td><td>source versus target</td><td>counts and sums match</td></tr><tr><td>Regression test</td><td>no change in outputs unless intended</td><td>compare gold tables before and after a code change</td></tr></tbody></table></div>
+<h3>The tools, in one table</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Tool</th><th>Style</th><th>How you define checks</th><th>Notes</th></tr></thead><tbody><tr><td>pandera</td><td>Python, DataFrame schemas</td><td><code>DataFrameSchema</code> with <code>Column(...)</code> and <code>Check</code></td><td>good for pandas and Polars pipelines</td></tr><tr><td>Great Expectations (GX)</td><td>Python, expectation suites</td><td><code>expect_column_values_to_not_be_null</code> and friends, checkpoints, data docs</td><td>rich, heavier setup</td></tr><tr><td>Soda</td><td>YAML (SodaCL)</td><td><code>checks for orders: - missing_count(customer_id) = 0</code></td><td>simple, good for warehouses</td></tr><tr><td>dbt tests</td><td>SQL / YAML in the dbt project</td><td><code>unique</code>, <code>not_null</code>, <code>accepted_values</code>, <code>relationships</code>, custom SQL tests</td><td>most used in warehouse ELT (Chapter 7)</td></tr><tr><td>Data observability (Monte Carlo and similar)</td><td>automated monitors on freshness, volume, schema, distribution, lineage</td><td>machine-learned thresholds, alerts</td><td>a product category; know the five pillars: freshness, volume, schema, distribution, lineage</td></tr></tbody></table></div>
+<p>Examples (<strong>not run here</strong>; none of these libraries is installed in this sandbox, but the shapes are standard):</p>
+<pre class="code lang-python"><code># pandera (concept)
+import pandera as pa
+schema = pa.DataFrameSchema({
+    "order_id": pa.Column(str, unique=True),
+    "amount":   pa.Column(float, pa.Check.ge(0)),
+    "status":   pa.Column(str, pa.Check.isin(["PAID", "SHIPPED", "REFUNDED"])),
+})
+validated = schema.validate(df)        # raises SchemaError listing failures</code></pre>
+<pre class="code lang-yaml"><code># dbt schema.yml (concept)
+models:
+  - name: orders
+    columns:
+      - name: order_id
+        tests: [unique, not_null]
+      - name: status
+        tests:
+          - accepted_values: {values: ['PAID','SHIPPED','REFUNDED']}</code></pre>
+<pre class="code lang-yaml"><code># Soda (concept)
+checks for orders:
+  - row_count &gt; 0
+  - duplicate_count(order_id) = 0
+  - freshness(created_at) &lt; 1d</code></pre>
+<p><strong>Alerting without noise.</strong> A check that fires every day is ignored. Rules: give each check an owner; set severity (error versus warn); alert on <em>trends</em> or thresholds, not on one row; send to a channel with a link to the runbook ("what to do when this fails"); review noisy checks monthly.</p>
+<p class="problem"><span class="pl">Problem 5.3.1</span> You test <code>clean_amount</code> with these inputs: "100", "0", "-1", "", "1e3", " 50 ". What does each return? (Run it, or reason from <code>int()</code>.)</p>
+<table class="steps"><tr><th>Step 1</th><td><code>int("100")</code> = 100 gives 1.0. <code>int("0")</code> = 0 gives 0.0.</td></tr><tr><th>Step 2</th><td><code>int("-1")</code> = −1 is negative, so <code>None</code>. <code>int("")</code> raises <code>ValueError</code>, so <code>None</code>.</td></tr><tr><th>Step 3</th><td><code>int("1e3")</code> raises <code>ValueError</code> (scientific notation is not an integer string), so <code>None</code>. <code>int(" 50 ")</code> = 50 because <code>int</code> strips spaces, giving 0.5.</td></tr><tr><th>Answer</th><td>1.0, 0.0, None, None, None, 0.5.</td></tr><tr><th>Check</th><td>Verified by running <code>clean_amount</code> on those strings in a Python session: the rules above are the documented behaviour of <code>int()</code> on strings.</td></tr><tr><th>Why it matters</th><td>Edge cases (zero, empty, spaces, scientific notation) are exactly what real feeds contain.</td></tr></table>
+<p class="problem"><span class="pl">Problem 5.3.2</span> Write a reconciliation rule for money: "the sum of <code>amount</code> in gold must equal the sum in silver within 0.01 rupees". The silver sum is 12,345,678.90 and the gold sum is 12,345,678.88. Pass or fail?</p>
+<table class="steps"><tr><th>Formula</th><td>|gold − silver| ≤ tolerance</td></tr><tr><th>Plug in</th><td>|12,345,678.88 − 12,345,678.90| ≤ 0.01</td></tr><tr><th>Compute</th><td>0.02 ≤ 0.01 is false</td></tr><tr><th>Answer</th><td>Fail: a difference of 0.02 rupees exceeds the tolerance. Floating-point rounding could cause tiny differences; this is why money should be stored as integers (paise) or decimals, and the tolerance should be explicit.</td></tr><tr><th>Check</th><td>12,345,678.90 − 12,345,678.88 = 0.02.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>In reviews, the question is "where are the tests for this model?" A new dbt model without <code>unique</code> and <code>not_null</code> on its key will not pass a decent code review. CI (Chapter 12) runs the unit tests and the data tests on every pull request.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> CI-run unit tests, per-run data tests, reconciliation jobs.</li><li><strong>Data Analytics:</strong> "accepted values" and relationship tests behind the dashboard.</li><li><strong>Machine Learning:</strong> data validation before training (schema and distribution), pandera or GX in feature pipelines.</li><li><strong>MLOps:</strong> monitors for drift and freshness of features in production.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Testing only on perfect sample data. Build tests from past incidents: every production bug becomes a new test case.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Unit test versus data test? Answer: a unit test checks code on a known input; a data test checks the real data that arrived.</li><li>Name two dbt generic tests. Answer: <code>unique</code>, <code>not_null</code> (also <code>accepted_values</code>, <code>relationships</code>).</li><li>Why store money as integers? Answer: floating-point rounding makes sums differ by tiny amounts.</li></ol>
+<h2 id="s4-5-4-observability-slos-anomaly-detection-and-incident-reports">5.4 Observability: SLOs, Anomaly Detection and Incident Reports</h2>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Observability means monitoring data systems to understand their health. A service level objective (SLO) is a target such as freshness within one hour, anomaly detection finds unusual values, and an incident report records what failed and how it was fixed.</div></div>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Tests are the checklist a pilot runs before take-off: known risks, written in advance. <strong>Observability</strong> is the cockpit instruments that run all the time: speed, height, fuel. You will not have written a rule for every way a flight can go wrong, but a needle moving the wrong way gets noticed. For data, the needles are freshness, volume, schema and distribution, each compared with what is normal for <em>this</em> table.</div></div>
+<figure><img src="images/de_check_pipeline.png" alt="A pipeline diagram: raw files pass a contract check and row checks to silver, bad rows go to a quarantine table, a high bad rate stops the run" loading="lazy"/><figcaption>Checks as gates in one pipeline: good rows continue, bad rows are kept with a reason in a quarantine table, and a large failure rate stops the run.</figcaption></figure>
+<p>How to read it: follow the top row left to right, the path of a good record. Each blue box is a gate (Sections 5.1 and 5.2). An orange arrow down is a record or batch that failed a gate; it lands in quarantine with its reason. The red box says what happens when too much goes to quarantine: stop and call a person, as in Problem 5.2.2. The purple gate at the right is the freshness and volume check, the one that catches data that never arrived.</p>
+<h3>Service level objectives (SLOs) for data</h3>
+<p>A <strong>service level indicator (SLI)</strong> is a number you measure, such as "the orders table was ready by 07:00". A <strong>service level objective (SLO)</strong> is the target for that number over a period, such as "ready on time on at least 95% of days in 30 days". An <strong>error budget</strong> is what the SLO lets you miss: 5% of 30 days is 1.5 days, so one miss is within budget and a second miss spends more than the budget. Budgets turn "the pipeline should be reliable" into a number the team and its consumers can agree on.</p>
+<p class="problem"><span class="pl">Problem 5.4.1</span> The SLO for <code>daily_orders</code> is "ready by 07:00 on at least 95% of days over a rolling 30 days". In the last 30 days it missed 2 days. Is the SLO met, and how many more misses can you afford?</p>
+<table class="steps"><tr><th>Formula</th><td>attainment = on-time days / total days</td></tr><tr><th>Plug in</th><td>(30 − 2) / 30 = 28 / 30</td></tr><tr><th>Compute</th><td>0.9333, or 93.3%</td></tr><tr><th>Answer</th><td>93.3% is below 95%, so the SLO is not met. The budget was 5% × 30 = 1.5 days, so with whole days you may miss 1 and you have missed 2. You can afford 0 more now; as old misses leave the 30-day window the budget returns.</td></tr><tr><th>Check</th><td>29 on-time days would give 29 / 30 = 96.7%, which meets it; 28 does not.</td></tr><tr><th>Why it matters</th><td>When the budget is spent, the team prioritises reliability work (fix the flaky source) over new features, by agreement made in advance.</td></tr></table>
+<p class="problem"><span class="pl">Problem 5.4.2</span> A streaming table promises 99.9% availability over 30 days. How many minutes of downtime fit in the budget?</p>
+<table class="steps"><tr><th>Setup</th><td>30 days × 24 hours × 60 minutes = 43,200 minutes.</td></tr><tr><th>Budget</th><td>0.1% of 43,200 = 0.001 × 43,200 = 43.2 minutes.</td></tr><tr><th>Answer</th><td>43.2 minutes per 30 days.</td></tr><tr><th>Check</th><td>For 99%: 432 minutes (7.2 hours); each extra nine divides the budget by ten.</td></tr></table>
+<h3>Worked example: anomaly detection that respects the weekly rhythm</h3>
+<p>A shop has about 1,000 orders on a weekday and about 400 on a weekend day. A plain z-score that mixes all days sees a huge spread (standard deviation near 280), so a real drop of 30% on a Monday looks harmless. The fix is a <strong>seasonal baseline</strong>: compare Monday with previous Mondays. Before you run it: will the plain rule flag a Monday with 700 orders? Will the seasonal rule?</p>
+<pre class="code lang-python"><code>import numpy as np
+rng = np.random.default_rng(5)
+pattern = [1000, 1000, 1000, 1000, 1000, 400, 400]            # Mon..Sun
+history = [int(round(pattern[d % 7] + rng.normal(0, 30))) for d in range(28)]   # 4 weeks, starts on Monday
+today = 700                                                    # a Monday (day 28)
+
+h = np.array(history)
+z_plain = (today - h.mean()) / h.std(ddof=1)
+same_weekday = h[0::7]                                         # the four earlier Mondays
+z_seasonal = (today - same_weekday.mean()) / same_weekday.std(ddof=1)
+print("history mean %.1f  sd %.1f" % (h.mean(), h.std(ddof=1)))
+print("earlier Mondays:", same_weekday.tolist())
+print("plain z    = %.2f -&gt; %s" % (z_plain, "FLAG" if abs(z_plain) &gt; 3 else "ok"))
+print("seasonal z = %.2f -&gt; %s" % (z_seasonal, "FLAG" if abs(z_seasonal) &gt; 3 else "ok"))</code></pre>
+<pre class="code lang-text"><code>history mean 822.8  sd 280.7
+earlier Mondays: [976, 976, 1006, 1017]
+plain z    = -0.44 -&gt; ok
+seasonal z = -14.00 -&gt; FLAG</code></pre>
+<p><strong>Explain.</strong> The plain rule divides by a standard deviation that is mostly the weekday/weekend gap, not noise, so a 30% drop is less than half a standard deviation from the mean (z about −0.4) and passes. The four earlier Mondays are tightly clustered near 1,000, so 700 is many standard deviations away and is flagged. The lesson: build the baseline from comparable periods (same weekday, same hour, same season), and watch for holidays and promotions, which are expected anomalies that you can add to a calendar.</p>
+<h3>Worked example: one old incident should not blind the monitor</h3>
+<p>If last week's outage (a day with 100 orders) is still in the history, it inflates the standard deviation and hides today's problem. The <strong>median</strong> (the middle value) and the <strong>median absolute deviation (MAD)</strong>, the median of the distances from the median, ignore a few extreme values. The <strong>modified z-score</strong> is 0.6745 × (x − median) / MAD; flagging beyond 3.5 is a common convention.</p>
+<pre class="code lang-python"><code>import numpy as np
+history = np.array([1000, 980, 1020, 1010, 990, 100, 1005, 995, 1015, 985])   # day 6 was an outage
+today = 700
+mean, sd = history.mean(), history.std(ddof=1)
+z = (today - mean) / sd
+median = np.median(history)
+mad = np.median(np.abs(history - median))
+mz = 0.6745 * (today - median) / mad
+print("mean %.1f  sd %.1f  median %.1f  MAD %.1f" % (mean, sd, median, mad))
+print("plain z    = %.2f -&gt; %s" % (z, "FLAG" if abs(z) &gt; 3 else "ok"))
+print("modified z = %.2f -&gt; %s" % (mz, "FLAG" if abs(mz) &gt; 3.5 else "ok"))</code></pre>
+<pre class="code lang-text"><code>mean 910.0  sd 284.9  median 997.5  MAD 12.5
+plain z    = -0.74 -&gt; ok
+modified z = -16.05 -&gt; FLAG</code></pre>
+<p><strong>Explain, by hand.</strong> Sorted history: 100, 980, 985, 990, 995, 1000, 1005, 1010, 1015, 1020. The median is the average of the 5th and 6th values, (995 + 1000) / 2 = 997.5. The distances from the median are 897.5, 17.5, 12.5, 7.5, 2.5, 2.5, 7.5, 12.5, 17.5, 22.5, and their sorted middle two are 12.5 and 12.5, so MAD = 12.5. Then 0.6745 × (700 − 997.5) / 12.5 = 0.6745 × (−23.8) = −16.05. The single outage day pulled the plain standard deviation up to about 285 and the mean down to 910, so the plain z is only about −0.7 (far below 3 in size) and the rule stays silent.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using a mean and standard deviation from a window that contains earlier incidents, holidays or a different weekly pattern. The monitor learns that bad is normal. Use a seasonal baseline, a robust statistic (median and MAD), or both, and exclude days that have been marked as incidents.</div></div>
+<h3>An incident write-up that people actually read</h3>
+<p>A <strong>post-incident review</strong> (postmortem) records what happened so the same failure does not return. It blames the system, not a person. Use the same headings every time.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Heading</th><th>What to write</th><th>Example (revenue dropped 40% on Monday)</th></tr></thead><tbody><tr><td>Summary</td><td>One or two sentences, with impact</td><td>The revenue dashboard showed 40% too little from Sat 00:00 to Mon 10:30; the CFO saw it at 09:15.</td></tr><tr><td>Timeline</td><td>Times in one time zone</td><td>Sat 02:00 export job produced 0 rows; Mon 09:15 report seen; Mon 10:30 fixed and reloaded.</td></tr><tr><td>Root cause</td><td>The deepest cause you can prove</td><td>The upstream export filtered on a renamed column and wrote an empty file; our load accepted empty files.</td></tr><tr><td>Detection</td><td>How we found out, and how we should have</td><td>A human found it. A volume check (ratio under 0.7) would have alerted on Saturday.</td></tr><tr><td>Fix and follow-up</td><td>Owner and due date for each action</td><td>Add the volume and freshness check (owner: A, 3 days); add a contract field for row counts (owner: B, 2 weeks).</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 5.4.3</span> A table has a freshness SLO of 60 minutes (the newest row must be at most 60 minutes old). Checks run every 10 minutes. The load stalls at 03:07. When is the alert guaranteed to fire at the latest, and how old is the data then?</p>
+<table class="steps"><tr><th>Setup</th><td>The newest row at the stall is from about 03:07. It becomes older than 60 minutes after 04:07.</td></tr><tr><th>Checks</th><td>Checks run at 03:10, 03:20, ... , 04:10. The first check after 04:07 is 04:10.</td></tr><tr><th>Answer</th><td>The alert fires at 04:10 at the latest, when the newest row is about 63 minutes old. Detection delay is up to one check interval (10 minutes) on top of the 60 minutes the SLO allows.</td></tr><tr><th>Check</th><td>Checking every minute would cut the delay to at most 1 minute but costs more queries. Pick the interval from how fast consumers react.</td></tr></table>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Observability answers three questions fast: <strong>is something wrong</strong> (monitors on freshness, volume, schema, distribution), <strong>where</strong> (lineage: which upstream table changed first) and <strong>who is told</strong> (an owner and a runbook). Tests catch what you predicted; monitors catch what you did not.</div></div>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>Quality has dimensions: completeness, uniqueness, validity, consistency, accuracy, freshness, schema.</li><li>Always pair row-level checks with freshness and volume checks, because missing data passes row-level tests.</li><li>Use statistical bands (mean ± 3σ) for volume, not a fixed minimum.</li><li>Reconcile counts and sums between layers, and account for every dropped row.</li><li>A data contract defines schema, units, quality rules, SLAs, owner and change process; unit changes are the silent killers.</li><li>Quarantine bad records with reasons, continue with good rows, and stop the load if the failure rate jumps.</li><li>Keep transformations as pure functions and unit-test edge cases; add data tests for each run.</li><li>pandera, Great Expectations, Soda and dbt tests are different syntaxes for the same ideas; observability tools add automated monitors.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Rule</th></tr></thead><tbody><tr><td>Duplicate count</td><td><code>COUNT(*) − COUNT(DISTINCT key)</code></td></tr><tr><td>Freshness</td><td><code>now − max(timestamp) &lt; limit</code></td></tr><tr><td>Volume band</td><td><code>abs(today − mean) ≤ 3 × σ</code> (z-score within ±3)</td></tr><tr><td>Reconciliation</td><td><code>source = silver + quarantined + duplicates</code>, within a tolerance for sums</td></tr><tr><td>Severity</td><td>error stops the pipeline, warn alerts</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p><strong>1.</strong> (easy) What does <code>COUNT(*) − COUNT(DISTINCT order_id)</code> measure? <strong>Answer:</strong> the number of extra duplicate rows for <code>order_id</code>.</p>
+<p><strong>2.</strong> (easy) A table must have a customer for every order. Which dimension? <strong>Answer:</strong> completeness (not null) and consistency (a matching row exists in the customer table).</p>
+<p><strong>3.</strong> Average rows = 20,000, σ = 500. Today 18,200. z-score and verdict? <strong>Answer:</strong> z = (18,200 − 20,000) / 500 = −3.6, beyond ±3: anomaly.</p>
+<p><strong>4.</strong> What is the output? <code>clean_amount("12")</code> and <code>clean_amount("12.5")</code>. <strong>Answer:</strong> <code>0.12</code> and <code>None</code> (<code>int("12.5")</code> raises <code>ValueError</code>).</p>
+<p><strong>5.</strong> Find the bug: a freshness check uses <code>datetime.now()</code> inside the unit test. <strong>Answer:</strong> the result depends on when the test is run; pass "now" in as a parameter so the test is repeatable.</p>
+<p><strong>6.</strong> 5,000 records, 40 invalid, rule is quarantine below 1%. What happens? <strong>Answer:</strong> 40 / 5,000 = 0.8%, below 1%: quarantine 40, load 4,960.</p>
+<p><strong>7.</strong> A "relationships" test checks that every <code>orders.customer_id</code> exists in <code>customers</code>. What does it return if 12 orders point to unknown customers? <strong>Answer:</strong> 12 failing rows, so the test fails (error severity would stop the build).</p>
+<p><strong>8.</strong> Gold revenue sum is 5,000,000.00 and finance says 5,010,000.00. Tolerance is 0.1%. Pass? <strong>Answer:</strong> difference 10,000 / 5,010,000 = 0.2%, above 0.1%: fail, investigate.</p>
+<p><strong>9.</strong> (interview) "How would you make sure a daily revenue table is correct?" <strong>Answer:</strong> Contract and schema checks on input; not null and unique on keys; accepted values; freshness and volume checks; reconciliation to the source and to finance within a tolerance; unit tests for the transformation; alert with an owner and runbook; quarantine bad rows.</p>
+<p><strong>10.</strong> (interview) "What is the difference between data quality testing and data observability?" <strong>Answer:</strong> Testing runs explicit rules you wrote. Observability monitors the data continuously with automatic baselines on freshness, volume, schema and distribution, and uses lineage to find the cause, catching unknown unknowns.</p>
+<p><strong>11.</strong> (scenario) The business says revenue on the dashboard looks about 3% low every Monday. How do you investigate with checks? <strong>Answer:</strong> Add day-of-week volume baselines, reconcile source to bronze to silver to gold for the last four Mondays, check late-arriving data (weekend events landing on Monday), check time-zone cut-offs, and add a freshness check for the Monday run.</p>
+<p><strong>12.</strong> (easy) A table must be fresh within 30 minutes and checks run every 5 minutes. What is the worst-case detection delay beyond the 30 minutes? <strong>Answer:</strong> just under 5 minutes (one check interval).</p>
+<p><strong>13.</strong> (easy) An SLO says 99% of days on time. Over 100 days, how many misses are allowed? <strong>Answer:</strong> 1% of 100 = 1 miss.</p>
+<p><strong>14.</strong> (medium) 99.95% availability over 30 days. Minutes of downtime allowed? <strong>Answer:</strong> 0.05% of 43,200 = 0.0005 × 43,200 = 21.6 minutes.</p>
+<p><strong>15.</strong> (medium) Saturday volumes in the last 4 weeks: 410, 395, 405, 390. Today (Saturday) is 330. Compute the seasonal z-score (use the sample standard deviation). <strong>Answer:</strong> mean = (410 + 395 + 405 + 390) / 4 = 400. Deviations: 10, −5, 5, −10; squares: 100, 25, 25, 100 = 250; sample variance = 250 / 3 = 83.33; sd = 9.13. z = (330 − 400) / 9.13 = −7.67: flag. A plain weekly-mixed baseline would likely have missed it.</p>
+<p><strong>16.</strong> (medium) History: 50, 52, 49, 51, 48, 5. Median and MAD? <strong>Answer:</strong> sorted 5, 48, 49, 50, 51, 52; median = (49 + 50) / 2 = 49.5. Distances: 0.5, 2.5, 0.5, 1.5, 1.5, 44.5 and sorted 0.5, 0.5, 1.5, 1.5, 2.5, 44.5; MAD = (1.5 + 1.5) / 2 = 1.5.</p>
+<p><strong>17.</strong> (medium, find the bug) A monitor computes its baseline from the last 7 calendar days and alerts every Monday morning. Why? <strong>Answer:</strong> the window ends with a weekend, whose low volume pulls the mean down and the spread up in an odd way, or compares Monday with weekend-heavy history. Use the same weekday in previous weeks as the baseline.</p>
+<p><strong>18.</strong> (hard) Why can an alert on the raw row count give false alarms on a holiday and what do you do? <strong>Answer:</strong> volume is expected to be lower. Add a calendar of known events as a feature of the baseline (or suppress and annotate those dates), and compare with the same holiday in earlier years if the data exists.</p>
+<p><strong>19.</strong> (interview) "How would you decide which tables get monitors, and what severity?" <strong>Answer:</strong> rank tables by consumers and business impact (revenue, regulatory, executive dashboards first), set an SLO per tier, page a human only for tier-1 SLO breaches and send tier-2 and tier-3 alerts to a channel, review noisy monitors every sprint, and attach an owner and runbook to each.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me the dimensions of data quality (completeness, uniqueness, validity, consistency, accuracy, freshness, schema) with an online shop example. For each, show one SQL check and what a failure looks like. Then ask me 3 questions, one at a time, about which check would catch a given problem.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: volume and freshness checks, z-scores and statistical bands for row counts, and reconciliation between pipeline layers. Give me 8 graded numeric exercises with no solutions. After I answer, I will paste my work: check each step, and explain any mistakes in simple English.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am learning data engineering. Topic: data contracts, schema drift, schema evolution (safe versus breaking changes), and quarantine or dead-letter tables. Explain with a supplier analogy, then give me 6 source changes to classify as safe or breaking, and a short design scenario for a partner feed. Critique my answers kindly.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: unit-testing data transformations in Python and dbt tests. Show me a small function with edge cases, tests for it, and the equivalent dbt generic tests. Then ask me to review a buggy function and its tests: find the bug and add the missing test. Here is my code: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am applying for data engineer roles. Run a mock interview on data quality: contracts, checks, Great Expectations, pandera, Soda, dbt tests, observability, alert fatigue. Ask 8 questions one at a time, score each answer 1 to 5, give a model answer in simple English, and give one follow-up question. My answers: [PASTE HERE]</pre></div><div class="readbtn"><button class="btn" data-read="study:de:ch05">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch04.html">← Chapter 4: Ingestion Patterns</a><a class="btn" href="ch06.html">Chapter 6: Orchestration with Apache Airflow (and Its Alternatives) →</a></div></div><script src="../../assets/study.js"></script></body></html>

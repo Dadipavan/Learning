@@ -1,0 +1,231 @@
+
+<h2>20.10 Columnar files: Parquet and Arrow</h2>
+<p>A CSV stores data <strong>row by row</strong> as text. To read one column you still parse every line. <strong>Parquet</strong> stores data <strong>column by column</strong>, in compressed, typed blocks, with a footer that holds the schema and per-block statistics. <strong>Apache Arrow</strong> is the matching in-memory format: a standard layout for columns that lets libraries (pandas, Polars, DuckDB, Spark) share data without copying or re-parsing. The Python package is <code>pyarrow</code>. It was <strong>not installed on the study machine</strong>, so the pyarrow and pandas Parquet code below is labelled "not run here", followed by runnable demonstrations of the ideas that make Parquet fast.</p>
+<h3>When to use it, and when not to</h3>
+<ul><li><strong>Use Parquet</strong> for analytic tables of more than a few hundred thousand rows, for data you read again and again, for files that keep their types (dates stay dates, integers stay integers, no <code>"007"</code> surprises) and for data lakes where engines read only needed columns and row blocks.</li><li><strong>Do not use it</strong> for tiny files people edit by hand, for append-one-row-at-a-time logging (write batches instead), or when the receiving system only accepts CSV.</li></ul>
+<h3>Reference: pandas and pyarrow Parquet essentials (not run here)</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>df.to_parquet(path)</code></td><td>Write a DataFrame (needs pyarrow or fastparquet)</td><td><code>df.to_parquet("o.parquet", index=False)</code></td></tr>
+<tr><td><code>pd.read_parquet(path)</code></td><td>Read a file or folder into a DataFrame</td><td><code>pd.read_parquet("o.parquet")</code></td></tr>
+<tr><td><code>columns=[...]</code></td><td>Read only these columns</td><td><code>pd.read_parquet(p, columns=["id", "total"])</code></td></tr>
+<tr><td><code>filters=[...]</code></td><td>Skip row blocks that cannot match</td><td><code>filters=[("year", "==", 2025)]</code></td></tr>
+<tr><td><code>compression=</code></td><td>Codec: <code>snappy</code> (default), <code>zstd</code>, <code>gzip</code></td><td><code>to_parquet(p, compression="zstd")</code></td></tr>
+<tr><td><code>partition_cols=[...]</code></td><td>Write a folder tree split by column values</td><td><code>to_parquet("out/", partition_cols=["year"])</code></td></tr>
+<tr><td><code>pa.Table.from_pandas(df)</code></td><td>DataFrame to Arrow table</td><td><code>t = pa.Table.from_pandas(df)</code></td></tr>
+<tr><td><code>table.to_pandas()</code></td><td>Arrow table to DataFrame</td><td><code>t.to_pandas()</code></td></tr>
+<tr><td><code>table.schema</code></td><td>Names and types of columns</td><td><code>print(t.schema)</code></td></tr>
+<tr><td><code>pq.write_table(table, path)</code></td><td>Write Parquet with full control</td><td><code>pq.write_table(t, "o.parquet", row_group_size=100_000)</code></td></tr>
+<tr><td><code>pq.read_table(path, columns=, filters=)</code></td><td>Read into an Arrow table</td><td><code>pq.read_table(p, columns=["id"])</code></td></tr>
+<tr><td><code>pq.ParquetFile(path)</code></td><td>Open for metadata and batch reading</td><td><code>pf = pq.ParquetFile(p)</code></td></tr>
+<tr><td><code>pf.metadata</code></td><td>Row count, row groups, statistics</td><td><code>pf.metadata.num_row_groups</code></td></tr>
+<tr><td><code>pf.iter_batches(batch_size=)</code></td><td>Stream a large file in pieces</td><td><code>for b in pf.iter_batches(50_000): ...</code></td></tr>
+<tr><td><code>pyarrow.dataset.dataset(path)</code></td><td>Treat a folder of files as one table</td><td><code>ds.dataset("out/", partitioning="hive")</code></td></tr>
+<tr><td><code>pyarrow.compute</code> (<code>pc</code>)</td><td>Fast column operations</td><td><code>pc.sum(t["total"])</code></td></tr>
+<tr><td><code>table.filter(mask)</code>, <code>table.select(cols)</code></td><td>Row and column selection</td><td><code>t.select(["id", "total"])</code></td></tr>
+<tr><td><code>pd.ArrowDtype</code>, <code>dtype_backend="pyarrow"</code></td><td>Keep Arrow-backed columns in pandas</td><td><code>pd.read_parquet(p, dtype_backend="pyarrow")</code></td></tr>
+</tbody></table></div>
+<h3>Typical use (not run here)</h3>
+<pre class="code lang-text"><code># NOT RUN HERE: pyarrow is not installed on the study machine (pip install pyarrow)
+import pandas as pd
+import pyarrow.parquet as pq
+
+df = pd.DataFrame({"year": [2024, 2025, 2025], "region": ["n", "s", "n"], "total": [1.5, 2.5, 3.5]})
+df.to_parquet("orders.parquet", compression="zstd", index=False)
+
+only_two = pd.read_parquet("orders.parquet", columns=["region", "total"])
+recent = pd.read_parquet("orders.parquet", filters=[("year", "==", 2025)])
+
+pf = pq.ParquetFile("orders.parquet")
+print(pf.metadata.num_rows, pf.metadata.num_row_groups, pf.schema_arrow)
+for batch in pf.iter_batches(batch_size=100_000, columns=["total"]):
+    chunk = batch.to_pandas()            # process one slice at a time
+
+df.to_parquet("orders_dataset", partition_cols=["year"])   # folder: year=2024/, year=2025/</code></pre>
+<ol><li>One call writes a typed, compressed file; <code>index=False</code> avoids storing the DataFrame index as a column.</li><li><code>columns=</code> reads only some column blocks; <code>filters=</code> compares the request with statistics in the file so row groups that cannot match are skipped.</li><li><code>ParquetFile</code> reads only the footer (rows, row groups, schema), which is cheap even for huge files; <code>iter_batches</code> is the Parquet equivalent of <code>chunksize</code>.</li><li><code>partition_cols</code> writes one sub-folder per value, so a filter on <code>year</code> never opens the other folders.</li></ol>
+<h3>Runnable demonstration 1: why columns and encodings save space</h3>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+n = 100_000
+df = pd.DataFrame({
+    "id": np.arange(n),
+    "region": rng.choice(["north", "south", "east", "west"], n),
+    "total": rng.normal(50, 10, n).round(2),
+})
+whole = df.to_csv(index=False)
+one_column = df["total"].to_csv(index=False)
+print("csv bytes:", len(whole), "| bytes of the total column alone:", len(one_column))
+print("share of the file you need:", round(len(one_column) / len(whole), 2))
+
+as_text = df["region"]
+as_codes = df["region"].astype("category")
+print("text column bytes:", as_text.memory_usage(deep=True))
+print("dictionary-encoded bytes:", as_codes.memory_usage(deep=True))
+print(as_codes.cat.categories.tolist(), as_codes.cat.codes.dtype)</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>The CSV text of the whole frame is compared with the CSV text of the <code>total</code> column alone, the size a column-by-column file would need for a query that wants only the total: about a third.</li><li>A text column repeats four words 100,000 times. <strong>Dictionary encoding</strong> stores each distinct word once and replaces every row by a small integer code. The pandas <code>category</code> type is the same idea, and the memory printed shows the saving. The codes fit in <code>int8</code>. Parquet applies this automatically and then compresses again.</li></ol>
+<h3>Runnable demonstration 2: skipping row groups with statistics</h3>
+<p>Parquet files are cut into <strong>row groups</strong>, and each group stores the minimum and maximum of every column. A filter such as "dates in March" lets the reader skip any group whose range does not overlap. The simulation below does exactly that with NumPy.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+rng = np.random.default_rng(1)
+days = np.sort(rng.integers(0, 365, 100_000))        # one year of events, sorted by day
+group_size = 10_000
+groups = [days[i:i + group_size] for i in range(0, len(days), group_size)]
+stats = [(g.min(), g.max()) for g in groups]
+print("row groups:", len(groups))
+
+lo, hi = 90, 120                                      # "the month of April"
+to_read = [i for i, (mn, mx) in enumerate(stats) if mx &gt;= lo and mn &lt;= hi]
+print("groups that can match:", to_read)
+rows = sum(((g &gt;= lo) &amp; (g &lt;= hi)).sum() for i, g in enumerate(groups) if i in to_read)
+check = ((days &gt;= lo) &amp; (days &lt;= hi)).sum()
+print("rows found:", rows, "same as full scan:", rows == check)
+print("fraction of data read:", len(to_read) / len(groups))</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>The data is sorted by day and cut into 10 blocks of 10,000 rows; per block we keep only (minimum, maximum), which Parquet writes in its footer for you.</li><li>A block can contain matches only if its range overlaps the query: <code>max &gt;= lo</code> and <code>min &lt;= hi</code>. Only blocks 2 and 3 qualify, so 20 per cent of the data is read, and the count equals the full scan.</li><li>Sorting matters: with shuffled days every block spans the whole year and nothing can be skipped. That is why people sort or partition by the column they filter on most.</li></ol>
+<div class="callout blue"><div class="lab">WHY IT MATTERS</div><div class="txt">Reading Parquet with <code>columns=</code> and <code>filters=</code> is often the difference between a notebook that loads in seconds and one that runs out of memory. In pandas 3 you can also keep the Arrow types after reading (<code>dtype_backend="pyarrow"</code>), which avoids converting everything to NumPy and keeps missing integers as integers. Both parts need pyarrow installed and were not run here.</div></div>
+
+<h2>20.11 Logging, progress, big files and encodings</h2>
+<p>These four tools make a pipeline <em>observable</em> and <em>survivable</em>. <strong>Logging</strong> records what happened, with severity levels and without <code>print</code>. A <strong>progress bar</strong> tells you a long loop is alive. <strong>Chunking</strong> processes a file in pieces so memory stays small. <strong>Encodings</strong> decide how bytes turn into characters; get one wrong and <code>é</code> becomes <code>Ã©</code>.</p>
+<h3>Reference: logging, progress, chunking and encoding essentials</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>logging.getLogger(__name__)</code></td><td>Named logger per module</td><td><code>log = logging.getLogger(__name__)</code></td></tr>
+<tr><td><code>logging.basicConfig(...)</code></td><td>One-time setup for scripts (level, format, stream)</td><td><code>basicConfig(level=logging.INFO)</code></td></tr>
+<tr><td>Levels</td><td>DEBUG, INFO, WARNING, ERROR, CRITICAL</td><td><code>log.warning("slow")</code></td></tr>
+<tr><td>Lazy arguments</td><td>Format only if the message is emitted</td><td><code>log.info("%d rows", n)</code></td></tr>
+<tr><td><code>log.exception(msg)</code></td><td>ERROR with the traceback (inside <code>except</code>)</td><td><code>log.exception("load failed")</code></td></tr>
+<tr><td><code>logging.Formatter(fmt)</code></td><td>Message layout with time, level, name</td><td><code>"%(asctime)s %(levelname)s %(message)s"</code></td></tr>
+<tr><td><code>handler.setLevel</code></td><td>Different thresholds per destination</td><td><code>console.setLevel(logging.WARNING)</code></td></tr>
+<tr><td><code>tqdm(iterable, total=, desc=)</code></td><td>Progress bar around a loop (package tqdm)</td><td><code>for r in tqdm(rows): ...</code></td></tr>
+<tr><td><code>tqdm.pandas()</code></td><td>Adds <code>progress_apply</code> to pandas</td><td><code>df.progress_apply(f, axis=1)</code></td></tr>
+<tr><td><code>pd.read_csv(chunksize=n)</code></td><td>Iterator of DataFrames</td><td><code>for ch in pd.read_csv(p, chunksize=50_000):</code></td></tr>
+<tr><td><code>usecols=</code>, <code>dtype=</code>, <code>nrows=</code></td><td>Read fewer columns, smaller types, a sample</td><td><code>read_csv(p, usecols=["a"], nrows=1000)</code></td></tr>
+<tr><td><code>open(p, encoding=, errors=)</code></td><td>Choose the codec and how to treat bad bytes</td><td><code>open(p, encoding="latin-1")</code></td></tr>
+<tr><td><code>bytes.decode(enc, errors=)</code></td><td>Bytes to text; errors: <code>strict</code>, <code>replace</code>, <code>ignore</code></td><td><code>raw.decode("utf-8", errors="replace")</code></td></tr>
+<tr><td><code>utf-8-sig</code></td><td>UTF-8 that drops a leading byte-order mark</td><td><code>open(p, encoding="utf-8-sig")</code></td></tr>
+<tr><td><code>pd.read_csv(encoding=, encoding_errors=)</code></td><td>Encoding control inside pandas</td><td><code>read_csv(p, encoding="cp1252")</code></td></tr>
+<tr><td><code>hashlib.sha256()</code></td><td>Checksum to verify a copy or download</td><td><code>h.update(chunk)</code></td></tr>
+</tbody></table></div>
+<h3>Example 1: logging that you can actually read</h3>
+<pre class="code lang-python"><code>import logging, sys, tempfile
+from pathlib import Path
+
+logfile = Path(tempfile.mkdtemp()) / "etl.log"
+root = logging.getLogger()
+root.setLevel(logging.DEBUG)
+root.handlers.clear()
+
+console = logging.StreamHandler(sys.stdout)
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter("%(levelname)-7s %(name)s: %(message)s"))
+to_file = logging.FileHandler(logfile)
+to_file.setFormatter(logging.Formatter("%(levelname)s|%(name)s|%(message)s"))
+root.addHandler(console)
+root.addHandler(to_file)
+
+log = logging.getLogger("etl.orders")
+log.debug("raw row sample: %s", {"id": 1})
+log.info("loaded %d rows from %s", 120, "orders.csv")
+log.warning("%d rows rejected (%.1f%%)", 3, 100 * 3 / 120)
+try:
+    int("12x")
+except ValueError as e:
+    log.error("parse failed: %s", e)
+
+print("--- file content ---")
+print(logfile.read_text().strip())</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>Handlers on the <strong>root</strong> logger receive messages from every logger below it. The console handler shows INFO and above in a compact layout; the file handler keeps everything, including DEBUG.</li><li><code>etl.orders</code> is a child of <code>etl</code>; the dots form a hierarchy, so <code>getLogger("etl")</code> tunes a whole subsystem.</li><li>The <code>%d</code> and <code>%s</code> arguments are passed separately, so Python builds the string only if the level is enabled.</li><li>Real formats add <code>%(asctime)s</code>; it is omitted so the output is repeatable. Inside <code>except</code>, <code>log.exception(...)</code> adds the traceback.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>log.info(f"calling {url} with token {token}")</code>. <strong>Symptom:</strong> secrets end up in log files and ticketing systems, and the f-string is built even when INFO is off. <strong>Fix:</strong> <code>log.info("calling %s", url)</code> and never log tokens, passwords or personal data; mask them (<code>token[:4] + "..."</code>).</div></div>
+<h3>Example 2: a progress bar without tqdm</h3>
+<p>The <code>tqdm</code> package (not installed here) is the usual choice. The idea is simple enough to build, which also shows how it works: wrap an iterable, count what passes, and report at intervals.</p>
+<pre class="code lang-python"><code>import sys
+
+def progress(iterable, total, desc="", steps=4, out=sys.stdout, width=20):
+    marks = {max(1, round(total * k / steps)) for k in range(1, steps + 1)}
+    for i, item in enumerate(iterable, 1):
+        yield item
+        if i in marks:
+            filled = round(width * i / total)
+            print(f"{desc}: [{'#' * filled}{' ' * (width - filled)}] {100 * i // total:3d}% ({i}/{total})", file=out)
+
+total = 0
+for x in progress(range(1, 101), total=100, desc="load"):
+    total += x
+print("sum =", total)</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li><code>progress</code> is a <strong>generator</strong> wrapper: it yields every item unchanged and reports at 25, 50, 75 and 100 per cent. Real tqdm reports by elapsed time, which is why its output cannot be pasted exactly.</li><li>Send progress to <code>sys.stderr</code> (the <code>out</code> argument) so stdout stays clean for data. The loop sums 1 to 100: 5050.</li></ol>
+<pre class="code lang-text"><code># NOT RUN HERE: tqdm is not installed on the study machine (pip install tqdm)
+from tqdm import tqdm
+import pandas as pd
+
+for row in tqdm(rows, desc="load", total=len(rows)):      # bar with rate and ETA
+    process(row)
+
+tqdm.pandas(desc="clean")                                  # adds progress_apply
+df["clean"] = df["raw"].progress_apply(clean_text)
+
+with tqdm(total=file_size, unit="B", unit_scale=True) as bar:   # manual updates
+    for part in response.iter_content(8192):
+        out.write(part)
+        bar.update(len(part))</code></pre>
+<h3>Example 3: encodings, byte-order marks and mojibake</h3>
+<pre class="code lang-python"><code>import io
+import pandas as pd
+
+raw = "Zoë,Müller,café\n".encode("latin-1")          # a file saved by an old tool
+try:
+    raw.decode("utf-8")
+except UnicodeDecodeError as e:
+    print("utf-8 failed:", e.reason, "at byte", e.start)
+print(raw.decode("latin-1").strip())
+print(raw.decode("utf-8", errors="replace").strip())
+
+bom = "id,name\n1,Zoë\n".encode("utf-8-sig")
+print(bom[:3])
+print(repr(bom.decode("utf-8").splitlines()[0]))
+print(repr(bom.decode("utf-8-sig").splitlines()[0]))
+print(pd.read_csv(io.BytesIO(bom), encoding="utf-8-sig").columns.tolist())
+
+garbled = "café".encode("utf-8").decode("latin-1")
+print(garbled, "->", garbled.encode("latin-1").decode("utf-8"))</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>A file is bytes. "Zoë" saved as Latin-1 uses the single byte <code>0xEB</code>; UTF-8 expects a longer sequence there, so decoding fails and the error gives the reason and byte position. Decoding as Latin-1 works. <code>errors="replace"</code> never crashes but swaps bad bytes for �; use it to inspect, never to load data you care about.</li><li>Some Windows tools start a UTF-8 file with a byte-order mark (<code>EF BB BF</code>). Plain <code>utf-8</code> keeps it as an invisible character, so the first header becomes <code>'\ufeffid'</code> and <code>df["id"]</code> fails. <code>utf-8-sig</code> removes it; pandas accepts the same name.</li><li><strong>Mojibake</strong> is text decoded with the wrong codec (UTF-8 bytes read as Latin-1 give <code>cafÃ©</code>). It is reversible: encode with the wrong codec, decode with the right one.</li></ol>
+<figure><img src="images/lib20_encoding.png" alt="Bar chart of the number of bytes needed to store the same 27-character accented string in ascii, latin-1, utf-8, utf-16 and utf-32, with ascii failing" loading="lazy"/><figcaption>The same text takes a different number of bytes in each encoding, and ASCII cannot hold it at all.</figcaption></figure>
+<p><strong>How to read it:</strong> every bar is the same 27-character string. ASCII (red) cannot represent accented letters, so it fails. Latin-1 uses one byte per character. UTF-8 uses one byte for plain letters and two for accented ones, so it is slightly bigger. UTF-16 and UTF-32 use two and four bytes per character (plus a header for UTF-16 and UTF-32). UTF-8 is the safe default for new files; when reading old files, expect Latin-1 or cp1252 from Windows tools.</p>
+<h3>Example 4: big files in chunks</h3>
+<pre class="code lang-python"><code>import os, tempfile
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(42)
+n = 50_000
+df = pd.DataFrame({
+    "region": rng.choice(["north", "south", "east"], n),
+    "units": rng.integers(1, 20, n),
+    "price": rng.uniform(1, 100, n).round(2),
+})
+path = os.path.join(tempfile.mkdtemp(), "sales.csv")
+df.to_csv(path, index=False)
+
+revenue, rows_seen = {}, 0
+for chunk in pd.read_csv(path, chunksize=10_000, dtype={"region": "category"}):
+    rows_seen += len(chunk)
+    part = (chunk["units"] * chunk["price"]).groupby(chunk["region"], observed=True).sum()
+    for region, value in part.items():
+        revenue[region] = revenue.get(region, 0.0) + value
+
+chunked = pd.Series(revenue).sort_index()
+full = (df["units"] * df["price"]).groupby(df["region"]).sum().sort_index()
+print(rows_seen)
+print(chunked.round(0).to_dict())
+print("matches full read:", np.allclose(chunked, full))
+
+sample = pd.read_csv(path, usecols=["region", "units"], nrows=3)
+print(sample)</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>The script writes a 50,000-row CSV so it is self-contained; in real life this is the file that does not fit in memory.</li><li><code>chunksize=10_000</code> makes <code>read_csv</code> an iterator of five DataFrames, one in memory at a time. Each chunk yields a <em>partial</em> result (revenue by region) added into a running dictionary. This works for combinable statistics: sums, counts, min, max; a mean is a sum plus a count; a median is not combinable.</li><li>The chunked result is compared with the all-at-once result using <code>np.allclose</code>, because additions in another order differ in the last digits. They match. <code>usecols</code> and <code>nrows</code> are the quickest way to peek at a big file.</li></ol>
+<figure><img src="images/lib20_chunking.png" alt="Bar chart of peak Python memory when reading a 200000-row CSV whole or in chunks of 100000, 20000, 5000 and 1000 rows" loading="lazy"/><figcaption>Peak memory tracked by <code>tracemalloc</code> while summing one column (measured once; values vary).</figcaption></figure>
+<p><strong>How to read it:</strong> the red bar is the whole file loaded at once and the other bars use smaller chunks. Memory falls as the chunk shrinks and levels off, because each chunk still has fixed overhead. The trade-off: very small chunks mean more Python-level loop iterations, so pick a chunk that is comfortably small (tens of thousands of rows), not the smallest possible.</p>

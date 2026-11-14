@@ -1,0 +1,277 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 2: Data Modeling for Analytics</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#6a2fd0"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">Data Engineering &amp; Big Data</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 2</div><h1>Data Modeling for Analytics</h1><p>Shaping tables so that business questions are easy, fast and correct: facts, dimensions, grain and slowly changing dimensions.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-2-1-facts-dimensions-grain-star-and-snowflake">2.1 Facts, Dimensions, Grain, Star and Snowflake</a></li><li><a href="#s2-2-2-slowly-changing-dimensions-scd">2.2 Slowly Changing Dimensions (SCD)</a></li><li><a href="#s3-2-3-inmon-data-vault-and-choosing-a-model">2.3 Inmon, Data Vault, and Choosing a Model</a></li><li><a href="#s4-2-4-modeling-for-experts-bridges-late-data-accumulating-snapshots-and-">2.4 Modeling for Experts: Bridges, Late Data, Accumulating Snapshots and Data Vault</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>A manager asks: "How much revenue did we make in Mumbai last month, by product category?" If your tables are shaped like the shop's order system (many small normalized tables), the answer needs six joins and nobody trusts it. If your tables are shaped for analysis, the answer is one short query that anyone can read. Data modeling is the craft of choosing that shape. In this chapter you will learn the Kimball method (facts and dimensions), how to state the grain of a table, what star and snowflake mean, and how to keep history when a customer moves city (slowly changing dimensions). You will build a real star schema in SQLite, run it, and see how the wrong choice gives a wrong revenue number. Basic SQL (SELECT, JOIN, GROUP BY) is assumed; if you need it, study the SQL document in <code>study/sql/</code> first (chapters on SELECT and aggregation).</p>
+<h2 id="s1-2-1-facts-dimensions-grain-star-and-snowflake">2.1 Facts, Dimensions, Grain, Star and Snowflake</h2>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">A fact table stores measurements of business events, such as sales, and dimension tables store descriptive details, such as customer or product. Grain is what one row of a fact table represents. A star schema links facts directly to dimensions, and a snowflake schema splits the dimensions into more tables.</div></div>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Think of a receipt. The numbers on the receipt (quantity, price, total) are <em>measurements of an event</em>. The words around it (which shop, which customer, which product, which date) are <em>context</em>. Dimensional modeling keeps these apart: measurements go into a <strong>fact table</strong>, context goes into <strong>dimension tables</strong>. A fact row points to its context with keys, like a receipt pointing to the shop address on a notice board.</div></div>
+<h3>Words you need</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th><th>ShopKart example</th></tr></thead><tbody><tr><td>Fact table</td><td>One row per business event, holding numbers you can add up</td><td><code>fact_sales</code>: one row per order line</td></tr><tr><td>Measure</td><td>A numeric column in a fact</td><td><code>qty</code>, <code>amount</code></td></tr><tr><td>Dimension table</td><td>Descriptive attributes used to filter and group</td><td><code>dim_customer</code>, <code>dim_product</code>, <code>dim_date</code></td></tr><tr><td>Grain</td><td>What exactly one fact row represents</td><td>"one product on one order"</td></tr><tr><td>Surrogate key</td><td>A meaningless integer key made by the warehouse</td><td><code>customer_key = 17</code></td></tr><tr><td>Natural (business) key</td><td>The key from the source system</td><td><code>customer_id = 'C1'</code></td></tr><tr><td>Star schema</td><td>A fact in the middle, dimensions around it, each one join away</td><td>see picture</td></tr><tr><td>Snowflake schema</td><td>Dimensions normalized into more tables (product to category to department)</td><td><code>dim_product -&gt; dim_category</code></td></tr></tbody></table></div>
+<h3>Declare the grain first</h3>
+<p>Kimball's rule: before you choose columns, say the grain in one sentence. "One row per order line per day" or "One row per customer per month-end". If the grain is vague, totals will be double counted. Everything in a fact row must be true <em>at that grain</em>.</p>
+<figure><img src="images/de_star_schema.svg" alt="A star schema: fact_sales in the center joined to date, customer, product and store dimensions" loading="lazy"/><figcaption>A star schema: fact_sales in the center joined to date, customer, product and store dimensions</figcaption></figure>
+<p>How to read it: the orange box in the middle is the fact table. Each arrow is a join from a key in the fact to the key of a dimension. To answer "revenue by month and category" you join the fact to <code>dim_date</code> and <code>dim_product</code>, then <code>GROUP BY</code>. A star has one join hop from the fact to any dimension, which is why queries are simple and warehouses can optimize them.</p>
+<h3>Three kinds of fact tables</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Type</th><th>Grain</th><th>Example</th><th>Typical use</th></tr></thead><tbody><tr><td>Transaction fact</td><td>one row per event</td><td>each order line</td><td>sales, clicks, payments</td></tr><tr><td>Periodic snapshot</td><td>one row per entity per period</td><td>account balance at each month end</td><td>inventory levels, balances</td></tr><tr><td>Accumulating snapshot</td><td>one row per process instance, updated as it moves</td><td>order with dates for placed, packed, shipped, delivered</td><td>pipeline or workflow durations</td></tr></tbody></table></div>
+<p>Other terms: a <strong>degenerate dimension</strong> is an identifier with no extra attributes that lives in the fact itself (the <code>order_id</code>). A <strong>junk dimension</strong> packs a few small flags (is_gift, payment_type) into one small table so the fact does not carry many tiny columns. A <strong>conformed dimension</strong> is a dimension shared by several facts with the same meaning (one <code>dim_date</code> for sales and for returns), which lets you compare across them. The <strong>bus matrix</strong> is a grid: rows are business processes (sales, returns, shipments), columns are conformed dimensions, and a tick says which process uses which dimension. It is the plan for the whole warehouse.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Process</th><th>Date</th><th>Customer</th><th>Product</th><th>Store</th></tr></thead><tbody><tr><td>Sales</td><td>x</td><td>x</td><td>x</td><td>x</td></tr><tr><td>Returns</td><td>x</td><td>x</td><td>x</td><td>x</td></tr><tr><td>Shipments</td><td>x</td><td></td><td>x</td><td></td></tr></tbody></table></div>
+<h3>Predict, Run, Explain: build a star and ask a business question</h3>
+<p>Before you run it: there are 4 sales lines with amounts 500, 300, 1000, 250. What should the total per month be?</p>
+<pre class="code lang-sql"><code>CREATE TABLE dim_customer(customer_key INTEGER PRIMARY KEY, customer_id TEXT, name TEXT, city TEXT, valid_from TEXT, valid_to TEXT, is_current INTEGER);
+CREATE TABLE dim_product(product_key INTEGER PRIMARY KEY, sku TEXT, category TEXT);
+CREATE TABLE dim_date(date_key INTEGER PRIMARY KEY, full_date TEXT, month TEXT);
+CREATE TABLE fact_sales(date_key INT, customer_key INT, product_key INT, order_id TEXT, qty INT, amount REAL);
+INSERT INTO dim_product VALUES (1,'P-100','Books'),(2,'P-200','Toys');
+INSERT INTO dim_date VALUES (20240110,'2024-01-10','2024-01'),(20240215,'2024-02-15','2024-02'),(20240301,'2024-03-01','2024-03');
+INSERT INTO dim_customer VALUES (1,'C1','Asha','Pune','2023-01-01','2024-02-01',0),
+  (2,'C1','Asha','Mumbai','2024-02-01','9999-12-31',1),(3,'C2','Ravi','Delhi','2023-05-01','9999-12-31',1);
+INSERT INTO fact_sales VALUES (20240110,1,1,'O1',2,500),(20240215,2,2,'O2',1,300),
+  (20240301,3,1,'O3',4,1000),(20240301,2,1,'O4',1,250);
+SELECT d.month, p.category, SUM(f.amount) AS revenue
+FROM fact_sales f JOIN dim_date d USING(date_key) JOIN dim_product p USING(product_key)
+GROUP BY 1,2 ORDER BY 1,2;</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>month    category  revenue
+-------  --------  -------
+2024-01  Books     500.0  
+2024-02  Toys      300.0  
+2024-03  Books     1250.0 </code></pre>
+<p><strong>Explain.</strong> <code>JOIN ... USING(date_key)</code> matches the fact's <code>date_key</code> to the dimension's. March Books = 1000 (O3) + 250 (O4) = 1250. Our <strong>Check</strong>: 500 + 300 + 1250 = 2050 and the four amounts add to 500 + 300 + 1000 + 250 = 2050. Nothing was lost or doubled. <em>Interpretation:</em> each dimension join added context but did not change the number of fact rows, because each fact row matches exactly one row in each dimension. If a join multiplied rows (a many-to-many by mistake), the total would be too high. Always compare the total before and after joining.</p>
+<p class="problem"><span class="pl">Problem 2.1.1</span> (grain) A fact table has one row per order line. An analyst adds the column <code>order_shipping_fee</code> (one fee per whole order) to each line. An order has 3 lines and a fee of 60. What does <code>SUM(order_shipping_fee)</code> give for that order, and what is the right fix?</p>
+<table class="steps"><tr><th>Step 1</th><td>The fee is repeated on each of the 3 rows: 60 + 60 + 60 = 180.</td></tr><tr><th>Step 2</th><td>The true fee is 60. The column does not belong at the order-line grain.</td></tr><tr><th>Answer</th><td>The sum is 180, three times too high. Fix: put the fee in a separate fact at order grain, or allocate it across lines (20 each) and say so in the column name.</td></tr><tr><th>Check</th><td>3 lines × 20 = 60, which equals the true fee.</td></tr><tr><th>Why it matters</th><td>Mixed grain is the number one cause of "the dashboard is wrong" bugs.</td></tr></table>
+<p class="problem"><span class="pl">Problem 2.1.2</span> (additivity) Which measures can be summed across all dimensions? (a) <code>amount</code> in a sales fact, (b) <code>account_balance</code> in a month-end snapshot, (c) <code>unit_price</code>.</p>
+<table class="steps"><tr><th>Step 1</th><td><em>Additive</em> means summing makes sense over every dimension. (a) yes: revenue over customers, products and days.</td></tr><tr><th>Step 2</th><td>(b) is <em>semi-additive</em>: you may add balances across customers on one date, but not across dates (adding January's and February's balance is meaningless). Use the last value or an average over time.</td></tr><tr><th>Step 3</th><td>(c) is <em>non-additive</em>: summing prices means nothing. Store <code>qty</code> and <code>amount</code>, compute price = amount / qty.</td></tr><tr><th>Answer</th><td>(a) additive, (b) semi-additive, (c) non-additive.</td></tr><tr><th>Check</th><td>If a customer holds 100 in January and 100 in February, the "sum" 200 is false: they never held 200.</td></tr></table>
+<h3>Star versus snowflake versus One Big Table</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Design</th><th>Joins to get an attribute</th><th>Storage</th><th>Ease</th><th>When to use</th></tr></thead><tbody><tr><td>Star</td><td>1</td><td>some repeated text in dimensions</td><td>easiest for analysts</td><td>default for marts</td></tr><tr><td>Snowflake</td><td>2 or more</td><td>least duplication</td><td>more joins, harder</td><td>when a dimension is huge and shared sub-dimensions matter</td></tr><tr><td>One Big Table (OBT)</td><td>0</td><td>duplicates all attributes on every row</td><td>simplest queries, fast scans in columnar engines</td><td>dashboards on columnar warehouses, ML features</td></tr></tbody></table></div>
+<p>OBT trade-offs: it is fast and simple, but you lose a clean single place to fix a dimension value, storage grows, and changing an attribute means rewriting many rows. A common pattern: model a star as the source of truth, then publish an OBT built from it for one dashboard. <strong>Wide tables</strong> (many columns, fewer rows, ideal for ML features) and <strong>narrow tables</strong> (few columns, many rows, such as an event log with <code>key, value</code>) trade flexibility against scan cost; columnar stores handle wide tables well because unused columns are never read.</p>
+<h3>Normalization and denormalization</h3>
+<p><strong>Normalization</strong> means storing each fact once, split into many tables (3NF: every non-key column depends on the key, the whole key, and nothing but the key). It protects OLTP systems from update mistakes. <strong>Denormalization</strong> copies attributes into wide tables to avoid joins, which suits OLAP. Rule: normalize where you write often, denormalize where you read a lot.</p>
+<h3>Connection to the real job</h3>
+<p>Almost every analytics-engineering interview has "design the tables for X". The expected steps are: pick the business process, declare the grain, choose dimensions, choose facts. In dbt (Chapter 7), your <code>marts</code> folder holds exactly these facts and dimensions.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> Power BI and Tableau models are stars; relationships follow fact-to-dimension keys.</li><li><strong>Data Engineering:</strong> you build and test the keys and the grain (one unique key per fact row).</li><li><strong>Machine Learning:</strong> feature tables are often OBTs at "one row per customer per day".</li><li><strong>Operations:</strong> a monitoring warehouse can use a fact per measurement run and dimensions for check, build, scenario and environment (Chapter 14).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Joining two fact tables directly (sales and returns) at different grains. You get row multiplication. Aggregate each to a common grain (for example product and day) first, then join through conformed dimensions.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is the grain of <code>fact_sales</code> above? Answer: one row per order line.</li><li>Why is a month-end balance semi-additive? Answer: you cannot sum balances across time.</li><li>Star or snowflake for the simplest analyst queries? Answer: star.</li></ol>
+<h2 id="s2-2-2-slowly-changing-dimensions-scd">2.2 Slowly Changing Dimensions (SCD)</h2>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">A slowly changing dimension (SCD) is a dimension whose attributes change over time, such as a customer address. SCD types define how to handle the change, for example Type 1 overwrites the value and Type 2 keeps history with a new row.</div></div>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Your friend Asha lived in Pune and moved to Mumbai. A photo album that only shows today's address would say her 2023 birthday party was in Mumbai, which is wrong. A <em>slowly changing dimension</em> decides how the warehouse remembers that people and products change, slowly, over time.</div></div>
+<h3>The types</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Type</th><th>What it does</th><th>History kept?</th><th>Cost</th></tr></thead><tbody><tr><td>0</td><td>Never change (attribute fixed, like birth date)</td><td>n/a</td><td>none</td></tr><tr><td>1</td><td>Overwrite the old value</td><td>no</td><td>cheapest</td></tr><tr><td>2</td><td>Add a new row with validity dates</td><td>full</td><td>more rows, join by key or date</td></tr><tr><td>3</td><td>Add a column for the previous value</td><td>one step back</td><td>a column per tracked attribute</td></tr><tr><td>6</td><td>Hybrid of 1+2+3: new row per change (type 2) plus a column holding the current value on all rows (type 1 style)</td><td>full, plus easy "current" view</td><td>most complex</td></tr></tbody></table></div>
+<p>Type 2 columns: <code>valid_from</code>, <code>valid_to</code> (use a far-future date like <code>9999-12-31</code> for the open row so range filters work), and <code>is_current</code>. The fact table stores the <strong>surrogate key</strong> of the version that was true when the event happened. That is the reason we need surrogate keys: the natural key <code>C1</code> now has two rows.</p>
+<h3>Predict, Run, Explain: why SCD2 changes the answer</h3>
+<p>Customer C1 lived in Pune until 2024-02-01 and then in Mumbai. Order O1 (500) was in January, O2 (300) in February, O4 (250) in March. C2 (Delhi) bought O3 (1000). Using the star from 2.1, before you run it: how much revenue belongs to Pune, Mumbai and Delhi "as it was at the time"?</p>
+<pre class="code lang-sql"><code>SELECT c.city, SUM(f.amount) AS revenue
+FROM fact_sales f JOIN dim_customer c USING(customer_key)
+GROUP BY 1 ORDER BY 1;</code></pre>
+<pre class="code lang-text"><code>city    revenue
+------  -------
+Delhi   1000.0 
+Mumbai  550.0  
+Pune    500.0  </code></pre>
+<p>Now the same question if we had used Type 1 (overwrite): every C1 order is attributed to the current city.</p>
+<pre class="code lang-sql"><code>SELECT x.city, SUM(f.amount) AS revenue
+FROM fact_sales f JOIN dim_customer c USING(customer_key)
+JOIN (SELECT customer_id, city FROM dim_customer WHERE is_current=1) x ON x.customer_id=c.customer_id
+GROUP BY 1 ORDER BY 1;</code></pre>
+<pre class="code lang-text"><code>city    revenue
+------  -------
+Delhi   1000.0
+Mumbai  1050.0</code></pre>
+<p><strong>Explain.</strong> With Type 2, O1 (500, January) points to customer_key 1 (Pune) and O2 and O4 point to key 2 (Mumbai): Mumbai = 300 + 250 = 550, Pune = 500. With Type 1, Pune disappears and Mumbai absorbs 500 + 300 + 250 = 1050. <strong>Check:</strong> both versions total 2550 (1000 + 550 + 500 and 1000 + 1050). <em>Interpretation:</em> Pune really did generate 500 of revenue in January, but Type 1 erased it. Use Type 2 when the business asks questions "as it was". Use Type 1 for corrections (a typo in a name) where history has no value.</p>
+<h3>Doing SCD2 in two steps (and proving it is idempotent)</h3>
+<p>A snapshot of the source arrives daily (<code>stg_customer</code>). Step A closes the current row when a tracked attribute changed. Step B inserts a new current row for changed or new customers. We run it for day 1, day 2, and then day 2 <em>again</em> to check idempotency.</p>
+<pre class="code lang-sql"><code>CREATE TABLE stg_customer(customer_id TEXT, name TEXT, city TEXT);
+CREATE TABLE dim_customer(customer_key INTEGER PRIMARY KEY AUTOINCREMENT, customer_id TEXT, name TEXT, city TEXT,
+                          valid_from TEXT, valid_to TEXT, is_current INTEGER);
+-- Day 1 load
+INSERT INTO stg_customer VALUES('C1','Asha','Pune'),('C2','Ravi','Delhi');
+INSERT INTO dim_customer(customer_id,name,city,valid_from,valid_to,is_current)
+SELECT customer_id,name,city,'2024-01-01','9999-12-31',1 FROM stg_customer;
+-- Day 2: Asha moved to Mumbai, Meena is new
+DELETE FROM stg_customer;
+INSERT INTO stg_customer VALUES('C1','Asha','Mumbai'),('C2','Ravi','Delhi'),('C3','Meena','Chennai');
+-- Step A: close changed rows
+UPDATE dim_customer SET valid_to='2024-01-02', is_current=0
+WHERE is_current=1 AND EXISTS (SELECT 1 FROM stg_customer s
+      WHERE s.customer_id=dim_customer.customer_id AND s.city&lt;&gt;dim_customer.city);
+-- Step B: insert new current rows for changed or new customers
+INSERT INTO dim_customer(customer_id,name,city,valid_from,valid_to,is_current)
+SELECT s.customer_id,s.name,s.city,'2024-01-02','9999-12-31',1 FROM stg_customer s
+LEFT JOIN dim_customer d ON d.customer_id=s.customer_id AND d.is_current=1
+WHERE d.customer_id IS NULL;
+SELECT * FROM dim_customer ORDER BY customer_key;</code></pre>
+<pre class="code lang-text"><code>customer_key  customer_id  name   city     valid_from  valid_to    is_current
+------------  -----------  -----  -------  ----------  ----------  ----------
+1             C1           Asha   Pune     2024-01-01  2024-01-02  0         
+2             C2           Ravi   Delhi    2024-01-01  9999-12-31  1         
+3             C1           Asha   Mumbai   2024-01-02  9999-12-31  1         
+4             C3           Meena  Chennai  2024-01-02  9999-12-31  1         </code></pre>
+<p>After running steps A and B a second time:</p>
+<pre class="code lang-text"><code>rows_after_rerun  current_rows
+----------------  ------------
+4                 3           </code></pre>
+<p><strong>Explain.</strong> Step A matches only rows that are current and differ, so a re-run finds nothing to close (the Pune row is no longer current). Step B inserts only when no current row exists, so a re-run inserts nothing. Row count stays 4 and there are 3 current rows (one per customer). <strong>Check:</strong> exactly one current row per customer is the invariant you test in Chapter 5. <em>Interpretation:</em> a retry cannot create duplicate versions. This is idempotency applied to a dimension.</p>
+<p><strong>Type 3 and the point-in-time lookup:</strong></p>
+<pre class="code lang-sql"><code>CREATE TABLE dim_cust3(customer_id TEXT PRIMARY KEY, city TEXT, prev_city TEXT);
+INSERT INTO dim_cust3 VALUES('C1','Pune',NULL);
+UPDATE dim_cust3 SET prev_city=city, city='Mumbai' WHERE customer_id='C1';
+SELECT * FROM dim_cust3;
+-- which city was C1 in on 2024-01-01 (SCD2 table above)?
+SELECT city FROM dim_customer WHERE customer_id='C1' AND '2024-01-01' &gt;= valid_from AND '2024-01-01' &lt; valid_to;</code></pre>
+<pre class="code lang-text"><code>customer_id  city    prev_city
+-----------  ------  ---------
+C1           Mumbai  Pune     
+city
+----
+Pune</code></pre>
+<p>In the <code>UPDATE</code>, the right side <code>prev_city=city</code> uses the <em>old</em> value of <code>city</code> (SQL evaluates the right sides with the row's old values), so Pune moves to <code>prev_city</code> and then city becomes Mumbai. Note the half-open range <code>&gt;= valid_from AND &lt; valid_to</code>: a date equal to the change date belongs to the new row only, so ranges never overlap.</p>
+<p class="problem"><span class="pl">Problem 2.2.1</span> Ravi (C2) moves to Goa on 2024-04-01. Write the two SCD2 changes and say how many rows C2 has afterwards.</p>
+<table class="steps"><tr><th>Step 1</th><td>Close the current row: <code>valid_to = '2024-04-01'</code>, <code>is_current = 0</code>.</td></tr><tr><th>Step 2</th><td>Insert a new row: Goa, <code>valid_from = '2024-04-01'</code>, <code>valid_to = '9999-12-31'</code>, <code>is_current = 1</code>.</td></tr><tr><th>Answer</th><td>C2 has 2 rows: Delhi (2023-05-01 to 2024-04-01) and Goa (from 2024-04-01). One is current.</td></tr><tr><th>Check</th><td>The Delhi row ends exactly where the Goa row begins, so there is no gap and no overlap.</td></tr></table>
+<p class="problem"><span class="pl">Problem 2.2.2</span> A fact row for an order on 2024-03-15 must get the right <code>customer_key</code> for C1 (Pune until 2024-02-01, Mumbai after). Which key and why? Use the SCD2 table from 2.1 (keys 1 and 2).</p>
+<table class="steps"><tr><th>Step 1</th><td>Find the version whose range contains 2024-03-15: key 1 covers 2023-01-01 to 2024-02-01, key 2 covers 2024-02-01 to 9999-12-31.</td></tr><tr><th>Step 2</th><td>2024-03-15 is inside key 2's range.</td></tr><tr><th>Answer</th><td><code>customer_key = 2</code> (Mumbai).</td></tr><tr><th>Check</th><td>The date is after 2024-02-01, the move date, so Mumbai is correct. This lookup is done while loading the fact (a "surrogate key lookup").</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>dbt snapshots (Chapter 7) generate SCD2 for you. Late-arriving dimension rows (a fact arrives before its customer) are handled with an "unknown" placeholder row (key −1) and a later fix-up.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Analytics:</strong> "revenue by the customer's segment <em>at purchase time</em>".</li><li><strong>Data Science:</strong> training sets must use attribute values valid at event time to avoid <em>leakage</em> (using future information).</li><li><strong>Machine Learning:</strong> point-in-time correct feature joins use exactly the <code>valid_from</code> / <code>valid_to</code> idea.</li><li><strong>Compliance:</strong> audit queries ("who had access on that date").</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Choosing <code>9999-12-31</code> for open rows and then forgetting that <code>valid_to</code> is exclusive in one query and inclusive in another. Pick one convention (we use <code>&gt;= from AND &lt; to</code>) and document it.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Which SCD type loses history? Answer: Type 1.</li><li>Why does Type 2 need a surrogate key? Answer: the natural key repeats across versions.</li><li>What makes SCD2 load idempotent? Answer: it only closes current rows that differ and only inserts when no current row exists.</li></ol>
+<h2 id="s3-2-3-inmon-data-vault-and-choosing-a-model">2.3 Inmon, Data Vault, and Choosing a Model</h2>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Kimball modelling builds dimensional data marts for business areas. Inmon modelling builds a central, normalised enterprise warehouse first. Data Vault is a model that separates keys (hubs), relationships (links) and details (satellites).</div></div>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Kimball builds many small shops (marts) designed around customers' questions. Inmon first builds one clean central warehouse (like a central kitchen) and delivers from it. Data Vault is an insurance policy against change: it stores raw facts with full audit trail, and you build marts on top.</div></div>
+<ul><li><strong>Inmon (corporate information factory):</strong> a normalized (3NF) enterprise warehouse first, then departmental marts. Strong consistency, slower to deliver.</li><li><strong>Kimball (dimensional):</strong> build business-process marts directly as stars with conformed dimensions. Faster to value, the most common style in analytics today.</li><li><strong>Data Vault:</strong> three table types.<ul><li><strong>Hub:</strong> a list of business keys only (<code>hub_customer</code>: customer_id, load date, record source).</li><li><strong>Link:</strong> a relationship between hubs (<code>link_order</code>: customer hub key + product hub key).</li><li><strong>Satellite:</strong> descriptive attributes of a hub or link, with load date, so history is kept by insertion (<code>sat_customer_details</code>: name, city, load date).</li></ul></li></ul>
+<pre class="code lang-text"><code>hub_customer (customer_hk, customer_id, load_dts, rec_src)
+sat_customer (customer_hk, load_dts, name, city, hash_diff)     &lt;- new row on every change
+link_order   (order_hk, customer_hk, product_hk, load_dts)</code></pre>
+<p><code>hash_diff</code> is a hash of the descriptive columns; if today's hash differs from the latest one, insert a new satellite row. Data Vault loads are highly parallel and easy to audit, but queries need joins and you normally build a star (the "business vault" or marts) on top. Treat it as awareness-to-working level: know the three table types and when it is chosen (many source systems, strict audit, frequent source change).</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Aspect</th><th>Kimball star</th><th>Inmon 3NF</th><th>Data Vault</th></tr></thead><tbody><tr><td>Built for</td><td>analysts</td><td>enterprise integration</td><td>integration and audit</td></tr><tr><td>Query ease</td><td>high</td><td>medium</td><td>low (needs marts)</td></tr><tr><td>Handling source change</td><td>rework</td><td>rework</td><td>add satellites easily</td></tr><tr><td>Typical size of team</td><td>small to medium</td><td>large</td><td>large, regulated</td></tr></tbody></table></div>
+<p class="problem"><span class="pl">Problem 2.3.1</span> The source adds a new attribute <code>loyalty_tier</code> to customers. What changes in (a) a Kimball dimension, (b) a Data Vault?</p>
+<table class="steps"><tr><th>Step 1</th><td>(a) Add a column to <code>dim_customer</code>, backfill it, decide Type 1 or 2 for it, test.</td></tr><tr><th>Step 2</th><td>(b) Add a new satellite <code>sat_customer_loyalty</code> hanging off the existing hub. No existing table changes.</td></tr><tr><th>Answer</th><td>Kimball alters a table; Data Vault adds a table, which is why vault is called change-tolerant.</td></tr><tr><th>Check</th><td>In (b), existing loads and history are untouched, so nothing can break.</td></tr></table>
+<p class="problem"><span class="pl">Problem 2.3.2</span> Pick a model: a 3-person startup wants dashboards in 4 weeks from one app database. Pick for a bank merging 14 legacy systems with audit rules.</p>
+<table class="steps"><tr><th>Step 1</th><td>Startup: speed and simplicity matter. Kimball star (or OBT) with dbt.</td></tr><tr><th>Step 2</th><td>Bank: many sources, audit trail, constant change. Data Vault for the integration layer, stars for reporting.</td></tr><tr><th>Answer</th><td>Kimball for the startup, Data Vault plus marts for the bank.</td></tr><tr><th>Check</th><td>The startup has one source and no audit rule, so the extra layers of Data Vault would only slow it down.</td></tr></table>
+<h3>Applications</h3>
+<ul><li><strong>Data Engineering:</strong> choosing the model is a design-review topic.</li><li><strong>Analytics Engineering:</strong> marts in dbt are Kimball-style.</li><li><strong>Regulated industries (banking, insurance, healthcare):</strong> Data Vault is common.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Treating the model choice as religion. Real teams mix: vault-like raw layer, star marts, OBT for one dashboard. Choose per layer by the question "who reads this and how often does it change?"</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Name the three Data Vault tables. Answer: hub, link, satellite.</li><li>What does a satellite store? Answer: descriptive attributes with load dates (history).</li><li>Which style is fastest to first dashboard? Answer: Kimball.</li></ol>
+<h2 id="s4-2-4-modeling-for-experts-bridges-late-data-accumulating-snapshots-and-">2.4 Modeling for Experts: Bridges, Late Data, Accumulating Snapshots and Data Vault</h2>
+<p>The star schema of 2.1 handles most reports. Real businesses keep breaking its assumptions: one sale belongs to <em>several</em> promotions, an order arrives before its customer exists, a process has milestones over days, and the source systems change without warning. This section gives you the standard answers, each with a run you can check.</p>
+<h3>Special dimension types in one table</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Problem it solves</th><th>Example</th></tr></thead><tbody><tr><td>Role-playing dimension</td><td>One dimension used several times by one fact</td><td><code>dim_date</code> joined as order date, ship date and delivery date (three joins or three views)</td></tr><tr><td>Junk dimension</td><td>Many tiny flags that clutter the fact</td><td>one <code>dim_order_flags</code> row per combination of gift_wrap, express, cod</td></tr><tr><td>Degenerate dimension</td><td>An identifier with no attributes of its own</td><td><code>order_number</code> stored directly on the fact line</td></tr><tr><td>Factless fact</td><td>Events with nothing to measure, or coverage</td><td>student attended class; product was on promotion (even if not sold)</td></tr><tr><td>Bridge table</td><td>Many-to-many between fact and dimension</td><td>a sale with 2 promotions; an account with 3 owners</td></tr></tbody></table></div>
+<p>Junk dimensions are small because they hold combinations, not rows: 3 yes/no flags make at most 2 x 2 x 2 = 8 rows, and the fact stores one small key instead of three columns.</p>
+<h3>Example 1: the bridge table and the double counting trap</h3>
+<p>A phone costing 1000 was bought with two promotions (Diwali and a bank offer). A case costing 100 had one promotion. The bridge links each sale's <em>group key</em> to promotions, with a <strong>weight</strong> that says how to split the amount. Predict: if you join fact to bridge and sum the amount, what total do you get? The true total is 1100.</p>
+<pre class="code lang-python"><code># Many-to-many with a bridge table: an order line can belong to several promotions.
+import sqlite3
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE fact_sales(sale_id INTEGER PRIMARY KEY, product TEXT, amount REAL, promo_group_key INTEGER);
+CREATE TABLE dim_promo(promo_key INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE bridge_promo(promo_group_key INTEGER, promo_key INTEGER, weight REAL);
+INSERT INTO fact_sales VALUES (1,'phone',1000,10),(2,'case',100,20);
+INSERT INTO dim_promo VALUES (1,'Diwali'),(2,'Bank offer'),(3,'Clearance');
+INSERT INTO bridge_promo VALUES (10,1,0.5),(10,2,0.5),(20,3,1.0);
+""")
+naive = db.execute("""SELECT SUM(f.amount) FROM fact_sales f JOIN bridge_promo b USING(promo_group_key)""").fetchone()[0]
+print("naive total after joining bridge (double counts):", naive, "| true total: 1100")
+for row in db.execute("""SELECT p.name, SUM(f.amount * b.weight)
+    FROM fact_sales f JOIN bridge_promo b USING(promo_group_key) JOIN dim_promo p USING(promo_key)
+    GROUP BY p.name ORDER BY p.name"""): print(row)
+print("weighted total:", db.execute("""SELECT SUM(f.amount*b.weight) FROM fact_sales f JOIN bridge_promo b USING(promo_group_key)""").fetchone()[0])</code></pre>
+<pre class="code lang-text"><code>naive total after joining bridge (double counts): 2100.0 | true total: 1100
+('Bank offer', 500.0)
+('Clearance', 100.0)
+('Diwali', 500.0)
+weighted total: 1100.0</code></pre>
+<table class="steps"><tr><th>Step 1</th><td>The phone appears in 2 bridge rows (Diwali, Bank offer), so after the join its 1000 is counted twice: 2 x 1000 + 100 = 2,100.</td></tr><tr><th>Step 2</th><td>Weights fix it: 1000 x 0.5 = 500 to each promo, and the case 100 x 1.0 = 100 to Clearance.</td></tr><tr><th>Check</th><td>500 + 500 + 100 = 1,100, equal to the true total.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> summing a fact measure after joining through a many-to-many bridge with no weight. Every extra link multiplies the amount (here 2,100 instead of 1,100). <strong>Right:</strong> add weights that sum to 1 per group, or decide that the report is "sales touched by promo" and say clearly that totals across promos will not add up.</div></div>
+<h3>Example 2: late-arriving dimension and the accumulating snapshot</h3>
+<p>Source systems are not synchronised. An order can arrive today and the customer record tomorrow. If you reject the order you lose revenue, and if you load it with a null key you cannot report on it. The standard fix is an <strong>inferred member</strong>: create a placeholder customer row with name "Unknown", flagged inferred, and give the fact its key. When the real record arrives you update the placeholder in place, and every fact already pointing at it becomes correct without touching the fact. Separately, a process with milestones (placed, shipped, delivered) suits an <strong>accumulating snapshot</strong> fact: one row per order that is updated as milestones happen, so lag times are one subtraction.</p>
+<pre class="code lang-python"><code># Late-arriving dimension (an "inferred member") and an accumulating snapshot fact.
+import sqlite3
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE dim_customer(customer_key INTEGER PRIMARY KEY AUTOINCREMENT, customer_id TEXT UNIQUE, name TEXT, is_inferred INTEGER);
+CREATE TABLE fact_order(order_id TEXT PRIMARY KEY, customer_key INTEGER, placed TEXT, shipped TEXT, delivered TEXT);
+""")
+def key_for(cid):
+    r = db.execute("SELECT customer_key FROM dim_customer WHERE customer_id=?", (cid,)).fetchone()
+    if r: return r[0]
+    db.execute("INSERT INTO dim_customer(customer_id,name,is_inferred) VALUES (?, 'Unknown', 1)", (cid,))
+    return db.execute("SELECT customer_key FROM dim_customer WHERE customer_id=?", (cid,)).fetchone()[0]
+# the order arrives BEFORE the customer record
+db.execute("INSERT INTO fact_order(order_id,customer_key,placed) VALUES ('o1', ?, '2025-01-01')", (key_for("c9"),))
+print("1", db.execute("SELECT * FROM dim_customer").fetchall())
+# later the real customer row arrives: update the inferred row in place, the fact keeps its key
+db.execute("UPDATE dim_customer SET name='Meera', is_inferred=0 WHERE customer_id='c9'")
+print("2", db.execute("SELECT f.order_id, d.name FROM fact_order f JOIN dim_customer d USING(customer_key)").fetchall())
+# accumulating snapshot: ONE row per order, milestones filled in as they happen
+db.execute("UPDATE fact_order SET shipped='2025-01-03' WHERE order_id='o1'")
+db.execute("UPDATE fact_order SET delivered='2025-01-06' WHERE order_id='o1'")
+r = db.execute("""SELECT order_id, julianday(shipped)-julianday(placed), julianday(delivered)-julianday(shipped)
+                  FROM fact_order""").fetchone()
+print("3 order", r[0], "days to ship", r[1], "days in transit", r[2])</code></pre>
+<pre class="code lang-text"><code>1 [(1, 'c9', 'Unknown', 1)]
+2 [('o1', 'Meera')]
+3 order o1 days to ship 2.0 days in transit 3.0</code></pre>
+<ul><li>Line 1: the order loaded fine, and the customer table has a placeholder row (key 1, inferred flag 1).</li><li>Line 2: after the real record arrived and we updated the placeholder, the same fact row now joins to "Meera". The fact never changed.</li><li>Line 3: days to ship = 3 Jan minus 1 Jan = 2, days in transit = 6 Jan minus 3 Jan = 3. With a normal transaction fact you would pivot three rows to get this.</li></ul>
+<p>If the dimension is SCD2 (Section 2.2), a late-arriving <em>change</em> is harder: the new version must be inserted with a past start date and the neighbouring row's end date adjusted, and facts loaded in the gap may need their key repointed. Many teams accept this cost only for dimensions where history really matters.</p>
+<h3>Example 3: Data Vault with hash keys</h3>
+<p>Data Vault (Section 2.3) separates <strong>hubs</strong> (the business keys), <strong>links</strong> (relationships between hubs) and <strong>satellites</strong> (descriptive attributes with history). Keys are computed as a hash of the business key, so any table can compute any key independently and loads run in parallel without lookups. A <strong>hashdiff</strong> (hash of all attributes) lets you store a new satellite row only when something changed. We load the same facts on day 1 and day 2 (a replay), then a change on day 3. Predict the row counts.</p>
+<pre class="code lang-python"><code># Data Vault style loading with hash keys: deterministic keys let hubs, links, satellites load in parallel.
+import hashlib, sqlite3
+def hk(*parts): return hashlib.md5("||".join(p.strip().upper() for p in parts).encode()).hexdigest()[:8]
+db = sqlite3.connect(":memory:")
+db.executescript("""
+CREATE TABLE hub_customer(hk TEXT PRIMARY KEY, customer_id TEXT, load_ts TEXT);
+CREATE TABLE hub_product(hk TEXT PRIMARY KEY, product_id TEXT, load_ts TEXT);
+CREATE TABLE link_order(hk TEXT PRIMARY KEY, hk_customer TEXT, hk_product TEXT, load_ts TEXT);
+CREATE TABLE sat_customer(hk TEXT, name TEXT, city TEXT, hashdiff TEXT, load_ts TEXT, PRIMARY KEY(hk, load_ts));
+""")
+def load(day, c_id, name, city, p_id):
+    db.execute("INSERT OR IGNORE INTO hub_customer VALUES (?,?,?)", (hk(c_id), c_id, day))
+    db.execute("INSERT OR IGNORE INTO hub_product VALUES (?,?,?)", (hk(p_id), p_id, day))
+    db.execute("INSERT OR IGNORE INTO link_order VALUES (?,?,?,?)", (hk(c_id, p_id), hk(c_id), hk(p_id), day))
+    diff = hk(name, city)
+    last = db.execute("SELECT hashdiff FROM sat_customer WHERE hk=? ORDER BY load_ts DESC LIMIT 1", (hk(c_id),)).fetchone()
+    if not last or last[0] != diff:                       # only store a new satellite row when attributes change
+        db.execute("INSERT INTO sat_customer VALUES (?,?,?,?,?)", (hk(c_id), name, city, diff, day))
+load("d1", "c1", "Asha", "Pune", "p1")
+load("d2", "c1", "Asha", "Pune", "p1")       # replay of the same facts: nothing new
+load("d3", "c1", "Asha", "Delhi", "p2")      # she moved and bought something else
+for t in ("hub_customer", "hub_product", "link_order", "sat_customer"):
+    print(t, db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0])
+print([r for r in db.execute("SELECT name, city, load_ts FROM sat_customer ORDER BY load_ts")])</code></pre>
+<pre class="code lang-text"><code>hub_customer 1
+hub_product 2
+link_order 2
+sat_customer 2
+[('Asha', 'Pune', 'd1'), ('Asha', 'Delhi', 'd3')]</code></pre>
+<table class="steps"><tr><th>Hubs</th><td>1 customer (c1) and 2 products (p1, p2). Re-loading c1 or p1 inserted nothing, because the hash key already exists.</td></tr><tr><th>Link</th><td>2 rows: (c1, p1) and (c1, p2). The replay on day 2 added none.</td></tr><tr><th>Satellite</th><td>2 rows: Asha in Pune from d1, Asha in Delhi from d3. Day 2 added no row because the hashdiff was the same. The satellite is the history.</td></tr><tr><th>Idempotent</th><td>The whole load can be re-run safely. That is the same property you built in Chapter 4.</td></tr></table>
+<h3>Going deeper</h3>
+<ul><li><strong>Semantic layer and additivity.</strong> A measure has a rule for combining. <em>Additive</em> (amount, quantity) sums over every dimension. <em>Semi-additive</em> (account balance, stock level) sums over customers but not over time: you take the last value per period. <em>Non-additive</em> (ratios, averages) must be recomputed from their parts: sum(revenue) / sum(orders), never the average of daily averages. A metric layer (dbt metrics, Cube, LookML) stores these definitions once so every dashboard agrees.</li><li><strong>Hash collisions.</strong> MD5 and short hashes can collide in theory. Real vaults use longer hashes, and many include a hash of the business key plus a source tag. We cut the hash to 8 characters for display only.</li><li><strong>When not to use Data Vault.</strong> For a small team with one source system, a star schema is much faster to build and query. Vault pays off with many sources, auditability needs and frequent source changes, and you still build marts (stars) on top of it.</li></ul>
+<p class="problem"><span class="pl">Problem 2.4.1</span> A balance table has account A with a balance of 500 on Monday and 700 on Tuesday. What is the "total balance" for the two days, and why is summing over time wrong?</p>
+<table class="steps"><tr><th>Wrong</th><td>500 + 700 = 1,200. That says the account holds 1,200, but it never did.</td></tr><tr><th>Right</th><td>The balance is semi-additive over time. Use the last value (700) for "balance at end of period", or the average (600) for "average balance".</td></tr><tr><th>Answer</th><td>700 at end of Tuesday, or 600 as the daily average. Across <em>accounts</em> on one day you can sum.</td></tr></table>
+<p class="problem"><span class="pl">Problem 2.4.2</span> A junk dimension holds three flags: gift_wrap (yes/no), delivery (standard/express/pickup) and payment (cod/prepaid). How many rows at most? An order table has 10 million rows. How much does it save?</p>
+<table class="steps"><tr><th>Rows</th><td>2 x 3 x 2 = 12 combinations.</td></tr><tr><th>Fact change</th><td>Three columns become one small integer key. At 4 bytes per key instead of about 3 short strings, the fact is smaller and the flags are labelled once.</td></tr><tr><th>Answer</th><td>12 rows. The dimension stays tiny however many orders you load.</td></tr></table>
+<p><strong>Practice (with answers)</strong></p>
+<ol><li>A fact joins <code>dim_date</code> twice, once as order date and once as ship date. What is this called? <strong>Answer:</strong> role-playing dimension.</li><li>A bridge has weights 0.6 and 0.4 for a sale of 250. What does each promo get? <strong>Answer:</strong> 150 and 100, total 250.</li><li>An order comes with customer id c7 that is not in the dimension yet. What do you do? <strong>Answer:</strong> insert an inferred placeholder, use its key, update it later.</li><li>Which fact type fits "order moves through 4 stages and we report lag between them"? <strong>Answer:</strong> accumulating snapshot.</li><li>Why store a hashdiff in a satellite? <strong>Answer:</strong> to detect attribute changes with one comparison and avoid duplicate history rows.</li><li>Is average order value additive? <strong>Answer:</strong> no. Store sum and count and divide after summing.</li></ol>
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>Model for the question: facts hold measurements, dimensions hold context.</li><li>Always state the grain in one sentence before adding columns. Mixed grain double counts.</li><li>Fact types: transaction, periodic snapshot, accumulating snapshot. Additive, semi-additive, non-additive measures.</li><li>Conformed dimensions and the bus matrix let different facts be compared.</li><li>Star is the default; snowflake saves space but adds joins; OBT is fastest to query and costly to maintain.</li><li>SCD Type 1 overwrites, Type 2 versions rows (valid_from, valid_to, is_current), Type 3 keeps one previous value, Type 6 combines.</li><li>Surrogate keys let one business key have many versions. The fact stores the version key valid at event time.</li><li>Inmon is normalized first, Kimball is marts first, Data Vault uses hubs, links and satellites.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Rule</th></tr></thead><tbody><tr><td>Revenue check after join</td><td>total before join = total after join</td></tr><tr><td>SCD2 columns</td><td><code>valid_from</code>, <code>valid_to</code> (exclusive), <code>is_current</code></td></tr><tr><td>Point in time</td><td><code>d &gt;= valid_from AND d &lt; valid_to</code></td></tr><tr><td>SCD2 invariant</td><td>exactly one current row per business key</td></tr><tr><td>Additivity</td><td>sum yes / semi (not over time) / no</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p><strong>1.</strong> (easy) What is the grain of a table with one row per customer per month-end balance? <strong>Answer:</strong> one customer at one month end (a periodic snapshot).</p>
+<p><strong>2.</strong> (easy) Put these into fact or dimension: <code>qty</code>, <code>city</code>, <code>amount</code>, <code>product_category</code>. <strong>Answer:</strong> facts: qty, amount. Dimensions: city, product_category.</p>
+<p><strong>3.</strong> Fact total is 2050 before joining three dimensions and 4100 after. What went wrong? <strong>Answer:</strong> a join multiplied rows (duplicate dimension keys, or many-to-many). Total doubled, so each fact row matched two dimension rows. Check dimension key uniqueness.</p>
+<p><strong>4.</strong> What does this output? <code>SELECT city FROM dim_customer WHERE customer_id='C1' AND '2024-02-01' &gt;= valid_from AND '2024-02-01' &lt; valid_to;</code> using the 2.1 data. <strong>Answer:</strong> <code>Mumbai</code> because 2024-02-01 is not &lt; the Pune row's <code>valid_to</code> (equal), but is &gt;= the Mumbai row's <code>valid_from</code>.</p>
+<p><strong>5.</strong> Find the bug: an SCD2 load inserts a new current row for every staging row without closing the old one. <strong>Answer:</strong> several current rows per customer, and facts join twice. Close the old row first, insert only when changed.</p>
+<p><strong>6.</strong> A fact table keeps <code>unit_price</code>. Why is <code>SUM(unit_price)</code> wrong, and what to store? <strong>Answer:</strong> price is non-additive. Store <code>qty</code> and <code>amount</code>; derive price as amount / qty (or a weighted average).</p>
+<p><strong>7.</strong> A table has Type 3 columns <code>city</code>, <code>prev_city</code>. A customer moves twice (Pune, Mumbai, Delhi). What is stored? <strong>Answer:</strong> city = Delhi, prev_city = Mumbai. Pune is lost, which is the limit of Type 3.</p>
+<p><strong>8.</strong> Design: "average delivery time per warehouse". Which fact type and why? <strong>Answer:</strong> an accumulating snapshot with ordered, shipped, delivered dates per order. Durations are differences between its date columns.</p>
+<p><strong>9.</strong> (interview) "Walk me through designing a warehouse for a food-delivery app." <strong>Answer:</strong> Choose a process (order delivery). Declare grain (one row per order). Dimensions: date, customer, restaurant, courier, location. Facts: item total, fee, discount, tip, delivery minutes. Use SCD2 for restaurant and customer attributes that affect reporting. Add a periodic snapshot for courier hours. Build a bus matrix and conform date and location.</p>
+<p><strong>10.</strong> (interview) "When would you use SCD Type 2 rather than Type 1?" <strong>Answer:</strong> When the business needs history "as it was", for example revenue by customer region at purchase time, audit, or ML features without leakage. Use Type 1 for corrections.</p>
+<p><strong>11.</strong> (scenario) A fact arrives for customer <code>C9</code>, but <code>dim_customer</code> has no <code>C9</code> yet. What do you do? <strong>Answer:</strong> Use the unknown-member key (for example −1) or insert a placeholder dimension row marked inferred, and update it when the real row arrives. Never drop the fact.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language. Teach me Kimball dimensional modeling: facts, dimensions, grain, star and snowflake schemas. Use an online shop with real numbers. Show a small SQLite example with output, then ask me 3 questions about grain and additivity, one at a time, and correct my answers kindly.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: slowly changing dimensions Type 1, 2, 3 and 6. Walk me step by step through an SCD2 load with a staging table and the SQL that closes old rows and inserts new ones. Then give me 8 graded exercises with different change scenarios, no solutions, and wait for my answers before checking them.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and I am applying for data engineering jobs. Topic: choosing between Kimball star, Inmon 3NF, Data Vault (hubs, links, satellites) and One Big Table. Make a comparison with real project examples and ask me to choose a model for 5 business cases. Explain each correct choice in simple English and name when I would NOT use it.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: finding double counting caused by wrong grain or bad joins in a star schema. Give me 6 broken SQL queries on fact and dimension tables (with small sample data), ask me to predict the wrong total, find the bug and fix it. Do not give answers until I reply. Review my answers: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Topic: designing a performance-results warehouse (test runs, builds, scenarios, transactions) as a star schema. Ask me to state the grain, pick facts and dimensions, and decide where SCD2 is needed. Then run a mock interview of 6 questions about dimensional modeling, scoring each answer 1 to 5 with a model answer.</pre></div><div class="readbtn"><button class="btn" data-read="study:de:ch02">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch01.html">← Chapter 1: The Data Engineering Lifecycle and Architectures</a><a class="btn" href="ch03.html">Chapter 3: File Formats, Storage and Lakehouse Table Formats →</a></div></div><script src="../../assets/study.js"></script></body></html>

@@ -1,0 +1,1916 @@
+<p>Priya has a Monday deadline. Finance sent a sales export as a CSV that opens with strange characters where the accented names should be. Operations keeps order history in a small SQLite file. The partner's shipping data sits behind a web API that returns 50 rows per page and sometimes answers "too many requests". The competitor's price list exists only as an HTML table on a web page. And her manager wants all four in one table, checked for bad values, loaded again every night without duplicates.</p>
+<p>None of this is modelling. It is plumbing, and plumbing decides whether a data project works at all. A model trained on half-read files is worse than no model. In this chapter you learn the libraries that move data in and out of Python: <code>pathlib</code>, <code>csv</code>, <code>json</code>, PyYAML, <code>openpyxl</code>, <code>sqlite3</code>, SQLAlchemy, <code>requests</code>, <code>httpx</code>, BeautifulSoup, validation with dataclasses and pydantic, Parquet and Arrow, plus <code>logging</code>, progress bars and chunked reading. By the end you can open any common source, read it safely, check it, and write it somewhere else, and you have a playbook for when something goes wrong.</p>
+<p><em>How this chapter is labelled.</em> Every code block marked as a normal Python block was run for this document with Python 3.14, pandas 3.0, NumPy 2.x, requests, httpx, BeautifulSoup 4, openpyxl and PyYAML, and the output under it is the real output. SQLAlchemy, pydantic, pyarrow and tqdm were <strong>not installed</strong> on the study machine, so their code appears in plain text blocks that start with <code># NOT RUN HERE</code>, and wherever possible a runnable equivalent is given next to it. Web examples never touch the internet: each one starts its own tiny server on <code>127.0.0.1</code> inside the script, so everything works offline. Timings in this chapter were measured once and vary between machines.</p>
+
+<h2>20.1 The data-access toolbox: what, when, and the mental model</h2>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Every data source is a different kind of door into the same house. A file is a door you open yourself, a database is a door with a receptionist (SQL), a web API is a door on another building, and a web page is a window you can only look through. Your job is to pick the right door, carry things out in manageable boxes, and check the contents before they enter the house (your DataFrame).</div></div>
+<h3>What each library is for, and when not to use it</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Library</th><th>Use it when</th><th>Do NOT use it when</th></tr></thead><tbody>
+<tr><td><code>pathlib</code>, <code>glob</code></td><td>Building paths, finding many files, safe file operations</td><td>You need remote storage such as S3 (use that provider's SDK or <code>fsspec</code>)</td></tr>
+<tr><td><code>csv</code></td><td>Small to medium text tables, streaming row by row, odd dialects</td><td>You need fast analysis (use <code>pandas.read_csv</code>)</td></tr>
+<tr><td><code>json</code>, PyYAML</td><td>Nested data, configs, API payloads</td><td>Huge tabular data (JSON repeats every key on every row)</td></tr>
+<tr><td><code>openpyxl</code></td><td>Reading and writing <code>.xlsx</code>, formatting, formulas</td><td>Old <code>.xls</code> files, or millions of rows</td></tr>
+<tr><td><code>sqlite3</code></td><td>Local single-file database, tests, small ETL state</td><td>Many concurrent writers or a shared server database</td></tr>
+<tr><td>SQLAlchemy</td><td>One code base for several databases, ORM models, safe query building</td><td>A five-line script on SQLite (plain <code>sqlite3</code> is enough)</td></tr>
+<tr><td><code>requests</code></td><td>Simple synchronous HTTP calls</td><td>Hundreds of parallel calls (use <code>httpx.AsyncClient</code>)</td></tr>
+<tr><td><code>httpx</code></td><td>Same style as requests plus async, HTTP/2 option, strict timeouts</td><td>You need a browser to run JavaScript</td></tr>
+<tr><td>BeautifulSoup</td><td>Pulling facts out of static HTML</td><td>The site offers an API or a download (use that), or the page is built by JavaScript</td></tr>
+<tr><td>pydantic / dataclasses</td><td>Checking that incoming records have the right shape</td><td>Checking statistical quality of a whole table (use DataFrame checks)</td></tr>
+<tr><td>Parquet / Arrow</td><td>Large analytic tables, fast column reads, typed storage</td><td>Files people must open in a text editor</td></tr>
+</tbody></table></div>
+<h3>Install and version check</h3>
+<p>Install with <code>python3 -m pip install pandas requests httpx beautifulsoup4 openpyxl pyyaml</code>, and add <code>sqlalchemy pydantic pyarrow tqdm</code> for the optional parts. Always print versions when something behaves oddly, because behaviour changes between releases (pandas 3.0 and requests 2.x differ from older tutorials).</p>
+<pre class="code lang-python"><code>import sys, sqlite3, importlib.util
+import pandas as pd, requests, httpx, bs4, openpyxl, yaml
+
+print("python", sys.version.split()[0])
+print("sqlite library", sqlite3.sqlite_version)
+for mod in (pd, requests, httpx, bs4, openpyxl, yaml):
+    print(mod.__name__, mod.__version__)
+for name in ("sqlalchemy", "pydantic", "pyarrow", "tqdm"):
+    found = importlib.util.find_spec(name) is not None
+    print(name, "installed" if found else "missing")</code></pre>
+<pre class="code lang-text"><code>python 3.14.3
+sqlite library 3.50.4
+pandas 3.0.6
+requests 2.34.2
+httpx 0.28.1
+bs4 4.15.0
+openpyxl 3.1.5
+yaml 6.0.3
+sqlalchemy missing
+pydantic missing
+pyarrow missing
+tqdm missing</code></pre>
+<ol><li>Line 1 imports the standard-library helpers: <code>sys</code> for the Python version, <code>sqlite3</code> for the engine version, <code>importlib.util</code> to test for a package without importing it.</li><li>Line 2 imports the five third-party libraries under their standard names (<code>pd</code> is the universal alias for pandas).</li><li>Lines 4 and 5 print the Python version (only the number, before the first space) and the version of the SQLite C library bundled with Python.</li><li>The <code>for</code> loop prints each module's own name and <code>__version__</code>. Every well-behaved package has that attribute.</li><li><code>find_spec</code> returns <code>None</code> when a package cannot be imported, so the last loop reports which optional packages are missing. Your output will differ; the point is to know what you have.</li></ol>
+<h3>Import conventions</h3>
+<ul><li><code>import pandas as pd</code>, <code>import numpy as np</code>, <code>import requests</code>, <code>import httpx</code>, <code>import sqlite3</code>, <code>import yaml</code> (the PyPI name is <code>pyyaml</code>, the import name is <code>yaml</code>), <code>from bs4 import BeautifulSoup</code> (PyPI <code>beautifulsoup4</code>), <code>from pathlib import Path</code>, <code>import openpyxl</code> or <code>from openpyxl import load_workbook</code>.</li><li>Create one logger per module with <code>logger = logging.getLogger(__name__)</code>, never <code>print</code> in library code.</li></ul>
+<h3>The mental model</h3>
+<p>Every data-access script, from ten lines to ten thousand, has the same four stages: <strong>extract</strong> (open the door), <strong>validate</strong> (check the shape), <strong>transform</strong> (clean and combine) and <strong>load</strong> (write somewhere durable). Libraries differ, the stages do not. Most bugs are stage confusion: loading before validating, or re-extracting everything when only new rows were needed.</p>
+<figure><img src="images/lib20_pipeline.png" alt="Diagram: four sources (files, database, web API, HTML pages) flow into a validate-and-clean step, then out to a DataFrame, Parquet files or a SQL database" loading="lazy"/><figcaption>Sources on the left, one validation gate in the middle, destinations on the right.</figcaption></figure>
+<p><strong>How to read it:</strong> follow the arrows left to right. All four blue sources pass through the single orange gate. That is deliberate: put your checks in one place, so bad data from any door is stopped the same way. The note under the diagram reminds you that logging and chunking apply to every arrow.</p>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Prefer the structured door. If a source offers a database, an API or a file download, use that before scraping HTML. Structured sources have types, versions and documented limits; HTML has layout that changes without notice.</div></div>
+
+<h2>20.2 Paths and files: pathlib and glob</h2>
+<p>Before any parser can run, you must find the file. <code>pathlib.Path</code> treats a path as an object with methods instead of a string you glue with <code>+</code>. It works the same on Windows (backslashes) and macOS or Linux (slashes), which is why it replaced <code>os.path</code> in modern code.</p>
+<h3>Reference: the most useful pathlib, glob and file helpers</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>Path(...)</code></td><td>Make a path object</td><td><code>Path("data") / "a.csv"</code></td></tr>
+<tr><td><code>/</code> operator</td><td>Join parts with the right separator</td><td><code>root / "raw" / "x.csv"</code></td></tr>
+<tr><td><code>.name</code>, <code>.stem</code>, <code>.suffix</code></td><td>File name, name without extension, extension with dot</td><td><code>Path("a/b.csv").stem</code> gives <code>b</code></td></tr>
+<tr><td><code>.parent</code>, <code>.parents</code></td><td>Folder containing it, all ancestors</td><td><code>p.parent.parent</code></td></tr>
+<tr><td><code>.parts</code></td><td>Tuple of path pieces</td><td><code>Path("a/b").parts</code></td></tr>
+<tr><td><code>.with_suffix(s)</code>, <code>.with_name(n)</code></td><td>Same path, new extension or file name</td><td><code>p.with_suffix(".parquet")</code></td></tr>
+<tr><td><code>.exists()</code>, <code>.is_file()</code>, <code>.is_dir()</code></td><td>Check what is there</td><td><code>if not p.is_file(): ...</code></td></tr>
+<tr><td><code>.mkdir(parents=True, exist_ok=True)</code></td><td>Create a folder and any missing parents, no error if present</td><td><code>out.mkdir(parents=True, exist_ok=True)</code></td></tr>
+<tr><td><code>.iterdir()</code></td><td>Items directly inside a folder (any order)</td><td><code>sorted(d.iterdir())</code></td></tr>
+<tr><td><code>.glob(pattern)</code></td><td>Items matching a pattern in one folder</td><td><code>d.glob("*.csv")</code></td></tr>
+<tr><td><code>.rglob(pattern)</code></td><td>Same, searching all sub-folders</td><td><code>d.rglob("*.json")</code></td></tr>
+<tr><td><code>.read_text(encoding=...)</code></td><td>Whole file as one string</td><td><code>p.read_text(encoding="utf-8")</code></td></tr>
+<tr><td><code>.write_text(s, encoding=...)</code></td><td>Write a string, replacing the file</td><td><code>p.write_text("hi", encoding="utf-8")</code></td></tr>
+<tr><td><code>.open(mode, encoding=...)</code></td><td>File handle for streaming</td><td><code>with p.open() as f: ...</code></td></tr>
+<tr><td><code>.stat()</code></td><td>Size, modified time</td><td><code>p.stat().st_size</code></td></tr>
+<tr><td><code>.replace(target)</code>, <code>.rename(target)</code></td><td>Move a file; <code>replace</code> overwrites atomically</td><td><code>tmp.replace(final)</code></td></tr>
+<tr><td><code>.relative_to(base)</code></td><td>Path seen from another folder</td><td><code>p.relative_to(root)</code></td></tr>
+<tr><td><code>glob.glob(pattern)</code>, <code>glob.iglob</code></td><td>String-based matching, list or lazy iterator</td><td><code>glob.glob("data/*_2025.csv")</code></td></tr>
+</tbody></table></div>
+<p><strong>Glob patterns:</strong> <code>*</code> matches any characters except a slash, <code>?</code> matches one character, <code>[12]</code> matches one of the listed characters, and <code>**</code> (with <code>rglob</code> or <code>recursive=True</code>) crosses folders.</p>
+<h3>Example 1: take a path apart</h3>
+<pre class="code lang-python"><code>from pathlib import Path
+
+p = Path("data") / "raw" / "sales_2025.csv"
+print(p)
+print(p.name, p.stem, p.suffix, p.parent)
+print(p.with_suffix(".parquet"))
+print(p.parts)
+print(p.is_absolute())</code></pre>
+<pre class="code lang-text"><code>data/raw/sales_2025.csv
+sales_2025.csv sales_2025 .csv data/raw
+data/raw/sales_2025.parquet
+('data', 'raw', 'sales_2025.csv')
+False</code></pre>
+<ol><li>The <code>/</code> operator joins three pieces into one path, so you never type a separator.</li><li><code>print(p)</code> shows the path with forward slashes (on Windows you would see backslashes).</li><li>The three attributes split the file name: <code>sales_2025.csv</code>, its stem <code>sales_2025</code> and the suffix <code>.csv</code>. <code>.parent</code> is the folder part.</li><li><code>with_suffix</code> returns a new path; <code>p</code> itself is unchanged because paths are immutable.</li><li><code>.parts</code> is a tuple, and <code>is_absolute()</code> is <code>False</code> because the path starts relative to the current folder.</li></ol>
+<h3>Example 2: search a tree, then write safely</h3>
+<p>A nightly job that crashes half way through writing a report leaves a broken file that the next job happily reads. The fix is to write to a temporary name in the same folder and then <code>replace</code> it in one step.</p>
+<pre class="code lang-python"><code>import glob, os, tempfile
+from pathlib import Path
+
+root = Path(tempfile.mkdtemp())
+for month in ("2025-01", "2025-02"):
+    (root / "raw" / month).mkdir(parents=True, exist_ok=True)
+    for day in (1, 2):
+        (root / "raw" / month / f"orders_{day:02d}.csv").write_text("id,total\n1,9.5\n")
+(root / "raw" / "notes.txt").write_text("hello")
+
+found = sorted(p.relative_to(root).as_posix() for p in root.rglob("*.csv"))
+print(len(found), found[0])
+print([p.name for p in sorted((root / "raw").glob("*"))])
+print(sorted(os.path.basename(f) for f in glob.glob(str(root / "raw" / "*" / "orders_01.csv"))))
+
+target = root / "report.txt"
+tmp = target.with_suffix(".tmp")
+tmp.write_text("final content")
+tmp.replace(target)
+print(target.read_text(), tmp.exists())</code></pre>
+<pre class="code lang-text"><code>4 raw/2025-01/orders_01.csv
+['2025-01', '2025-02', 'notes.txt']
+['orders_01.csv', 'orders_01.csv']
+final content False</code></pre>
+<ol><li><code>mkdir(parents=True, exist_ok=True)</code> builds <code>raw/2025-01</code> and its parent, and is safe to re-run. The <code>:02d</code> pads days so names sort correctly.</li><li><code>rglob("*.csv")</code> searches every sub-folder and finds 4 files; <code>sorted</code> is needed because file systems return any order; <code>relative_to</code> drops the temporary prefix.</li><li><code>glob("*")</code> lists only direct children of <code>raw</code> (two folders and a text file). <code>glob.glob</code> works on strings, hence <code>str()</code>.</li><li>The write goes to <code>report.tmp</code> first; <code>replace</code> swaps it in atomically. Readers see the old report or the new one, never half of it.</li></ol>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">Data teams name files by date (<code>orders_2025-03-01.csv</code>) and use <code>glob</code> to pick up "everything not yet processed". Sort the matches, because lexical order of ISO dates equals time order, and your pipeline becomes deterministic.</div></div>
+
+<h2>20.3 Text formats: csv, json and yaml</h2>
+<p>These three formats cover most files you will meet. <strong>CSV</strong> is a flat table in text, <strong>JSON</strong> is nested data (dicts and lists), and <strong>YAML</strong> is human-friendly nested data, mostly used for configuration. The golden rule: parse them with a real parser, never with <code>line.split(",")</code>, because real data contains commas and quotes inside values.</p>
+<h3>Reference: csv, json and yaml essentials</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>csv.reader(f)</code></td><td>Yields each row as a list of strings</td><td><code>for row in csv.reader(f): ...</code></td></tr>
+<tr><td><code>csv.DictReader(f)</code></td><td>Yields each row as a dict keyed by the header</td><td><code>rows = list(csv.DictReader(f))</code></td></tr>
+<tr><td><code>csv.writer(f)</code></td><td>Writes lists as rows, quoting when needed</td><td><code>w.writerow(["a", 1])</code></td></tr>
+<tr><td><code>csv.DictWriter(f, fieldnames)</code></td><td>Writes dicts as rows</td><td><code>w.writeheader()</code></td></tr>
+<tr><td><code>open(path, newline="", encoding=...)</code></td><td>The correct way to open a file for csv</td><td><code>open("a.csv", newline="", encoding="utf-8")</code></td></tr>
+<tr><td><code>delimiter=</code>, <code>quotechar=</code></td><td>Handle semicolon, tab or pipe files</td><td><code>csv.reader(f, delimiter=";")</code></td></tr>
+<tr><td><code>quoting=csv.QUOTE_ALL</code> (and others)</td><td>Control when output is quoted</td><td><code>csv.writer(f, quoting=csv.QUOTE_ALL)</code></td></tr>
+<tr><td><code>csv.Sniffer().sniff(sample)</code></td><td>Guess the delimiter from a sample</td><td><code>dialect = csv.Sniffer().sniff(text[:1024])</code></td></tr>
+<tr><td><code>json.loads(s)</code>, <code>json.load(f)</code></td><td>Text or file to Python objects</td><td><code>json.loads('{"a": 1}')</code></td></tr>
+<tr><td><code>json.dumps(obj)</code>, <code>json.dump(obj, f)</code></td><td>Python objects to text or file</td><td><code>json.dumps({"a": 1})</code></td></tr>
+<tr><td><code>indent=</code>, <code>sort_keys=</code></td><td>Pretty and stable output</td><td><code>json.dumps(d, indent=2, sort_keys=True)</code></td></tr>
+<tr><td><code>ensure_ascii=False</code></td><td>Keep accents readable instead of <code>é</code></td><td><code>json.dumps("café", ensure_ascii=False)</code></td></tr>
+<tr><td><code>default=</code></td><td>Function that converts unknown types (dates)</td><td><code>json.dumps(d, default=str)</code></td></tr>
+<tr><td><code>json.JSONDecodeError</code></td><td>Raised on bad JSON; has <code>msg</code>, <code>pos</code></td><td><code>except json.JSONDecodeError as e:</code></td></tr>
+<tr><td>JSON Lines pattern</td><td>One JSON object per line; streams well</td><td><code>[json.loads(l) for l in f]</code></td></tr>
+<tr><td><code>pd.json_normalize(records)</code></td><td>Flatten nested dicts into columns</td><td><code>pd.json_normalize(recs, sep="_")</code></td></tr>
+<tr><td><code>yaml.safe_load(text)</code></td><td>YAML text to Python objects, safely</td><td><code>cfg = yaml.safe_load(f)</code></td></tr>
+<tr><td><code>yaml.safe_dump(obj, sort_keys=False)</code></td><td>Python objects to YAML text</td><td><code>yaml.safe_dump(cfg)</code></td></tr>
+</tbody></table></div>
+<h3>Example 1: write and read CSV with quotes inside values</h3>
+<pre class="code lang-python"><code>import csv, io
+
+buf = io.StringIO()
+w = csv.DictWriter(buf, fieldnames=["id", "name", "amount"], lineterminator="\n")
+w.writeheader()
+w.writerow({"id": 1, "name": "Ana, Jr.", "amount": 12.5})
+w.writerow({"id": 2, "name": 'Bo "B" Lee', "amount": 7})
+text = buf.getvalue()
+print(text)
+
+rows = list(csv.DictReader(io.StringIO(text)))
+print(rows[0])
+print(type(rows[0]["amount"]).__name__)
+print(sum(float(r["amount"]) for r in rows))</code></pre>
+<pre class="code lang-text"><code>id,name,amount
+1,"Ana, Jr.",12.5
+2,"Bo ""B"" Lee",7
+
+{'id': '1', 'name': 'Ana, Jr.', 'amount': '12.5'}
+str
+19.5</code></pre>
+<ol><li><code>io.StringIO</code> is an in-memory "file", handy for demos; with a real file you would use <code>open(path, "w", newline="", encoding="utf-8")</code>.</li><li><code>DictWriter</code> needs the column names. <code>lineterminator="\n"</code> avoids the default <code>\r\n</code>, so the output is the same on every system.</li><li>The two rows contain a comma and double quotes. The writer wraps the first name in quotes and doubles the inner quotes (<code>""</code>), which is the CSV rule for a quote inside a quoted value.</li><li><code>DictReader</code> reads it back correctly: the comma stayed inside the name.</li><li>Every value comes back as a <strong>string</strong>, including <code>amount</code>. CSV has no types, so you convert with <code>float()</code> yourself (or let pandas guess).</li><li>The last line adds 12.5 and 7.0 to get 19.5.</li></ol>
+<h3>Example 2: nested JSON Lines, the JSON date trap and a YAML config</h3>
+<pre class="code lang-python"><code>import json, yaml
+from datetime import date
+import pandas as pd
+
+print(json.dumps({"when": date(2025, 3, 1), "note": "café"}, default=str, ensure_ascii=False))
+try:
+    json.loads("{'a': 1}")
+except json.JSONDecodeError as e:
+    print("bad json:", e.msg, "at char", e.pos)
+
+lines = (
+    '{"id": 1, "user": {"name": "Ana", "tier": "gold"}, "total": 30}\n'
+    '{"id": 2, "user": {"name": "Bo", "tier": "basic"}, "total": 12}\n'
+)
+records = [json.loads(line) for line in lines.splitlines()]
+df = pd.json_normalize(records)
+print(df)
+
+cfg = yaml.safe_load("""
+source:
+  path: data/orders.jsonl
+  encoding: utf-8
+columns: [id, total]
+dropna: true
+""")
+print(cfg)
+print(df[cfg["columns"]].sum().to_dict())
+print(yaml.safe_dump({"a": [1, 2], "b": {"c": None}}, sort_keys=False))</code></pre>
+<pre class="code lang-text"><code>{"when": "2025-03-01", "note": "café"}
+bad json: Expecting property name enclosed in double quotes at char 1
+   id  total user.name user.tier
+0   1     30       Ana      gold
+1   2     12        Bo     basic
+{'source': {'path': 'data/orders.jsonl', 'encoding': 'utf-8'}, 'columns': ['id', 'total'], 'dropna': True}
+{'id': 3, 'total': 42}
+a:
+- 1
+- 2
+b:
+  c: null</code></pre>
+<ol><li>JSON cannot hold a <code>date</code>, so <code>dumps</code> would raise <code>TypeError</code>; <code>default=str</code> converts unknown objects (reading it back gives a string, so convert dates yourself). <code>ensure_ascii=False</code> keeps the accent. The bad-JSON test uses single quotes, which JSON forbids; the exception carries <code>msg</code> and <code>pos</code>, which is what you log.</li><li>The string is JSON Lines: one JSON object per line, so a huge file can be processed line by line.</li><li>Each line is parsed on its own; <code>json_normalize</code> flattens the inner <code>user</code> dict into columns <code>user.name</code> and <code>user.tier</code>.</li><li><code>yaml.safe_load</code> parses the triple-quoted text. Indentation means nesting; <code>[id, total]</code> is a list; <code>true</code> becomes Python <code>True</code>.</li><li>The config drives the code: the column list picks two columns and sums them.</li><li><code>safe_dump</code> writes YAML back. <code>sort_keys=False</code> keeps your order and <code>None</code> becomes <code>null</code>.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>yaml.load(text)</code>. <strong>Symptom:</strong> in old PyYAML it could construct arbitrary Python objects from a malicious file, which is a code-execution risk; in PyYAML 6 it fails with a missing <code>Loader</code> argument. <strong>Fix:</strong> always call <code>yaml.safe_load</code> for data you did not write yourself.</div></div>
+
+<h2>20.4 Excel: openpyxl and pandas</h2>
+<p>Excel files are everywhere in business: budgets, exports, hand-edited lists. An <code>.xlsx</code> file is a zip of XML files. <code>openpyxl</code> reads and writes it cell by cell, with formatting and formulas. <code>pandas.read_excel</code> and <code>DataFrame.to_excel</code> use openpyxl underneath for the whole-table case.</p>
+<h3>Reference: openpyxl and pandas Excel essentials</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>Workbook()</code></td><td>New empty workbook (one sheet)</td><td><code>wb = Workbook()</code></td></tr>
+<tr><td><code>load_workbook(path)</code></td><td>Open an existing file</td><td><code>wb = load_workbook("a.xlsx")</code></td></tr>
+<tr><td><code>read_only=True</code></td><td>Stream large files with low memory</td><td><code>load_workbook(p, read_only=True)</code></td></tr>
+<tr><td><code>data_only=True</code></td><td>Read cached formula results, not formulas</td><td><code>load_workbook(p, data_only=True)</code></td></tr>
+<tr><td><code>wb.active</code></td><td>The currently selected sheet</td><td><code>ws = wb.active</code></td></tr>
+<tr><td><code>wb.sheetnames</code></td><td>List of sheet names</td><td><code>wb.sheetnames</code></td></tr>
+<tr><td><code>wb["Name"]</code></td><td>Get a sheet by name</td><td><code>ws = wb["Sales"]</code></td></tr>
+<tr><td><code>wb.create_sheet(title)</code></td><td>Add a sheet</td><td><code>wb.create_sheet("Summary")</code></td></tr>
+<tr><td><code>ws["A1"]</code></td><td>One cell by address</td><td><code>ws["A1"] = "id"</code></td></tr>
+<tr><td><code>ws.append(list)</code></td><td>Add a row after the last used row</td><td><code>ws.append(["Ana", 30])</code></td></tr>
+<tr><td><code>ws.iter_rows(values_only=True)</code></td><td>Iterate rows as tuples of values</td><td><code>for r in ws.iter_rows(min_row=2, values_only=True)</code></td></tr>
+<tr><td><code>ws.freeze_panes</code></td><td>Keep header visible when scrolling</td><td><code>ws.freeze_panes = "A2"</code></td></tr>
+<tr><td><code>Font</code>, <code>PatternFill</code></td><td>Bold text, background colour</td><td><code>cell.font = Font(bold=True)</code></td></tr>
+<tr><td><code>cell.number_format</code></td><td>Display format of a number</td><td><code>cell.number_format = "0.00"</code></td></tr>
+<tr><td><code>wb.save(path)</code></td><td>Write the file to disk</td><td><code>wb.save("out.xlsx")</code></td></tr>
+<tr><td><code>pd.read_excel(path, sheet_name=...)</code></td><td>Sheet to DataFrame; <code>None</code> gives a dict of all sheets</td><td><code>pd.read_excel(p, sheet_name=None)</code></td></tr>
+<tr><td><code>skiprows=</code>, <code>header=</code>, <code>usecols=</code>, <code>dtype=</code></td><td>Handle title rows and pick columns and types</td><td><code>pd.read_excel(p, skiprows=2, usecols="A:C")</code></td></tr>
+<tr><td><code>df.to_excel(writer, sheet_name=, index=False)</code></td><td>DataFrame to a sheet</td><td><code>df.to_excel(w, sheet_name="Data", index=False)</code></td></tr>
+<tr><td><code>pd.ExcelWriter(path, engine="openpyxl")</code></td><td>Write several sheets into one file</td><td><code>with pd.ExcelWriter("o.xlsx") as w: ...</code></td></tr>
+</tbody></table></div>
+<h3>Example 1: create, save, reload, and the formula trap</h3>
+<pre class="code lang-python"><code>import tempfile
+from pathlib import Path
+from openpyxl import Workbook, load_workbook
+
+path = Path(tempfile.mkdtemp()) / "sales.xlsx"
+wb = Workbook()
+ws = wb.active
+ws.title = "Sales"
+ws.append(["region", "units"])
+for row in [("north", 120), ("south", 95), ("east", 143)]:
+    ws.append(row)
+ws["B5"] = "=SUM(B2:B4)"
+wb.save(path)
+
+sheet = load_workbook(path)["Sales"]
+print(sheet.max_row, sheet.max_column)
+for region, units in sheet.iter_rows(min_row=2, max_row=4, values_only=True):
+    print(region, units)
+print(sheet["B5"].value, load_workbook(path, data_only=True)["Sales"]["B5"].value)</code></pre>
+<pre class="code lang-text"><code>5 2
+north 120
+south 95
+east 143
+=SUM(B2:B4) None</code></pre>
+<ol><li>A new <code>Workbook</code> has one sheet; <code>append</code> adds a row per call. Nothing exists on disk until <code>wb.save</code>.</li><li>After reloading, <code>max_row</code> is 5 (header, three rows and the formula row) and <code>max_column</code> is 2. <code>iter_rows(values_only=True)</code> yields plain tuples; without it you get cell objects.</li><li>Cell B5 stores the <em>text</em> of a formula. A normal load returns that text. With <code>data_only=True</code> you ask for the cached result, but only Excel writes that cache; openpyxl never calculates, so you get <code>None</code>.</li><li>Lesson: formulas written by a script have no values until a spreadsheet application saves the file. Compute in pandas and write values instead.</li></ol>
+<h3>Example 2: a multi-sheet report with pandas</h3>
+<pre class="code lang-python"><code>import tempfile
+from pathlib import Path
+import pandas as pd
+
+path = Path(tempfile.mkdtemp()) / "report.xlsx"
+sales = pd.DataFrame({"region": ["north", "south", "east"], "units": [120, 95, 143]})
+notes = pd.DataFrame({"note": ["Prepared by Priya"]})
+with pd.ExcelWriter(path, engine="openpyxl") as writer:
+    sales.to_excel(writer, sheet_name="Sales", index=False)
+    notes.to_excel(writer, sheet_name="Notes", index=False)
+
+everything = pd.read_excel(path, sheet_name=None)
+print(list(everything))
+print(everything["Sales"])
+print(pd.read_excel(path, sheet_name="Sales", usecols="B").columns.tolist())
+print(pd.read_excel(path, sheet_name="Sales", dtype={"units": "float64"})["units"].dtype)</code></pre>
+<pre class="code lang-text"><code>['Sales', 'Notes']
+  region  units
+0  north    120
+1  south     95
+2   east    143
+['units']
+float64</code></pre>
+<ol><li><code>ExcelWriter</code> as a context manager saves and closes the file when the <code>with</code> block ends.</li><li>Each <code>to_excel</code> call writes one sheet; <code>index=False</code> avoids an unwanted extra column holding 0, 1, 2.</li><li><code>sheet_name=None</code> reads every sheet into a dict of DataFrames, keyed by sheet name.</li><li><code>usecols="B"</code> uses Excel column letters and returns only the second column.</li><li><code>dtype</code> forces a type on read, here turning whole numbers into floats. Use it to keep codes as text, for example <code>dtype={"zip": str}</code>.</li></ol>
+
+<h2>20.5 Databases with sqlite3</h2>
+<p>SQLite is a complete SQL database stored in one file (or in memory), and Python ships with the driver. It is the best place to learn database access, and a good home for small pipelines, caches and ETL bookkeeping. The same ideas (connection, cursor, parameters, transaction) apply to PostgreSQL, MySQL and SQL Server drivers, because they all follow the Python DB-API.</p>
+<h3>Reference: sqlite3 essentials</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>sqlite3.connect(path)</code></td><td>Open (or create) a database file</td><td><code>con = sqlite3.connect("app.db")</code></td></tr>
+<tr><td><code>":memory:"</code></td><td>Temporary database that vanishes on close</td><td><code>sqlite3.connect(":memory:")</code></td></tr>
+<tr><td><code>con.execute(sql, params)</code></td><td>Run one statement, get a cursor</td><td><code>con.execute("select 1")</code></td></tr>
+<tr><td><code>con.executemany(sql, rows)</code></td><td>Run one statement for many parameter sets</td><td><code>con.executemany("insert into t values (?,?)", rows)</code></td></tr>
+<tr><td><code>cursor.fetchone()</code></td><td>Next row, or <code>None</code></td><td><code>cur.fetchone()</code></td></tr>
+<tr><td><code>cursor.fetchall()</code></td><td>All remaining rows as a list</td><td><code>cur.fetchall()</code></td></tr>
+<tr><td>iterate a cursor</td><td>Stream rows one by one</td><td><code>for row in con.execute(sql): ...</code></td></tr>
+<tr><td><code>? placeholder</code></td><td>Positional parameter binding</td><td><code>"where id = ?", (7,)</code></td></tr>
+<tr><td><code>:name placeholder</code></td><td>Named parameter binding</td><td><code>"where id = :id", {"id": 7}</code></td></tr>
+<tr><td><code>con.commit()</code>, <code>con.rollback()</code></td><td>Save or undo the open transaction</td><td><code>con.commit()</code></td></tr>
+<tr><td><code>with con:</code></td><td>Commit on success, roll back on error (does not close)</td><td><code>with con: con.execute(...)</code></td></tr>
+<tr><td><code>con.close()</code></td><td>Release the file</td><td><code>con.close()</code></td></tr>
+<tr><td><code>con.row_factory = sqlite3.Row</code></td><td>Rows accessible by column name</td><td><code>row["name"]</code></td></tr>
+<tr><td><code>cursor.lastrowid</code>, <code>cursor.rowcount</code></td><td>Id of last insert, rows changed</td><td><code>cur.rowcount</code></td></tr>
+<tr><td><code>insert ... on conflict do update</code></td><td>Upsert: insert or update by key</td><td><code>on conflict(id) do update set v = excluded.v</code></td></tr>
+<tr><td><code>sqlite3.IntegrityError</code></td><td>Constraint failed (duplicate key, NOT NULL)</td><td><code>except sqlite3.IntegrityError:</code></td></tr>
+<tr><td><code>pragma table_info(t)</code></td><td>List columns of a table</td><td><code>con.execute("pragma table_info(t)")</code></td></tr>
+<tr><td><code>pragma journal_mode = wal</code></td><td>Readers do not block the writer</td><td><code>con.execute("pragma journal_mode = wal")</code></td></tr>
+<tr><td><code>explain query plan ...</code></td><td>Show whether an index is used</td><td><code>con.execute("explain query plan select ...")</code></td></tr>
+</tbody></table></div>
+<p><strong>Parameter binding</strong> means you send the SQL text and the values separately. The database treats values only as data, never as SQL. It is the single most important habit in this section.</p>
+<h3>Example 1: create, insert, query</h3>
+<pre class="code lang-python"><code>import sqlite3
+
+con = sqlite3.connect(":memory:")
+con.execute("create table orders(id integer primary key, customer text, total real)")
+rows = [(1, "ana", 30.0), (2, "bo", 12.5), (3, "ana", 8.0)]
+con.executemany("insert into orders values (?, ?, ?)", rows)
+con.commit()
+
+cur = con.execute("select customer, sum(total) from orders group by customer order by 2 desc")
+print([d[0] for d in cur.description])
+for customer, spent in cur:
+    print(customer, spent)
+
+con.row_factory = sqlite3.Row
+row = con.execute("select * from orders where id = :id", {"id": 2}).fetchone()
+print(row["customer"], row["total"], tuple(row))
+con.close()</code></pre>
+<pre class="code lang-text"><code>['customer', 'sum(total)']
+ana 38.0
+bo 12.5
+bo 12.5 (2, 'bo', 12.5)</code></pre>
+<ol><li><code>":memory:"</code> makes a throw-away database, ideal for demos and tests. <code>executemany</code> runs one insert three times, binding each tuple to the three <code>?</code> marks; <code>commit()</code> makes the rows permanent for other connections.</li><li>The query groups by customer. <code>cursor.description</code> lists column names; iterating the cursor streams rows; <code>order by 2</code> means the second selected column.</li><li>With <code>row_factory = sqlite3.Row</code> a row works like a tuple and a dict. The named placeholder <code>:id</code> takes a dict.</li></ol>
+<h3>Example 2: SQL injection, shown and fixed</h3>
+<pre class="code lang-python"><code>import sqlite3
+
+con = sqlite3.connect(":memory:")
+con.execute("create table users(name text, role text)")
+con.executemany("insert into users values (?, ?)", [("ana", "admin"), ("bo", "user"), ("cy", "user")])
+
+evil = "x' OR '1'='1"
+bad_sql = f"select name from users where name = '{evil}'"
+print(bad_sql)
+print(con.execute(bad_sql).fetchall())
+
+safe = con.execute("select name from users where name = ?", (evil,)).fetchall()
+print(safe)</code></pre>
+<pre class="code lang-text"><code>select name from users where name = 'x' OR '1'='1'
+[('ana',), ('bo',), ('cy',)]
+[]</code></pre>
+<ol><li><code>evil</code> imitates what an attacker, or just a surname with an apostrophe, might type into a form.</li><li>The f-string pastes it into the SQL, giving <code>where name = 'x' OR '1'='1'</code>, which is always true: every user is returned. In a real system the same trick can read or delete other tables.</li><li>With <code>?</code> the driver sends the text as a value only. Nobody has that name, so the result is empty.</li><li>Values are bound with <code>?</code>; table and column names cannot be bound, so check them against a fixed allow-list.</li></ol>
+<h3>Example 3: transactions, rollback and upsert</h3>
+<pre class="code lang-python"><code>import sqlite3
+
+con = sqlite3.connect(":memory:")
+con.execute("create table stock(sku text primary key, qty integer not null)")
+con.execute("insert into stock values ('A1', 10)")
+con.commit()
+
+try:
+    with con:
+        con.execute("update stock set qty = qty - 4 where sku = 'A1'")
+        con.execute("insert into stock values ('A1', 99)")
+except sqlite3.IntegrityError as e:
+    print("rolled back:", e)
+print(con.execute("select * from stock").fetchall())
+
+sql = """insert into stock(sku, qty) values (?, ?)
+         on conflict(sku) do update set qty = qty + excluded.qty"""
+con.executemany(sql, [("A1", 5), ("B2", 7)])
+con.commit()
+print(con.execute("select * from stock order by sku").fetchall())</code></pre>
+<pre class="code lang-text"><code>rolled back: UNIQUE constraint failed: stock.sku
+[('A1', 10)]
+[('A1', 15), ('B2', 7)]</code></pre>
+<ol><li>Inside <code>with con:</code> the first update succeeds, then the duplicate-key insert raises <code>IntegrityError</code>. The block is rolled back as a whole, so the update is undone too: stock is still 10.</li><li>The upsert says: insert the row, but if the key exists, add the new quantity to the old one (<code>excluded</code> is the rejected row). A1 becomes 15 and B2 is created with 7.</li></ol>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">A transaction is a promise: either every change in the block happens or none does. Wrap each logical unit of work (one batch load, one order) in <code>with con:</code>. Idempotent loads (safe to run twice) use upserts like the one above.</div></div>
+
+<h2>20.6 SQLAlchemy and pandas.read_sql</h2>
+<p>SQLAlchemy is the standard Python toolkit for relational databases. It was <strong>not installed on the study machine, so its code below is not run here</strong>. It has two layers. <strong>Core</strong> builds SQL from Python objects (tables, <code>select()</code>, <code>insert()</code>) and executes it. The <strong>ORM</strong> (object-relational mapper) sits on Core and maps tables to classes, so a row becomes an object and a <code>Session</code> tracks your changes. The examples use the SQLAlchemy 2.0 style (<code>select()</code>, <code>Mapped</code>, <code>mapped_column</code>).</p>
+<h3>Connection strings</h3>
+<p>An engine is created from a URL shaped like <code>dialect+driver://user:password@host:port/database</code>. The engine owns a <strong>connection pool</strong>, so create one engine per process, not one per query.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Database</th><th>URL example</th><th>Driver package</th></tr></thead><tbody>
+<tr><td>SQLite file (relative)</td><td><code>sqlite:///data/app.db</code></td><td>built in</td></tr>
+<tr><td>SQLite file (absolute)</td><td><code>sqlite:////home/me/app.db</code> (four slashes)</td><td>built in</td></tr>
+<tr><td>SQLite in memory</td><td><code>sqlite:///:memory:</code></td><td>built in</td></tr>
+<tr><td>PostgreSQL</td><td><code>postgresql+psycopg://user:pw@host:5432/sales</code></td><td><code>psycopg</code></td></tr>
+<tr><td>MySQL</td><td><code>mysql+pymysql://user:pw@host:3306/sales</code></td><td><code>pymysql</code></td></tr>
+<tr><td>SQL Server</td><td><code>mssql+pyodbc://user:pw@dsn_name</code></td><td><code>pyodbc</code></td></tr>
+</tbody></table></div>
+<p>Passwords with characters such as <code>@</code> or <code>/</code> must be percent-encoded, or the URL is parsed wrongly. This runnable check shows the anatomy of a URL using only the standard library:</p>
+<pre class="code lang-python"><code>from urllib.parse import urlsplit, quote_plus, unquote
+
+password = "p@ss/word"
+url = f"postgresql+psycopg://etl_user:{quote_plus(password)}@db.internal:5432/sales"
+print(url)
+u = urlsplit(url)
+print(u.scheme, u.username, unquote(u.password), u.hostname, u.port, u.path.lstrip("/"))</code></pre>
+<pre class="code lang-text"><code>postgresql+psycopg://etl_user:p%40ss%2Fword@db.internal:5432/sales
+postgresql+psycopg etl_user p@ss/word db.internal 5432 sales</code></pre>
+<ol><li><code>quote_plus</code> turns the unsafe characters into <code>%40</code> and <code>%2F</code>.</li><li>The f-string assembles the URL. In real code the password comes from an environment variable, never from the source file.</li><li><code>urlsplit</code> cuts the URL into parts; the <code>+</code> in the scheme is allowed.</li><li><code>unquote</code> restores the original password, which shows the encoding is reversible. SQLAlchemy's <code>URL.create(...)</code> builds the URL from separate fields and does this encoding for you.</li></ol>
+<h3>Reference: SQLAlchemy 2.0 essentials (not run here)</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>create_engine(url)</code></td><td>Make the engine and pool</td><td><code>engine = create_engine("sqlite:///app.db")</code></td></tr>
+<tr><td><code>engine.connect()</code></td><td>Borrow a connection (use <code>with</code>)</td><td><code>with engine.connect() as conn:</code></td></tr>
+<tr><td><code>engine.begin()</code></td><td>Connection plus automatic commit or rollback</td><td><code>with engine.begin() as conn:</code></td></tr>
+<tr><td><code>text(sql)</code></td><td>Raw SQL with <code>:name</code> parameters</td><td><code>text("select * from t where id = :id")</code></td></tr>
+<tr><td><code>conn.execute(stmt, params)</code></td><td>Run a statement</td><td><code>conn.execute(text(...), {"id": 1})</code></td></tr>
+<tr><td><code>result.mappings().all()</code></td><td>Rows as dict-like objects</td><td><code>conn.execute(q).mappings().all()</code></td></tr>
+<tr><td><code>MetaData()</code>, <code>Table</code>, <code>Column</code></td><td>Describe tables in Core</td><td><code>Table("t", md, Column("id", Integer, primary_key=True))</code></td></tr>
+<tr><td><code>metadata.create_all(engine)</code></td><td>Create missing tables</td><td><code>md.create_all(engine)</code></td></tr>
+<tr><td><code>select(...)</code></td><td>Build a SELECT</td><td><code>select(t.c.name).where(t.c.id &gt; 3)</code></td></tr>
+<tr><td><code>insert(t)</code>, <code>update(t)</code>, <code>delete(t)</code></td><td>Build DML statements</td><td><code>conn.execute(insert(t), [{"name": "a"}])</code></td></tr>
+<tr><td><code>.where()</code>, <code>.join()</code>, <code>.group_by()</code>, <code>.order_by()</code></td><td>Compose clauses</td><td><code>select(t).order_by(t.c.id.desc())</code></td></tr>
+<tr><td><code>DeclarativeBase</code></td><td>Base class of ORM models</td><td><code>class Base(DeclarativeBase): pass</code></td></tr>
+<tr><td><code>Mapped[...]</code>, <code>mapped_column()</code></td><td>Declare typed columns</td><td><code>id: Mapped[int] = mapped_column(primary_key=True)</code></td></tr>
+<tr><td><code>Session(engine)</code></td><td>Unit of work for ORM objects</td><td><code>with Session(engine) as s:</code></td></tr>
+<tr><td><code>session.add</code>, <code>add_all</code></td><td>Queue new objects</td><td><code>s.add(Order(...))</code></td></tr>
+<tr><td><code>session.commit()</code>, <code>rollback()</code></td><td>Save or undo</td><td><code>s.commit()</code></td></tr>
+<tr><td><code>relationship()</code></td><td>Link two models</td><td><code>items: Mapped[list["Item"]] = relationship()</code></td></tr>
+<tr><td><code>selectinload</code>, <code>joinedload</code></td><td>Load related rows in one go (avoids N+1)</td><td><code>select(Order).options(selectinload(Order.items))</code></td></tr>
+</tbody></table></div>
+<h3>Core and ORM in one sketch (not run here)</h3>
+<pre class="code lang-text"><code># NOT RUN HERE: sqlalchemy is not installed on the study machine (pip install sqlalchemy)
+from sqlalchemy import create_engine, text, select, func, String
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
+
+engine = create_engine("sqlite:///:memory:")
+
+# Core with raw SQL and bound parameters
+with engine.begin() as conn:                      # commits at the end of the block
+    conn.execute(text("create table t(id integer primary key, name text)"))
+    conn.execute(text("insert into t(name) values (:n)"), [{"n": "ana"}, {"n": "bo"}])
+with engine.connect() as conn:
+    rows = conn.execute(text("select * from t where name = :n"), {"n": "ana"}).mappings().all()
+
+# ORM: a class per table, a Session per unit of work
+class Base(DeclarativeBase):
+    pass
+
+class Order(Base):
+    __tablename__ = "orders"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    customer: Mapped[str] = mapped_column(String(50))
+    total: Mapped[float]
+
+Base.metadata.create_all(engine)
+with Session(engine) as s:
+    s.add_all([Order(customer="ana", total=30.0), Order(customer="bo", total=12.5)])
+    s.commit()
+    big = s.scalars(select(Order).where(Order.total &gt; 20)).all()
+    per_customer = s.execute(
+        select(Order.customer, func.sum(Order.total)).group_by(Order.customer)
+    ).all()</code></pre>
+<ol><li>One engine is created and reused. With <code>sqlite:///:memory:</code> stay in one thread, because each new connection would see its own empty database.</li><li><code>text()</code> with <code>:n</code> binds parameters separately, like <code>?</code> in sqlite3. <code>engine.begin()</code> commits at the end of the block or rolls back on error; <code>engine.connect()</code> does not commit by itself. <code>.mappings().all()</code> gives dict-like rows.</li><li>The class <code>Order</code> declares the table; <code>Mapped[float]</code> alone is a required column. The <code>Session</code> collects objects from <code>add_all</code> and writes them on <code>commit()</code>; <code>scalars().all()</code> unwraps objects into a list.</li><li>The last query is a group-by written with class attributes; SQLAlchemy parameterises it automatically.</li></ol>
+<div class="callout blue"><div class="lab">WHY IT MATTERS</div><div class="txt">The ORM is great for applications that create and update single objects. For analytics, where you read millions of rows into a DataFrame, plain SQL through <code>text()</code> or <code>pandas.read_sql</code> is shorter and faster. Use the ORM for writes with business rules and Core or SQL for bulk reads.</div></div>
+<h3>pandas.read_sql and to_sql (run with sqlite3)</h3>
+<p><code>pd.read_sql_query(sql, con, params=, parse_dates=, chunksize=)</code> runs a query and returns a DataFrame. It accepts a SQLAlchemy engine/connection, and, for SQLite only, a plain <code>sqlite3</code> connection. <code>df.to_sql(name, con, if_exists=, index=False, chunksize=)</code> writes a DataFrame. <code>if_exists</code> is <code>"fail"</code> (default), <code>"replace"</code> (drops the table!) or <code>"append"</code>.</p>
+<pre class="code lang-python"><code>import sqlite3
+import pandas as pd
+
+con = sqlite3.connect(":memory:")
+df = pd.DataFrame({
+    "id": [1, 2, 3, 4],
+    "customer": ["ana", "bo", "ana", "cy"],
+    "total": [30.0, 12.5, 8.0, 44.0],
+    "day": ["2025-03-01", "2025-03-02", "2025-03-02", "2025-03-03"],
+})
+df.to_sql("orders", con, index=False)
+more = pd.DataFrame({"id": [5], "customer": ["bo"], "total": [9.9], "day": ["2025-03-04"]})
+more.to_sql("orders", con, if_exists="append", index=False)
+
+q = "select * from orders where total &gt; ? and day &gt;= ?"
+out = pd.read_sql_query(q, con, params=(10, "2025-03-02"), parse_dates=["day"])
+print(out)
+print(out["day"].dtype, out["customer"].dtype)
+
+ids = [1, 3, 5]
+marks = ",".join("?" * len(ids))
+print(pd.read_sql_query(f"select id, total from orders where id in ({marks})", con, params=ids))
+
+total = 0
+for chunk in pd.read_sql_query("select * from orders", con, chunksize=2):
+    total += chunk["total"].sum()
+print(round(total, 1))</code></pre>
+<pre class="code lang-text"><code>id customer  total        day
+0   2       bo   12.5 2025-03-02
+1   4       cy   44.0 2025-03-03
+datetime64[us] str
+   id  total
+0   1   30.0
+1   3    8.0
+2   5    9.9
+104.4</code></pre>
+<ol><li><code>to_sql</code> creates <code>orders</code> from the DataFrame (<code>index=False</code> keeps the index out); the second call uses <code>if_exists="append"</code> to add a fifth row.</li><li><code>params</code> supplies the two values for the two <code>?</code> marks. <code>parse_dates=["day"]</code> converts text to datetimes (first printed dtype <code>datetime64[us]</code>; the second, <code>str</code>, is the pandas 3 default text type). SQLite has no date type, so say which columns to parse.</li><li>An <code>IN</code> list cannot be one bound value: build one <code>?</code> per item (<code>"?" * 3</code> is <code>"???"</code>) and pass the list. Only the count of marks is formatted into the SQL, never the data.</li><li>With <code>chunksize=2</code> you get an iterator of small DataFrames, so you can aggregate a table larger than memory: the total is 104.4.</li></ol>
+
+<h2>20.7 Web APIs: requests and httpx</h2>
+<p>An API call is one question and one answer over HTTP: you send a method (<code>GET</code> to read, <code>POST</code> to create), a URL, optional headers and body, and you get back a status code, headers and a body, usually JSON. <code>requests</code> is the long-standing simple choice. <code>httpx</code> has almost the same API and adds async support and strict default timeouts. The networking basics (methods, status families, REST design) are in Chapter 12; this chapter is about using the clients robustly to collect data.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>requests.get(url)</code> with no timeout. <strong>Symptom:</strong> a nightly job hangs forever when the server accepts the connection and then goes silent; <code>requests</code> has no default timeout. <strong>Fix:</strong> always pass <code>timeout=</code>, for example <code>timeout=(3.05, 10)</code> (connect, read). <code>httpx</code> defaults to 5 seconds, but set it explicitly anyway.</div></div>
+<h3>Reference: requests and httpx essentials</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>requests.get(url)</code></td><td>Read a resource</td><td><code>requests.get(u, timeout=5)</code></td></tr>
+<tr><td><code>requests.post(url, json=...)</code></td><td>Send a JSON body and set the header</td><td><code>requests.post(u, json={"a": 1}, timeout=5)</code></td></tr>
+<tr><td><code>params={...}</code></td><td>Build the query string safely</td><td><code>get(u, params={"page": 2})</code></td></tr>
+<tr><td><code>headers={...}</code></td><td>Custom headers</td><td><code>get(u, headers={"Accept": "application/json"})</code></td></tr>
+<tr><td><code>timeout=</code></td><td>Maximum seconds to connect and to wait for data</td><td><code>timeout=(3, 10)</code></td></tr>
+<tr><td><code>auth=(user, pw)</code></td><td>HTTP Basic authentication</td><td><code>get(u, auth=("me", pw))</code></td></tr>
+<tr><td>Bearer token header</td><td>Token authentication</td><td><code>headers={"Authorization": f"Bearer {tok}"}</code></td></tr>
+<tr><td><code>r.status_code</code>, <code>r.ok</code></td><td>Result number; <code>True</code> if below 400</td><td><code>if not r.ok: ...</code></td></tr>
+<tr><td><code>r.raise_for_status()</code></td><td>Raise <code>HTTPError</code> for 4xx and 5xx</td><td><code>r.raise_for_status()</code></td></tr>
+<tr><td><code>r.json()</code></td><td>Parse the body as JSON</td><td><code>data = r.json()</code></td></tr>
+<tr><td><code>r.text</code>, <code>r.content</code></td><td>Body as decoded text, as raw bytes</td><td><code>r.content[:100]</code></td></tr>
+<tr><td><code>r.headers</code></td><td>Case-insensitive header dict</td><td><code>r.headers["Retry-After"]</code></td></tr>
+<tr><td><code>stream=True</code>, <code>r.iter_content(n)</code></td><td>Download big bodies in pieces</td><td><code>for part in r.iter_content(8192): ...</code></td></tr>
+<tr><td><code>requests.Session()</code></td><td>Reuse connection, headers and cookies</td><td><code>s = requests.Session(); s.get(u)</code></td></tr>
+<tr><td><code>HTTPAdapter(max_retries=Retry(...))</code></td><td>Automatic retries with backoff</td><td><code>s.mount("https://", adapter)</code></td></tr>
+<tr><td><code>requests.Timeout</code>, <code>ConnectionError</code>, <code>HTTPError</code></td><td>The exceptions to catch</td><td><code>except requests.Timeout:</code></td></tr>
+<tr><td><code>httpx.Client(base_url=, timeout=)</code></td><td>Session-like client with shared base URL</td><td><code>httpx.Client(base_url="https://api.x.com")</code></td></tr>
+<tr><td><code>httpx.AsyncClient</code></td><td>Many requests concurrently with <code>await</code></td><td><code>await ac.get("/x")</code></td></tr>
+<tr><td><code>httpx.Timeout(5, connect=2)</code></td><td>Separate limits per phase</td><td><code>Client(timeout=httpx.Timeout(10, connect=3))</code></td></tr>
+<tr><td><code>httpx.HTTPTransport(retries=n)</code></td><td>Retry failed connections only (not 5xx)</td><td><code>Client(transport=httpx.HTTPTransport(retries=2))</code></td></tr>
+</tbody></table></div>
+<p><strong>The offline test server.</strong> All HTTP examples start the same small server on <code>127.0.0.1</code> with a free port chosen by the operating system (port <code>0</code>). You pass it one function that decides the reply for each path. This is also how you can unit-test your own API code without the internet.</p>
+<h3>Example 1: one call, parameters, auth, errors, then httpx</h3>
+<pre class="code lang-python"><code>import asyncio, json, os, threading, time
+import httpx, requests
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+def start(route):
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            u = urlparse(self.path)
+            code, obj, hdrs = route(u.path, parse_qs(u.query), self.headers)
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            for k, v in {"Content-Type": "application/json", "Content-Length": len(body), **hdrs}.items():
+                self.send_header(k, str(v))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *args):
+            pass
+    os.environ["NO_PROXY"] = "127.0.0.1"   # local test traffic must never go through a proxy
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_port}"
+
+def route(path, query, headers):
+    if path == "/secure" and headers.get("Authorization") != "Bearer s3cret":
+        return 401, {"error": "bad token"}, {}
+    if path == "/slow":
+        time.sleep(0.3)
+    return 200, {"path": path, "query": query}, {}
+
+srv, base = start(route)
+r = requests.get(f"{base}/items", params={"page": 2, "tag": ["a", "b"]}, timeout=5)
+print(r.status_code, r.ok, r.url.split("/items")[1])
+print(r.json())
+
+bad = requests.get(f"{base}/secure", timeout=5)
+print(bad.status_code, bad.json())
+try:
+    bad.raise_for_status()
+except requests.HTTPError as e:
+    print("HTTPError, status", e.response.status_code)
+
+s = requests.Session()
+s.headers.update({"Authorization": "Bearer s3cret"})
+print(s.get(f"{base}/secure", timeout=5).status_code)
+
+async def many():
+    async with httpx.AsyncClient(base_url=base, timeout=5.0) as ac:
+        return await asyncio.gather(*(ac.get("/slow", params={"n": i}) for i in range(3)))
+
+t0 = time.perf_counter()
+replies = asyncio.run(many())
+print([x.json()["query"]["n"][0] for x in replies], "concurrent:", time.perf_counter() - t0 &lt; 0.8)
+srv.shutdown()</code></pre>
+<pre class="code lang-text"><code>200 True ?page=2&amp;tag=a&amp;tag=b
+{'path': '/items', 'query': {'page': ['2'], 'tag': ['a', 'b']}}
+401 {'error': 'bad token'}
+HTTPError, status 401
+200
+['0', '1', '2'] concurrent: True</code></pre>
+<ol><li>Lines 1 to 22 are the reusable test server: <code>start(route)</code> builds a handler whose <code>do_GET</code> asks your <code>route</code> function for a status code, a JSON-able object and extra headers. It binds port 0 (any free port) in a background thread. Setting <code>NO_PROXY</code> makes <code>requests</code> and <code>httpx</code> skip any environment proxy (common on company networks) for the local address.</li><li><code>route</code> answers 401 on <code>/secure</code> without the right bearer token, sleeps 0.3 s on <code>/slow</code>, and otherwise echoes path and query.</li><li>The first call passes <code>params</code> as a dict; a list becomes a repeated key (<code>tag=a&amp;tag=b</code>). The server sees every value as a list of strings, as <code>parse_qs</code> always reports.</li><li><code>requests</code> does <strong>not</strong> raise on 4xx by itself: call <code>raise_for_status()</code>; the response stays available as <code>e.response</code>.</li><li>A <code>Session</code> stores headers once and keeps the connection open between calls.</li><li><code>httpx</code> looks almost the same but adds async. <code>asyncio.gather</code> sends three 0.3 s calls at once and returns replies in the order given. Done one after another they would need 0.9 s; the printed <code>True</code> means they finished in under 0.8 s (exact seconds vary, so I print a yes/no).</li></ol>
+<p>The figure shows why sessions matter even on a local machine: opening a new connection for every call costs more time than reusing one.</p>
+<figure><img src="images/lib20_session.png" alt="Bar chart comparing the time for 300 local GET requests with a new connection each time against one shared Session" loading="lazy"/><figcaption>Measured on one machine against a local server; absolute numbers vary, the gap is what matters.</figcaption></figure>
+<p><strong>How to read it:</strong> the left bar is 300 calls that each build a fresh connection, the right bar is the same 300 calls through one <code>Session</code>. Over a real network the gap is larger, because DNS lookup and the TLS handshake are skipped too.</p>
+<h3>Example 2: timeouts, retries, backoff, pagination and 429</h3>
+<p><strong>Retry only what can succeed later</strong>: timeouts, connection errors, 429 and 5xx. Never retry 400, 401, 403 or 404, because the answer will not change. <strong>Backoff</strong> means waiting longer after each failure (0.05, 0.1, 0.2 seconds ...), and <strong>jitter</strong> means adding randomness so that many clients do not all return at the same instant.</p>
+<pre class="code lang-python"><code>import json, os, random, threading, time, requests
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def start(route):
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            u = urlparse(self.path)
+            code, obj, hdrs = route(u.path, parse_qs(u.query), self.headers)
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            for k, v in {"Content-Type": "application/json", "Content-Length": len(body), **hdrs}.items():
+                self.send_header(k, str(v))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *args):
+            pass
+    os.environ["NO_PROXY"] = "127.0.0.1"
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_port}"
+
+ITEMS = [{"id": i, "v": i * i} for i in range(1, 24)]
+state = {"flaky": 0, "feed": 0, "limited": 0}
+def route(path, query, headers):
+    if path == "/flaky":
+        state["flaky"] += 1
+        return (503, {"error": "busy"}, {}) if state["flaky"] &lt; 3 else (200, {"ok": True}, {})
+    if path == "/slow":
+        time.sleep(1.0)
+    if path == "/feed":
+        state["feed"] += 1
+        if state["feed"] % 3 == 0:
+            state["limited"] += 1
+            return 429, {"error": "slow down"}, {"Retry-After": "0"}
+        after, limit = int(query["after"][0]), int(query["limit"][0])
+        page = [x for x in ITEMS if x["id"] &gt; after][:limit]
+        return 200, {"items": page, "next": page[-1]["id"] if len(page) == limit else None}, {}
+    return 200, {}, {}
+
+srv, base = start(route)
+
+def get_with_retry(session, url, tries=5, base_delay=0.05, cap=1.0, rng=random.Random(0)):
+    delays = []
+    for attempt in range(1, tries + 1):
+        try:
+            r = session.get(url, timeout=2)
+            if r.status_code not in (429, 500, 502, 503, 504):
+                r.raise_for_status()
+                return r, delays
+        except (requests.ConnectionError, requests.Timeout):
+            pass
+        if attempt == tries:
+            raise RuntimeError(f"gave up after {tries} tries")
+        delay = rng.uniform(0, min(cap, base_delay * 2 ** (attempt - 1)))
+        delays.append(round(delay, 3))
+        time.sleep(delay)
+
+r, delays = get_with_retry(requests.Session(), f"{base}/flaky")
+print(r.json(), "waits:", delays)
+
+state["flaky"] = 0
+s = requests.Session()
+s.mount("http://", HTTPAdapter(max_retries=Retry(total=4, backoff_factor=0.05, status_forcelist=[503])))
+print(s.get(f"{base}/flaky", timeout=2).json(), "server calls:", state["flaky"])
+
+try:
+    requests.get(f"{base}/slow", timeout=(1, 0.3))
+except requests.exceptions.ReadTimeout as e:
+    print("timeout:", type(e).__name__)
+
+def paged(session, url, limit=10):
+    after = 0
+    while True:
+        r = session.get(url, params={"after": after, "limit": limit}, timeout=5)
+        if r.status_code == 429:
+            time.sleep(float(r.headers.get("Retry-After", 1)))
+            continue
+        r.raise_for_status()
+        body = r.json()
+        yield from body["items"]
+        if body["next"] is None:
+            break
+        after = body["next"]
+
+rows = list(paged(requests.Session(), f"{base}/feed"))
+print(len(rows), rows[0], rows[-1], "unique:", len({x["id"] for x in rows}))
+print("feed calls:", state["feed"], "rate limited:", state["limited"])
+srv.shutdown()</code></pre>
+<pre class="code lang-text"><code>{'ok': True} waits: [0.042, 0.076]
+{'ok': True} server calls: 3
+timeout: ReadTimeout
+23 {'id': 1, 'v': 1} {'id': 23, 'v': 529} unique: 23
+feed calls: 4 rate limited: 1</code></pre>
+<ol><li>The first 22 lines are the same test server as Example 1. The route table has <code>/flaky</code> (503 twice, then 200), <code>/slow</code> (sleeps one second) and <code>/feed</code> (cursor pages of 23 items, with every third call answered by 429 and <code>Retry-After: 0</code>).</li><li><code>get_with_retry</code> retries connection errors, timeouts and the statuses 429, 500, 502, 503, 504. A 4xx such as 404 goes straight to <code>raise_for_status()</code>. The delay is <code>uniform(0, min(cap, base * 2**(attempt-1)))</code>: exponential growth, a cap and full jitter; the seeded generator makes the printed waits repeatable. Two waits were needed.</li><li>The second approach mounts a urllib3 <code>Retry</code> policy: <code>total=4</code> retries, <code>backoff_factor=0.05</code> (the first retry is immediate, later waits grow), <code>status_forcelist=[503]</code>. The server saw three calls. It also honours <code>Retry-After</code>.</li><li>The slow route needs a second but we allow 0.3 s to <em>read</em>, so <code>ReadTimeout</code> is raised. A tuple means (connect timeout, read timeout).</li><li><code>paged</code> is a <strong>generator</strong>: <code>yield from</code> hands out items one by one, so the caller can stream them into a database. On 429 it sleeps as long as the server asked and repeats the same request; the cursor did not move, so nothing is skipped.</li><li>Result: 23 unique items from four feed calls: two full pages, one refused call, and a last short page of 3.</li></ol>
+<figure><img src="images/lib20_backoff.png" alt="Line chart of wait time against retry number for exponential backoff with a cap, a fixed delay, and random jittered delays" loading="lazy"/><figcaption>Exponential backoff doubles the wait up to a cap; full jitter picks a random point below the line.</figcaption></figure>
+<p><strong>How to read it:</strong> the horizontal axis is how many times you have already failed, the vertical axis is how long you wait before the next try. The red line shows a fixed delay, which keeps hitting a struggling server every half second. The blue line doubles each time until it reaches the 20 second cap. The orange dots are jittered waits: each is a random value between zero and the blue line, so a crowd of clients does not move in lockstep.</p>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">Concurrency is permission to hurt a server faster. Cap it (for example with <code>asyncio.Semaphore(5)</code>) and respect the provider's rate limit, otherwise your fast script gets your key blocked.</div></div>
+<h3>Offset or cursor pagination</h3>
+<p>APIs return big collections in pages (the <code>paged</code> generator above is the pattern). There are two styles. <strong>Offset or page-number</strong> pagination (<code>?page=3</code>) is simple, but if rows are added while you read, the pages shift and you see duplicates or miss rows. <strong>Cursor</strong> pagination (<code>?after=20</code>) asks for "the next rows after the last one I saw" and stays correct.</p>
+<figure><img src="images/lib20_pagination.png" alt="Two scatter plots of row ids returned per request: offset paging shows duplicate rows after new rows arrive, cursor paging shows none" loading="lazy"/><figcaption>Three new rows arrive after request 2. Offset paging repeats rows (red crosses); cursor paging does not.</figcaption></figure>
+<p><strong>How to read it:</strong> each column of dots is one request and each dot is a row id it returned (newest ids at the top). On the left, request 3 starts three ids too high because the new rows pushed everything down, so it returns rows already seen in request 2 (red crosses). On the right, the cursor says "ids below 81", so request 3 continues exactly where request 2 stopped.</p>
+<h3>Example 3: staying under a rate limit with a token bucket</h3>
+<p>A <strong>token bucket</strong> is the classic polite-client tool. The bucket refills at a steady rate, up to a maximum. Each request takes one token. If the bucket is empty you wait. This allows short bursts but a steady average. To keep the example repeatable, the clock is passed in, so we can use a fake clock.</p>
+<pre class="code lang-python"><code>class TokenBucket:
+    def __init__(self, rate, capacity, clock):
+        self.rate, self.capacity, self.clock = rate, capacity, clock
+        self.tokens, self.last = capacity, clock()
+
+    def take(self):
+        """Return 0.0 if a request may go now, else the seconds to wait."""
+        now = self.clock()
+        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+        self.last = now
+        if self.tokens &gt;= 1:
+            self.tokens -= 1
+            return 0.0
+        return round((1 - self.tokens) / self.rate, 3)
+
+now = [0.0]
+bucket = TokenBucket(rate=2, capacity=3, clock=lambda: now[0])
+print([bucket.take() for _ in range(5)])
+now[0] += 1.0
+print([bucket.take() for _ in range(3)])</code></pre>
+<pre class="code lang-text"><code>[0.0, 0.0, 0.0, 0.5, 0.5]
+[0.0, 0.0, 0.5]</code></pre>
+<ol><li>The bucket stores the refill rate (2 per second), the capacity (3) and a clock function. It starts full.</li><li><code>take</code> adds tokens for the time passed (capped), then spends one and returns 0.0, or returns how long to wait for the missing part of a token.</li><li>At time 0 the first three calls pass (the burst); the fourth and fifth must wait 0.5 s. After one fake second two tokens are back, so two calls pass and the third waits again.</li><li>In real code pass <code>time.monotonic</code> as the clock and <code>time.sleep(wait)</code> when the result is above zero.</li></ol>
+<figure><img src="images/lib20_tokenbucket.png" alt="Line chart of tokens in the bucket over ten seconds with two bursts of requests that drain it and a steady refill" loading="lazy"/><figcaption>A simulated bucket (2 tokens per second, capacity 5) absorbing two bursts.</figcaption></figure>
+<p><strong>How to read it:</strong> the blue line is how many tokens are available. Each green dot is a request that went out and drains the bucket by one. During the burst at second 2 the line falls; the red cross shows a moment when the bucket was nearly empty and a request would have had to wait. Between bursts the line climbs at the refill rate and stops at the capacity of 5. The average rate stays at 2 requests per second, but short bursts are allowed.</p>
+<h3>Authentication in practice</h3>
+<ul><li><strong>Bearer token</strong>: <code>Authorization: Bearer &lt;token&gt;</code> in a header. Store the token in an environment variable (<code>os.environ["API_TOKEN"]</code>), never in the script, and never print it.</li><li><strong>API key</strong>: usually a header such as <code>X-API-Key</code>. A key in the URL query string ends up in server logs and browser history, so prefer headers when the API allows.</li><li><strong>Basic auth</strong>: <code>auth=("user", "password")</code>. Only over HTTPS.</li><li><strong>OAuth 2</strong>: you exchange credentials for a short-lived token and must refresh it when it expires. Use a library built for the provider.</li><li>Proxies: <code>requests</code> and <code>httpx</code> read <code>HTTP_PROXY</code> and <code>NO_PROXY</code> from the environment. If a local test call is unexpectedly routed through a corporate proxy, set <code>NO_PROXY=127.0.0.1</code> (as the examples do) or pass <code>trust_env=False</code>.</li></ul>
+
+<h2>20.8 HTML parsing with BeautifulSoup, and scraping ethics</h2>
+<p>When a page has no API, its facts are inside HTML tags. <strong>BeautifulSoup</strong> (package <code>beautifulsoup4</code>) turns HTML text into a tree you can search. It does <em>not</em> download pages (that is <code>requests</code>) and it does not run JavaScript. Always give it the <code>"html.parser"</code> argument (built into Python); <code>lxml</code> and <code>html5lib</code> are optional faster or more forgiving parsers, and neither was installed on the study machine.</p>
+<h3>Reference: BeautifulSoup essentials</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>BeautifulSoup(html, "html.parser")</code></td><td>Parse text into a tree</td><td><code>soup = BeautifulSoup(page, "html.parser")</code></td></tr>
+<tr><td><code>soup.find(name, ...)</code></td><td>First matching tag or <code>None</code></td><td><code>soup.find("h1")</code></td></tr>
+<tr><td><code>soup.find_all(name, ...)</code></td><td>List of all matching tags (possibly empty)</td><td><code>soup.find_all("a")</code></td></tr>
+<tr><td><code>find(class_="x")</code></td><td>Filter by CSS class (underscore avoids the keyword)</td><td><code>soup.find_all("tr", class_="row")</code></td></tr>
+<tr><td><code>find(id="x")</code>, <code>attrs={...}</code></td><td>Filter by id or any attribute</td><td><code>soup.find(attrs={"data-sku": "W-1"})</code></td></tr>
+<tr><td><code>soup.select(css)</code></td><td>List by CSS selector</td><td><code>soup.select("table#prices tr.row")</code></td></tr>
+<tr><td><code>soup.select_one(css)</code></td><td>First match or <code>None</code></td><td><code>soup.select_one("h1")</code></td></tr>
+<tr><td><code>tag.get_text(strip=True)</code></td><td>Visible text, trimmed</td><td><code>td.get_text(strip=True)</code></td></tr>
+<tr><td><code>tag.get_text(" ", strip=True)</code></td><td>Text pieces joined by a separator</td><td><code>p.get_text(" ", strip=True)</code></td></tr>
+<tr><td><code>tag["href"]</code>, <code>tag.get("href")</code></td><td>Attribute value (<code>get</code> returns <code>None</code> if absent)</td><td><code>a.get("href")</code></td></tr>
+<tr><td><code>tag.parent</code>, <code>.children</code></td><td>Walk up or down the tree</td><td><code>td.parent.name</code></td></tr>
+<tr><td><code>find_all(string=re.compile(...))</code></td><td>Search by text content</td><td><code>soup.find_all(string=re.compile("Price"))</code></td></tr>
+<tr><td><code>tag.decompose()</code></td><td>Remove a tag from the tree</td><td><code>script.decompose()</code></td></tr>
+<tr><td><code>urllib.parse.urljoin(base, href)</code></td><td>Turn relative links into full URLs</td><td><code>urljoin(page_url, "/about")</code></td></tr>
+<tr><td><code>urllib.robotparser.RobotFileParser</code></td><td>Read <code>robots.txt</code> rules</td><td><code>rp.can_fetch("bot", url)</code></td></tr>
+<tr><td><code>pd.read_html(source)</code></td><td>All tables of a page into DataFrames (needs <code>lxml</code> or <code>bs4</code> with <code>html5lib</code>; not run here)</td><td><code>tables = pd.read_html(html_text)</code></td></tr>
+</tbody></table></div>
+<h3>Example 1: find things</h3>
+<pre class="code lang-python"><code>from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+page = """
+&lt;html&gt;&lt;head&gt;&lt;title&gt;Price list&lt;/title&gt;&lt;/head&gt;&lt;body&gt;
+&lt;h1 id="top"&gt;Widgets&lt;/h1&gt;
+&lt;p class="intro"&gt;Updated &lt;b&gt;today&lt;/b&gt;. Prices in USD.&lt;/p&gt;
+&lt;a href="/about"&gt;About&lt;/a&gt; &lt;a href="https://other.example/x"&gt;Partner&lt;/a&gt; &lt;a name="anchor"&gt;no link&lt;/a&gt;
+&lt;/body&gt;&lt;/html&gt;
+"""
+soup = BeautifulSoup(page, "html.parser")
+print(soup.title.string, "|", soup.find("h1").get_text(strip=True), soup.find("h1")["id"])
+print(soup.select_one("p.intro").get_text(" ", strip=True))
+for a in soup.find_all("a"):
+    print(a.get("href"), "-&gt;", urljoin("https://shop.example/list/", a.get("href") or ""))
+print(soup.find("table"), soup.find_all("table"))</code></pre>
+<pre class="code lang-text"><code>Price list | Widgets top
+Updated today . Prices in USD.
+/about -&gt; https://shop.example/about
+https://other.example/x -&gt; https://other.example/x
+None -&gt; https://shop.example/list/
+None []</code></pre>
+<ol><li>The inline string is the whole "web page". <code>soup.title.string</code> reads the title; <code>find("h1")["id"]</code> reads an attribute; <code>select_one("p.intro")</code> uses a CSS selector, and <code>get_text(" ", strip=True)</code> joins the text pieces <code>Updated</code>, <code>today</code> and <code>. Prices in USD.</code> with spaces.</li><li>The third anchor has no <code>href</code>: <code>.get</code> returns <code>None</code> (<code>["href"]</code> would raise <code>KeyError</code>). <code>urljoin</code> resolves <code>/about</code> against the page address and leaves a full URL unchanged.</li><li>There is no table: <code>find</code> returns <code>None</code> and <code>find_all</code> returns <code>[]</code>. A method call on that <code>None</code> is the classic scraping crash.</li></ol>
+<h3>Example 2: robots.txt and defensive extraction</h3>
+<pre class="code lang-python"><code>from urllib.robotparser import RobotFileParser
+from bs4 import BeautifulSoup
+
+robots = """
+User-agent: *
+Disallow: /private/
+Crawl-delay: 5
+
+User-agent: BadBot
+Disallow: /
+"""
+rp = RobotFileParser()
+rp.parse(robots.splitlines())
+for agent, url in [("my-study-bot", "https://shop.example/list"),
+                   ("my-study-bot", "https://shop.example/private/data"),
+                   ("BadBot", "https://shop.example/list")]:
+    print(agent, url.split(".example")[1], rp.can_fetch(agent, url))
+print("crawl delay:", rp.crawl_delay("my-study-bot"))
+
+def text_or_none(soup, css):
+    tag = soup.select_one(css)
+    return tag.get_text(strip=True) if tag else None
+
+soup = BeautifulSoup("&lt;div&gt;&lt;span class='price'&gt;9.99&lt;/span&gt;&lt;/div&gt;", "html.parser")
+print(text_or_none(soup, "span.price"), text_or_none(soup, "span.discount"))</code></pre>
+<pre class="code lang-text"><code>my-study-bot /list True
+my-study-bot /private/data False
+BadBot /list False
+crawl delay: 5
+9.99 None</code></pre>
+<ol><li><code>robots.txt</code> is a public file where a site owner says which paths automated clients may visit. Here every agent is kept out of <code>/private/</code> and asked to wait 5 seconds, and <code>BadBot</code> is shut out completely. In real use call <code>rp.set_url(...)</code> and <code>rp.read()</code>.</li><li><code>can_fetch(agent, url)</code> answers per user-agent; <code>crawl_delay</code> returns 5, which your loop should honour with <code>time.sleep</code>.</li><li><code>text_or_none</code> turns a missing element into <code>None</code> instead of a crash. Real pages change; this helper prevents most overnight failures.</li></ol>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt"><strong>Scraping ethics and law, in practice.</strong> (1) Look for an API, a data download or a licence first. (2) Read <code>robots.txt</code> and the site's terms of use; robots.txt is a convention, not a security lock, but ignoring it is poor practice and can be a terms breach. (3) Identify yourself with an honest <code>User-Agent</code> that includes contact details. (4) Slow down: one request per few seconds, honour <code>Crawl-delay</code> and 429, cache pages you already have. (5) Do not collect personal data without a lawful reason, and do not republish copyrighted content. (6) Do not bypass logins, paywalls or captchas. This is general guidance, not legal advice; ask your legal team for commercial projects.</div></div>
+
+<h2>20.9 Validating data: dataclasses and pydantic</h2>
+<p>Data from outside is guilty until proven innocent. An API can send <code>"total": "N/A"</code>, a CSV can have a negative age, a scraped price can be empty. <strong>Validation</strong> means checking each record against a schema (names, types, ranges, allowed values) at the door, so errors are caught with a clear message instead of ten steps later as a mysterious <code>NaN</code>. <strong>pydantic</strong> is the standard library for this. It was <strong>not installed here</strong>, so its code is labelled "not run" and each concept is paired with a runnable dataclass or plain-Python version.</p>
+<h3>Reference: pydantic v2 essentials (not run here) and the plain-Python equivalent</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>BaseModel</code></td><td>Class whose fields are checked and converted on creation</td><td><code>class Order(BaseModel): id: int</code></td></tr>
+<tr><td>Type hints (<code>int</code>, <code>float</code>, <code>date</code>, <code>list[int]</code>)</td><td>Declare and coerce types (<code>"7"</code> becomes <code>7</code>)</td><td><code>total: float</code></td></tr>
+<tr><td><code>Field(ge=, le=, min_length=, pattern=)</code></td><td>Numeric, length and regex limits</td><td><code>age: int = Field(ge=0, le=120)</code></td></tr>
+<tr><td><code>Literal[...]</code></td><td>Only listed values allowed</td><td><code>status: Literal["new", "paid"]</code></td></tr>
+<tr><td><code>Model.model_validate(dict)</code></td><td>Build and check from a dict</td><td><code>Order.model_validate(rec)</code></td></tr>
+<tr><td><code>Model.model_validate_json(text)</code></td><td>Build and check from JSON text</td><td><code>Order.model_validate_json(body)</code></td></tr>
+<tr><td><code>obj.model_dump()</code></td><td>Back to a plain dict</td><td><code>row = order.model_dump()</code></td></tr>
+<tr><td><code>ValidationError</code></td><td>Raised with every problem found</td><td><code>except ValidationError as e:</code></td></tr>
+<tr><td><code>@field_validator("name")</code></td><td>Custom check or clean-up for one field</td><td><code>@classmethod def strip(cls, v): ...</code></td></tr>
+<tr><td><code>@model_validator(mode="after")</code></td><td>Check relations between fields</td><td><code>if self.end &lt; self.start: raise ValueError(...)</code></td></tr>
+<tr><td><code>ConfigDict(extra="forbid")</code></td><td>Reject unknown keys</td><td><code>model_config = ConfigDict(extra="forbid")</code></td></tr>
+<tr><td><code>ConfigDict(strict=True)</code></td><td>No coercion: <code>"7"</code> is an error for <code>int</code></td><td><code>model_config = ConfigDict(strict=True)</code></td></tr>
+<tr><td><code>TypeAdapter(list[Order])</code></td><td>Validate a list or any type without a model class</td><td><code>TypeAdapter(list[Order]).validate_python(rows)</code></td></tr>
+<tr><td><code>Field(alias="Total Amt")</code></td><td>Map awkward source names to clean field names</td><td><code>total: float = Field(alias="Total Amt")</code></td></tr>
+<tr><td><code>dataclasses.dataclass</code> + <code>__post_init__</code></td><td>Runnable equivalent: fields plus your own checks</td><td><code>def __post_init__(self): ...</code></td></tr>
+<tr><td><code>dataclasses.asdict</code></td><td>Dataclass to dict</td><td><code>asdict(order)</code></td></tr>
+</tbody></table></div>
+<h3>pydantic in practice (not run here)</h3>
+<pre class="code lang-text"><code># NOT RUN HERE: pydantic is not installed on the study machine (pip install pydantic)
+from datetime import date
+from typing import Literal
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter, ValidationError, field_validator
+
+class Order(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    id: int
+    customer: str = Field(min_length=1)
+    total: float = Field(ge=0)
+    status: Literal["new", "paid", "shipped"] = "new"
+    placed: date
+
+    @field_validator("customer")
+    @classmethod
+    def clean_name(cls, v: str) -&gt; str:
+        return v.strip()
+
+good = Order.model_validate({"id": "7", "customer": " Ana ", "total": "12.5", "placed": "2025-03-01"})
+print(good.model_dump())      # id is the int 7, customer "Ana", placed a date object
+
+try:
+    Order.model_validate({"id": "x", "customer": "", "total": -1, "placed": "tomorrow"})
+except ValidationError as e:
+    for err in e.errors():     # one entry per bad field: err["loc"], err["msg"]
+        print(err["loc"], err["msg"])
+
+orders = TypeAdapter(list[Order]).validate_python(list_of_dicts)</code></pre>
+<ol><li>The class body lists typed fields. pydantic converts compatible input (<code>"7"</code> to <code>7</code>, <code>"2025-03-01"</code> to a <code>date</code>) and rejects the rest; <code>strict=True</code> disables conversion.</li><li><code>Field(min_length=1)</code> and <code>Field(ge=0)</code> add limits, <code>Literal</code> restricts <code>status</code>, and a default makes it optional. <code>extra="forbid"</code> turns an unexpected key into an error.</li><li>The second record has four bad fields, and pydantic reports <em>all four</em> in one <code>ValidationError</code>. <code>TypeAdapter</code> validates a whole page of API results in one call.</li></ol>
+<h3>Example 1: a runnable dataclass validator</h3>
+<pre class="code lang-python"><code>from dataclasses import dataclass, field, asdict
+from datetime import date
+
+@dataclass
+class Order:
+    id: int
+    customer: str
+    total: float
+    placed: date
+    status: str = "new"
+    tags: list = field(default_factory=list)
+
+    def __post_init__(self):
+        self.id = int(self.id)
+        self.total = float(self.total)
+        self.customer = self.customer.strip()
+        if isinstance(self.placed, str):
+            self.placed = date.fromisoformat(self.placed)
+        if not self.customer:
+            raise ValueError("customer must not be empty")
+        if self.total &lt; 0:
+            raise ValueError(f"total must be &gt;= 0, got {self.total}")
+        if self.status not in {"new", "paid", "shipped"}:
+            raise ValueError(f"bad status {self.status!r}")
+
+ok = Order("7", " Ana ", "12.5", "2025-03-01")
+print(ok)
+print(asdict(ok)["total"], type(ok.id).__name__)
+for bad in [dict(id=1, customer="Bo", total=-5, placed="2025-03-02"),
+            dict(id="x", customer="Cy", total=1, placed="2025-03-02"),
+            dict(id=2, customer="Di", total=3, placed="tomorrow")]:
+    try:
+        Order(**bad)
+    except ValueError as e:
+        print("rejected:", e)</code></pre>
+<pre class="code lang-text"><code>Order(id=7, customer='Ana', total=12.5, placed=datetime.date(2025, 3, 1), status='new', tags=[])
+12.5 int
+rejected: total must be &gt;= 0, got -5.0
+rejected: invalid literal for int() with base 10: 'x'
+rejected: Invalid isoformat string: 'tomorrow'</code></pre>
+<ol><li>A dataclass writes <code>__init__</code> and <code>__repr__</code>. <code>field(default_factory=list)</code> gives each object its own list. <code>__post_init__</code> runs after <code>__init__</code>: we convert types first, then check rules.</li><li>The first record is accepted, with converted values. The three bad ones fail for three reasons (negative total, an id that is not an integer, a date that is not ISO format). All are <code>ValueError</code>, so one <code>except</code> catches them.</li><li>Compared with pydantic you write the conversions yourself and stop at the first error. Recipe 3 (20.12) collects every error and sets rejects aside.</li></ol>
+<h3>Example 2: validate a whole DataFrame</h3>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+def check_frame(df):
+    problems = []
+    required = {"id": "int", "total": "float", "region": "str"}
+    for col, kind in required.items():
+        if col not in df.columns:
+            problems.append(f"missing column {col}")
+        elif kind == "int" and not pd.api.types.is_integer_dtype(df[col]):
+            problems.append(f"{col} should be integer, is {df[col].dtype}")
+        elif kind == "float" and not pd.api.types.is_float_dtype(df[col]):
+            problems.append(f"{col} should be float, is {df[col].dtype}")
+    if "id" in df and df["id"].duplicated().any():
+        problems.append(f"duplicate ids: {df.loc[df['id'].duplicated(), 'id'].tolist()}")
+    if "total" in df:
+        if df["total"].isna().any():
+            problems.append(f"{int(df['total'].isna().sum())} missing totals")
+        if (df["total"] &lt; 0).any():
+            problems.append("negative totals")
+    return problems
+
+good = pd.DataFrame({"id": [1, 2], "total": [5.0, 6.5], "region": ["n", "s"]})
+bad = pd.DataFrame({"id": [1, 1, 3], "total": [5.0, np.nan, -2.0], "region": ["n", "s", "e"]})
+print(check_frame(good))
+print(check_frame(bad))
+print(check_frame(bad.drop(columns="region").astype({"id": "float64"})))</code></pre>
+<pre class="code lang-text"><code>[]
+['duplicate ids: [1]', '1 missing totals', 'negative totals']
+['id should be integer, is float64', 'missing column region', 'duplicate ids: [1.0]', '1 missing totals', 'negative totals']</code></pre>
+<ol><li>The function returns a list of problems instead of raising, so a pipeline can warn, drop rows or stop.</li><li>Column existence and dtype use <code>pandas.api.types</code>, which also recognises pandas 3 nullable and string types. <code>duplicated()</code> flags repeated ids; <code>NaN &lt; 0</code> is false, so missing values need their own check.</li><li>The good frame gives <code>[]</code>; the second gives three problems; the third (region dropped, id as float) adds the dtype and missing-column messages, and its duplicate id shows as <code>1.0</code>.</li></ol>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Validate at the boundary, once. Convert text to real types, check ranges and keys, and send rejects to a dead-letter file with the reason. Everything downstream may then assume clean data. Libraries such as pydantic (records) and pandera or Great Expectations (tables) do the same job with more features.</div></div>
+
+<h2>20.10 Columnar files: Parquet and Arrow</h2>
+<p>A CSV stores data <strong>row by row</strong> as text. To read one column you still parse every line. <strong>Parquet</strong> stores data <strong>column by column</strong>, in compressed, typed blocks, with a footer that holds the schema and per-block statistics. <strong>Apache Arrow</strong> is the matching in-memory format: a standard layout for columns that lets libraries (pandas, Polars, DuckDB, Spark) share data without copying or re-parsing. The Python package is <code>pyarrow</code>. It was <strong>not installed on the study machine</strong>, so the pyarrow and pandas Parquet code below is labelled "not run here", followed by runnable demonstrations of the ideas that make Parquet fast.</p>
+<h3>When to use it, and when not to</h3>
+<ul><li><strong>Use Parquet</strong> for analytic tables of more than a few hundred thousand rows, for data you read again and again, for files that keep their types (dates stay dates, integers stay integers, no <code>"007"</code> surprises) and for data lakes where engines read only needed columns and row blocks.</li><li><strong>Do not use it</strong> for tiny files people edit by hand, for append-one-row-at-a-time logging (write batches instead), or when the receiving system only accepts CSV.</li></ul>
+<h3>Reference: pandas and pyarrow Parquet essentials (not run here)</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>df.to_parquet(path)</code></td><td>Write a DataFrame (needs pyarrow or fastparquet)</td><td><code>df.to_parquet("o.parquet", index=False)</code></td></tr>
+<tr><td><code>pd.read_parquet(path)</code></td><td>Read a file or folder into a DataFrame</td><td><code>pd.read_parquet("o.parquet")</code></td></tr>
+<tr><td><code>columns=[...]</code></td><td>Read only these columns</td><td><code>pd.read_parquet(p, columns=["id", "total"])</code></td></tr>
+<tr><td><code>filters=[...]</code></td><td>Skip row blocks that cannot match</td><td><code>filters=[("year", "==", 2025)]</code></td></tr>
+<tr><td><code>compression=</code></td><td>Codec: <code>snappy</code> (default), <code>zstd</code>, <code>gzip</code></td><td><code>to_parquet(p, compression="zstd")</code></td></tr>
+<tr><td><code>partition_cols=[...]</code></td><td>Write a folder tree split by column values</td><td><code>to_parquet("out/", partition_cols=["year"])</code></td></tr>
+<tr><td><code>pa.Table.from_pandas(df)</code></td><td>DataFrame to Arrow table</td><td><code>t = pa.Table.from_pandas(df)</code></td></tr>
+<tr><td><code>table.to_pandas()</code></td><td>Arrow table to DataFrame</td><td><code>t.to_pandas()</code></td></tr>
+<tr><td><code>table.schema</code></td><td>Names and types of columns</td><td><code>print(t.schema)</code></td></tr>
+<tr><td><code>pq.write_table(table, path)</code></td><td>Write Parquet with full control</td><td><code>pq.write_table(t, "o.parquet", row_group_size=100_000)</code></td></tr>
+<tr><td><code>pq.read_table(path, columns=, filters=)</code></td><td>Read into an Arrow table</td><td><code>pq.read_table(p, columns=["id"])</code></td></tr>
+<tr><td><code>pq.ParquetFile(path)</code></td><td>Open for metadata and batch reading</td><td><code>pf = pq.ParquetFile(p)</code></td></tr>
+<tr><td><code>pf.metadata</code></td><td>Row count, row groups, statistics</td><td><code>pf.metadata.num_row_groups</code></td></tr>
+<tr><td><code>pf.iter_batches(batch_size=)</code></td><td>Stream a large file in pieces</td><td><code>for b in pf.iter_batches(50_000): ...</code></td></tr>
+<tr><td><code>pyarrow.dataset.dataset(path)</code></td><td>Treat a folder of files as one table</td><td><code>ds.dataset("out/", partitioning="hive")</code></td></tr>
+<tr><td><code>pyarrow.compute</code> (<code>pc</code>)</td><td>Fast column operations</td><td><code>pc.sum(t["total"])</code></td></tr>
+<tr><td><code>table.filter(mask)</code>, <code>table.select(cols)</code></td><td>Row and column selection</td><td><code>t.select(["id", "total"])</code></td></tr>
+<tr><td><code>pd.ArrowDtype</code>, <code>dtype_backend="pyarrow"</code></td><td>Keep Arrow-backed columns in pandas</td><td><code>pd.read_parquet(p, dtype_backend="pyarrow")</code></td></tr>
+</tbody></table></div>
+<h3>Typical use (not run here)</h3>
+<pre class="code lang-text"><code># NOT RUN HERE: pyarrow is not installed on the study machine (pip install pyarrow)
+import pandas as pd
+import pyarrow.parquet as pq
+
+df = pd.DataFrame({"year": [2024, 2025, 2025], "region": ["n", "s", "n"], "total": [1.5, 2.5, 3.5]})
+df.to_parquet("orders.parquet", compression="zstd", index=False)
+
+only_two = pd.read_parquet("orders.parquet", columns=["region", "total"])
+recent = pd.read_parquet("orders.parquet", filters=[("year", "==", 2025)])
+
+pf = pq.ParquetFile("orders.parquet")
+print(pf.metadata.num_rows, pf.metadata.num_row_groups, pf.schema_arrow)
+for batch in pf.iter_batches(batch_size=100_000, columns=["total"]):
+    chunk = batch.to_pandas()            # process one slice at a time
+
+df.to_parquet("orders_dataset", partition_cols=["year"])   # folder: year=2024/, year=2025/</code></pre>
+<ol><li>One call writes a typed, compressed file; <code>index=False</code> avoids storing the DataFrame index as a column.</li><li><code>columns=</code> reads only some column blocks; <code>filters=</code> compares the request with statistics in the file so row groups that cannot match are skipped.</li><li><code>ParquetFile</code> reads only the footer (rows, row groups, schema), which is cheap even for huge files; <code>iter_batches</code> is the Parquet equivalent of <code>chunksize</code>.</li><li><code>partition_cols</code> writes one sub-folder per value, so a filter on <code>year</code> never opens the other folders.</li></ol>
+<h3>Runnable demonstration 1: why columns and encodings save space</h3>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(0)
+n = 100_000
+df = pd.DataFrame({
+    "id": np.arange(n),
+    "region": rng.choice(["north", "south", "east", "west"], n),
+    "total": rng.normal(50, 10, n).round(2),
+})
+whole = df.to_csv(index=False)
+one_column = df["total"].to_csv(index=False)
+print("csv bytes:", len(whole), "| bytes of the total column alone:", len(one_column))
+print("share of the file you need:", round(len(one_column) / len(whole), 2))
+
+as_text = df["region"]
+as_codes = df["region"].astype("category")
+print("text column bytes:", as_text.memory_usage(deep=True))
+print("dictionary-encoded bytes:", as_codes.memory_usage(deep=True))
+print(as_codes.cat.categories.tolist(), as_codes.cat.codes.dtype)</code></pre>
+<pre class="code lang-text"><code>csv bytes: 1728852 | bytes of the total column alone: 589910
+share of the file you need: 0.34
+text column bytes: 5350174
+dictionary-encoded bytes: 100346
+['east', 'north', 'south', 'west'] int8</code></pre>
+<ol><li>The CSV text of the whole frame is compared with the CSV text of the <code>total</code> column alone, the size a column-by-column file would need for a query that wants only the total: about a third.</li><li>A text column repeats four words 100,000 times. <strong>Dictionary encoding</strong> stores each distinct word once and replaces every row by a small integer code. The pandas <code>category</code> type is the same idea, and the memory printed shows the saving. The codes fit in <code>int8</code>. Parquet applies this automatically and then compresses again.</li></ol>
+<h3>Runnable demonstration 2: skipping row groups with statistics</h3>
+<p>Parquet files are cut into <strong>row groups</strong>, and each group stores the minimum and maximum of every column. A filter such as "dates in March" lets the reader skip any group whose range does not overlap. The simulation below does exactly that with NumPy.</p>
+<pre class="code lang-python"><code>import numpy as np
+
+rng = np.random.default_rng(1)
+days = np.sort(rng.integers(0, 365, 100_000))        # one year of events, sorted by day
+group_size = 10_000
+groups = [days[i:i + group_size] for i in range(0, len(days), group_size)]
+stats = [(g.min(), g.max()) for g in groups]
+print("row groups:", len(groups))
+
+lo, hi = 90, 120                                      # "the month of April"
+to_read = [i for i, (mn, mx) in enumerate(stats) if mx &gt;= lo and mn &lt;= hi]
+print("groups that can match:", to_read)
+rows = sum(((g &gt;= lo) &amp; (g &lt;= hi)).sum() for i, g in enumerate(groups) if i in to_read)
+check = ((days &gt;= lo) &amp; (days &lt;= hi)).sum()
+print("rows found:", rows, "same as full scan:", rows == check)
+print("fraction of data read:", len(to_read) / len(groups))</code></pre>
+<pre class="code lang-text"><code>row groups: 10
+groups that can match: [2, 3]
+rows found: 8490 same as full scan: True
+fraction of data read: 0.2</code></pre>
+<ol><li>The data is sorted by day and cut into 10 blocks of 10,000 rows; per block we keep only (minimum, maximum), which Parquet writes in its footer for you.</li><li>A block can contain matches only if its range overlaps the query: <code>max &gt;= lo</code> and <code>min &lt;= hi</code>. Only blocks 2 and 3 qualify, so 20 per cent of the data is read, and the count equals the full scan.</li><li>Sorting matters: with shuffled days every block spans the whole year and nothing can be skipped. That is why people sort or partition by the column they filter on most.</li></ol>
+<div class="callout blue"><div class="lab">WHY IT MATTERS</div><div class="txt">Reading Parquet with <code>columns=</code> and <code>filters=</code> is often the difference between a notebook that loads in seconds and one that runs out of memory. In pandas 3 you can also keep the Arrow types after reading (<code>dtype_backend="pyarrow"</code>), which avoids converting everything to NumPy and keeps missing integers as integers. Both parts need pyarrow installed and were not run here.</div></div>
+
+<h2>20.11 Logging, progress, big files and encodings</h2>
+<p>These four tools make a pipeline <em>observable</em> and <em>survivable</em>. <strong>Logging</strong> records what happened, with severity levels and without <code>print</code>. A <strong>progress bar</strong> tells you a long loop is alive. <strong>Chunking</strong> processes a file in pieces so memory stays small. <strong>Encodings</strong> decide how bytes turn into characters; get one wrong and <code>é</code> becomes <code>Ã©</code>.</p>
+<h3>Reference: logging, progress, chunking and encoding essentials</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>logging.getLogger(__name__)</code></td><td>Named logger per module</td><td><code>log = logging.getLogger(__name__)</code></td></tr>
+<tr><td><code>logging.basicConfig(...)</code></td><td>One-time setup for scripts (level, format, stream)</td><td><code>basicConfig(level=logging.INFO)</code></td></tr>
+<tr><td>Levels</td><td>DEBUG, INFO, WARNING, ERROR, CRITICAL</td><td><code>log.warning("slow")</code></td></tr>
+<tr><td>Lazy arguments</td><td>Format only if the message is emitted</td><td><code>log.info("%d rows", n)</code></td></tr>
+<tr><td><code>log.exception(msg)</code></td><td>ERROR with the traceback (inside <code>except</code>)</td><td><code>log.exception("load failed")</code></td></tr>
+<tr><td><code>logging.Formatter(fmt)</code></td><td>Message layout with time, level, name</td><td><code>"%(asctime)s %(levelname)s %(message)s"</code></td></tr>
+<tr><td><code>handler.setLevel</code></td><td>Different thresholds per destination</td><td><code>console.setLevel(logging.WARNING)</code></td></tr>
+<tr><td><code>tqdm(iterable, total=, desc=)</code></td><td>Progress bar around a loop (package tqdm)</td><td><code>for r in tqdm(rows): ...</code></td></tr>
+<tr><td><code>tqdm.pandas()</code></td><td>Adds <code>progress_apply</code> to pandas</td><td><code>df.progress_apply(f, axis=1)</code></td></tr>
+<tr><td><code>pd.read_csv(chunksize=n)</code></td><td>Iterator of DataFrames</td><td><code>for ch in pd.read_csv(p, chunksize=50_000):</code></td></tr>
+<tr><td><code>usecols=</code>, <code>dtype=</code>, <code>nrows=</code></td><td>Read fewer columns, smaller types, a sample</td><td><code>read_csv(p, usecols=["a"], nrows=1000)</code></td></tr>
+<tr><td><code>open(p, encoding=, errors=)</code></td><td>Choose the codec and how to treat bad bytes</td><td><code>open(p, encoding="latin-1")</code></td></tr>
+<tr><td><code>bytes.decode(enc, errors=)</code></td><td>Bytes to text; errors: <code>strict</code>, <code>replace</code>, <code>ignore</code></td><td><code>raw.decode("utf-8", errors="replace")</code></td></tr>
+<tr><td><code>utf-8-sig</code></td><td>UTF-8 that drops a leading byte-order mark</td><td><code>open(p, encoding="utf-8-sig")</code></td></tr>
+<tr><td><code>pd.read_csv(encoding=, encoding_errors=)</code></td><td>Encoding control inside pandas</td><td><code>read_csv(p, encoding="cp1252")</code></td></tr>
+<tr><td><code>hashlib.sha256()</code></td><td>Checksum to verify a copy or download</td><td><code>h.update(chunk)</code></td></tr>
+</tbody></table></div>
+<h3>Example 1: logging that you can actually read</h3>
+<pre class="code lang-python"><code>import logging, sys, tempfile
+from pathlib import Path
+
+logfile = Path(tempfile.mkdtemp()) / "etl.log"
+root = logging.getLogger()
+root.setLevel(logging.DEBUG)
+root.handlers.clear()
+
+console = logging.StreamHandler(sys.stdout)
+console.setLevel(logging.INFO)
+console.setFormatter(logging.Formatter("%(levelname)-7s %(name)s: %(message)s"))
+to_file = logging.FileHandler(logfile)
+to_file.setFormatter(logging.Formatter("%(levelname)s|%(name)s|%(message)s"))
+root.addHandler(console)
+root.addHandler(to_file)
+
+log = logging.getLogger("etl.orders")
+log.debug("raw row sample: %s", {"id": 1})
+log.info("loaded %d rows from %s", 120, "orders.csv")
+log.warning("%d rows rejected (%.1f%%)", 3, 100 * 3 / 120)
+try:
+    int("12x")
+except ValueError as e:
+    log.error("parse failed: %s", e)
+
+print("--- file content ---")
+print(logfile.read_text().strip())</code></pre>
+<pre class="code lang-text"><code>INFO    etl.orders: loaded 120 rows from orders.csv
+WARNING etl.orders: 3 rows rejected (2.5%)
+ERROR   etl.orders: parse failed: invalid literal for int() with base 10: '12x'
+--- file content ---
+DEBUG|etl.orders|raw row sample: {'id': 1}
+INFO|etl.orders|loaded 120 rows from orders.csv
+WARNING|etl.orders|3 rows rejected (2.5%)
+ERROR|etl.orders|parse failed: invalid literal for int() with base 10: '12x'</code></pre>
+<ol><li>Handlers on the <strong>root</strong> logger receive messages from every logger below it. The console handler shows INFO and above in a compact layout; the file handler keeps everything, including DEBUG.</li><li><code>etl.orders</code> is a child of <code>etl</code>; the dots form a hierarchy, so <code>getLogger("etl")</code> tunes a whole subsystem.</li><li>The <code>%d</code> and <code>%s</code> arguments are passed separately, so Python builds the string only if the level is enabled.</li><li>Real formats add <code>%(asctime)s</code>; it is omitted so the output is repeatable. Inside <code>except</code>, <code>log.exception(...)</code> adds the traceback.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>log.info(f"calling {url} with token {token}")</code>. <strong>Symptom:</strong> secrets end up in log files and ticketing systems, and the f-string is built even when INFO is off. <strong>Fix:</strong> <code>log.info("calling %s", url)</code> and never log tokens, passwords or personal data; mask them (<code>token[:4] + "..."</code>).</div></div>
+<h3>Example 2: a progress bar without tqdm</h3>
+<p>The <code>tqdm</code> package (not installed here) is the usual choice. The idea is simple enough to build, which also shows how it works: wrap an iterable, count what passes, and report at intervals.</p>
+<pre class="code lang-python"><code>import sys
+
+def progress(iterable, total, desc="", steps=4, out=sys.stdout, width=20):
+    marks = {max(1, round(total * k / steps)) for k in range(1, steps + 1)}
+    for i, item in enumerate(iterable, 1):
+        yield item
+        if i in marks:
+            filled = round(width * i / total)
+            print(f"{desc}: [{'#' * filled}{' ' * (width - filled)}] {100 * i // total:3d}% ({i}/{total})", file=out)
+
+total = 0
+for x in progress(range(1, 101), total=100, desc="load"):
+    total += x
+print("sum =", total)</code></pre>
+<pre class="code lang-text"><code>load: [#####               ]  25% (25/100)
+load: [##########          ]  50% (50/100)
+load: [###############     ]  75% (75/100)
+load: [####################] 100% (100/100)
+sum = 5050</code></pre>
+<ol><li><code>progress</code> is a <strong>generator</strong> wrapper: it yields every item unchanged and reports at 25, 50, 75 and 100 per cent. Real tqdm reports by elapsed time, which is why its output cannot be pasted exactly.</li><li>Send progress to <code>sys.stderr</code> (the <code>out</code> argument) so stdout stays clean for data. The loop sums 1 to 100: 5050.</li></ol>
+<pre class="code lang-text"><code># NOT RUN HERE: tqdm is not installed on the study machine (pip install tqdm)
+from tqdm import tqdm
+import pandas as pd
+
+for row in tqdm(rows, desc="load", total=len(rows)):      # bar with rate and ETA
+    process(row)
+
+tqdm.pandas(desc="clean")                                  # adds progress_apply
+df["clean"] = df["raw"].progress_apply(clean_text)
+
+with tqdm(total=file_size, unit="B", unit_scale=True) as bar:   # manual updates
+    for part in response.iter_content(8192):
+        out.write(part)
+        bar.update(len(part))</code></pre>
+<h3>Example 3: encodings, byte-order marks and mojibake</h3>
+<pre class="code lang-python"><code>import io
+import pandas as pd
+
+raw = "Zoë,Müller,café\n".encode("latin-1")          # a file saved by an old tool
+try:
+    raw.decode("utf-8")
+except UnicodeDecodeError as e:
+    print("utf-8 failed:", e.reason, "at byte", e.start)
+print(raw.decode("latin-1").strip())
+print(raw.decode("utf-8", errors="replace").strip())
+
+bom = "id,name\n1,Zoë\n".encode("utf-8-sig")
+print(bom[:3])
+print(repr(bom.decode("utf-8").splitlines()[0]))
+print(repr(bom.decode("utf-8-sig").splitlines()[0]))
+print(pd.read_csv(io.BytesIO(bom), encoding="utf-8-sig").columns.tolist())
+
+garbled = "café".encode("utf-8").decode("latin-1")
+print(garbled, "-&gt;", garbled.encode("latin-1").decode("utf-8"))</code></pre>
+<pre class="code lang-text"><code>utf-8 failed: invalid continuation byte at byte 2
+Zoë,Müller,café
+Zo�,M�ller,caf�
+b'\xef\xbb\xbf'
+'\ufeffid,name'
+'id,name'
+['id', 'name']
+cafÃ© -&gt; café</code></pre>
+<ol><li>A file is bytes. "Zoë" saved as Latin-1 uses the single byte <code>0xEB</code>; UTF-8 expects a longer sequence there, so decoding fails and the error gives the reason and byte position. Decoding as Latin-1 works. <code>errors="replace"</code> never crashes but swaps bad bytes for �; use it to inspect, never to load data you care about.</li><li>Some Windows tools start a UTF-8 file with a byte-order mark (<code>EF BB BF</code>). Plain <code>utf-8</code> keeps it as an invisible character, so the first header becomes <code>'\ufeffid'</code> and <code>df["id"]</code> fails. <code>utf-8-sig</code> removes it; pandas accepts the same name.</li><li><strong>Mojibake</strong> is text decoded with the wrong codec (UTF-8 bytes read as Latin-1 give <code>cafÃ©</code>). It is reversible: encode with the wrong codec, decode with the right one.</li></ol>
+<figure><img src="images/lib20_encoding.png" alt="Bar chart of the number of bytes needed to store the same 27-character accented string in ascii, latin-1, utf-8, utf-16 and utf-32, with ascii failing" loading="lazy"/><figcaption>The same text takes a different number of bytes in each encoding, and ASCII cannot hold it at all.</figcaption></figure>
+<p><strong>How to read it:</strong> every bar is the same 27-character string. ASCII (red) cannot represent accented letters, so it fails. Latin-1 uses one byte per character. UTF-8 uses one byte for plain letters and two for accented ones, so it is slightly bigger. UTF-16 and UTF-32 use two and four bytes per character (plus a header for UTF-16 and UTF-32). UTF-8 is the safe default for new files; when reading old files, expect Latin-1 or cp1252 from Windows tools.</p>
+<h3>Example 4: big files in chunks</h3>
+<pre class="code lang-python"><code>import os, tempfile
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(42)
+n = 50_000
+df = pd.DataFrame({
+    "region": rng.choice(["north", "south", "east"], n),
+    "units": rng.integers(1, 20, n),
+    "price": rng.uniform(1, 100, n).round(2),
+})
+path = os.path.join(tempfile.mkdtemp(), "sales.csv")
+df.to_csv(path, index=False)
+
+revenue, rows_seen = {}, 0
+for chunk in pd.read_csv(path, chunksize=10_000, dtype={"region": "category"}):
+    rows_seen += len(chunk)
+    part = (chunk["units"] * chunk["price"]).groupby(chunk["region"], observed=True).sum()
+    for region, value in part.items():
+        revenue[region] = revenue.get(region, 0.0) + value
+
+chunked = pd.Series(revenue).sort_index()
+full = (df["units"] * df["price"]).groupby(df["region"]).sum().sort_index()
+print(rows_seen)
+print(chunked.round(0).to_dict())
+print("matches full read:", np.allclose(chunked, full))
+
+sample = pd.read_csv(path, usecols=["region", "units"], nrows=3)
+print(sample)</code></pre>
+<pre class="code lang-text"><code>50000
+{'east': 8494800.0, 'north': 8473515.0, 'south': 8326957.0}
+matches full read: True
+  region  units
+0  north      2
+1   east     19
+2  south     10</code></pre>
+<ol><li>The script writes a 50,000-row CSV so it is self-contained; in real life this is the file that does not fit in memory.</li><li><code>chunksize=10_000</code> makes <code>read_csv</code> an iterator of five DataFrames, one in memory at a time. Each chunk yields a <em>partial</em> result (revenue by region) added into a running dictionary. This works for combinable statistics: sums, counts, min, max; a mean is a sum plus a count; a median is not combinable.</li><li>The chunked result is compared with the all-at-once result using <code>np.allclose</code>, because additions in another order differ in the last digits. They match. <code>usecols</code> and <code>nrows</code> are the quickest way to peek at a big file.</li></ol>
+<figure><img src="images/lib20_chunking.png" alt="Bar chart of peak Python memory when reading a 200000-row CSV whole or in chunks of 100000, 20000, 5000 and 1000 rows" loading="lazy"/><figcaption>Peak memory tracked by <code>tracemalloc</code> while summing one column (measured once; values vary).</figcaption></figure>
+<p><strong>How to read it:</strong> the red bar is the whole file loaded at once and the other bars use smaller chunks. Memory falls as the chunk shrinks and levels off, because each chunk still has fixed overhead. The trade-off: very small chunks mean more Python-level loop iterations, so pick a chunk that is comfortably small (tens of thousands of rows), not the smallest possible.</p>
+
+<h2>20.12 Recipes: How do I ...?</h2>
+<p>Ten solved tasks. Each is a complete script you can copy. The first four are the big ones that tie several libraries together. The rest are short answers to questions that come up every week.</p>
+
+<h3>Recipe 1. How do I ingest a paginated API into SQLite, safely and repeatably?</h3>
+<p>Plan: fetch page by page with a cursor, validate each record, set aside the bad ones, and upsert the good ones so that running the job twice gives the same table. To keep the recipe short, <code>fetch_page</code> stands in for <code>requests.get(url, params=..., timeout=5).json()</code>; the real HTTP code with a local server is in 20.7.</p>
+<pre class="code lang-python"><code>import sqlite3
+
+ITEMS = [{"id": i, "name": f"item{i}", "price": str(i * 1.5)} for i in range(1, 8)]
+ITEMS[4]["price"] = "n/a"                               # one bad record from the provider
+
+def fetch_page(after, limit):
+    page = [x for x in ITEMS if x["id"] &gt; after][:limit]
+    return {"items": page, "next": page[-1]["id"] if len(page) == limit else None}
+
+con = sqlite3.connect(":memory:")
+con.execute("create table items(id integer primary key, name text not null, price real not null)")
+UPSERT = """insert into items values (?, ?, ?)
+            on conflict(id) do update set name = excluded.name, price = excluded.price"""
+rejected = []
+
+def ingest(page_size=3):
+    after, loaded = 0, 0
+    while True:
+        body = fetch_page(after, page_size)
+        good = []
+        for rec in body["items"]:
+            try:
+                good.append((int(rec["id"]), rec["name"], float(rec["price"])))
+            except (KeyError, ValueError) as e:
+                rejected.append((rec.get("id"), str(e)))
+        with con:
+            con.executemany(UPSERT, good)
+        loaded += len(good)
+        if body["next"] is None:
+            return loaded
+        after = body["next"]
+
+print("run 1 loaded:", ingest())
+print("run 2 loaded:", ingest())
+print("rows in table:", con.execute("select count(*) from items").fetchone()[0])
+print("rejected:", rejected[:1])
+print(con.execute("select * from items where id = 7").fetchone())</code></pre>
+<pre class="code lang-text"><code>run 1 loaded: 6
+run 2 loaded: 6
+rows in table: 6
+rejected: [(5, "could not convert string to float: 'n/a'")]
+(7, 'item7', 10.5)</code></pre>
+<ol><li>Seven provider items; the fifth has a broken price. <code>fetch_page</code> does cursor paging: ids above <code>after</code>, and <code>next</code> is <code>None</code> on a short page.</li><li>The table has a primary key and <code>not null</code> columns as the last line of defence. <code>UPSERT</code> overwrites an existing id, so a re-run is harmless.</li><li>Each record is converted inside <code>try</code>; a bad one goes to <code>rejected</code> with the reason and the loop continues. <code>with con:</code> commits each page as one transaction.</li><li>Each run loads 6 good rows (3, 2 and 1 per page). Run 2 changes nothing: still 6 rows. The bad record is rejected in both runs (only the first is shown).</li></ol>
+
+<h3>Recipe 2. How do I scrape a multi-page table into a DataFrame, politely?</h3>
+<pre class="code lang-python"><code>import time
+import pandas as pd
+from bs4 import BeautifulSoup
+from urllib.robotparser import RobotFileParser
+
+PAGES = {
+    "https://shop.example/list?p=1": "&lt;table&gt;&lt;tr&gt;&lt;th&gt;SKU&lt;/th&gt;&lt;th&gt;Price&lt;/th&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;A&lt;/td&gt;&lt;td&gt;$1.10&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;B&lt;/td&gt;&lt;td&gt;$2.20&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;",
+    "https://shop.example/list?p=2": "&lt;table&gt;&lt;tr&gt;&lt;th&gt;SKU&lt;/th&gt;&lt;th&gt;Price&lt;/th&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;B&lt;/td&gt;&lt;td&gt;$2.20&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;C&lt;/td&gt;&lt;td&gt;$3.30&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;",
+    "https://shop.example/list?p=3": "&lt;p&gt;No table here&lt;/p&gt;",
+}
+rp = RobotFileParser()
+rp.parse(["User-agent: *", "Disallow: /admin/"])
+
+def fetch(url):                       # stand-in for requests.get(url, headers=..., timeout=...).text
+    return PAGES[url]
+
+frames = []
+for url in PAGES:
+    if not rp.can_fetch("study-bot", url):
+        continue
+    table = BeautifulSoup(fetch(url), "html.parser").find("table")
+    if table is None:
+        print("no table at", url[-3:])
+        continue
+    rows = [[c.get_text(strip=True) for c in tr.find_all(["th", "td"])] for tr in table.find_all("tr")]
+    frames.append(pd.DataFrame(rows[1:], columns=rows[0]))
+    time.sleep(0.01)                  # be polite: real crawls wait seconds, not 0.01
+
+df = pd.concat(frames, ignore_index=True).drop_duplicates().reset_index(drop=True)
+df["Price"] = df["Price"].str.lstrip("$").astype(float)
+print(df)</code></pre>
+<pre class="code lang-text"><code>no table at p=3
+  SKU  Price
+0   A    1.1
+1   B    2.2
+2   C    3.3</code></pre>
+<ol><li>The dictionary stands in for three web pages; replace <code>fetch</code> with <code>requests.get(...).text</code> (plus timeout and error handling). <code>can_fetch</code> is asked before every page.</li><li>Page 3 has no table, so <code>find</code> returns <code>None</code> and is reported instead of crashing. Each row (header included) is read into a list of strings; the first row names the columns.</li><li><code>concat</code> and <code>drop_duplicates</code> remove product B, which appears on both pages; <code>reset_index</code> renumbers. The price text is cleaned and converted to float.</li></ol>
+
+<h3>Recipe 3. How do I validate a schema and keep the rejects?</h3>
+<pre class="code lang-python"><code>import json, tempfile
+from pathlib import Path
+
+lines = [
+    '{"id": 1, "total": 10.5, "region": "north"}',
+    '{"id": 2, "total": "oops", "region": "south"}',
+    'not json at all',
+    '{"id": 4, "total": -1, "region": "east"}',
+    '{"id": 5, "total": 3, "region": "mars"}',
+    '{"id": 6, "region": "west"}',
+]
+REGIONS = {"north", "south", "east", "west"}
+
+def parse(line):
+    rec = json.loads(line)
+    total = float(rec["total"])
+    if total &lt; 0:
+        raise ValueError("negative total")
+    if rec["region"] not in REGIONS:
+        raise ValueError(f"unknown region {rec['region']!r}")
+    return {"id": int(rec["id"]), "total": total, "region": rec["region"]}
+
+good = []
+rejects = Path(tempfile.mkdtemp()) / "rejected.jsonl"
+with rejects.open("w", encoding="utf-8") as bad:
+    for n, line in enumerate(lines, 1):
+        try:
+            good.append(parse(line))
+        except (ValueError, KeyError) as e:      # JSONDecodeError is a ValueError
+            bad.write(json.dumps({"line": n, "error": f"{type(e).__name__}: {e}"}) + "\n")
+
+print(len(good), "good:", good)
+for row in rejects.read_text().splitlines():
+    print(row)</code></pre>
+<pre class="code lang-text"><code>1 good: [{'id': 1, 'total': 10.5, 'region': 'north'}]
+{"line": 2, "error": "ValueError: could not convert string to float: 'oops'"}
+{"line": 3, "error": "JSONDecodeError: Expecting value: line 1 column 1 (char 0)"}
+{"line": 4, "error": "ValueError: negative total"}
+{"line": 5, "error": "ValueError: unknown region 'mars'"}
+{"line": 6, "error": "KeyError: 'total'"}</code></pre>
+<ol><li>The input has every kind of damage: bad number, broken JSON, negative value, unknown category, missing key.</li><li>One <code>except</code> catches <code>ValueError</code> (which includes <code>JSONDecodeError</code>) and <code>KeyError</code>.</li><li>Each reject is one JSON object with the line number and reason in a JSON Lines file: an audit trail for the data owner. One record passes, five are rejected with five different messages.</li></ol>
+
+<h3>Recipe 4. How do I do an incremental load with a watermark?</h3>
+<p>A <strong>watermark</strong> is the highest <code>updated_at</code> value you have already loaded. Each run asks the source only for rows at or after it. The watermark is stored in the target database and updated in the same transaction as the data, so a crash can never advance it without the rows.</p>
+<pre class="code lang-python"><code>import sqlite3
+from datetime import datetime, timedelta
+
+src, dst = sqlite3.connect(":memory:"), sqlite3.connect(":memory:")
+for c in (src, dst):
+    c.execute("create table orders(id integer primary key, total real, updated_at text)")
+dst.execute("create table etl_state(name text primary key, watermark text)")
+UPSERT = """insert into orders values (?, ?, ?) on conflict(id) do update
+            set total = excluded.total, updated_at = excluded.updated_at"""
+
+def load(overlap_hours=0):
+    row = dst.execute("select watermark from etl_state where name = 'orders'").fetchone()
+    wm = row[0] if row else "1970-01-01T00:00:00"
+    start = (datetime.fromisoformat(wm) - timedelta(hours=overlap_hours)).isoformat()
+    rows = src.execute("select id, total, updated_at from orders where updated_at &gt;= ? order by updated_at",
+                       (start,)).fetchall()
+    with dst:                                         # data and watermark commit together
+        dst.executemany(UPSERT, rows)
+        if rows:
+            dst.execute("""insert into etl_state values ('orders', ?)
+                           on conflict(name) do update set watermark = max(watermark, excluded.watermark)""",
+                        (rows[-1][2],))
+    return len(rows)
+
+src.executemany("insert into orders values (?, ?, ?)",
+                [(1, 10.0, "2025-03-01T09:00:00"), (2, 20.0, "2025-03-01T10:00:00"), (3, 30.0, "2025-03-01T11:00:00")])
+print("run 1 read", load())
+print("run 2 read", load(), "(only the boundary row again)")
+
+src.execute("update orders set total = 25.0, updated_at = '2025-03-01T12:00:00' where id = 2")
+src.execute("insert into orders values (4, 40.0, '2025-03-01T12:30:00')")
+print("run 3 read", load())
+print(dst.execute("select * from orders order by id").fetchall())
+
+src.execute("insert into orders values (5, 50.0, '2025-03-01T11:30:00')")      # arrives late, older timestamp
+print("run 4 (no overlap) read", load(), "-&gt; rows in target:", dst.execute("select count(*) from orders").fetchone()[0])
+print("run 5 (2 h overlap) read", load(overlap_hours=2), "-&gt; rows in target:", dst.execute("select count(*) from orders").fetchone()[0])</code></pre>
+<pre class="code lang-text"><code>run 1 read 3
+run 2 read 1 (only the boundary row again)
+run 3 read 3
+[(1, 10.0, '2025-03-01T09:00:00'), (2, 25.0, '2025-03-01T12:00:00'), (3, 30.0, '2025-03-01T11:00:00'), (4, 40.0, '2025-03-01T12:30:00')]
+run 4 (no overlap) read 1 -&gt; rows in target: 4
+run 5 (2 h overlap) read 4 -&gt; rows in target: 5</code></pre>
+<ol><li>Two in-memory databases play the source and the warehouse; the warehouse has a state table with one row per job.</li><li><code>load</code> reads the watermark (1970 on the first run), steps back by an optional overlap, and selects rows with <code>updated_at &gt;= start</code>. Using <code>&gt;=</code> means rows sharing the exact watermark are never missed; they are read again and the upsert makes that harmless.</li><li>Inside <code>with dst:</code> the rows and the new watermark commit together, or neither does. <code>max(...)</code> stops the watermark moving backwards during an overlap run.</li><li>Run 1 reads 3 rows; run 2 reads only the boundary row. Run 3 sees the changed order 2 (now 25.0), the new order 4 and the boundary row.</li><li>Run 4 shows the weakness: order 5 arrives late with an older timestamp (11:30, watermark 12:30) and is never read. Run 5 uses a two-hour overlap and catches it, at the price of re-reading recent data.</li></ol>
+<figure><img src="images/lib20_watermark.png" alt="Bar chart of rows loaded in each of five runs and a line of the cumulative rows in the target table" loading="lazy"/><figcaption>Illustrative numbers: a first full load, then small incremental loads, one run with nothing new.</figcaption></figure>
+<p><strong>How to read it:</strong> blue bars are the rows each run touches; the orange line is how many rows the target holds in total. After the big first load the bars are small, which is the whole point: later runs do a tiny amount of work. Run 4 brought nothing new and the orange line stays flat, which is a healthy result and not an error.</p>
+
+<h3>Recipe 5. How do I combine many CSV files and remember where each row came from?</h3>
+<pre class="code lang-python"><code>import tempfile
+from pathlib import Path
+import pandas as pd
+
+root = Path(tempfile.mkdtemp())
+(root / "sales_2025-01.csv").write_text("sku,units\nA,3\nB,5\n")
+(root / "sales_2025-02.csv").write_text("sku,units\nA,4\nC,1\n")
+(root / "notes.txt").write_text("ignore me")
+
+frames = [pd.read_csv(p).assign(source=p.stem) for p in sorted(root.glob("sales_*.csv"))]
+df = pd.concat(frames, ignore_index=True)
+df["month"] = df["source"].str[-7:]
+print(df)
+print(df.groupby("month")["units"].sum().to_dict())</code></pre>
+<pre class="code lang-text"><code>sku  units         source    month
+0   A      3  sales_2025-01  2025-01
+1   B      5  sales_2025-01  2025-01
+2   A      4  sales_2025-02  2025-02
+3   C      1  sales_2025-02  2025-02
+{'2025-01': 8, '2025-02': 5}</code></pre>
+<ol><li><code>glob("sales_*.csv")</code> ignores the notes file; <code>sorted</code> makes the order reproducible.</li><li><code>assign(source=p.stem)</code> tags each row with its file, so a wrong number can be traced back; <code>concat(..., ignore_index=True)</code> gives a fresh index.</li></ol>
+
+<h3>Recipe 6. How do I open a mystery CSV (unknown delimiter, encoding and decimal comma)?</h3>
+<pre class="code lang-python"><code>import csv, io
+import pandas as pd
+
+raw = "id;name;amount\n1;Zoë;12,5\n2;Müller;7,25\n".encode("cp1252")
+
+def guess(raw):
+    for enc in ("utf-8", "cp1252"):
+        try:
+            text = raw.decode(enc)
+            break
+        except UnicodeDecodeError:
+            continue
+    sep = csv.Sniffer().sniff(text[:2000], delimiters=",;\t|").delimiter
+    return enc, sep
+
+enc, sep = guess(raw)
+print(enc, repr(sep))
+df = pd.read_csv(io.BytesIO(raw), sep=sep, encoding=enc, decimal=",")
+print(df)
+print(df["amount"].sum())</code></pre>
+<pre class="code lang-text"><code>cp1252 ';'
+   id    name  amount
+0   1     Zoë   12.50
+1   2  Müller    7.25
+19.75</code></pre>
+<ol><li>The bytes imitate a Windows export: cp1252, semicolons, decimal comma.</li><li><code>guess</code> tries strict UTF-8 first, fails on the accented byte, then uses <code>cp1252</code>. <code>csv.Sniffer</code> finds the delimiter among the allowed ones.</li><li><code>decimal=","</code> makes pandas read <code>12,5</code> as 12.5; without it the column would be text.</li></ol>
+
+<h3>Recipe 7. How do I write a formatted Excel report?</h3>
+<pre class="code lang-python"><code>import tempfile
+from pathlib import Path
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill
+
+path = Path(tempfile.mkdtemp()) / "report.xlsx"
+wb = Workbook()
+ws = wb.active
+ws.title = "Summary"
+ws.append(["Region", "Revenue"])
+for row in [("North", 1234.5), ("South", 987.25)]:
+    ws.append(row)
+for cell in ws[1]:
+    cell.font = Font(bold=True, color="FFFFFF")
+    cell.fill = PatternFill("solid", fgColor="2B4FD6")
+for (cell,) in ws.iter_rows(min_row=2, min_col=2, max_col=2):
+    cell.number_format = "#,##0.00"
+ws.freeze_panes = "A2"
+ws.column_dimensions["A"].width = 18
+ws.auto_filter.ref = ws.dimensions
+wb.save(path)
+
+check = load_workbook(path)["Summary"]
+print(check["A1"].font.bold, check["B2"].number_format, check.freeze_panes, check.auto_filter.ref)
+print(check["B2"].value)</code></pre>
+<pre class="code lang-text"><code>True #,##0.00 A2 A1:B3
+1234.5</code></pre>
+<ol><li>Data goes in with <code>append</code>; styling is applied afterwards: bold white header text on a blue fill (hex without <code>#</code>).</li><li><code>number_format</code> changes only the display; the cell still holds the number 1234.5, so finance can still sum it. Freeze panes, a column width and a filter finish the sheet.</li><li>Reloading the file confirms what was really saved.</li></ol>
+
+<h3>Recipe 8. How do I upsert a whole DataFrame into a table?</h3>
+<pre class="code lang-python"><code>import sqlite3
+import pandas as pd
+
+con = sqlite3.connect(":memory:")
+con.execute("create table prices(sku text primary key, price real)")
+con.execute("insert into prices values ('A', 1.0), ('B', 2.0)")
+new = pd.DataFrame({"sku": ["B", "C"], "price": [2.5, 3.0]})
+
+with con:
+    new.to_sql("prices_stage", con, if_exists="replace", index=False)
+    con.execute("""insert into prices select sku, price from prices_stage where true
+                   on conflict(sku) do update set price = excluded.price""")
+    con.execute("drop table prices_stage")
+print(pd.read_sql_query("select * from prices order by sku", con))</code></pre>
+<pre class="code lang-text"><code>sku  price
+0   A    1.0
+1   B    2.5
+2   C    3.0</code></pre>
+<ol><li><code>to_sql</code> cannot upsert, so the DataFrame goes to a throw-away <strong>staging table</strong>.</li><li>One SQL statement moves staging rows into the real table (in SQLite, <code>where true</code> after the <code>select</code> avoids a parsing ambiguity before <code>on conflict</code>), then the stage is dropped, all in one transaction.</li><li>Result: A unchanged, B updated to 2.5, C inserted. PostgreSQL uses the same <code>insert ... on conflict</code>.</li></ol>
+
+<h3>Recipe 9. How do I flatten nested JSON that contains lists?</h3>
+<pre class="code lang-python"><code>import pandas as pd
+
+orders = [
+    {"id": 1, "customer": {"name": "Ana"}, "lines": [{"sku": "A", "qty": 2}, {"sku": "B", "qty": 1}]},
+    {"id": 2, "customer": {"name": "Bo"}, "lines": [{"sku": "A", "qty": 5}]},
+    {"id": 3, "customer": {"name": "Cy"}, "lines": []},
+]
+lines = pd.json_normalize(orders, record_path="lines", meta=["id", ["customer", "name"]])
+print(lines)
+print(lines.groupby("customer.name")["qty"].sum().to_dict())</code></pre>
+<pre class="code lang-text"><code>sku  qty id customer.name
+0   A    2  1           Ana
+1   B    1  1           Ana
+2   A    5  2            Bo
+{'Ana': 3, 'Bo': 5}</code></pre>
+<ol><li>Each order has a list of lines, so the natural table has one row per line. <code>record_path="lines"</code> expands that list.</li><li><code>meta</code> copies parent fields onto every child row, including the nested <code>["customer", "name"]</code>. Order 3 has an empty list and therefore no rows; join the parent table back if you need it.</li></ol>
+
+<h3>Recipe 10. How do I cache API responses so reruns are cheap?</h3>
+<pre class="code lang-python"><code>import hashlib, json, tempfile, time
+from pathlib import Path
+
+cache_dir = Path(tempfile.mkdtemp())
+calls = {"n": 0}
+
+def fake_api(url):                                    # stands in for requests.get(url).json()
+    calls["n"] += 1
+    return {"url": url, "value": len(url)}
+
+def cached_get(url, max_age=3600, fetch=fake_api):
+    f = cache_dir / (hashlib.sha256(url.encode()).hexdigest()[:16] + ".json")
+    if f.exists() and time.time() - f.stat().st_mtime &lt; max_age:
+        return json.loads(f.read_text())
+    data = fetch(url)
+    tmp = f.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(f)
+    return data
+
+for u in ["https://api.example/a", "https://api.example/b", "https://api.example/a"]:
+    cached_get(u)
+print("api calls:", calls["n"])
+cached_get("https://api.example/a", max_age=0)
+print("api calls after forcing a refresh:", calls["n"])</code></pre>
+<pre class="code lang-text"><code>api calls: 2
+api calls after forcing a refresh: 3</code></pre>
+<ol><li>The cache key is a hash of the URL, so any URL becomes a safe file name. A file younger than <code>max_age</code> seconds is returned without a network call.</li><li>Otherwise the function fetches and writes through a temporary file plus <code>replace</code> (the atomic write from 20.2).</li><li>Three lookups cost two real calls; <code>max_age=0</code> forces a refresh, giving a third. Caching also keeps development runs far below rate limits.</li></ol>
+
+<h2>20.13 Performance and pitfalls</h2>
+<h3>Where time and memory actually go</h3>
+<ul><li><strong>Round trips and syncs.</strong> Every network call and every SQLite commit has a fixed cost (a commit forces a disk sync). Batch, page, and reuse connections.</li><li><strong>Parsing and memory.</strong> CSV and JSON are parsed character by character, and a DataFrame is often several times bigger than its file. Read fewer columns, use smaller dtypes (<code>category</code>, <code>int32</code>), and chunk.</li><li><strong>Waiting.</strong> An HTTP loop is mostly idle; threads or <code>httpx.AsyncClient</code> help, within the provider's limits.</li></ul>
+<pre class="code lang-python"><code>import os, sqlite3, tempfile, time
+
+rows = [(i, f"name{i}", i * 0.5) for i in range(3000)]
+
+def insert_seconds(per_row_commit):
+    con = sqlite3.connect(os.path.join(tempfile.mkdtemp(), "t.db"))
+    con.execute("create table t(id integer, name text, v real)")
+    t0 = time.perf_counter()
+    if per_row_commit:
+        for r in rows:
+            con.execute("insert into t values (?, ?, ?)", r)
+            con.commit()
+    else:
+        with con:
+            con.executemany("insert into t values (?, ?, ?)", rows)
+    elapsed = time.perf_counter() - t0
+    assert con.execute("select count(*) from t").fetchone()[0] == 3000
+    con.close()
+    return elapsed
+
+slow, fast = insert_seconds(True), insert_seconds(False)
+print("same 3000 rows, commit per row is slower than one batch:", slow &gt; fast)</code></pre>
+<pre class="code lang-text"><code>same 3000 rows, commit per row is slower than one batch: True</code></pre>
+<ol><li>The function writes the same 3,000 rows into a real file database, once with a commit after each row and once with one <code>executemany</code> inside one transaction.</li><li>The <code>assert</code> proves both variants stored all rows, so the comparison is fair.</li><li>I print a yes/no result because absolute timings depend on your disk and operating system; the figure below shows what was measured on the study machine for 5,000 rows.</li></ol>
+<figure><img src="images/lib20_sqlite_insert.png" alt="Bar chart of the time to insert 5000 rows into SQLite using a commit per row, one transaction with a loop, and executemany" loading="lazy"/><figcaption>Measured once on the study machine (it varies by machine and disk).</figcaption></figure>
+<p><strong>How to read it:</strong> each bar is the time to insert the same 5,000 rows. The vertical axis is logarithmic, so each gridline is ten times the last. The red bar commits after every row and is hundreds of times slower (or worse) than the other two. The orange bar loops inside one transaction. The green bar uses <code>executemany</code> in one transaction, which is the fastest or about equal to the loop, because the statement is prepared once. The fix costs one line (<code>with con:</code>).</p>
+<h3>Pitfall lab: five failures on purpose</h3>
+<pre class="code lang-python"><code>import io, json, os, sqlite3, tempfile
+import numpy as np
+import pandas as pd
+from bs4 import BeautifulSoup
+
+raw = "zip,qty\n02134,5\n90210,7\n"
+print(pd.read_csv(io.StringIO(raw))["zip"].tolist())
+print(pd.read_csv(io.StringIO(raw), dtype={"zip": str})["zip"].tolist())
+
+try:
+    json.dumps({"n": np.int64(5)})
+except TypeError as e:
+    print("TypeError:", e)
+print(json.dumps({"x": float("nan")}), json.dumps({"n": int(np.int64(5)), "x": None}))
+
+path = os.path.join(tempfile.mkdtemp(), "t.db")
+con = sqlite3.connect(path)
+con.execute("create table t(a)")
+con.commit()
+con.execute("insert into t values (1)")
+con.close()
+print("rows after forgetting commit:", sqlite3.connect(path).execute("select count(*) from t").fetchone()[0])
+
+try:
+    BeautifulSoup("&lt;p&gt;hi&lt;/p&gt;", "html.parser").find("table").find_all("tr")
+except AttributeError as e:
+    print("AttributeError:", e)
+
+c2 = sqlite3.connect(":memory:")
+c2.execute("create table keep(id integer primary key, v text)")
+pd.DataFrame({"id": [1], "v": ["a"]}).to_sql("keep", c2, if_exists="replace", index=False)
+print("primary-key flags after to_sql replace:", [r[5] for r in c2.execute("pragma table_info(keep)")])</code></pre>
+<pre class="code lang-text"><code>[2134, 90210]
+['02134', '90210']
+TypeError: Object of type int64 is not JSON serializable
+{"x": NaN} {"n": 5, "x": null}
+rows after forgetting commit: 0
+AttributeError: 'NoneType' object has no attribute 'find_all'
+primary-key flags after to_sql replace: [0, 0]</code></pre>
+<ol><li>Zip codes with a leading zero are read as integers, so <code>02134</code> becomes <code>2134</code>. With <code>dtype={"zip": str}</code> they survive.</li><li><code>json.dumps</code> refuses NumPy integers (they are not Python <code>int</code>), and it writes <code>NaN</code> for a float nan, which is <strong>not valid JSON</strong> and breaks strict parsers. Convert to plain Python types and use <code>None</code> (JSON <code>null</code>) for missing values.</li><li>The insert was never committed before <code>close()</code>, so the reopened database has zero rows. The data is silently lost.</li><li><code>find</code> returned <code>None</code> for the missing table; calling <code>.find_all</code> on it raised <code>AttributeError</code>.</li><li><code>to_sql(if_exists="replace")</code> drops the table and recreates it from the DataFrame, so the primary key and any constraints are gone (flags 0 and 0, where the original had 1 on <code>id</code>).</li></ol>
+<h3>Common mistakes, with symptom and fix</h3>
+<p>Three more are shown earlier: <code>yaml.load</code> (20.3), no <code>timeout</code> (20.7) and secrets in logs (20.11).</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE 1: encoding and newlines</div><div class="txt"><strong>Wrong:</strong> <code>open("export.csv")</code> then <code>csv.reader(f)</code>. <strong>Symptom:</strong> accented names turn into <code>Ã©</code> or the script crashes on another computer; on Windows, blank lines appear between rows. The default encoding depends on the machine. <strong>Fix:</strong> <code>open("export.csv", newline="", encoding="utf-8")</code> (or the encoding the provider documents).</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 2: SQL built with an f-string</div><div class="txt"><strong>Wrong:</strong> <code>con.execute(f"select * from users where name = '{name}'")</code>. <strong>Symptom:</strong> a name such as <code>O'Brien</code> crashes the query, and a crafted name returns or destroys other rows (SQL injection). <strong>Fix:</strong> <code>con.execute("select * from users where name = ?", (name,))</code>.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 3: forgetting to commit</div><div class="txt"><strong>Wrong:</strong> <code>con.execute("insert ..."); con.close()</code>. <strong>Symptom:</strong> the script prints no error, but the next run finds an empty table. <strong>Fix:</strong> <code>with con: con.execute("insert ...")</code> (commits on success, rolls back on error). Remember that <code>with con</code> does not close the connection; call <code>con.close()</code> yourself, or use <code>contextlib.closing</code>.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 4: codes read as numbers</div><div class="txt"><strong>Wrong:</strong> <code>pd.read_csv("zips.csv")</code>. <strong>Symptom:</strong> zip code <code>02134</code> becomes <code>2134</code>, a product id <code>1E5</code> becomes the float 100000.0, and a join to another table silently matches nothing. <strong>Fix:</strong> <code>pd.read_csv("zips.csv", dtype={"zip": str})</code>. Identifiers are labels, not numbers.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 5: page-number pagination on live data</div><div class="txt"><strong>Wrong:</strong> <code>for page in range(1, 50): get(url, params={"page": page})</code>. <strong>Symptom:</strong> the final table has duplicates and some missing rows, and the counts differ on every run. <strong>Fix:</strong> use the cursor or <code>updated_since</code> parameter when the API offers one, and de-duplicate on the primary key with an upsert.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 6: trusting that the element exists</div><div class="txt"><strong>Wrong:</strong> <code>soup.find("span", class_="price").text</code>. <strong>Symptom:</strong> <code>AttributeError: 'NoneType' object has no attribute 'text'</code> the day the site changes its layout, or on one product with no price. <strong>Fix:</strong> a helper such as <code>text_or_none</code> from 20.8, counting how many items had missing fields, and failing the job if the missing share suddenly jumps.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 7: to_sql with replace and an index column</div><div class="txt"><strong>Wrong:</strong> <code>df.to_sql("orders", con, if_exists="replace")</code>. <strong>Symptom:</strong> the table loses its primary key, indexes and column types, and an extra <code>index</code> column appears. <strong>Fix:</strong> create the table yourself with constraints, then <code>df.to_sql("orders", con, if_exists="append", index=False)</code>, or load a staging table and upsert (Recipe 8).</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 8: loading everything, committing everything</div><div class="txt"><strong>Wrong:</strong> <code>df = pd.read_csv("40_million_rows.csv")</code>, or a commit inside a row loop. <strong>Symptom:</strong> <code>MemoryError</code> or the process killed by the operating system; a load that takes hours. <strong>Fix:</strong> <code>chunksize=</code>, <code>usecols=</code> and <code>dtype=</code> when reading; one transaction per batch of thousands of rows when writing.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 9: retrying a POST that is not idempotent</div><div class="txt"><strong>Wrong:</strong> a retry policy that repeats <code>POST /payments</code> after a timeout. <strong>Symptom:</strong> the first request had actually succeeded, so the customer is charged twice. <strong>Fix:</strong> retry only GET, PUT and DELETE by default; for POST send an idempotency key header if the API supports one, or look up the result before repeating.</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 10: swallowing every error</div><div class="txt"><strong>Wrong:</strong> <code>try: load(row) except Exception: pass</code>. <strong>Symptom:</strong> the job reports success while half the rows are missing, and nobody can tell why. <strong>Fix:</strong> catch the specific exceptions you expect, log the reason with the record key, count rejects, and fail the run when the reject rate passes a threshold.</div></div>
+
+<h2>20.14 Cross-library integration</h2>
+<p>The skill of data access is hand-offs. Each library hands a plain Python object to the next, and the cleanest hand-offs use the simplest types: <code>list[dict]</code>, <code>DataFrame</code>, <code>bytes</code> and <code>str</code>.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>From</th><th>To</th><th>Hand-off</th></tr></thead><tbody>
+<tr><td><code>requests</code> / <code>httpx</code></td><td>pandas</td><td><code>pd.DataFrame(r.json()["items"])</code> or <code>pd.json_normalize(r.json())</code></td></tr>
+<tr><td>BeautifulSoup</td><td>pandas</td><td>list of row lists, then <code>pd.DataFrame(rows, columns=header)</code></td></tr>
+<tr><td><code>sqlite3</code> / SQLAlchemy</td><td>pandas</td><td><code>pd.read_sql_query(sql, con, params=...)</code></td></tr>
+<tr><td>pandas</td><td>SQL</td><td><code>df.to_sql(name, con, if_exists="append", index=False)</code></td></tr>
+<tr><td>pandas</td><td>Excel</td><td><code>with pd.ExcelWriter(p) as w: df.to_excel(w, ...)</code>, then openpyxl for styling</td></tr>
+<tr><td>pandas</td><td>Parquet</td><td><code>df.to_parquet(p)</code> and <code>pd.read_parquet(p, columns=...)</code></td></tr>
+<tr><td>files (csv/json/yaml)</td><td>validation</td><td>dict per record into a dataclass or pydantic model</td></tr>
+<tr><td>validation</td><td>database</td><td>validated objects to tuples (<code>astuple</code>) for <code>executemany</code></td></tr>
+<tr><td><code>logging</code></td><td>everything</td><td>one logger per module; log counts at every stage boundary</td></tr>
+<tr><td><code>pathlib</code></td><td>everything</td><td>pass <code>Path</code> objects; pandas, openpyxl, sqlite3 and <code>open</code> accept them</td></tr>
+</tbody></table></div>
+<h3>Worked example: HTML + API + SQL in one logged pipeline</h3>
+<pre class="code lang-python"><code>import json, logging, sqlite3, sys
+import pandas as pd
+from bs4 import BeautifulSoup
+
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(levelname)s %(message)s", force=True)
+log = logging.getLogger("pipeline")
+
+HTML = ("&lt;table&gt;&lt;tr&gt;&lt;th&gt;sku&lt;/th&gt;&lt;th&gt;price&lt;/th&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;A&lt;/td&gt;&lt;td&gt;$1.50&lt;/td&gt;&lt;/tr&gt;"
+        "&lt;tr&gt;&lt;td&gt;B&lt;/td&gt;&lt;td&gt;$2.00&lt;/td&gt;&lt;/tr&gt;&lt;tr&gt;&lt;td&gt;C&lt;/td&gt;&lt;td&gt;oops&lt;/td&gt;&lt;/tr&gt;&lt;/table&gt;")
+API = '[{"sku": "A", "units": 10}, {"sku": "B", "units": 4}, {"sku": "D", "units": 7}]'
+
+def extract_prices(html):
+    rows = [[c.get_text(strip=True) for c in tr.find_all(["th", "td"])]
+            for tr in BeautifulSoup(html, "html.parser").find_all("tr")]
+    df = pd.DataFrame(rows[1:], columns=rows[0])
+    df["price"] = pd.to_numeric(df["price"].str.lstrip("$"), errors="coerce")
+    return df
+
+prices = extract_prices(HTML)
+units = pd.DataFrame(json.loads(API))
+log.info("extracted %d price rows and %d unit rows", len(prices), len(units))
+
+bad = prices[prices["price"].isna()]
+if len(bad):
+    log.warning("dropping %d price rows without a valid price: %s", len(bad), bad["sku"].tolist())
+prices = prices.dropna(subset=["price"])
+
+merged = prices.merge(units, on="sku", how="outer", indicator=True)
+log.info("join result: %s", merged["_merge"].astype(str).value_counts().sort_index().to_dict())
+both = merged[merged["_merge"] == "both"].drop(columns="_merge")
+
+con = sqlite3.connect(":memory:")
+both.to_sql("revenue_base", con, index=False)
+out = pd.read_sql_query("select sku, price * units as revenue from revenue_base order by sku", con)
+log.info("loaded %d rows", len(out))
+print(out)</code></pre>
+<pre class="code lang-text"><code>INFO extracted 3 price rows and 3 unit rows
+WARNING dropping 1 price rows without a valid price: ['C']
+INFO join result: {'both': 2, 'right_only': 1}
+INFO loaded 2 rows
+  sku  revenue
+0   A     15.0
+1   B      8.0</code></pre>
+<ol><li>Two sources: a scraped HTML table and an API's JSON text. Both are inline strings, so the example runs anywhere.</li><li><code>extract_prices</code> turns table rows into a DataFrame. <code>to_numeric(errors="coerce")</code> converts the bad price <code>oops</code> into <code>NaN</code> instead of failing.</li><li>The invalid row is logged as a WARNING with the sku (not silently dropped), then removed.</li><li>An outer merge with <code>indicator=True</code> adds a <code>_merge</code> column that says whether each key was in both tables, left only or right only. Logging the counts is a cheap, powerful check on a join: sku D has units but no price, and C was dropped earlier.</li><li>Only the matched rows go to SQLite with <code>to_sql</code>; the revenue is computed in SQL and read back with <code>read_sql_query</code>.</li><li>The log lines are the audit trail of one run: how much came in, how much was dropped, how many joined, how many were loaded.</li></ol>
+
+<h2>20.15 How to solve any data-access problem: the playbook</h2>
+<h3>The decision flow</h3>
+<ol><li><strong>Where does it live?</strong> Prefer a database or API, then a file download, then scraping.</li><li><strong>How big?</strong> Fits in about a quarter of RAM: read whole. Otherwise chunk, stream, or use a columnar format.</li><li><strong>How does it change?</strong> Never: load once. Otherwise pick watermark, cursor or changed-since.</li><li><strong>How much do you trust it?</strong> Validate at the boundary and keep rejects.</li><li><strong>What can fail?</strong> Network (timeouts, retries, 429), format (encoding, delimiter, schema drift), process (use transactions and idempotent writes).</li><li><strong>How will you know it worked?</strong> Counts, sums and key sets compared between source and target.</li></ol>
+<h3>Seven recurring problem patterns, each solved</h3>
+<p class="problem"><span class="pl">Problem 20.15.1</span> <strong>The file will not parse.</strong> A supplier file raises <code>UnicodeDecodeError</code> at byte 2 and then loads as one column. Fix it.</p>
+<table class="steps"><tr><th>Diagnose</th><td>Print <code>open(p, "rb").read(200)</code>. UTF-8 is wrong; semicolons mean the delimiter is not a comma.</td></tr><tr><th>Fix</th><td><code>pd.read_csv(p, sep=";", encoding="cp1252", decimal=",")</code> (Recipe 6).</td></tr><tr><th>Verify</th><td>Column count, no <code>?</code> or <code>Ã</code> in text, a numeric sum against the supplier's total.</td></tr></table>
+<p class="problem"><span class="pl">Problem 20.15.2</span> <strong>Too big for memory.</strong> A 40,000,000-row CSV must be summarised by region. How many chunks with <code>chunksize=500_000</code>, and what do you keep?</p>
+<table class="steps"><tr><th>Count</th><td>40,000,000 / 500,000 = 80 chunks.</td></tr><tr><th>Keep</th><td>Only a running dictionary of region totals (20.11, Example 4). Add <code>usecols</code> and a <code>category</code> dtype, or convert once to Parquet.</td></tr><tr><th>Limit</th><td>Sum, count, min and max combine across chunks; a median does not.</td></tr></table>
+<p class="problem"><span class="pl">Problem 20.15.3</span> <strong>The request fails sometimes.</strong> An API returns 503 about one call in ten. You allow 5 retries, base delay 0.5 s, doubling. What is the longest total wait without jitter?</p>
+<table class="steps"><tr><th>Delays</th><td>0.5, 1, 2, 4, 8 seconds, total 15.5 seconds.</td></tr><tr><th>Add</th><td>Jitter (each wait between 0 and its value), a total deadline, and a log line per retry.</td></tr><tr><th>Never retry</th><td>400, 401, 403, 404.</td></tr></table>
+<p class="problem"><span class="pl">Problem 20.15.4</span> <strong>I only want what is new.</strong> The source has 2,000,000 orders and about 3,000 change per day. What does a nightly watermark load touch?</p>
+<table class="steps"><tr><th>Work</th><td>About 3,000 rows plus the boundary row and any overlap, against 2,000,000 for a full reload: 3,000 / 2,000,000 = 0.15 per cent.</td></tr><tr><th>Needs</th><td>An indexed <code>updated_at</code> in the source, an upsert in the target, a state table (Recipe 4).</td></tr><tr><th>Blind spot</th><td>Deletes. Ask for a soft-delete flag or compare keys periodically.</td></tr></table>
+<p class="problem"><span class="pl">Problem 20.15.5</span> <strong>Nested and messy JSON.</strong> Each of 1,000 orders holds 1 to 6 lines. What shape does <code>json_normalize(orders, record_path="lines", meta=["id"])</code> give?</p>
+<table class="steps"><tr><th>Shape</th><td>One row per line: between 1,000 and 6,000 rows; line fields plus <code>id</code> as columns.</td></tr><tr><th>Trap</th><td>Orders with an empty list vanish (Recipe 9); join the parent table back if needed.</td></tr></table>
+<p class="problem"><span class="pl">Problem 20.15.6</span> <strong>Garbage in.</strong> Validation rejects 120 of 10,000 records. What is the reject rate, and what should the job do?</p>
+<table class="steps"><tr><th>Rate</th><td>120 / 10,000 = 1.2 per cent.</td></tr><tr><th>Action</th><td>Load 9,880, write 120 to a rejects file with reasons, log the rate, and stop with an alert above a threshold (say 5 per cent): a jump means the source changed.</td></tr></table>
+<p class="problem"><span class="pl">Problem 20.15.7</span> <strong>Writes are slow.</strong> A load commits once per row for 1,000,000 rows. You commit every 10,000 rows instead. How many commits are saved?</p>
+<table class="steps"><tr><th>Count</th><td>1,000,000 before; 1,000,000 / 10,000 = 100 after; 999,900 saved, each of them a disk sync.</td></tr><tr><th>Mind</th><td><code>executemany</code> per batch inside one transaction, and an idempotent load so a failed batch can be repeated. If the source changes shape (<code>total</code> becomes <code>amount</code>), required-field validation catches it instead of loading NULLs.</td></tr></table>
+<h3>How to verify a load</h3>
+<ul><li><strong>Counts and totals:</strong> rows read = rows loaded + rows rejected; one numeric sum matches in source and target.</li><li><strong>Keys and samples:</strong> compare id sets in both directions; eyeball 3 random rows from each side.</li><li><strong>Idempotence:</strong> run the job twice; the second run must change nothing.</li></ul>
+<h3>How to debug</h3>
+<ul><li><strong>Look at the raw thing:</strong> <code>r.status_code</code>, <code>r.text[:300]</code>, the first bytes of a file, <code>repr()</code> of a suspicious string.</li><li><strong>Shrink the problem:</strong> one page, one file, <code>nrows=5</code>. <strong>Turn on detail:</strong> <code>logging.getLogger("urllib3").setLevel(logging.DEBUG)</code>.</li><li><strong>Ask the database:</strong> <code>explain query plan</code> says whether an index is used.</li></ul>
+<pre class="code lang-python"><code>import sqlite3
+
+con = sqlite3.connect(":memory:")
+con.execute("create table events(id integer primary key, user_id integer, kind text)")
+con.executemany("insert into events(user_id, kind) values (?, ?)", [(i % 100, "click") for i in range(5000)])
+q = "select count(*) from events where user_id = ?"
+
+def plan():
+    return con.execute("explain query plan " + q, (7,)).fetchall()[0][3]
+
+print(plan())
+con.execute("create index ix_events_user on events(user_id)")
+print(plan())
+print(con.execute(q, (7,)).fetchone()[0])
+print(repr("caf\u00e9\u00a0x"), repr("  padded \n"))
+src_ids, dst_ids = {1, 2, 3, 4}, {1, 2, 4, 9}
+print("missing in target:", sorted(src_ids - dst_ids), "| unexpected in target:", sorted(dst_ids - src_ids))</code></pre>
+<pre class="code lang-text"><code>SCAN events
+SEARCH events USING COVERING INDEX ix_events_user (user_id=?)
+50
+'café\xa0x' '  padded \n'
+missing in target: [3] | unexpected in target: [9]</code></pre>
+<ol><li>The first plan scans the whole table; after <code>create index</code> the plan searches the index and touches only matching rows. Reading a plan is the quickest way to explain a slow query. The count for user 7 is 50.</li><li><code>repr</code> shows a non-breaking space as <code>\xa0</code> and the newline as <code>\n</code>; both are invisible in <code>print</code> and a classic reason why two "equal" keys do not match.</li><li>Set differences in both directions are the fastest reconciliation.</li></ol>
+
+<h2>20.16 Going deeper: internals, memory, speed and what interviewers ask</h2>
+<h3>Internals worth knowing</h3>
+<ul><li><strong>sqlite3 transactions.</strong> In the default (legacy) mode Python opens a transaction before <code>INSERT</code>, <code>UPDATE</code> and <code>DELETE</code>, so you must commit; since Python 3.12 <code>connect(autocommit=...)</code> gives explicit control. SQLite allows many readers but one writer; WAL mode (<code>pragma journal_mode = wal</code>) lets readers continue while a writer works. Typing is by <em>affinity</em>: a declared type is a preference unless the table is <code>STRICT</code> (below).</li><li><strong>requests and httpx.</strong> <code>requests</code> sits on urllib3, which keeps a connection pool per host; a <code>Session</code> reuses it (HTTP keep-alive). <code>requests</code> blocks one thread per reply; <code>httpx.AsyncClient</code> overlaps thousands of waits in one thread. Threads also work for I/O because Python releases the GIL while waiting on a socket.</li><li><strong>pandas 3.</strong> Strings default to a <code>str</code> dtype (Arrow-backed when pyarrow is installed) and copy-on-write is always on: <code>sub = df[["a"]]</code> behaves as an independent copy, so changing <code>sub</code> never changes <code>df</code> and defensive <code>.copy()</code> calls are no longer needed.</li><li><strong>Parquet and memory.</strong> A file holds row groups, each with one compressed, dictionary-encoded column chunk per column, and a footer with the schema and min/max statistics. Repeated strings become millions of Python objects unless you use <code>category</code> or Arrow strings (20.10 showed about 5 MB shrink to 0.1 MB on the study machine).</li></ul>
+<pre class="code lang-python"><code>import sqlite3
+
+con = sqlite3.connect(":memory:")
+con.execute("create table loose(n integer, s text)")
+con.execute("insert into loose values ('42', 7)")
+con.execute("insert into loose values ('abc', 'x')")
+print(con.execute("select n, typeof(n), s, typeof(s) from loose").fetchall())
+
+con.execute("create table strict_t(n integer) strict")
+try:
+    con.execute("insert into strict_t values ('abc')")
+except sqlite3.IntegrityError as e:
+    print("strict table says:", e)</code></pre>
+<pre class="code lang-text"><code>[(42, 'integer', '7', 'text'), ('abc', 'text', 'x', 'text')]
+strict table says: cannot store TEXT value in INTEGER column strict_t.n</code></pre>
+<ol><li>The first table is normal. Inserting the text <code>'42'</code> into an integer column converts it to the integer 42, because it looks like a number. The integer 7 in a text column is stored as the text <code>'7'</code>.</li><li>The text <code>'abc'</code> cannot become an integer, so SQLite stores it as text in an integer column and does not complain. This is why a column typed INTEGER can still contain words.</li><li>A <code>STRICT</code> table (SQLite 3.37 and later) refuses such values with an error. Use it for tables where type safety matters.</li></ol>
+<h3>What interviewers probe</h3>
+<ul><li><strong>Idempotency:</strong> "What if your job runs twice?" Upsert on a natural key, a transaction per batch, the watermark advanced in the same transaction. Retries give at-least-once delivery; add idempotent writes for an exactly-once effect.</li><li><strong>Late data and deletes:</strong> overlap windows, event time versus ingestion time, periodic reconciliation; a watermark cannot see deletes (soft deletes or change data capture can).</li><li><strong>Pagination:</strong> offset versus cursor, and why a large offset gets slow (the database still walks past the skipped rows).</li><li><strong>Security and failure design:</strong> parameter binding, secrets in the environment, least-privilege users; timeouts everywhere, retry only the retryable, backoff with jitter, dead-letter files.</li><li><strong>Formats and scale:</strong> why Parquet over CSV (types, compression, column pruning, predicate pushdown), when CSV is still right, and what changes at 10x data (chunking, columnar files, a database server, a distributed engine).</li></ul>
+
+<h2>Chapter recap</h2>
+<ul>
+<li>Every data-access job is extract, validate, transform, load. Validate once, at the boundary.</li>
+<li><code>pathlib</code> and <code>glob</code> find files; write results through a temporary file and <code>replace</code>. Give <code>open</code> an <code>encoding</code> (and <code>newline=""</code> for csv).</li>
+<li>CSV has no types, JSON has no dates, YAML needs <code>safe_load</code>. openpyxl never calculates formulas.</li>
+<li>sqlite3: bind with <code>?</code>, use <code>with con:</code>, batch with <code>executemany</code>, upsert with <code>on conflict</code>. SQLAlchemy Core builds SQL, the ORM maps classes, <code>text()</code> binds <code>:name</code>.</li>
+<li>pandas: <code>read_sql_query(params=, chunksize=)</code> in, <code>to_sql(if_exists="append", index=False)</code> out; <code>replace</code> destroys constraints.</li>
+<li>HTTP: always a timeout, a Session, <code>raise_for_status()</code>, backoff with jitter on retryable errors only, cursor pagination, respect 429 and <code>Retry-After</code>.</li>
+<li>BeautifulSoup parses static HTML; handle missing elements; read robots.txt and the terms; prefer an API.</li>
+<li>Validate with dataclasses or pydantic, keep rejects, alarm on a high reject rate. Parquet and Arrow (not run here) store typed columns with statistics so you read fewer bytes.</li>
+<li>Log counts at every stage, chunk what is large, and fix encoding errors by finding the right codec.</li>
+</ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / pattern</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>open(p, newline="", encoding="utf-8")</code></td><td>Safe way to open text for csv</td></tr>
+<tr><td><code>con.execute(sql, (value,))</code></td><td>Parameter binding, no injection</td></tr>
+<tr><td><code>with con: ...</code></td><td>Commit on success, roll back on error</td></tr>
+<tr><td><code>insert ... on conflict(key) do update ...</code></td><td>Upsert, makes loads idempotent</td></tr>
+<tr><td><code>pd.read_csv(p, usecols=, dtype=, chunksize=)</code></td><td>Small, typed, bounded-memory reads</td></tr>
+<tr><td><code>requests.get(u, params=, headers=, timeout=)</code></td><td>The minimum safe API call</td></tr>
+<tr><td>delay = uniform(0, min(cap, base * 2<sup>n-1</sup>))</td><td>Exponential backoff with full jitter</td></tr>
+<tr><td>tokens = min(capacity, tokens + elapsed * rate)</td><td>Token bucket refill</td></tr>
+<tr><td><code>where updated_at &gt;= watermark - overlap</code></td><td>Incremental load that tolerates late rows</td></tr>
+<tr><td>chunks = ceil(rows / chunksize)</td><td>Number of reads for a chunked job</td></tr>
+<tr><td>reject rate = rejected / total</td><td>Data-quality alarm metric</td></tr>
+<tr><td><code>pd.json_normalize(recs, record_path=, meta=)</code></td><td>Nested JSON to a flat table</td></tr>
+</tbody></table></div>
+
+<h2>Practice set</h2>
+<p class="problem"><span class="pl">Problem 20.P.1</span> (easy) For <code>Path("data/2025/sales.csv")</code>, what are <code>.stem</code>, <code>.suffix</code> and <code>.parent.name</code>?</p>
+<p><strong>Answer:</strong> <code>sales</code>, <code>.csv</code> and <code>2025</code>.</p>
+<p class="problem"><span class="pl">Problem 20.P.2</span> (easy) What Python value does <code>json.loads('[1, 2, {"a": null}]')</code> return?</p>
+<p><strong>Answer:</strong> The list <code>[1, 2, {'a': None}]</code>. JSON <code>null</code> becomes <code>None</code>, objects become dicts, arrays become lists.</p>
+<p class="problem"><span class="pl">Problem 20.P.3</span> (easy) Which is safe and why: <code>con.execute("select * from u where name = ?", (n,))</code> or <code>con.execute(f"select * from u where name = '{n}'")</code>?</p>
+<p><strong>Answer:</strong> The first. The value is sent separately from the SQL text, so the database cannot mistake it for SQL. The f-string version lets a value such as <code>x' OR '1'='1</code> change the query.</p>
+<p class="problem"><span class="pl">Problem 20.P.4</span> (easy) Which of 401, 404, 429 and 503 are worth retrying, and which not?</p>
+<p><strong>Answer:</strong> Retry 429 (after the <code>Retry-After</code> delay) and 503 (the server is busy). Do not retry 401 (your credentials are wrong) or 404 (the resource does not exist); repeating gives the same answer.</p>
+<p class="problem"><span class="pl">Problem 20.P.5</span> (easy) What do <code>soup.find("table")</code> and <code>soup.find_all("table")</code> return when the page has no table?</p>
+<p><strong>Answer:</strong> <code>None</code> and an empty list <code>[]</code>. Calling a method on the <code>None</code> raises <code>AttributeError</code>.</p>
+<p class="problem"><span class="pl">Problem 20.P.6</span> (medium) What does this print?</p>
+<pre class="code lang-python"><code>from pathlib import Path
+p = Path("/tmp/data/report.final.csv")
+print(p.suffix, p.stem, p.with_suffix(".txt").name, p.with_name("x.csv").parent.name)</code></pre>
+<p><strong>Answer:</strong> <code>.csv report.final report.final.txt data</code>. Only the last dot counts as the suffix, so the stem keeps <code>.final</code>. <code>with_suffix</code> swaps just <code>.csv</code>, and <code>with_name</code> keeps the folder.</p>
+<p class="problem"><span class="pl">Problem 20.P.7</span> (medium) What does this print, and why is the second line not <code>[(1,), (2,)]</code>?</p>
+<pre class="code lang-python"><code>import sqlite3
+con = sqlite3.connect(":memory:")
+con.execute("create table t(a integer unique)")
+con.execute("insert into t values (1)")
+con.commit()
+try:
+    with con:
+        con.execute("insert into t values (2)")
+        con.execute("insert into t values (1)")
+except sqlite3.IntegrityError:
+    print("error")
+print(con.execute("select a from t").fetchall())</code></pre>
+<p><strong>Answer:</strong> <code>error / [(1,)]</code>. The duplicate raises <code>IntegrityError</code> inside the <code>with</code> block, which rolls back the whole block, including the successful insert of 2.</p>
+<p class="problem"><span class="pl">Problem 20.P.8</span> (medium) Find the bug: <code>name = "O'Brien"; con.execute(f"select * from users where name = '{name}'")</code>.</p>
+<p><strong>Answer:</strong> The apostrophe ends the SQL string early, giving a syntax error, and the same hole allows injection. Fix: <code>con.execute("select * from users where name = ?", (name,))</code>.</p>
+<p class="problem"><span class="pl">Problem 20.P.9</span> (medium) Find the bug: <code>data = requests.get(url).json()</code> in a nightly job that sometimes hangs and sometimes crashes with <code>JSONDecodeError</code>.</p>
+<p><strong>Answer:</strong> No timeout (the hang) and no status check (the crash comes from an HTML error page). Fix: <code>r = requests.get(url, timeout=(3, 10)); r.raise_for_status(); data = r.json()</code>.</p>
+<p class="problem"><span class="pl">Problem 20.P.10</span> (medium) An API holds 95 records and returns 20 per page, and allows 1 request per second. How many requests are needed, how many records are on the last page, and what is the minimum time between the first and the last request?</p>
+<p><strong>Answer:</strong> ceil(95 / 20) = 5 requests. The last page has 95 - 4 x 20 = 15 records. Five requests at one per second are spread over at least 4 seconds (the gaps between them).</p>
+<p class="problem"><span class="pl">Problem 20.P.11</span> (medium) What does this print?</p>
+<pre class="code lang-python"><code>import json
+print(json.dumps({"a": [1, 2], "b": None, "c": "é"}, ensure_ascii=False, separators=(",", ":")))</code></pre>
+<p><strong>Answer:</strong> <code>{"a":[1,2],"b":null,"c":"é"}</code>. Compact separators remove spaces, <code>None</code> becomes <code>null</code>, and the accent stays because <code>ensure_ascii=False</code>.</p>
+<p class="problem"><span class="pl">Problem 20.P.12</span> (medium) Write a function that counts rows per value of a column in a CSV too large to load, using chunks. Test it on an in-memory CSV with 5 rows and <code>chunksize=2</code>.</p>
+<p><strong>Answer:</strong></p>
+<pre class="code lang-python"><code>import io
+import pandas as pd
+
+def count_by(source, column, chunksize=2):
+    totals = {}
+    for chunk in pd.read_csv(source, usecols=[column], chunksize=chunksize):
+        for key, n in chunk[column].value_counts().items():
+            totals[key] = totals.get(key, 0) + int(n)
+    return dict(sorted(totals.items()))
+
+csv_text = "region,units\nn,1\ns,2\nn,3\ne,4\nn,5\n"
+print(count_by(io.StringIO(csv_text), "region"))</code></pre>
+<pre class="code lang-text"><code>{'e': 1, 'n': 3, 's': 1}</code></pre>
+<p>Only the one needed column is read (<code>usecols</code>), each chunk is counted on its own, and counts are added into one dictionary. Chunks of 2, 2 and 1 rows give the same answer as a full read.</p>
+<p class="problem"><span class="pl">Problem 20.P.13</span> (hard) What does this print?</p>
+<pre class="code lang-python"><code>from bs4 import BeautifulSoup
+html = '&lt;ul&gt;&lt;li class="a"&gt;One &lt;b&gt;1&lt;/b&gt;&lt;/li&gt;&lt;li class="b"&gt;Two&lt;/li&gt;&lt;li class="a"&gt;&lt;a href="/x"&gt;Three&lt;/a&gt;&lt;/li&gt;&lt;/ul&gt;'
+soup = BeautifulSoup(html, "html.parser")
+print([li.get_text(strip=True) for li in soup.select("li.a")])
+print(soup.select_one("li.a a")["href"], len(soup.find_all("li")), soup.select_one("li.c"))</code></pre>
+<p><strong>Answer:</strong> <code>['One1', 'Three'] / /x 3 None</code>. The selector <code>li.a</code> matches the first and third items; <code>get_text(strip=True)</code> joins the nested text without a space, giving <code>One1</code>. The link href is <code>/x</code>, there are 3 list items, and the missing class gives <code>None</code>.</p>
+<p class="problem"><span class="pl">Problem 20.P.14</span> (hard) Your watermark is 12:30. A source row with <code>updated_at</code> 11:30 appears after the last run. With a 2-hour overlap, which times are re-read, and does the late row load? What protects you from duplicates?</p>
+<p><strong>Answer:</strong> The query starts at 12:30 - 2 h = 10:30, so the 11:30 row is read and loads. The upsert makes re-read rows harmless and <code>max(watermark, new)</code> stops the watermark moving backwards. The cost is re-reading two hours of data per run.</p>
+<p class="problem"><span class="pl">Problem 20.P.15</span> (hard) Find the bug: a loop <code>for page in range(1, 100): rows += get(url, params={"page": page})</code> reads a feed that receives new rows all day. The final data has duplicates and gaps.</p>
+<p><strong>Answer:</strong> New rows at the top push older rows onto later pages (duplicates), and deletions pull rows back across a boundary (gaps). Fix: cursor pagination (<code>after=last_id</code>) or an <code>as_of</code> snapshot, plus an upsert on the key.</p>
+<p class="problem"><span class="pl">Problem 20.P.16</span> (hard) Write a dataclass <code>Reading(sensor: str, celsius: float)</code> that rejects a temperature below -50 or above 60 and an empty sensor name, then test it with three records.</p>
+<p><strong>Answer:</strong></p>
+<pre class="code lang-python"><code>from dataclasses import dataclass
+
+@dataclass
+class Reading:
+    sensor: str
+    celsius: float
+
+    def __post_init__(self):
+        self.celsius = float(self.celsius)
+        if not self.sensor.strip():
+            raise ValueError("sensor must not be empty")
+        if not -50 &lt;= self.celsius &lt;= 60:
+            raise ValueError(f"celsius {self.celsius} outside -50..60")
+
+for rec in [("s1", "21.5"), ("", 20), ("s3", 99)]:
+    try:
+        print("ok", Reading(*rec))
+    except ValueError as e:
+        print("rejected:", e)</code></pre>
+<pre class="code lang-text"><code>ok Reading(sensor='s1', celsius=21.5)
+rejected: sensor must not be empty
+rejected: celsius 99.0 outside -50..60</code></pre>
+<p>The chained comparison <code>-50 &lt;= x &lt;= 60</code> tests both limits at once; the string <code>"21.5"</code> is converted first, so text input is accepted when it is valid.</p>
+<p class="problem"><span class="pl">Problem 20.P.17</span> (hard) What does this print?</p>
+<pre class="code lang-python"><code>import tempfile
+from pathlib import Path
+from openpyxl import Workbook, load_workbook
+p = Path(tempfile.mkdtemp()) / "t.xlsx"
+wb = Workbook()
+ws = wb.active
+ws["A1"], ws["A2"], ws["A3"] = 2, 3, "=A1*A2"
+wb.save(p)
+print(load_workbook(p).active["A3"].value, load_workbook(p, data_only=True).active["A3"].value)</code></pre>
+<p><strong>Answer:</strong> <code>=A1*A2 None</code>. The file stores the formula text and no cached result, because openpyxl does not calculate.</p>
+<p class="problem"><span class="pl">Problem 20.P.18</span> (hard) A file has 40 million rows and 3 float64 columns. How many bytes do the numbers need in memory, and how much for a chunk of 1 million rows?</p>
+<p><strong>Answer:</strong> 40,000,000 x 3 x 8 = 960,000,000 bytes, about 0.96 GB, before pandas overhead. A chunk of 1,000,000 rows needs 1,000,000 x 3 x 8 = 24,000,000 bytes, about 24 MB, and there are 40 chunks.</p>
+<p class="problem"><span class="pl">Problem 20.P.19</span> (expert) Show that an upsert-based load is idempotent: run the same load twice and report the row count and the total.</p>
+<p><strong>Answer:</strong></p>
+<pre class="code lang-python"><code>import sqlite3
+
+con = sqlite3.connect(":memory:")
+con.execute("create table sales(id integer primary key, amount real)")
+batch = [(1, 10.0), (2, 20.0), (3, 5.5)]
+SQL = "insert into sales values (?, ?) on conflict(id) do update set amount = excluded.amount"
+for run in (1, 2):
+    with con:
+        con.executemany(SQL, batch)
+    print(run, con.execute("select count(*), sum(amount) from sales").fetchone())
+batch[1] = (2, 25.0)
+with con:
+    con.executemany(SQL, batch)
+print(3, con.execute("select count(*), sum(amount) from sales").fetchone())</code></pre>
+<pre class="code lang-text"><code>1 (3, 35.5)
+2 (3, 35.5)
+3 (3, 40.5)</code></pre>
+<p>Running the load a second time leaves the count at 3 and the total at 35.5, because each key is overwritten with the same values. A changed record (id 2 now 25.0) updates in place instead of creating a duplicate: the total becomes 40.5. A plain <code>insert</code> would fail on the second run (primary key) or, without a key, double the rows.</p>
+<p class="problem"><span class="pl">Problem 20.P.20</span> (expert) Interview: a 500-million-row events table is queried mostly by date range and country, and rarely needs more than 4 of its 40 columns. Argue for Parquet over CSV and describe how to lay it out.</p>
+<p><strong>Answer:</strong> (1) Column pruning: 4 of 40 columns reads roughly a tenth of the bytes, while CSV parses every line. (2) Types and compression: dictionary encoding of repeated values such as country, no re-parsing of numbers. (3) Row-group statistics: with data partitioned or sorted by date, a date filter skips whole groups or folders. Layout: partition by year and month, keep files of hundreds of megabytes rather than thousands of tiny ones, and keep CSV only for hand-off. Not run here (pyarrow is not installed); the principle was demonstrated in 20.10.</p>
+<p class="problem"><span class="pl">Problem 20.P.21</span> (expert) A scheduler retried a timed-out job, so a table that should have unique ids contains duplicates. Repair it, and prevent it from happening again.</p>
+<p><strong>Answer:</strong></p>
+<pre class="code lang-python"><code>import sqlite3
+
+con = sqlite3.connect(":memory:")
+con.execute("create table events(id integer, kind text)")
+con.executemany("insert into events values (?, ?)", [(1, "a"), (2, "b"), (2, "b"), (3, "c"), (1, "a")])
+print(con.execute("select count(*) from events").fetchone()[0])
+with con:
+    con.execute("delete from events where rowid not in (select min(rowid) from events group by id)")
+    con.execute("create unique index ux_events_id on events(id)")
+print(con.execute("select * from events order by id").fetchall())
+try:
+    con.execute("insert into events values (2, 'b')")
+except sqlite3.IntegrityError as e:
+    print("blocked:", e)</code></pre>
+<pre class="code lang-text"><code>5
+[(1, 'a'), (2, 'b'), (3, 'c')]
+blocked: UNIQUE constraint failed: events.id</code></pre>
+<p>Repair: keep the first row (smallest <code>rowid</code>) of each id and delete the others. Prevention at three levels: a unique index (the database now refuses duplicates), upserts in the load instead of plain inserts, and a run identifier or idempotency key so a retried run is recognised as the same run.</p>
+<p class="problem"><span class="pl">Problem 20.P.22</span> (expert) Find the bug: the job writes <code>etl_state.watermark = max(updated_at)</code> and commits, and then loads the rows in a second transaction. It crashed during the second step.</p>
+<p><strong>Answer:</strong> The watermark moved forward but the rows never arrived, so the next run starts after them and they are lost. Fix: update rows and watermark in the <em>same</em> transaction (Recipe 4).</p>
+
+<h2>Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles. Teach me data access in Python step by step: pathlib and glob, csv/json/yaml, openpyxl, sqlite3 with parameter binding and transactions, requests and httpx with timeouts, retries and pagination, BeautifulSoup, and validation. Use small runnable examples that need no internet (inline data, a local http.server, SQLite in memory), show the real output, and explain each line in numbered points. After each topic, ask me one quiz question and wait for my answer before continuing. Start with a diagnostic question to find my level.</pre></div>
+<div class="prompt"><div class="ph"><span>AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>Act as a senior data engineer doing a code review. I will paste a Python script that reads data from a CSV, an API or a web page and loads it into a database. Review it for: missing timeouts and status checks, retry and backoff problems, SQL injection and parameter binding, missing commits or transactions, encoding and newline mistakes, schema validation, idempotency (what happens if it runs twice), memory use on big files, logging and secrets. List each problem with the line, why it fails in real life, and the corrected code. Then give me a checklist of three tests I should write.</pre></div>
+<div class="prompt"><div class="ph"><span>AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>Run a mock interview for a data engineer or analytics engineer role, focused on getting data in and out of systems. Ask me one question at a time, from easy to hard: parameter binding, transactions, upserts, incremental loads with watermarks and late data, API pagination and rate limits, idempotency and retries, Parquet versus CSV, handling files that do not fit in memory, and data validation. After each answer, grade it out of 10, show a model answer with a short code example, and note what a strong candidate would add. Keep a running score and finish with my three weakest topics.</pre></div>

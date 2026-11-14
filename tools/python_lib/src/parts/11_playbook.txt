@@ -1,0 +1,255 @@
+
+<h2>19.11 How to Solve Any scikit-learn Problem: A Playbook</h2>
+<h3>The decision flow</h3>
+<p>Follow these steps in order. Most real problems are solved by doing step 3 or 4 properly, not by finding a cleverer algorithm.</p>
+<ol>
+<li><strong>Name the task and the cost of mistakes.</strong> Predict a category (classification), a number (regression), group rows (clustering), find odd rows (anomaly detection), or compress columns (PCA)? Which error hurts more, a false alarm or a miss? That chooses the metric.</li>
+<li><strong>Split first and lock the test set.</strong> Use <code>stratify</code> for classes, <code>GroupKFold</code> for repeated entities, <code>TimeSeriesSplit</code> for time.</li>
+<li><strong>Baseline.</strong> A <code>DummyClassifier</code> or <code>DummyRegressor</code>, then a scaled linear model. Record the numbers.</li>
+<li><strong>Put all preprocessing in a Pipeline</strong> with a <code>ColumnTransformer</code>: impute, scale, encode.</li>
+<li><strong>Try one strong nonlinear model</strong> (<code>HistGradientBoosting*</code> or a forest). Compare with the same folds.</li>
+<li><strong>Diagnose</strong> with train versus validation scores: both low means underfit; high train and low validation means overfit; a suspiciously perfect score means leakage.</li>
+<li><strong>Tune</strong> the best one with randomised search, then choose the threshold for the business cost.</li>
+<li><strong>Check calibration</strong> if probabilities are used as numbers, and <strong>inspect</strong> with permutation importance.</li>
+<li><strong>Open the test set once</strong>, report the score with its uncertainty, save the pipeline with versions.</li>
+</ol>
+<div class="tablewrap"><table class="data"><thead><tr><th>Situation</th><th>Start with</th><th>Why</th></tr></thead><tbody>
+<tr><td>Tabular, mixed types, missing values</td><td><code>HistGradientBoostingClassifier</code> or Regressor</td><td>Strong default, handles NaN, fast</td></tr>
+<tr><td>Small data, little tuning time</td><td><code>RandomForest*</code></td><td>Hard to break, free OOB estimate</td></tr>
+<tr><td>Need a readable baseline</td><td>Scaled <code>LogisticRegression</code> / <code>Ridge</code></td><td>Weights you can explain</td></tr>
+<tr><td>Text</td><td><code>TfidfVectorizer</code> + <code>LogisticRegression</code> / <code>LinearSVC</code></td><td>Fast and strong on sparse features</td></tr>
+<tr><td>Unlabelled, round groups</td><td><code>KMeans</code> on scaled data</td><td>Simple and scalable</td></tr>
+<tr><td>Odd shapes or noise</td><td><code>DBSCAN</code> / <code>HDBSCAN</code></td><td>No k needed, labels noise</td></tr>
+<tr><td>Spot unusual rows</td><td><code>IsolationForest</code></td><td>Works without labels</td></tr>
+</tbody></table></div>
+<h3>Eight recurring problem patterns, each solved</h3>
+<p><strong>Pattern 1: "The score is too good to be true" (leakage).</strong> Look at what the model leans on. Below, a column <code>refund_issued</code> is only filled in after a customer has already cancelled.</p>
+@@PY
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
+
+rng = np.random.default_rng(0)
+n = 3000
+df = pd.DataFrame({"tenure": rng.integers(1, 60, n), "calls": rng.poisson(2, n)})
+p = 1 / (1 + np.exp(-(0.4 * df["calls"] - 0.03 * df["tenure"] - 0.5)))
+df["churn"] = (rng.random(n) < p).astype(int)
+df["refund_issued"] = df["churn"] * (rng.random(n) < 0.9)       # consequence of the label
+
+def run(cols):
+    X_tr, X_te, y_tr, y_te = train_test_split(df[cols], df["churn"], random_state=0)
+    m = HistGradientBoostingClassifier(random_state=0).fit(X_tr, y_tr)
+    return m, X_te, y_te, roc_auc_score(y_te, m.predict_proba(X_te)[:, 1])
+
+m, X_te, y_te, auc = run(["tenure", "calls", "refund_issued"])
+imp = permutation_importance(m, X_te, y_te, n_repeats=5, random_state=0, scoring="roc_auc")
+print("with leak AUC:", round(auc, 3), {c: round(float(v), 3) for c, v in zip(X_te.columns, imp.importances_mean)})
+print("fixed AUC    :", round(run(["tenure", "calls"])[3], 3))
+@@END
+<ol>
+<li>We build a churn target from tenure and calls, then add <code>refund_issued</code>, which is 1 for 90% of churners and never for others. It exists only after the outcome.</li>
+<li>With it included, the model reaches an AUC of 0.945.</li>
+<li>Permutation importance on the test rows shows that one column carries almost all the weight: shuffling <code>refund_issued</code> costs 0.398 AUC, while shuffling tenure or calls costs about nothing. That is the signature of a leak.</li>
+<li>Removing it gives an AUC of 0.646, the real number that will hold in production. The leaky model was reporting an excellent result that no live system could reproduce.</li>
+</ol>
+<p><strong>Pattern 2: "Great on train, poor on validation" (overfitting).</strong> Make the model simpler or average more.</p>
+@@PY
+from sklearn.datasets import make_classification
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import train_test_split
+
+X, y = make_classification(1500, 20, n_informative=5, flip_y=0.15, random_state=0)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, random_state=0)
+for leaf in (1, 10, 30):
+    m = RandomForestClassifier(200, min_samples_leaf=leaf, random_state=0).fit(X_tr, y_tr)
+    print(f"min_samples_leaf={leaf:2d} train={m.score(X_tr, y_tr):.3f} test={m.score(X_te, y_te):.3f}")
+@@END
+<ol>
+<li>15% of labels are flipped, so no model can exceed about 0.85 to 0.90 honestly.</li>
+<li>With <code>min_samples_leaf=1</code> every tree grows until leaves are single rows, so the forest memorises training noise (train near 1.0).</li>
+<li>Larger leaves force each tree to average over more rows. The train score falls from 1.000 to 0.891 to 0.832 while the test score stays near 0.83 (0.829, 0.832, 0.824). The gap shrinks from 0.171 to 0.008 and the forest stops memorising, without losing test accuracy. The gap, not the training score, is the thing to watch. Here the test score is already at the noise ceiling, so simplifying cost nothing.</li>
+</ol>
+<p><strong>Pattern 3: "Poor on both" (underfitting).</strong> The model is too simple. Add flexibility or better features.</p>
+@@PY
+from sklearn.datasets import make_moons
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import cross_val_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+
+X, y = make_moons(800, noise=0.25, random_state=0)
+options = {
+    "logistic": LogisticRegression(),
+    "logistic + degree-3 polynomial": make_pipeline(PolynomialFeatures(3), StandardScaler(), LogisticRegression(max_iter=1000)),
+    "hist boosting": HistGradientBoostingClassifier(random_state=0),
+}
+for name, m in options.items():
+    print(f"{name:32s} {cross_val_score(m, X, y, cv=5).mean():.3f}")
+@@END
+<ol>
+<li>The moons are not separable by a straight line, so plain logistic regression underfits (both train and validation low).</li>
+<li>Adding polynomial features lets the same linear model draw a curved boundary, a cheap and interpretable fix.</li>
+<li>A boosted tree model gets there by itself. Cross-validated accuracy rises from 0.859 (logistic) to 0.909 (polynomial) and 0.938 (boosting). The diagnostic that told you to try them was low training accuracy.</li>
+</ol>
+<p><strong>Pattern 4: "Rare positives" (imbalance).</strong> Optimise a rare-class metric and set the threshold deliberately.</p>
+@@PY
+from sklearn.datasets import make_classification
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import f1_score
+from sklearn.model_selection import TunedThresholdClassifierCV, train_test_split
+
+X, y = make_classification(8000, 12, n_informative=4, weights=[0.95], flip_y=0.02, random_state=2)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, stratify=y, random_state=2)
+
+plain = LogisticRegression(max_iter=1000).fit(X_tr, y_tr)
+tuned = TunedThresholdClassifierCV(LogisticRegression(max_iter=1000), scoring="f1", cv=5).fit(X_tr, y_tr)
+print("default 0.5 threshold F1:", round(f1_score(y_te, plain.predict(X_te)), 3))
+print("tuned threshold      F1:", round(f1_score(y_te, tuned.predict(X_te)), 3),
+      " threshold:", round(float(tuned.best_threshold_), 3))
+@@END
+<ol>
+<li>A 5% positive problem. Plain logistic regression uses the 0.5 cut-off, which is too high for a rare class.</li>
+<li><code>TunedThresholdClassifierCV</code> fits the model in cross-validation, finds the threshold that maximises F1 on out-of-fold predictions, and returns a classifier that applies it.</li>
+<li>The tuned F1 on the untouched test set rises from 0.481 to 0.530, and <code>best_threshold_</code> shows the cut-off chosen, 0.22, well below 0.5. The gain is modest because the ranking itself is mediocre; a threshold can only move the operating point.</li>
+</ol>
+<p><strong>Pattern 5: "The score jumps around" (small, noisy data).</strong> Repeat the CV and prefer the simpler model when scores tie within one standard error.</p>
+@@PY
+import numpy as np
+from sklearn.datasets import load_breast_cancer
+from sklearn.model_selection import RepeatedStratifiedKFold, cross_val_score, StratifiedKFold
+from sklearn.tree import DecisionTreeClassifier
+
+X, y = load_breast_cancer(return_X_y=True)
+X, y = X[:200], y[:200]                       # a small sample makes estimates noisy
+m = DecisionTreeClassifier(max_depth=3, random_state=0)
+for seed in (0, 1, 2):
+    s = cross_val_score(m, X, y, cv=StratifiedKFold(5, shuffle=True, random_state=seed)).mean()
+    print("single 5-fold, seed", seed, round(s, 4))
+rep = cross_val_score(m, X, y, cv=RepeatedStratifiedKFold(n_splits=5, n_repeats=10, random_state=0))
+print("repeated 5x10 mean:", rep.mean().round(4), " std error:", (rep.std() / np.sqrt(len(rep))).round(4))
+@@END
+<ol>
+<li>We deliberately use only 200 rows and a tree, which is sensitive. Three single 5-fold runs differ only by the shuffling seed, yet give 0.895, 0.890 and 0.905. That wobble of a point and a half is the noise in your estimate.</li>
+<li>Ten repetitions average over 50 fold scores, giving a steadier mean (0.9025) and a standard error of 0.0052.</li>
+<li>Rule of thumb ("one standard error rule"): among models within one standard error of the best, choose the simplest.</li>
+</ol>
+<p><strong>Pattern 6: "Works in the notebook, fails in production" (schema and drift).</strong> The cause is almost always different columns, new categories, missing values or a different library version. Make the pipeline tolerant and add an input check.</p>
+@@PY
+import numpy as np
+import pandas as pd
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline, make_pipeline
+from sklearn.preprocessing import OneHotEncoder
+
+train = pd.DataFrame({"plan": ["a", "b", "a", "b", "a", "b"], "usage": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]})
+y = [0, 0, 0, 1, 1, 1]
+prep = ColumnTransformer([("c", OneHotEncoder(handle_unknown="ignore"), ["plan"]),
+                          ("n", SimpleImputer(strategy="median"), ["usage"])])
+pipe = Pipeline([("prep", prep), ("clf", LogisticRegression())]).fit(train, y)
+
+def check_input(df, expected=("plan", "usage")):
+    missing = [c for c in expected if c not in df.columns]
+    if missing:
+        raise ValueError(f"missing columns: {missing}")
+    return df[list(expected)]
+
+live = pd.DataFrame({"usage": [np.nan, 5.5], "plan": ["zzz", "b"], "extra": [1, 2]})
+print(pipe.predict(check_input(live)))
+try:
+    check_input(live.drop(columns="plan"))
+except ValueError as e:
+    print(e)
+@@END
+<ol>
+<li>The encoder uses <code>handle_unknown="ignore"</code> and the numeric imputer covers missing values, so a never-seen plan <code>zzz</code> and a missing usage no longer crash prediction.</li>
+<li><code>check_input</code> enforces the schema: it selects and orders the expected columns, dropping surprises like <code>extra</code>, and fails loudly with a clear message if one is missing.</li>
+<li>Also record the library versions with the saved model, and log the input distributions so drift is visible.</li>
+</ol>
+<p><strong>Pattern 7: "It is too slow."</strong> Change the algorithm before tuning code.</p>
+@@PY
+import time
+from sklearn.datasets import make_classification
+from sklearn.linear_model import SGDClassifier
+from sklearn.svm import LinearSVC, SVC
+
+X, y = make_classification(15000, 30, n_informative=10, random_state=0)
+
+def seconds(model):
+    start = time.perf_counter(); model.fit(X, y); return time.perf_counter() - start
+
+t_rbf = seconds(SVC())
+t_lin = seconds(LinearSVC(dual=False))
+t_sgd = seconds(SGDClassifier(random_state=0))
+print("LinearSVC at least 5x faster than RBF SVC:", t_lin * 5 < t_rbf)
+print("SGDClassifier at least 5x faster than RBF SVC:", t_sgd * 5 < t_rbf)
+@@END
+<ol>
+<li>Exact timings change from run to run, so we print only a robust yes/no about a large ratio.</li>
+<li>A kernel SVM scales poorly with rows; <code>LinearSVC</code> and <code>SGDClassifier</code> scale linearly.</li>
+<li>Other levers in order: switch to <code>HistGradientBoosting</code> instead of exact boosting, use <code>n_jobs</code>, reduce rows for experiments, keep matrices sparse, and cache slow pipeline steps with <code>memory</code>.</li>
+</ol>
+<p><strong>Pattern 8: "The business wants to know why."</strong> Combine permutation importance, partial dependence and a small surrogate tree that imitates the complex model.</p>
+@@PY
+from sklearn.datasets import load_breast_cancer
+from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.tree import DecisionTreeClassifier, export_text
+
+data = load_breast_cancer()
+X_tr, X_te, y_tr, y_te = train_test_split(data.data, data.target, random_state=0)
+black_box = HistGradientBoostingClassifier(random_state=0).fit(X_tr, y_tr)
+
+surrogate = DecisionTreeClassifier(max_depth=2, random_state=0).fit(X_tr, black_box.predict(X_tr))
+fidelity = (surrogate.predict(X_te) == black_box.predict(X_te)).mean()
+print("black box accuracy:", round(black_box.score(X_te, y_te), 3), " surrogate fidelity:", round(fidelity, 3))
+print(export_text(surrogate, feature_names=list(data.feature_names)))
+@@END
+<ol>
+<li>The complex model is trained normally.</li>
+<li>The surrogate is a depth-2 tree trained to predict the <em>black box's predictions</em>, not the true labels. It is a readable approximation.</li>
+<li>Fidelity is how often the surrogate agrees with the black box on unseen rows: 0.937 here, with the black box itself at 0.986 accuracy. High fidelity means the rules are a fair summary (two features, <code>mean concave points</code> and <code>worst area</code>, explain about 94% of its decisions); low fidelity means do not present them as an explanation.</li>
+<li>The printed rules show which features and thresholds drive decisions, a conversation-friendly artefact.</li>
+</ol>
+<h3>How to verify any result</h3>
+<ul>
+<li>Beat the dummy baseline by a clear margin, on the same folds.</li>
+<li>Check that the score on shuffled labels collapses to chance (the next example does this).</li>
+<li>Compare train and validation scores; read the confusion matrix, not just a single number.</li>
+<li>Look at the top features; if one dominates, ask whether it could be a consequence of the label.</li>
+<li>Test on a time-later or other-group slice if the real use is on new groups or future dates.</li>
+</ul>
+<h3>How to debug when something is wrong</h3>
+@@PY
+import numpy as np
+from sklearn.datasets import load_breast_cancer
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import permutation_test_score
+from sklearn.pipeline import make_pipeline
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+
+X, y = load_breast_cancer(return_X_y=True)
+print("shape", X.shape, " NaN:", int(np.isnan(X).sum()), " class counts:", np.bincount(y))
+
+score, perm_scores, pvalue = permutation_test_score(
+    make_pipeline(StandardScaler(), LogisticRegression(max_iter=1000)), X, y,
+    cv=5, n_permutations=20, random_state=0)
+print("real score:", round(score, 3), " shuffled-label mean:", perm_scores.mean().round(3),
+      " p-value:", round(pvalue, 3))
+
+tiny = RandomForestClassifier(random_state=0).fit(X[:20], y[:20])
+print("can it memorise 20 rows?", tiny.score(X[:20], y[:20]))
+@@END
+<ol>
+<li>First look at the raw facts: shape, number of missing cells and class counts. Many "model bugs" are data bugs.</li>
+<li><code>permutation_test_score</code> repeats the CV with shuffled labels 20 times. If the real score is far above the shuffled scores (and the p-value small), the model has found real signal. If real and shuffled scores are close, there is nothing to find or a bug.</li>
+<li>Reading the output: the real score is 0.981 and the shuffled-label scores average 0.602, not 0.5, because 62.7% of the rows are one class and a model that learns nothing still gets that. This is why the baseline and the shuffled test matter. The p-value is 0.048 = 1/21, the smallest value possible with 20 permutations.</li>
+<li>The tiny-subset test asks whether the model can at least memorise 20 rows. If a flexible model cannot, the code path (labels, shapes, dtypes) is broken, not the algorithm.</li>
+<li>When a pipeline misbehaves, run it in pieces: <code>pipe[:-1].fit_transform(X)</code> and look at the output matrix, then fit the last step on that.</li>
+</ol>

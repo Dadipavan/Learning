@@ -1,0 +1,338 @@
+<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Chapter 3: Experiment Tracking and the Model Registry</title><link rel="stylesheet" href="../../assets/study.css"></head><body style="--accent:#357a70"><div class="topbar"><div class="in"><a href="../../index.html#/study">← Study library</a><a href="index.html">Contents</a><span class="doc">MLOps, AI Engineering &amp; Cloud</span><span class="sp"></span><a href="../../index.html#/home">Tracker</a></div></div><div class="page"><div class="banner"><div class="eyebrow">CHAPTER 3</div><h1>Experiment Tracking and the Model Registry</h1><p>How to remember every run you ever made, and how to decide which model is allowed into production.</p></div><details class="toc" open><summary>In this chapter</summary><ol><li><a href="#s1-3-1-tracking-runs-parameters-metrics-artifacts">3.1 Tracking Runs: Parameters, Metrics, Artifacts</a></li><li><a href="#s2-3-2-the-model-registry-versions-aliases-promotion">3.2 The Model Registry: Versions, Aliases, Promotion</a></li><li><a href="#s3-3-3-hyperparameter-search-and-cost-control">3.3 Hyperparameter Search and Cost Control</a></li><li><a href="#s4-3-4-hyperparameter-search-at-scale-random-halving-and-bayesian">3.4 Hyperparameter Search at Scale: Random, Halving and Bayesian</a></li><li><a href="#s5-chapter-recap">Chapter recap</a></li><li><a href="#s6-practice-set">Practice set</a></li><li><a href="#s7-prompt-pack">Prompt pack</a></li></ol></details><p>After three weeks of trying models, someone asks: "Which settings gave the 0.8356 result, and can we deploy that exact model?" If your answer is "I think it was in notebook v7 or v8", you have a problem. Experiment tracking records every run (settings, results, files) automatically. A model registry is a catalogue of approved models with version numbers and labels such as "champion". In this chapter you will build a tiny tracker and registry yourself in about 40 lines (so you understand what MLflow does under the hood), then see the real MLflow code. By the end you can compare runs in a table, register a model, and write a promotion rule ("deploy only if better by a margin").</p>
+<p>Honest note: we tried to install MLflow in a clean virtual environment, but the network here blocked the package download. So the MLflow code below is <strong>not run here</strong>. The mini tracker is real and was run, and it follows the same concepts.</p>
+<p>Words you need:</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Word</th><th>Plain meaning</th></tr></thead><tbody><tr><td>Experiment</td><td>A named group of related runs (for example "churn").</td></tr><tr><td>Run</td><td>One execution of training with one set of settings.</td></tr><tr><td>Parameter</td><td>A setting you chose before training (for example <code>C = 0.01</code>).</td></tr><tr><td>Metric</td><td>A number measuring results (for example test accuracy).</td></tr><tr><td>Artifact</td><td>A file produced by a run: the model, a plot, a report.</td></tr><tr><td>Registry</td><td>A catalogue of models with versions and labels.</td></tr><tr><td>Alias / stage</td><td>A label on a version, such as <code>champion</code> (the one live now).</td></tr></tbody></table></div>
+<h2 id="s1-3-1-tracking-runs-parameters-metrics-artifacts">3.1 Tracking Runs: Parameters, Metrics, Artifacts</h2>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Experiment tracking records the parameters, metrics and artifacts (files such as models) of each training run. It is used to compare runs and reproduce results.</div></div>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A lab notebook. A scientist writes what she did (parameters), what she measured (metrics), and glues in the printouts (artifacts). Months later, anyone can repeat or question the work. Tracking tools are an automatic lab notebook.</div></div>
+<h3>What a tracker stores</h3>
+<p>Per run: a unique ID, parameters, metrics (possibly over time), tags (free labels), artifacts (files), plus code version (git commit), data version and environment. You then query across runs: "show me all runs sorted by test accuracy".</p>
+<h3>Build the idea: a 40-line tracker</h3>
+<pre class="code lang-python"><code>import json, uuid, pathlib, shutil, pickle
+from sklearn.linear_model import LogisticRegression
+from sklearn.datasets import make_classification
+from sklearn.model_selection import train_test_split
+ROOT = pathlib.Path("/tmp/lab/mini_runs"); shutil.rmtree(ROOT, ignore_errors=True); ROOT.mkdir()
+class Run:
+    def __init__(self, experiment):
+        self.id = uuid.uuid4().hex[:8]; self.dir = ROOT/experiment/self.id; self.dir.mkdir(parents=True)
+        self.data = {"params": {}, "metrics": {}, "tags": {}}
+    def log_param(self, k, v): self.data["params"][k] = v
+    def log_metric(self, k, v): self.data["metrics"][k] = v
+    def log_artifact(self, name, obj): (self.dir/name).write_bytes(pickle.dumps(obj))
+    def end(self): (self.dir/"meta.json").write_text(json.dumps(self.data, indent=1))
+def search_runs(experiment, order_by):
+    rows = []
+    for p in (ROOT/experiment).glob("*/meta.json"):
+        d = json.loads(p.read_text()); d["run_id"] = p.parent.name; rows.append(d)
+    return sorted(rows, key=lambda r: -r["metrics"][order_by])
+X, y = make_classification(n_samples=1500, n_features=15, n_informative=6, flip_y=0.05, random_state=1)
+Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=1)
+for C in [0.001, 0.01, 0.1, 1, 10]:
+    r = Run("churn")
+    m = LogisticRegression(C=C, max_iter=500).fit(Xtr, ytr)
+    r.log_param("C", C); r.log_metric("test_acc", round(m.score(Xte, yte), 4))
+    r.log_metric("train_acc", round(m.score(Xtr, ytr), 4)); r.log_artifact("model.pkl", m); r.end()
+print(f"{'run_id':10}{'C':&gt;8}{'train':&gt;8}{'test':&gt;8}")
+for row in search_runs("churn", "test_acc"):
+    print(f"{row['run_id']:10}{row['params']['C']:&gt;8}{row['metrics']['train_acc']:&gt;8}{row['metrics']['test_acc']:&gt;8}")</code></pre>
+<p>Before you run it, which <code>C</code> do you expect to win? (<code>C</code> is the inverse of regularisation strength: a small <code>C</code> means a strongly restrained model.)</p>
+<p>Real output (run IDs are random, so yours will differ):</p>
+<pre class="code lang-text"><code>run_id           C   train    test
+11221f97      0.01  0.8333  0.8356
+cb76fed1         1  0.8257  0.8333
+a93161d1        10  0.8257  0.8333
+8ebdf055       0.1  0.8276  0.8311
+df31160f     0.001  0.8057  0.8156</code></pre>
+<p><strong>Explain.</strong> Each loop pass makes a <code>Run</code>, which creates its own folder and ID. We log one parameter and two metrics, save the model as an artifact, and <code>end()</code> writes <code>meta.json</code>. <code>search_runs</code> reads all <code>meta.json</code> files and sorts by test accuracy, highest first. The winner is <code>C = 0.01</code> with test accuracy 0.8356. The smallest <code>C = 0.001</code> is too restrained and underfits (train 0.8057, lower for both). Notice the top three are within 0.0045 of each other, which, from Chapter 2, is probably within noise. A table makes that visible.</p>
+<h3>The real MLflow code (not run here)</h3>
+<pre class="code lang-python"><code>import mlflow, mlflow.sklearn
+mlflow.set_experiment("churn")
+for C in [0.001, 0.01, 0.1, 1, 10]:
+    with mlflow.start_run():
+        m = LogisticRegression(C=C, max_iter=500).fit(Xtr, ytr)
+        mlflow.log_param("C", C)
+        mlflow.log_metric("test_acc", m.score(Xte, yte))
+        mlflow.sklearn.log_model(m, "model")      # saves the model as an artifact
+# or one line for common libraries:
+mlflow.sklearn.autolog()    # logs params, metrics and the model automatically</code></pre>
+<p>Start the UI with <code>mlflow ui</code> and open it in the browser to compare runs. Mapping: <code>start_run</code> is our <code>Run()</code>, <code>log_param</code> and <code>log_metric</code> are the same names, and <code>log_model</code> is <code>log_artifact</code> plus a standard packaging format called a <strong>model flavor</strong> (a described way to load the model, such as "sklearn" or "pyfunc", which is a generic Python-function wrapper). MLflow also has <strong>Projects</strong> (a packaged, runnable project definition), a basic <strong>serving</strong> command (<code>mlflow models serve</code>), and plugins for deploying to cloud services. Check the current MLflow docs for exact flags, since they change between versions.</p>
+<p class="problem"><span class="pl">Problem 3.1.1</span> From the table, how much did the best run (<code>C = 0.01</code>) beat the worst (<code>C = 0.001</code>) on test accuracy, in points and in relative percent?</p>
+<table class="steps"><tr><th>Formula</th><td>gain = best − worst; relative % = gain ÷ worst × 100</td></tr><tr><th>Plug in</th><td>0.8356 − 0.8156; then 0.0200 ÷ 0.8156 × 100</td></tr><tr><th>Compute</th><td>0.8356 − 0.8156 = 0.0200; 0.0200 ÷ 0.8156 = 0.02452, so 2.45%</td></tr><tr><th>Answer</th><td>The best run is 2.0 accuracy points higher (2.45% relative). On 450 test rows that is about 9 more correct predictions (0.02 × 450).</td></tr><tr><th>Check</th><td>0.8156 × 450 = 367.0 correct, 0.8356 × 450 = 376.0 correct, a difference of 9.</td></tr><tr><th>Why it matters</th><td>Converting a metric difference into "number of customers affected" helps non-technical people judge whether it matters.</td></tr></table>
+<p class="problem"><span class="pl">Problem 3.1.2</span> For <code>C = 0.01</code> the train accuracy is 0.8333 and test is 0.8356. What does the tiny gap tell you?</p>
+<table class="steps"><tr><th>Step 1</th><td>Gap = test − train = 0.8356 − 0.8333 = +0.0023.</td></tr><tr><th>Step 2</th><td>A large positive train-over-test gap would mean overfitting (memorising training data). Here there is none.</td></tr><tr><th>Step 3</th><td>Test slightly above train happens by chance on small test sets.</td></tr><tr><th>Answer</th><td>The model is not overfitting; it generalises about equally to unseen data.</td></tr><tr><th>Check</th><td>Compare <code>C = 10</code>: train 0.8257, test 0.8333, also no overfitting. Consistent.</td></tr></table>
+<h3>The picture</h3>
+<pre class="code lang-text"><code> experiment "churn"
+ |-- run 11221f97  params {C: 0.01}   metrics {test: 0.8356}  artifacts [model.pkl]
+ |-- run cb76fed1  params {C: 1}      metrics {test: 0.8333}  artifacts [model.pkl]
+ |-- run ...
+ query: sort by test_acc desc  -&gt;  champion candidate = top row</code></pre>
+<h3>Connection to the real job</h3>
+<p>Every ML team has a tracker. In an interview, expect "how do you make sure you can reproduce the model in production?" The answer starts with: "the run ID links code commit, data version, config, environment and artifacts." Alternatives to MLflow: Weights &amp; Biases, Neptune, Comet, ClearML (hosted dashboards with rich charts) and TensorBoard (mainly for training curves in deep learning). The ideas are identical.</p>
+<h3>Applications</h3>
+<ul><li><strong>Data Science</strong>: compare dozens of experiments without losing any.</li><li><strong>MLOps</strong>: link a deployed model to its run for audits.</li><li><strong>Deep Learning</strong>: track loss curves per epoch and GPU use per run.</li><li><strong>GenAI</strong>: track prompt versions and evaluation scores (Chapter 13).</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Logging only the final metric. Also log the data version, git commit, config and environment. Without those, a good number cannot be reproduced and is nearly worthless.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Difference between a parameter and a metric?</li></ol>
+<p>Answer: A parameter is an input setting you choose; a metric is a measured result.</p>
+<ol><li>What is an artifact?</li></ol>
+<p>Answer: A file produced by a run, such as the model or a plot.</p>
+<ol><li>Why sort runs by metric in a table?</li></ol>
+<p>Answer: To choose a candidate and see whether differences are bigger than noise.</p>
+<h2 id="s2-3-2-the-model-registry-versions-aliases-promotion">3.2 The Model Registry: Versions, Aliases, Promotion</h2>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">A model registry is a store of trained model versions with names, aliases and stages. Promotion moves a version from candidate to production, so teams know which model is in use.</div></div>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">A library with a "staff picks" shelf. Every book (model) has an edition number. The "staff pick" label (alias <code>champion</code>) moves from one edition to a newer one when the librarian approves it. Readers (the serving code) always ask for "the staff pick" and never care about the edition number.</div></div>
+<h3>Definition</h3>
+<p>A <strong>model registry</strong> stores named models with <strong>versions</strong> (v1, v2, ...), each pointing to the run that produced it. <strong>Aliases</strong> (MLflow's newer mechanism; older MLflow used fixed "stages" such as Staging and Production) are movable labels like <code>champion</code> or <code>candidate</code>. The serving code loads <code>models:/churn@champion</code>, so promoting a model means moving a label, not editing code. The <strong>champion</strong> is the model currently serving; the <strong>challenger</strong> (or candidate) is the new one trying to replace it.</p>
+<p>A <strong>promotion rule</strong> is a written, automatic decision: "promote if the challenger beats the champion by at least 0.005 accuracy, passes behaviour tests, and keeps p95 latency under 100 ms." We code the first part now.</p>
+<pre class="code lang-python"><code>registry = {"versions": {}, "aliases": {}}
+def register(run_id, acc):
+    v = len(registry["versions"]) + 1; registry["versions"][v] = {"run_id": run_id, "acc": acc}; return v
+best = search_runs("churn", "test_acc")                  # from the earlier code
+v1 = register(best[-1]["run_id"], best[-1]["metrics"]["test_acc"]); registry["aliases"]["champion"] = v1
+print("registered v1 (worst run) as champion")
+cand = register(best[0]["run_id"], best[0]["metrics"]["test_acc"])
+if registry["versions"][cand]["acc"] &gt; registry["versions"][registry["aliases"]["champion"]]["acc"] + 0.005:
+    registry["aliases"]["champion"] = cand; print(f"v{cand} beats champion by &gt;0.005 -&gt; promoted")
+print(json.dumps(registry["aliases"]))</code></pre>
+<p>Real output:</p>
+<pre class="code lang-text"><code>registered v1 (worst run) as champion
+v2 beats champion by &gt;0.005 -&gt; promoted
+{"champion": 2}</code></pre>
+<p><strong>Explain.</strong> We pretended the weakest run (<code>C = 0.001</code>, 0.8156) was in production, then registered the best run (0.8356) as v2. The margin is 0.8356 − 0.8156 = 0.0200, which is more than the required 0.005, so the alias <code>champion</code> moved from 1 to 2. Version 1 is still stored, so rollback means moving the alias back.</p>
+<p>The real MLflow calls (not run here):</p>
+<pre class="code lang-python"><code>result = mlflow.register_model(f"runs:/{run_id}/model", "churn")       # creates a new version
+from mlflow import MlflowClient
+client = MlflowClient()
+client.set_registered_model_alias("churn", "champion", result.version)  # move the label
+model = mlflow.pyfunc.load_model("models:/churn@champion")              # serving loads by alias</code></pre>
+<p class="problem"><span class="pl">Problem 3.2.1</span> Champion accuracy is 0.8356. A challenger scores 0.8380. The rule requires a gain of at least 0.005. Promote?</p>
+<table class="steps"><tr><th>Formula</th><td>gain = challenger − champion; promote if gain ≥ margin</td></tr><tr><th>Plug in</th><td>0.8380 − 0.8356 vs 0.005</td></tr><tr><th>Compute</th><td>0.8380 − 0.8356 = 0.0024, and 0.0024 &lt; 0.005</td></tr><tr><th>Answer</th><td>Do not promote. The gain of 0.0024 is below the margin, and from Chapter 2 it is inside typical run-to-run noise.</td></tr><tr><th>Check</th><td>On 450 test rows 0.0024 is about 1 customer (0.0024 × 450 = 1.08), clearly not worth a risky change.</td></tr><tr><th>Why it matters</th><td>The margin protects you from deploying noise and from constant model churn, which costs engineering time.</td></tr></table>
+<p class="problem"><span class="pl">Problem 3.2.2</span> You promoted v7 on Monday and customers complain on Tuesday. Describe the rollback.</p>
+<table class="steps"><tr><th>Step 1</th><td>Look up which version held <code>champion</code> before: v6 (the registry keeps history).</td></tr><tr><th>Step 2</th><td>Move the alias <code>champion</code> back to v6.</td></tr><tr><th>Step 3</th><td>Serving reloads by alias (or you trigger a restart or a rolling update). Confirm with the health and version endpoint.</td></tr><tr><th>Answer</th><td>Rollback is a label change plus reload; it takes minutes because v6 was never deleted.</td></tr><tr><th>Check</th><td>After rollback, <code>GET /ready</code> should report version v6 (our Chapter 7 service reports its version).</td></tr></table>
+<h3>The picture</h3>
+<pre class="code lang-text"><code>  run 11221f97 --register--&gt; churn v2 ---alias---&gt; champion   (serving loads this)
+  run df31160f --register--&gt; churn v1  (kept for rollback)</code></pre>
+<h3>Connection to the real job</h3>
+<p>The registry is the handshake between data science and operations. Real teams add metadata to each version: training data hash, metrics, owner, model card (Chapter 4), approval status. Cloud platforms offer their own: SageMaker Model Registry, Vertex AI Model Registry, Azure ML registry.</p>
+<h3>Applications</h3>
+<ul><li><strong>MLOps</strong>: promotion gates in CI/CD (Chapter 9) read and write aliases.</li><li><strong>Compliance</strong>: audit trail of who approved which model and when.</li><li><strong>Data Science</strong>: safely hand a model to engineers without emailing files.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Deploying a model straight from someone's laptop folder. If it is not in the registry with a run link, nobody can trace or reproduce it. Make the registry the only door to production.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>What is the benefit of loading <code>models:/churn@champion</code> instead of <code>version 2</code>?</li></ol>
+<p>Answer: Promotion and rollback change a label, not the serving code.</p>
+<ol><li>Why keep old versions?</li></ol>
+<p>Answer: Instant rollback and audit.</p>
+<ol><li>What is a promotion rule?</li></ol>
+<p>Answer: An explicit, automatic condition (metrics, tests, latency) a candidate must meet to become champion.</p>
+<h2 id="s3-3-3-hyperparameter-search-and-cost-control">3.3 Hyperparameter Search and Cost Control</h2>
+<div class="callout green"><div class="lab">BASIC EXPLANATION</div><div class="txt">Hyperparameter search tries different settings, such as learning rate or tree depth, to find those that give the best validation score. Cost control limits the number of trials and compute used.</div></div>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">You are tuning a radio with three knobs. Trying every combination of 4 + 5 + 4 knob positions takes 80 tries. Trying a dozen random settings usually lands you near the best station much faster.</div></div>
+<h3>Definitions</h3>
+<p>A <strong>hyperparameter</strong> is a setting chosen before training (tree depth, learning rate). <strong>Grid search</strong> tries every combination. <strong>Random search</strong> samples combinations at random and is often more efficient because only a few hyperparameters really matter. <strong>Bayesian</strong> tools (Optuna, Ray Tune, and the cloud services SageMaker, Vertex and Azure tuning jobs) learn from previous trials where to look next, and can <strong>stop bad trials early</strong> (early stopping or pruning), saving compute.</p>
+<h3>Predict, run, explain</h3>
+<p>How many trials does the full grid need for 4 values of <code>n_estimators</code>, 5 of <code>max_depth</code>, and 4 of <code>min_samples_leaf</code>? Then see 12 random trials.</p>
+<pre class="code lang-python"><code>import random
+from sklearn.ensemble import RandomForestClassifier
+rng = random.Random(0); best = (0, None)
+space = {"n_estimators": [20, 50, 100, 200], "max_depth": [2, 4, 8, 16, None], "min_samples_leaf": [1, 2, 5, 10]}
+print("full grid size:", 4*5*4)
+for t in range(12):
+    p = {k: rng.choice(v) for k, v in space.items()}
+    acc = RandomForestClassifier(random_state=0, **p).fit(Xtr, ytr).score(Xva, yva)
+    if acc &gt; best[0]: best = (acc, p)
+print("best:", best)</code></pre>
+<p>Real output (the script also printed each trial; the best was found at trial 1 by luck):</p>
+<pre class="code lang-text"><code>full grid size: 80
+best: (0.8911111111111111, {'n_estimators': 200, 'max_depth': 16, 'min_samples_leaf': 1})</code></pre>
+<p>Trial accuracies ranged from 0.8578 to 0.8911 across the 12 trials. <strong>Explain.</strong> The grid has 4 × 5 × 4 = 80 combinations, we tried 12 (15% of the cost) and found a configuration at 0.8911. Honest warning: we tuned on one validation set, so 0.8911 is slightly optimistic. After tuning, evaluate once on a <strong>separate test set</strong> that tuning never saw.</p>
+<p>The Optuna version (not run here):</p>
+<pre class="code lang-python"><code>import optuna
+def objective(trial):
+    depth = trial.suggest_int("max_depth", 2, 16)
+    n = trial.suggest_int("n_estimators", 20, 200)
+    return RandomForestClassifier(max_depth=depth, n_estimators=n, random_state=0).fit(Xtr, ytr).score(Xva, yva)
+study = optuna.create_study(direction="maximize")
+study.optimize(objective, n_trials=30)</code></pre>
+<p class="problem"><span class="pl">Problem 3.3.1</span> One trial costs 2 GPU-hours at $3 per GPU-hour. A grid has 80 trials; random search uses 12. Cost of each, and saving?</p>
+<table class="steps"><tr><th>Formula</th><td>cost = trials × hours × price</td></tr><tr><th>Plug in</th><td>80 × 2 × 3 and 12 × 2 × 3</td></tr><tr><th>Compute</th><td>80 × 6 = 480; 12 × 6 = 72; saving = 480 − 72 = 408</td></tr><tr><th>Answer</th><td>Grid costs $480, random search $72, a saving of $408 (85%). (The $3 is an assumed example price.)</td></tr><tr><th>Check</th><td>72 ÷ 480 = 0.15, so 15% of the cost remains.</td></tr><tr><th>Why it matters</th><td>Experiment budgets are real money; set a maximum number of trials and use early stopping.</td></tr></table>
+<p class="problem"><span class="pl">Problem 3.3.2</span> An early-stopping rule kills any trial whose validation accuracy after 25% of the epochs is in the bottom half. About how much compute does it save if half the trials die at 25% of their length?</p>
+<table class="steps"><tr><th>Step 1</th><td>Without stopping: 100 trials × 1.0 length = 100 units.</td></tr><tr><th>Step 2</th><td>With stopping: 50 survivors × 1.0 + 50 stopped × 0.25 = 50 + 12.5 = 62.5 units.</td></tr><tr><th>Step 3</th><td>Saving = 100 − 62.5 = 37.5 units.</td></tr><tr><th>Answer</th><td>About 37.5% less compute.</td></tr><tr><th>Check</th><td>62.5 ÷ 100 = 0.625; the remaining share is 62.5%.</td></tr></table>
+<h3>Connection to the real job</h3>
+<p>Cloud tuning jobs charge by instance time, so budget caps matter. Log every trial in the tracker, so the best run is a query result, not a memory.</p>
+<h3>Applications</h3>
+<ul><li><strong>Machine Learning</strong>: Optuna or Ray Tune for XGBoost and deep models.</li><li><strong>MLOps</strong>: scheduled tuning jobs with budgets.</li><li><strong>Deep Learning</strong>: population-based or Bayesian search with early stopping.</li></ul>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reporting the best validation score from tuning as the final performance. The more trials you run, the more you overfit the validation set. Keep a final untouched test set.</div></div>
+<p><strong>Check yourself</strong></p>
+<ol><li>Why is random search often better than grid search?</li></ol>
+<p>Answer: Few hyperparameters matter, and random sampling tries more distinct values of each.</p>
+<ol><li>What does early stopping of trials save?</li></ol>
+<p>Answer: Compute on trials that clearly will not win.</p>
+<ol><li>Where should the final accuracy be measured?</li></ol>
+<p>Answer: On a test set the tuning never saw.</p>
+<h2 id="s4-3-4-hyperparameter-search-at-scale-random-halving-and-bayesian">3.4 Hyperparameter Search at Scale: Random, Halving and Bayesian</h2>
+<p>Section 3.3 introduced search and cost control. This section shows the methods you will meet in real tools (Optuna, Ray Tune, SageMaker and Vertex AI tuning) and how to reason about their cost. Everything below that has a printed output was run here with numpy and scikit-learn. Optuna is not installed here, so the Optuna script is labelled not run here. I used a hand-written successive-halving loop to demonstrate the idea it implements.</p>
+<h3>Beginner: why grid search wastes trials</h3>
+<p>A hyperparameter is a setting you choose before training (learning rate, tree depth, dropout). Grid search tries every combination of a few chosen values. With 3 values each for 2 settings that is 9 trials, but only 3 different values of each setting are ever tested. Most of the time one or two settings matter a lot and the rest hardly matter. Then a grid spends most of its trials repeating the same important value. Random search draws every setting at random, so nine trials test nine different values of the important one.</p>
+<figure><img src="images/ch03_grid_vs_random.png" alt="Grid and random search points over a score landscape" loading="lazy"/><figcaption>Where nine trials land under grid search (left) and random search (right).</figcaption></figure>
+<p>How to read it: darker blue means a higher score. The score depends mostly on the learning rate (x axis) and hardly on dropout (y axis). The grid puts its nine points in three vertical columns, so it only ever tests three learning rates, and all three may miss the dark band. Random search spreads nine points over nine different learning rates, so it is far more likely to land near the band.</p>
+<p>I wrote a made-up score where the learning rate matters a lot and dropout barely matters, then compared 9 grid trials with 9 random trials, repeating the random search 2000 times. Real output:</p>
+<pre class="code lang-python"><code>import numpy as np
+# A made-up but realistic objective: learning rate matters a lot, dropout barely matters.
+def score(lr, dropout):
+    return np.exp(-((np.log10(lr) + 2.3) ** 2) / 0.5) - 0.02 * (dropout - 0.3) ** 2
+
+def best_grid():
+    lrs = np.logspace(-4, -1, 3)            # 3 x 3 = 9 trials
+    drops = np.linspace(0.0, 0.6, 3)
+    return max(score(a, b) for a in lrs for b in drops)
+
+def best_random(rng):
+    lr = 10 ** rng.uniform(-4, -1, 9)       # 9 trials, every one tries a new learning rate
+    dr = rng.uniform(0.0, 0.6, 9)
+    return max(score(a, b) for a, b in zip(lr, dr))
+
+rng = np.random.default_rng(0)
+rand = [best_random(rng) for _ in range(2000)]
+print("grid, 9 trials:           best score", round(best_grid(), 3))
+print("random, 9 trials (mean of 2000 repeats):", round(float(np.mean(rand)), 3))
+print("random beats grid in", f"{np.mean(np.array(rand) &gt; best_grid()):.0%}", "of repeats")
+print("distinct learning rates tried: grid 3, random 9")</code></pre>
+<pre class="code lang-text"><code>grid, 9 trials:           best score 0.923
+random, 9 trials (mean of 2000 repeats): 0.93
+random beats grid in 71% of repeats
+distinct learning rates tried: grid 3, random 9</code></pre>
+<p class="problem"><span class="pl">Problem 3.4.1</span> Read the output. Is random search always better than the grid? What do you take from the numbers?</p>
+<table class="steps"><tr><th>Mean</th><td>The random search averages 0.930 against the grid's 0.923, a small average gain.</td></tr><tr><th>Win rate</th><td>Random wins in 71% of repeats, so it loses in 29%. Any single random search can be unlucky.</td></tr><tr><th>Why</th><td>The gain is larger when the number of important settings is small relative to the total. Here 1 of 2 settings matters.</td></tr><tr><th>Answer</th><td>Random is better on average and never worse in expectation, but it is not a guarantee. With a bigger budget the gap becomes clear.</td></tr><tr><th>Meaning</th><td>Prefer random over grid unless you have one or two settings and know the sensible values.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Searching on a linear scale. A learning rate between 0.0001 and 0.1 on a linear scale puts 90% of the draws above 0.01 and almost none near 0.0001. Search rates, regularisation strengths and similar settings on a log scale: draw the exponent uniformly, as the code above does with <code>10 ** rng.uniform(-4, -1)</code>.</div></div>
+<h3>Intermediate: stop the losers early (successive halving)</h3>
+<p>Training to the end for every trial is the most expensive part. Most bad settings look bad after a few epochs. Successive halving uses that: start many trials with a tiny budget, keep the best third, give the survivors three times more budget, and repeat. Hyperband runs several such brackets with different starting budgets to hedge against the case where early scores are misleading. ASHA is the asynchronous version used by Ray Tune: it promotes a trial as soon as it ranks in the top third of its rung, without waiting for the whole rung.</p>
+<p>The budget arithmetic with 27 trials, a reduction factor of 3, and 1 epoch to start:</p>
+<pre class="code lang-python"><code># Budget arithmetic for successive halving (reduction factor 3)
+n, r, eta = 27, 1, 3
+total = 0
+while n &gt;= 1:
+    print(f"{n:2d} trials x {r:2d} epochs = {n * r:3d}")
+    total += n * r
+    n //= eta; r *= eta
+print("total", total, "versus", 27 * 27, "for full training of all")</code></pre>
+<pre class="code lang-text"><code>27 trials x  1 epochs =  27
+ 9 trials x  3 epochs =  27
+ 3 trials x  9 epochs =  27
+ 1 trials x 27 epochs =  27
+total 108 versus 729 for full training of all</code></pre>
+<p>If every rung restarted from scratch the cost is 108 epochs. If survivors resume from where they stopped (which a checkpoint allows), the cost is smaller still. The next experiment uses a real model: logistic regression trained with stochastic gradient descent, with 27 random settings of regularisation and learning rate. Method A trains all 27 for 27 epochs. Method B uses successive halving with resumed training. Real output:</p>
+<pre class="code lang-python"><code>import numpy as np
+from sklearn.datasets import make_classification
+from sklearn.linear_model import SGDClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+
+X, y = make_classification(n_samples=6000, n_features=30, n_informative=8, flip_y=0.08, random_state=3)
+Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.3, random_state=3)
+rng = np.random.default_rng(5)
+configs = [{"alpha": 10 ** rng.uniform(-6, -1), "eta0": 10 ** rng.uniform(-4, -0.5)} for _ in range(27)]
+
+def make(cfg):
+    return SGDClassifier(loss="log_loss", alpha=cfg["alpha"], learning_rate="constant", eta0=cfg["eta0"], random_state=0)
+
+def train_epochs(model, n):
+    for _ in range(n):
+        model.partial_fit(Xtr, ytr, classes=[0, 1])
+    return roc_auc_score(yva, model.decision_function(Xva))
+
+# Method A: train all 27 configs for the full 27 epochs
+full = [train_epochs(make(c), 27) for c in configs]
+print("A) all configs, 27 epochs: cost", 27 * 27, "epochs, best AUC", round(max(full), 4))
+
+# Method B: successive halving: 27 configs at 1 epoch, keep best third, give them 3x more
+models = [make(c) for c in configs]; epochs_done = 0; cost = 0
+alive = list(range(27)); budget = 1
+while True:
+    scores = {}
+    for i in alive:
+        extra = budget - epochs_done
+        scores[i] = train_epochs(models[i], extra)
+        cost += extra
+    epochs_done = budget
+    print(f"   rung: {len(alive):2d} configs, {budget:2d} epochs each, best AUC so far {max(scores.values()):.4f}")
+    if len(alive) == 1: break
+    keep = max(1, len(alive) // 3)
+    alive = sorted(alive, key=lambda i: -scores[i])[:keep]
+    budget *= 3
+print("B) successive halving: cost", cost, "epochs, final AUC", round(scores[alive[0]], 4))
+print("best config found by A is also the winner of B:", int(np.argmax(full)) == alive[0])</code></pre>
+<pre class="code lang-text"><code>A) all configs, 27 epochs: cost 729 epochs, best AUC 0.8248
+   rung: 27 configs,  1 epochs each, best AUC so far 0.8256
+   rung:  9 configs,  3 epochs each, best AUC so far 0.8254
+   rung:  3 configs,  9 epochs each, best AUC so far 0.8245
+   rung:  1 configs, 27 epochs each, best AUC so far 0.8245
+B) successive halving: cost 81 epochs, final AUC 0.8245
+best config found by A is also the winner of B: False</code></pre>
+<p class="problem"><span class="pl">Problem 3.4.2</span> Method B cost 81 epochs and A cost 729. Method B's final model has AUC 0.8245 and A's best is 0.8248. Is B worth it?</p>
+<table class="steps"><tr><th>Cost</th><td>81 ÷ 729 = 11%. B uses nine times less compute.</td></tr><tr><th>Quality</th><td>The difference is 0.0003 AUC, far below the noise between data splits (usually 0.005 or more).</td></tr><tr><th>Why not the same winner</th><td>One epoch is a noisy guide for a fast-learning model, so the order of the top few configs changes. They are all nearly equal, so it does not matter.</td></tr><tr><th>Answer</th><td>B is worth it. If the final scores were far apart and the early ranks wrong, you would see a gap.</td></tr><tr><th>Meaning</th><td>Halving finds a model that is as good for a fraction of the cost, but cannot promise the single best one.</td></tr></table>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using successive halving when the early score does not predict the final score. Some models improve slowly (large learning-rate warm-up, big transformers with long warm-up) and look bad at epoch 1 but win at epoch 50. Check by letting 5 to 10 random trials run to the end once and see whether their early rank matches their final rank. If it does not, start the budget higher or use fewer, longer rungs.</div></div>
+<h3>Intermediate: smarter than random (Bayesian and TPE)</h3>
+<p>Random search ignores what it has learned. Bayesian methods build a rough model of the score from past trials and choose the next trial where a good score is likely or where little is known. Optuna's default, TPE (Tree-structured Parzen Estimator), splits past trials into a good group and a bad group, models where each group lives, and proposes settings that are likely under the good group and unlikely under the bad one. It handles log scales, integers and categories, and settings that exist only if another is chosen (for example, <code>max_depth</code> only for tree models). The usual gain over random search appears after 20 to 30 trials. With fewer trials, random is as good.</p>
+<p>This is the Optuna version of the experiment above, with TPE as the sampler and a Hyperband pruner to stop weak trials, which is what you would run on a real project. Not run here (Optuna is not installed on this machine).</p>
+<pre class="code lang-python"><code>import optuna
+from sklearn.datasets import make_classification
+from sklearn.linear_model import SGDClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+
+X, y = make_classification(n_samples=6000, n_features=30, n_informative=8, flip_y=0.08, random_state=3)
+Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.3, random_state=3)
+
+def objective(trial):
+    alpha = trial.suggest_float("alpha", 1e-6, 1e-1, log=True)
+    eta0 = trial.suggest_float("eta0", 1e-4, 0.3, log=True)
+    model = SGDClassifier(loss="log_loss", alpha=alpha, learning_rate="constant", eta0=eta0, random_state=0)
+    for epoch in range(27):
+        model.partial_fit(Xtr, ytr, classes=[0, 1])
+        auc = roc_auc_score(yva, model.decision_function(Xva))
+        trial.report(auc, epoch)              # tell Optuna how this trial is doing
+        if trial.should_prune():              # a clearly losing trial stops early
+            raise optuna.TrialPruned()
+    return auc
+
+study = optuna.create_study(direction="maximize",
+                            sampler=optuna.samplers.TPESampler(seed=0),
+                            pruner=optuna.pruners.HyperbandPruner())
+study.optimize(objective, n_trials=60)
+print(study.best_params, study.best_value)</code></pre>
+<p>Each trial reports its score after every epoch. <code>should_prune()</code> compares it with the other trials at the same epoch and stops it if it is clearly behind. The study object stores everything, so you can resume it, log it to MLflow (Section 3.1) and plot importance.</p>
+<p class="problem"><span class="pl">Problem 3.4.3</span> You have 4 GPUs for 6 hours, one trial takes 30 minutes on one GPU, and you want to search 5 settings. How many full trials can you afford, and does the budget favour random, TPE or halving?</p>
+<table class="steps"><tr><th>Capacity</th><td>4 GPUs × 6 hours = 24 GPU-hours. Each trial is 0.5 GPU-hours.</td></tr><tr><th>Full trials</th><td>24 ÷ 0.5 = 48 trials.</td></tr><tr><th>Choice</th><td>48 trials is enough for TPE to start to help, but 5 settings is a big space. With halving at factor 3 you would test about 3 times more configurations in the same budget (about 100 to 150).</td></tr><tr><th>Answer</th><td>Use TPE with Hyperband pruning (the Optuna setup above): more configs for the same cost and a guided search. Run 4 workers in parallel against one shared study.</td></tr><tr><th>Meaning</th><td>Compute budget in GPU-hours decides the method.</td></tr></table>
+<h3>Running search on a cluster</h3>
+<ul><li><strong>Optuna</strong> workers share a study through a database (<code>storage="postgresql://..."</code>); start the same script on N machines and they cooperate.</li><li><strong>Ray Tune</strong> runs trials as Ray tasks on a cluster, with ASHA, Population Based Training and many search algorithms, and integrates with MLflow and Weights and Biases.</li><li><strong>SageMaker Automatic Model Tuning</strong> and <strong>Vertex AI Vizier</strong> are managed versions: you provide a training container, the ranges, the objective metric and the maximum trials and parallel jobs. They charge for the training jobs, not for the tuner itself. Check each service's current options and pricing in its documentation.</li></ul>
+<p>Whatever the tool, log every trial to the tracker from Section 3.1 with the same names for parameters and the metric, so you can compare searches later.</p>
+<h3>Going deeper</h3>
+<ul><li><strong>Parallelism hurts guided search.</strong> If 16 workers each start a trial before any finishes, TPE cannot learn from them. A small number of workers with more rounds beats many workers with one round.</li><li><strong>Overfitting the validation set.</strong> After 500 trials, the best validation score is partly luck. Report the score of the chosen model on a separate test set, and prefer a setting in a flat region of good scores over the single highest peak.</li><li><strong>Noise.</strong> If two seeds of the same config differ by 0.004, trying to separate configs 0.001 apart is wasted compute. Measure the seed noise first (run one config with 5 seeds) and use it as the resolution of your search.</li><li><strong>Multi-objective search.</strong> Accuracy against latency or cost: ask for the Pareto front (the set where one cannot improve without hurting the other) and let the team choose. Optuna supports this directly.</li><li><strong>Reproducibility.</strong> Seed the sampler (<code>TPESampler(seed=0)</code>), store the study, and log the library versions.</li></ul>
+
+<h2 id="s5-chapter-recap">Chapter recap</h2>
+<ul><li>Tracking records parameters, metrics, artifacts, code, data and environment for every run.</li><li>Our 5-run table showed <code>C = 0.01</code> winning at 0.8356 and underfitting at <code>C = 0.001</code>.</li><li>A registry stores versioned models with aliases like <code>champion</code>; serving loads by alias.</li><li>A promotion rule needs a margin larger than the noise (we used 0.005).</li><li>Rollback is moving the alias back to a kept version.</li><li>MLflow's concepts (run, param, metric, artifact, register, alias) match our mini version; MLflow code here is not run.</li><li>Random search found a good setting in 12 of 80 trials; budgets and early stopping control cost.</li><li>Tune on validation data, report on a separate test set.</li></ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Pattern</th><th>Meaning</th></tr></thead><tbody><tr><td><code>mlflow.start_run()</code></td><td>Begin recording one run</td></tr><tr><td><code>mlflow.log_param/metric</code></td><td>Record settings and results</td></tr><tr><td><code>mlflow.register_model(uri, name)</code></td><td>Create a new registry version</td></tr><tr><td><code>models:/name@alias</code></td><td>Load the model behind a label</td></tr><tr><td>promote if <code>new &gt; champ + margin</code></td><td>Gate against noise</td></tr></tbody></table></div>
+<h2 id="s6-practice-set">Practice set</h2>
+<p class="problem"><span class="pl">Problem 3.1</span> Name three things a tracker should store besides the metric. <strong>Answer:</strong> Parameters, artifacts (the model), and code version, data version, environment or seed.</p>
+<p class="problem"><span class="pl">Problem 3.2</span> Gain = 0.8356 − 0.8333. Is that above a 0.005 margin? <strong>Answer:</strong> 0.0023 is below 0.005, so no.</p>
+<p class="problem"><span class="pl">Problem 3.3</span> What is the output? <code>sorted([("a",0.8),("b",0.9)], key=lambda r: -r[1])[0][0]</code> <strong>Answer:</strong> <code>'b'</code>. Sorting by negative score puts the highest score first.</p>
+<p class="problem"><span class="pl">Problem 3.4</span> Grid: 3 values × 3 values × 3 values. How many trials? <strong>Answer:</strong> 27.</p>
+<p class="problem"><span class="pl">Problem 3.5</span> Find the bug: <code>yaml.load</code> is used to read an MLflow-style config from an uploaded file. <strong>Answer:</strong> <code>yaml.load</code> can execute arbitrary object construction. Use <code>yaml.safe_load</code>.</p>
+<p class="problem"><span class="pl">Problem 3.6</span> A run's test accuracy is 0.95 but train accuracy is 0.99. Comment. <strong>Answer:</strong> A 4-point gap suggests overfitting. Consider stronger regularisation or more data.</p>
+<p class="problem"><span class="pl">Problem 3.7</span> Why not deploy "the best run from my notebook" directly? <strong>Answer:</strong> No registry entry means no version, no approval, no rollback and no audit trail.</p>
+<p class="problem"><span class="pl">Problem 3.8</span> 50 trials, 3 hours each, $2 per hour. Cost? With 40% saved by early stopping? <strong>Answer:</strong> 50 × 3 × 2 = $300. With 40% saved: 300 × 0.6 = $180.</p>
+<p class="problem"><span class="pl">Problem 3.9 (interview)</span> "Walk me through promoting a model safely." <strong>Answer:</strong> Train and log a run, register a version, run automated tests (data, behaviour, performance floor, latency), compare with the champion using a margin, deploy with a canary (Chapter 8), then move the <code>champion</code> alias after metrics hold. Keep the previous version for rollback.</p>
+<p class="problem"><span class="pl">Problem 3.10 (interview)</span> "MLflow vs Weights &amp; Biases?" <strong>Answer:</strong> Both track runs. MLflow is open source and includes a registry and model packaging; W&amp;B is a hosted product with strong dashboards and collaboration. The choice depends on cost, hosting rules and team habit; the concepts transfer.</p>
+<p class="problem"><span class="pl">Problem 3.11</span> You have a log-uniform learning rate range 1e-5 to 1e-1. What fraction of random draws fall below 1e-3 on a log scale, and on a linear scale? <strong>Answer:</strong> Log scale: the exponent is uniform on [-5, -1] and 1e-3 is exponent -3, so 2 ÷ 4 = 50%. Linear scale: draws are uniform on [0.00001, 0.1], so about 0.001 ÷ 0.1 = 1%.</p>
+<p class="problem"><span class="pl">Problem 3.12</span> Successive halving with 81 trials, factor 3, 1 epoch to start. List the rungs and the total epochs with restarts. <strong>Answer:</strong> 81×1, 27×3, 9×9, 3×27, 1×81 = 81 + 81 + 81 + 81 + 81 = 405 epochs, against 81 × 81 = 6,561 for training all to the end.</p>
+<p class="problem"><span class="pl">Problem 3.13</span> Why does TPE need a few random trials first? <strong>Answer:</strong> It needs past results to split into a good group and a bad group. Optuna starts with a number of random trials (10 by default) and then switches to the model.</p>
+<p class="problem"><span class="pl">Problem 3.14 (find the bug)</span> A study maximises validation AUC and reports the best value as the expected production AUC. What is wrong? <strong>Answer:</strong> The best of many trials is biased upward because of selection (some of the lead is luck). Evaluate the chosen model once on a held-out test set and report that number.</p>
+<p class="problem"><span class="pl">Problem 3.15</span> One trial costs 2 GPU-hours. Your budget is 100 GPU-hours. How many trials with plain search, and how many configs can you screen with halving (factor 3, 4 rungs, resumed training)? <strong>Answer:</strong> Plain: 50 trials. Halving with 4 rungs on 27 starters costs 81 epochs in total, 3 per starter, against 27 per starter for a full train (11%), so the same 100 GPU-hours covers about 9 times more starters: roughly 450 configs, if early ranks are informative.</p>
+<p class="problem"><span class="pl">Problem 3.16 (interview)</span> "How do you tune hyperparameters on a limited budget?" <strong>Answer:</strong> Start with a coarse random search on log scales to find the important settings, narrow the ranges, then use TPE with pruning for the final search. Use early stopping by halving when early curves predict final ones. Fix seeds, log every trial, measure seed noise, and confirm the winner on a held-out set.</p>
+<h2 id="s7-prompt-pack">Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps, and English is my second language. Teach me experiment tracking: parameters, metrics, artifacts, runs, experiments. Use a lab-notebook analogy, then walk through MLflow's tracking API step by step with a small scikit-learn example. After each step ask me to predict what the UI will show, and check my answer.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Explain the model registry: versions, aliases (champion and challenger), old stages, promotion rules and rollback. Give a worked numeric example of a promotion decision with a margin. Then give me 8 graded exercises without solutions and offer to check my answers one at a time.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Compare MLflow, Weights and Biases, Neptune, Comet, ClearML and TensorBoard. Make a table with hosting, registry support, strengths and when NOT to choose each. Keep every claim general enough not to go out of date, and tell me what to verify in their current docs.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Review my experiment-tracking setup and promotion rule. Check what I log, whether results are reproducible, whether my margin is larger than run noise, and whether rollback is possible. Be specific and kind. My setup: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into ML and MLOps. Teach hyperparameter search: grid, random, Bayesian (Optuna, Ray Tune), early stopping and budgets. Use cost arithmetic with GPU hours. Then run a mock interview, one question at a time, grading each answer out of 10 with a model answer.</pre></div><div class="readbtn"><button class="btn" data-read="study:mlops:ch03">Mark this chapter as read</button></div><div class="pager"><a class="btn ghost" href="ch02.html">← Chapter 2: Reproducibility: Environments, Docker, Config and Seeds</a><a class="btn" href="ch04.html">Chapter 4: Data and Model Versioning →</a></div></div><script src="../../assets/study.js"></script></body></html>

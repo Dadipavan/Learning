@@ -1,0 +1,227 @@
+<h2>22.9 Recipes: How do I ...?</h2>
+<p>Every recipe below follows the same shape: the task, a runnable pandas or standard-library solution with a check, and the equivalent in the big libraries where it differs. All files are generated in temporary folders.</p>
+
+<h3>How do I process a 10 GB CSV in chunks?</h3>
+<p>Stream the file, clean each chunk, update small running totals, and never hold more than one chunk. This block makes a dirty 300,000-row file (lowercase region names, missing prices, negative quantities) and aggregates it in 50,000-row chunks.</p>
+<py>
+import os, tempfile
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(11)
+n = 300_000
+raw = pd.DataFrame({
+    "region": rng.choice(["eu", "US", " apac", "EU"], n),
+    "qty": rng.integers(-2, 10, n),
+    "price": np.where(rng.random(n) < 0.05, np.nan, rng.normal(40, 10, n).round(2)),
+})
+path = os.path.join(tempfile.mkdtemp(), "dirty.csv")
+raw.to_csv(path, index=False)
+
+revenue, kept, dropped = {}, 0, 0
+for chunk in pd.read_csv(path, chunksize=50_000):
+    chunk["region"] = chunk["region"].str.strip().str.upper()
+    ok = chunk["qty"].gt(0) & chunk["price"].notna()
+    dropped += int((~ok).sum())
+    good = chunk[ok]
+    kept += len(good)
+    for region, value in (good["qty"] * good["price"]).groupby(good["region"]).sum().items():
+        revenue[region] = revenue.get(region, 0.0) + value
+
+print("kept", kept, "dropped", dropped, "total", kept + dropped)
+print({k: round(v) for k, v in sorted(revenue.items())})
+
+whole = raw.assign(region=raw.region.str.strip().str.upper())
+whole = whole[whole.qty.gt(0) & whole.price.notna()]
+check = (whole.qty * whole.price).groupby(whole.region).sum()
+print("matches one-shot pandas:", all(abs(check[k] - revenue[k]) < 1e-6 * check[k] for k in check.index))
+</py>
+<ol>
+<li>The generator plants three kinds of dirt: inconsistent region spellings, missing prices (about 5 percent) and non-positive quantities.</li>
+<li>For each chunk, <code>str.strip().str.upper()</code> normalizes the region, then a boolean mask keeps only valid rows. Counting the dropped rows is part of any honest pipeline: you must report how many rows you discarded.</li>
+<li>The running totals live in a plain dictionary: small, and independent of file size.</li>
+<li>The last block recomputes everything in one shot on the in-memory frame and compares. Chunked and one-shot agree to floating-point accuracy.</li>
+<li>In Polars the equivalent is a lazy scan with the same filters and a <code>group_by</code>, and the engine does the chunking for you: <code>pl.scan_csv(p).filter((pl.col("qty") &gt; 0) &amp; pl.col("price").is_not_null()).group_by(pl.col("region").str.strip_chars().str.to_uppercase()).agg((pl.col("qty") * pl.col("price")).sum()).collect(engine="streaming")</code> (not run here).</li>
+</ol>
+
+<h3>How do I dedupe at scale?</h3>
+<p>A hash set of all keys may not fit in memory. Use the shuffle idea: write rows into B bucket files by hash of the key, so every copy of the same key lands in the same bucket; then dedupe each bucket on its own, which fits in memory.</p>
+<py>
+import os, tempfile
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(21)
+n = 200_000
+df = pd.DataFrame({
+    "order_id": rng.integers(0, 120_000, n),          # many repeated ids
+    "ts": np.arange(n),                                # later row = newer version
+    "status": rng.choice(["new", "paid", "shipped"], n),
+})
+d = tempfile.mkdtemp()
+src = os.path.join(d, "orders.csv")
+df.to_csv(src, index=False)
+
+B = 8
+for chunk in pd.read_csv(src, chunksize=40_000):                       # pass 1: scatter
+    bucket = pd.util.hash_pandas_object(chunk["order_id"], index=False) % B
+    for b, part in chunk.groupby(bucket):
+        part.to_csv(os.path.join(d, f"bucket{b}.csv"), mode="a", header=not os.path.exists(os.path.join(d, f"bucket{b}.csv")), index=False)
+
+kept = []
+for b in range(B):                                                      # pass 2: dedupe each bucket
+    part = pd.read_csv(os.path.join(d, f"bucket{b}.csv"))
+    kept.append(part.sort_values("ts").drop_duplicates("order_id", keep="last"))
+result = pd.concat(kept)
+
+truth = df.sort_values("ts").drop_duplicates("order_id", keep="last")
+print("rows in:", n, "unique ids:", len(result), "expected:", len(truth))
+print("same rows:", result.sort_values("order_id").reset_index(drop=True).equals(truth.sort_values("order_id").reset_index(drop=True)))
+print("largest bucket rows:", max(len(k) for k in kept) < n / 2)
+</py>
+<ol>
+<li>The data has 200,000 rows but only about 97,000 distinct ids, each possibly repeated with different timestamps. We keep the newest row per id.</li>
+<li>Pass 1 reads chunks and appends each row to <code>bucketK.csv</code>, where K is the stable hash of the id modulo 8. The header is written only when the bucket file is first created.</li>
+<li>Pass 2 loads one bucket at a time. All copies of an id are in the same bucket, so sorting by <code>ts</code> and <code>drop_duplicates(keep="last")</code> gives the right answer locally.</li>
+<li>The result equals a global dedupe on the in-memory table. Memory use is one bucket, which you control by raising B.</li>
+<li>This is exactly what Spark's <code>dropDuplicates</code> does (shuffle by key, dedupe within partitions). For "keep the latest", use a window: <code>row_number() over (partition by order_id order by ts desc)</code> and keep 1, in Spark, DuckDB (<code>QUALIFY</code>) or Polars (<code>df.sort("ts").unique(subset="order_id", keep="last")</code>).</li>
+</ol>
+
+<h3>How do I aggregate incrementally as new files arrive?</h3>
+<p>Keep a small state (sums and counts, never means) and a list of processed files. Each run adds only the new files, and a rerun does nothing.</p>
+<py>
+import json, os, tempfile
+import numpy as np
+import pandas as pd
+
+d = tempfile.mkdtemp()
+state_path = os.path.join(d, "state.json")
+rng = np.random.default_rng(8)
+for day in (1, 2):
+    pd.DataFrame({"region": rng.choice(["EU", "US"], 1000), "amount": rng.integers(1, 100, 1000)}).to_csv(os.path.join(d, f"day{day}.csv"), index=False)
+
+def update(folder):
+    state = json.load(open(state_path)) if os.path.exists(state_path) else {"files": [], "sum": {}, "count": {}}
+    for name in sorted(f for f in os.listdir(folder) if f.startswith("day")):
+        if name in state["files"]:
+            continue                                          # already processed: idempotent
+        part = pd.read_csv(os.path.join(folder, name)).groupby("region")["amount"].agg(["sum", "count"])
+        for region, row in part.iterrows():
+            state["sum"][region] = state["sum"].get(region, 0) + int(row["sum"])
+            state["count"][region] = state["count"].get(region, 0) + int(row["count"])
+        state["files"].append(name)
+    json.dump(state, open(state_path, "w"))
+    return state
+
+s1 = update(d)
+print("after run 1:", s1["files"], s1["count"])
+s2 = update(d)
+print("after rerun:", s2["files"], s2["count"] == s1["count"])
+pd.DataFrame({"region": rng.choice(["EU", "US"], 500), "amount": rng.integers(1, 100, 500)}).to_csv(os.path.join(d, "day3.csv"), index=False)
+s3 = update(d)
+print("after day 3:", s3["files"], sum(s3["count"].values()))
+print("mean EU:", round(s3["sum"]["EU"] / s3["count"]["EU"], 2))
+</py>
+<ol>
+<li>The state holds, per region, the running sum and count, so the mean can be computed at any time without the raw data.</li>
+<li>Processed file names are stored in the state. Each run skips any file already in the list, which makes the job <strong>idempotent</strong>: running it twice changes nothing. This matters when a scheduler retries a failed night.</li>
+<li>Run 1 processes two files with 1,000 rows each. The rerun reads nothing new and the counts are identical (<code>True</code>).</li>
+<li>When day 3 arrives, only that file is read, and the total count becomes 2,500.</li>
+<li>In Spark or Delta-style systems the same pattern is called an incremental load, with a checkpoint or watermark in place of the JSON file. Write the state and the outputs atomically (write a temporary file and rename) so a crash cannot leave half an update.</li>
+</ol>
+
+<h3>How do I join a big table with a small one?</h3>
+<p>Load the small table into memory and look up values chunk by chunk. This is a <strong>broadcast join</strong>: the small side is copied to wherever the big side is processed, so the big side never moves. The block checks the answer with a real SQL join in <code>sqlite3</code>.</p>
+<py>
+import io, os, sqlite3, tempfile
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(4)
+n = 200_000
+big = pd.DataFrame({"customer_id": rng.integers(0, 1_000, n), "amount": rng.integers(1, 100, n)})
+small = pd.DataFrame({"customer_id": np.arange(0, 900), "tier": rng.choice(["gold", "silver", "bronze"], 900)})   # 100 customers unknown
+path = os.path.join(tempfile.mkdtemp(), "big.csv")
+big.to_csv(path, index=False)
+
+lookup = small.set_index("customer_id")["tier"]
+totals, unmatched = {}, 0
+for chunk in pd.read_csv(path, chunksize=50_000):
+    tier = chunk["customer_id"].map(lookup)                    # hash lookup, no shuffle
+    unmatched += int(tier.isna().sum())
+    for t, v in chunk["amount"].groupby(tier.fillna("unknown")).sum().items():
+        totals[t] = totals.get(t, 0) + int(v)
+print(dict(sorted(totals.items())), "unmatched rows:", unmatched)
+
+con = sqlite3.connect(":memory:")
+big.to_sql("big", con, index=False); small.to_sql("small", con, index=False)
+rows = con.execute("""SELECT COALESCE(s.tier, 'unknown') AS tier, SUM(b.amount)
+                      FROM big b LEFT JOIN small s ON s.customer_id = b.customer_id
+                      GROUP BY 1 ORDER BY 1""").fetchall()
+print("sqlite3 agrees:", dict(rows) == totals)
+</py>
+<ol>
+<li>The big table has customers 0 to 999 but the small table knows only 0 to 899, so about a tenth of the rows will not match. This is deliberate: real joins always have unmatched keys.</li>
+<li><code>small.set_index(...)["tier"]</code> is a Series that acts as a dictionary. <code>chunk["customer_id"].map(lookup)</code> gives the tier for each row, NaN where unknown.</li>
+<li>The unmatched rows are counted and grouped as <code>unknown</code>. A left join keeps them; an inner join would silently drop about 10 percent of the data. Always check the unmatched count after a join.</li>
+<li>The SQL <code>LEFT JOIN</code> in sqlite3 gives identical totals per tier.</li>
+<li>Spark: <code>big.join(F.broadcast(small), "customer_id", "left")</code>. Polars: <code>big_lf.join(small_lf, on="customer_id", how="left")</code> (the small side is held in memory). DuckDB: the same SQL, and its hash join builds the table on the smaller side.</li>
+</ol>
+
+<h3>How do I write a partitioned dataset from a stream of chunks?</h3>
+<p>Append each chunk's rows into the right partition folder as you go, so the whole dataset never sits in memory. The block uses CSV files because Parquet is unavailable; the layout logic is identical to Parquet.</p>
+<py>
+import os, tempfile
+from pathlib import Path
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(6)
+n = 120_000
+src = os.path.join(tempfile.mkdtemp(), "events.csv")
+pd.DataFrame({
+    "ts": pd.to_datetime("2025-01-01") + pd.to_timedelta(rng.integers(0, 90, n), unit="D"),
+    "country": rng.choice(["DE", "FR", "US"], n),
+    "value": rng.integers(1, 1000, n),
+}).to_csv(src, index=False)
+
+root = Path(tempfile.mkdtemp()) / "events"
+rows_written = 0
+for chunk in pd.read_csv(src, chunksize=30_000, parse_dates=["ts"]):
+    chunk["month"] = chunk["ts"].dt.strftime("%Y-%m")
+    for (month, country), part in chunk.groupby(["month", "country"]):
+        folder = root / f"month={month}" / f"country={country}"
+        folder.mkdir(parents=True, exist_ok=True)
+        target = folder / "part-0.csv"
+        part[["ts", "value"]].to_csv(target, mode="a", header=not target.exists(), index=False)
+        rows_written += len(part)
+
+files = sorted(root.rglob("*.csv"))
+print("folders:", len({p.parent for p in files}), "rows written:", rows_written == n)
+print(files[0].relative_to(root))
+only = pd.read_csv(root / "month=2025-02" / "country=DE" / "part-0.csv")
+print("one partition rows:", len(only), "of", n)
+</py>
+<ol>
+<li>Dates are spread over 90 days from 1 January, so months 2025-01, 2025-02 and 2025-03 appear; there are 3 countries, so 9 folders.</li>
+<li>Each chunk is split by (month, country). The target file is opened in append mode and the header is written only when the file does not exist yet.</li>
+<li>Only <code>ts</code> and <code>value</code> are written inside the files, since month and country are in the folder names.</li>
+<li>The counters prove that no row was lost. Reading a single partition touches about a tenth of the rows.</li>
+<li>Parquet equivalent (not run): in PyArrow use <code>pq.write_to_dataset(table, root, partition_cols=["month", "country"])</code> for each chunk, or in one statement in DuckDB: <code>COPY (SELECT *, strftime(ts, '%Y-%m') AS month FROM 'events.csv') TO 'events' (FORMAT PARQUET, PARTITION_BY (month, country))</code>. Spark: <code>df.write.partitionBy("month", "country").parquet("events")</code>.</li>
+<li>Watch out for the small-files problem: appending every chunk as a new Parquet file makes thousands of files. Prefer one big conversion job, or compact files afterwards.</li>
+</ol>
+
+<h3>More "How do I ...?" one-liners (not run here)</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>How do I ...?</th><th>Polars</th><th>DuckDB SQL</th><th>PySpark</th></tr></thead><tbody>
+<tr><td>Convert CSV to Parquet</td><td><code>pl.scan_csv(p).sink_parquet(q)</code></td><td><code>COPY (SELECT * FROM 'p.csv') TO 'q.parquet' (FORMAT PARQUET)</code></td><td><code>spark.read.csv(p, header=True).write.parquet(q)</code></td></tr>
+<tr><td>Read many files at once</td><td><code>pl.scan_parquet("d/*.parquet")</code></td><td><code>FROM read_parquet('d/*.parquet')</code></td><td><code>spark.read.parquet("d/")</code></td></tr>
+<tr><td>Top 3 per group</td><td><code>df.sort("v", descending=True).group_by("g").head(3)</code></td><td><code>QUALIFY ROW_NUMBER() OVER (PARTITION BY g ORDER BY v DESC) &lt;= 3</code></td><td><code>filter(F.row_number().over(w) &lt;= 3)</code> on a withColumn</td></tr>
+<tr><td>Latest record per key</td><td><code>df.sort("ts").unique("k", keep="last")</code></td><td><code>SELECT k, arg_max(status, ts) FROM t GROUP BY k</code></td><td>window <code>row_number</code> ordered by <code>ts</code> desc, keep 1</td></tr>
+<tr><td>Count distinct, approximately</td><td><code>pl.col("u").approx_n_unique()</code></td><td><code>approx_count_distinct(u)</code></td><td><code>F.approx_count_distinct("u")</code></td></tr>
+<tr><td>Take a 1 percent sample</td><td><code>df.sample(fraction=0.01, seed=0)</code></td><td><code>SELECT * FROM t USING SAMPLE 1%</code></td><td><code>df.sample(fraction=0.01, seed=0)</code></td></tr>
+<tr><td>Median per group</td><td><code>pl.col("v").median()</code> in <code>agg</code></td><td><code>quantile_cont(v, 0.5)</code></td><td><code>F.percentile_approx("v", 0.5)</code></td></tr>
+<tr><td>Rolling 7-day sum</td><td><code>pl.col("v").rolling_sum_by("ts", window_size="7d")</code></td><td><code>SUM(v) OVER (ORDER BY ts RANGE BETWEEN INTERVAL 6 DAYS PRECEDING AND CURRENT ROW)</code></td><td>window with <code>rangeBetween</code> on a numeric time column</td></tr>
+<tr><td>Find rows with no match</td><td><code>a.join(b, on="k", how="anti")</code></td><td><code>a ANTI JOIN b USING (k)</code></td><td><code>a.join(b, "k", "left_anti")</code></td></tr>
+<tr><td>Peek at the schema cheaply</td><td><code>pl.scan_csv(p).collect_schema()</code></td><td><code>DESCRIBE SELECT * FROM 'p.csv'</code></td><td><code>spark.read.csv(p, header=True).printSchema()</code></td></tr>
+</tbody></table></div>
+<p>Count so far: five fully worked runnable recipes and ten more one-liners, fifteen "How do I" tasks in total.</p>

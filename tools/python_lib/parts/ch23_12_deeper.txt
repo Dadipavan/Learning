@@ -1,0 +1,111 @@
+
+<h2>23.12 Going Deeper: Internals, Memory, Speed and What Interviewers Probe</h2>
+<p>This part is for when you want to know why things behave as they do. You can skip it on a first read and return later.</p>
+<h3>How pytest finds fixtures: a 15-line model</h3>
+<p>pytest looks at the parameter names of a test function and builds each requested fixture, recursively building fixtures that the fixture itself requests, and caching them for the scope. The model below reproduces that idea with <code>inspect.signature</code>.</p>
+@@py
+import inspect
+
+FIXTURES, builds = {}, []
+
+def fixture(fn):
+    FIXTURES[fn.__name__] = fn
+    return fn
+
+@fixture
+def base():
+    builds.append("base")
+    return 10
+
+@fixture
+def doubled(base):
+    builds.append("doubled")
+    return base * 2
+
+def resolve(name, cache):
+    if name not in cache:
+        fn = FIXTURES[name]
+        cache[name] = fn(*[resolve(p, cache) for p in inspect.signature(fn).parameters])
+    return cache[name]
+
+def run_test(test):
+    cache = {}                                    # one cache per test = function scope
+    test(*[resolve(p, cache) for p in inspect.signature(test).parameters])
+
+def test_values(doubled, base):
+    assert doubled == 2 * base
+
+run_test(test_values)
+print("passed; built:", builds)
+@@end
+<ol><li><code>fixture</code> registers a function under its name. The decorator in real pytest also records scope and parameters.</li>
+<li><code>resolve</code> builds a fixture by first building every fixture named in <i>its</i> signature. <code>doubled</code> needs <code>base</code>, so <code>base</code> is built first.</li>
+<li>The cache makes sure <code>base</code> is built once even though both the test and <code>doubled</code> ask for it. A wider scope means a longer-lived cache.</li>
+<li>Output: <code>passed; built: ['base', 'doubled']</code>. This is why fixture names must match argument names exactly, and why a typo gives "fixture not found" instead of a silent default.</li></ol>
+<p>Two more pytest internals worth knowing: pytest rewrites the <code>assert</code> statements of test modules when it imports them (an import hook edits the syntax tree), which is how a bare <code>assert a == b</code> can print both values; and it collects tests by name patterns (<code>test_*.py</code>, functions named <code>test_*</code>, classes named <code>Test*</code> without an <code>__init__</code>).</p>
+<h3>Logging internals: lazy work and the hierarchy</h3>
+@@py
+import logging
+
+class Loud:
+    calls = 0
+    def __str__(self):
+        Loud.calls += 1
+        return "value"
+
+log = logging.getLogger("lazy")
+log.setLevel(logging.INFO)
+log.addHandler(logging.NullHandler())
+log.propagate = False
+
+log.debug("a %s", Loud())            # DEBUG is below INFO: the record is never formatted
+print(Loud.calls)
+log.debug(f"a {Loud()}")             # the f-string is evaluated BEFORE the call
+print(Loud.calls)
+log.info("a %s", Loud())             # emitted, so the argument is formatted once
+print(Loud.calls)
+print(logging.getLogger("a.b").parent.name, logging.getLogger("a.b.c").parent.name)
+@@end
+<ol><li><code>Loud.__str__</code> counts how many times Python converts the object to text, which is the work we want to avoid.</li>
+<li>With %-style arguments a disabled call formats nothing: the counter stays at 0. With an f-string the text is built before <code>log.debug</code> is even called, so the counter becomes 1 for a message nobody sees. The object still has to be created in both cases, only the formatting is deferred.</li>
+<li>An emitted message is formatted once, so the counter reaches 2. Handlers do not format again.</li>
+<li>The last line shows the hierarchy: the parent of <code>a.b</code> is the root logger (name <code>root</code>) until <code>a</code> exists, and once <code>a.b</code> exists the parent of <code>a.b.c</code> is <code>a.b</code>. Dotted names are how configuration for <code>"pipeline"</code> reaches <code>"pipeline.clean"</code>.</li></ol>
+<h3>Memory: dataclasses with slots</h3>
+@@py
+import tracemalloc
+from dataclasses import dataclass
+
+@dataclass
+class Plain:
+    x: int
+    y: int
+
+@dataclass(slots=True)
+class Slotted:
+    x: int
+    y: int
+
+def traced_bytes(cls, n=20000):
+    tracemalloc.start()
+    objs = [cls(1, 2) for _ in range(n)]
+    current, _ = tracemalloc.get_traced_memory()
+    tracemalloc.stop()
+    return current, len(objs)
+
+plain, _ = traced_bytes(Plain)
+slotted, _ = traced_bytes(Slotted)
+print(slotted < plain)
+print(hasattr(Plain(1, 2), "__dict__"), hasattr(Slotted(1, 2), "__dict__"))
+@@end
+<ol><li>A normal instance stores its attributes in a per-object dictionary (<code>__dict__</code>); <code>slots=True</code> stores them in fixed slots, with no dictionary.</li>
+<li><code>tracemalloc</code> counts bytes allocated by Python code. We create 20,000 objects of each kind and compare. We print a boolean because the byte counts depend on the Python build.</li>
+<li>Slotted instances use less memory (<code>True</code>), and have no <code>__dict__</code>: the second line is <code>True False</code>. The trade-off: you cannot add attributes at will, and some tools that expect <code>__dict__</code> behave differently. It matters when you hold millions of small records, not for a config object.</li></ol>
+<h3>Speed and concurrency, in plain terms</h3>
+<ul><li><strong>The GIL.</strong> In the standard CPython build, only one thread runs Python bytecode at a time. Threads help when work waits (network, disk) or when a C library releases the lock (much of numpy and scikit-learn). For pure-Python CPU work use processes. Python 3.13 and later include an optional free-threaded build, but the default build you will meet in production still has the GIL.</li>
+<li><strong>joblib backends.</strong> The default <code>loky</code> backend uses separate worker processes, so arguments and results are pickled and copied. Large numpy arrays are memory-mapped instead of copied above a size threshold, which is why passing a big array to workers is cheaper than it sounds. The <code>threading</code> backend avoids copying but only helps when the task releases the GIL.</li>
+<li><strong>FastAPI threads.</strong> A plain <code>def</code> endpoint runs in a thread pool of limited size (the library sets a default; check your version). If each request does heavy CPU work in pure Python, add worker processes (<code>uvicorn --workers N</code> or a process manager), not more threads. Each worker process loads its own copy of the model, so memory use multiplies.</li>
+<li><strong>pydantic v2</strong> performs validation in a compiled core written in Rust, which is much faster than hand-written Python checks; the validation cost is small compared with model inference.</li>
+<li><strong>Docker layers.</strong> Each instruction creates a read-only filesystem layer, identified by a content hash. The build cache reuses a layer if its instruction and inputs are unchanged. Multi-stage builds compile or download in one stage and copy only the result into a small final stage, which shrinks images and attack surface.</li>
+<li><strong>Determinism limits.</strong> Floating-point addition is not associative, so summing in a different order (as multithreaded libraries may do) can change the last digits. Seeds fix random choices, not these effects. Compare metrics with tolerances, and fix thread counts if you need bit-for-bit repeatability.</li>
+<li><strong>Pickle safety.</strong> Unpickling executes code. Only load joblib or pickle files you created. For exchange between teams prefer formats such as ONNX, JSON for parameters, or skops for scikit-learn models, and always verify checksums.</li></ul>
+<div class="callout cream"><div class="lab">INTERVIEW</div><div class="txt"><strong>What interviewers probe in this area.</strong> (1) "How do you make an ML project reproducible?" Seeds, pinned and locked dependencies, data versioning, parameter and metric logging, container. (2) "How do you test a model?" Unit-test data code, test shapes and ranges of outputs, invariants (monotonicity, no NaN), a small golden dataset with a metric floor; do not assert exact accuracy on random data. (3) "Training-serving skew: what is it and how do you prevent it?" Same preprocessing code in both places, one saved Pipeline, schema validation, shadow traffic. (4) "Fixture scope trade-offs?" Speed versus isolation. (5) "What is idempotency and why do schedulers need it?" Re-running a task must be safe, because retries happen. (6) "async def versus def in FastAPI?" Blocking work must not run on the event loop. (7) "Why not <code>pip freeze</code> as your only dependency management?" It mixes direct and indirect dependencies and encodes your platform; use a lock file from a resolver. (8) "Where do secrets live?" Outside the image and the repository, in the runtime environment or a secrets manager, never in logs.</div></div>

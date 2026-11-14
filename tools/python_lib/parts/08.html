@@ -1,0 +1,45 @@
+<h2>22.8 How to choose</h2>
+<p>Start with the size of the data and the size of your machine, then ask what you already know. The flow chart below encodes the order of questions. Follow it from the top; stop at the first tool that answers yes.</p>
+<figure><img src="images/lib22_flow.png" alt="Flow chart: fits in RAM leads to pandas; otherwise fits on one disk leads to DuckDB for SQL or Polars lazy for code; otherwise Spark if a platform exists, else Dask." loading="lazy"/><figcaption>Figure 22.9. Decision flow for choosing a data library.</figcaption></figure>
+<p><strong>How to read it:</strong> blue boxes are questions, green boxes are single-machine answers, orange boxes are multi-machine answers. Notice how many paths end on one machine: a modern laptop or a single big cloud machine with DuckDB or Polars handles data far beyond what people expect, and avoids the cost of a cluster. Go right and down only when the data truly cannot be handled by one machine, or when the platform (data lake, scheduler, security) is already built on Spark.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Situation</th><th>Pick</th><th>Why</th></tr></thead><tbody>
+<tr><td>2 GB CSV, analysis in a notebook, 16 GB laptop</td><td>pandas with <code>usecols</code>, dtypes</td><td>No new tool needed</td></tr>
+<tr><td>30 GB of Parquet, SQL-literate team, one workstation</td><td>DuckDB</td><td>Reads Parquet directly, spills to disk</td></tr>
+<tr><td>30 GB, Python method chains, repeated transformations</td><td>Polars lazy</td><td>Optimizer, expressions, streaming</td></tr>
+<tr><td>Existing 5,000 lines of pandas that must scale somewhat</td><td>Dask DataFrame</td><td>Same API, partitions</td></tr>
+<tr><td>2 TB of logs in a data lake, nightly jobs, shared cluster</td><td>PySpark</td><td>Distributed shuffle, ecosystem, schedulers</td></tr>
+<tr><td>Streaming ingestion with exactly-once guarantees</td><td>Spark Structured Streaming or a stream processor</td><td>Beyond this chapter</td></tr>
+</tbody></table></div>
+<p>A quick way to know which row you are in: estimate the in-memory size from a sample before you load anything. The block builds a 200,000-row CSV, reads only the first 20,000 rows, and extrapolates.</p>
+<py>
+import os, tempfile
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(3)
+n = 200_000
+df = pd.DataFrame({
+    "order_id": np.arange(n),
+    "region": rng.choice(["EU", "US", "APAC", "LATAM", "MEA"], n),
+    "qty": rng.integers(1, 20, n),
+    "price": rng.normal(50, 15, n).round(2),
+})
+path = os.path.join(tempfile.mkdtemp(), "o.csv")
+df.to_csv(path, index=False)
+
+total_rows = sum(1 for _ in open(path)) - 1
+sample = pd.read_csv(path, nrows=20_000)
+per_row = sample.memory_usage(deep=True, index=False).sum() / len(sample)
+estimate = per_row * total_rows
+actual = pd.read_csv(path).memory_usage(deep=True, index=False).sum()
+print("rows:", total_rows)
+print("estimate within 5% of actual:", abs(estimate - actual) / actual < 0.05)
+print("in-memory is larger than the file:", actual > os.path.getsize(path))
+</py>
+<ol>
+<li>Counting lines is a cheap streaming pass over the file (no parsing), giving the row count.</li>
+<li>Reading the first 20,000 rows and measuring <code>memory_usage(deep=True)</code> gives bytes per row at the dtypes pandas would choose.</li>
+<li>Multiplying by the row count estimates the full size. The estimate is good when the sample is representative: if the file is sorted so that long strings appear only at the end, the sample under-estimates.</li>
+<li>For this table the in-memory size exceeds the CSV file size, mostly because strings are bulky as Python objects. A common surprise: a 10 GB CSV can need 20 GB or more of RAM in pandas, plus working memory for every operation.</li>
+</ol>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">In interviews and design reviews, defend the choice with numbers: data size, growth rate, how many people run the job, how often, and the cost of the platform. "We used Spark because it is big data" is a weak answer. "Our largest table is 40 GB, DuckDB on one 64 GB machine finished in 3 minutes, so we skipped the cluster" is a strong one.</div></div>

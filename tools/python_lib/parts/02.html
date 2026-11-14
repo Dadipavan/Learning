@@ -1,0 +1,200 @@
+<h2>22.2 Before you scale: measure, shrink and chunk in pandas</h2>
+<p>The cheapest speed-up is the one that needs no new library. Most "big data" problems at the 1 to 20 GB scale are really "wasteful data" problems: columns you never use, 64-bit numbers holding values below 100, and the word <code>"EU"</code> stored a million times. This section gives you the measuring tools and the three fixes: read less, store smaller, read in pieces.</p>
+<h3>Reference table: the 24 most useful pandas scaling tools</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>df.info(memory_usage="deep")</code></td><td>Prints dtypes and the true memory including string contents</td><td><code>df.info(memory_usage="deep")</code></td></tr>
+<tr><td><code>df.memory_usage(deep=True)</code></td><td>Bytes used per column</td><td><code>df.memory_usage(deep=True).sum()</code></td></tr>
+<tr><td><code>pd.read_csv(usecols=)</code></td><td>Read only the columns you need</td><td><code>pd.read_csv(p, usecols=["a","b"])</code></td></tr>
+<tr><td><code>pd.read_csv(dtype=)</code></td><td>Choose dtypes at read time, skip the guessing</td><td><code>dtype={"qty": "uint8"}</code></td></tr>
+<tr><td><code>pd.read_csv(chunksize=)</code></td><td>Iterator of DataFrames of N rows each</td><td><code>for ch in pd.read_csv(p, chunksize=10**5):</code></td></tr>
+<tr><td><code>pd.read_csv(nrows=)</code></td><td>Read only the first N rows (peek at a huge file)</td><td><code>pd.read_csv(p, nrows=1000)</code></td></tr>
+<tr><td><code>pd.read_csv(skiprows=)</code></td><td>Skip rows (also a callable to sample at random)</td><td><code>skiprows=lambda i: i &gt; 0 and random() &gt; .01</code></td></tr>
+<tr><td><code>pd.read_csv(parse_dates=)</code></td><td>Turn text dates into real datetimes while reading</td><td><code>parse_dates=["ts"]</code></td></tr>
+<tr><td><code>pd.to_numeric(downcast=)</code></td><td>Shrink a number column to the smallest dtype that fits</td><td><code>pd.to_numeric(s, downcast="unsigned")</code></td></tr>
+<tr><td><code>astype("category")</code></td><td>Store repeated strings once, plus small integer codes</td><td><code>df["region"].astype("category")</code></td></tr>
+<tr><td><code>astype("float32")</code></td><td>Halve a float column (loses precision)</td><td><code>df["x"].astype("float32")</code></td></tr>
+<tr><td><code>astype("uint8")</code> etc.</td><td>Integer dtypes: int8/16/32/64, uint8/16/32/64</td><td><code>df["qty"].astype("uint8")</code></td></tr>
+<tr><td><code>pd.Series.nunique()</code></td><td>Counts distinct values; low counts suggest category</td><td><code>df["region"].nunique()</code></td></tr>
+<tr><td><code>df.select_dtypes()</code></td><td>Pick columns by dtype, for bulk conversion</td><td><code>df.select_dtypes("int64").columns</code></td></tr>
+<tr><td><code>df.convert_dtypes()</code></td><td>Switch to nullable dtypes (Int64, boolean)</td><td><code>df.convert_dtypes()</code></td></tr>
+<tr><td><code>groupby(observed=True)</code></td><td>Group on a category without empty combinations (the default since pandas 3.0; older versions needed it)</td><td><code>df.groupby("region", observed=True)</code></td></tr>
+<tr><td><code>Series.add(other, fill_value=0)</code></td><td>Add two partial results, treating a missing key as 0</td><td><code>total.add(part, fill_value=0)</code></td></tr>
+<tr><td><code>pd.concat(list)</code></td><td>Glue many small frames once (not in a loop)</td><td><code>pd.concat(parts, ignore_index=True)</code></td></tr>
+<tr><td><code>df.to_csv(mode="a", header=False)</code></td><td>Append a chunk to a file</td><td><code>ch.to_csv(out, mode="a", header=first)</code></td></tr>
+<tr><td><code>pd.read_sql(chunksize=)</code></td><td>Stream a database query in chunks</td><td><code>pd.read_sql(q, con, chunksize=50_000)</code></td></tr>
+<tr><td><code>df.sample(frac=)</code></td><td>Random sample to develop on a small slice</td><td><code>df.sample(frac=0.01, random_state=0)</code></td></tr>
+<tr><td><code>np.load(mmap_mode="r")</code></td><td>Memory-map a .npy file: arrays on disk behave like arrays in RAM</td><td><code>np.load("a.npy", mmap_mode="r")</code></td></tr>
+<tr><td><code>tracemalloc</code></td><td>Standard-library tool to measure peak Python memory</td><td><code>tracemalloc.start(); ...; tracemalloc.get_traced_memory()</code></td></tr>
+<tr><td><code>time.perf_counter()</code></td><td>Precise clock for timing code</td><td><code>t0 = time.perf_counter()</code></td></tr>
+<tr><td><code>del df; gc.collect()</code></td><td>Drop big objects you no longer need</td><td><code>del raw</code></td></tr>
+</tbody></table></div>
+
+<h3>Beginner: how big is a column really?</h3>
+<p>An integer in pandas defaults to 64 bits, which is 8 bytes, even if the value is 7. A column of 1 million integers therefore takes 8 MB. A string column is worse: each Python string object costs dozens of bytes beyond its characters. A <strong>category</strong> column keeps each distinct value once and stores a tiny integer code per row. The next block builds a synthetic table of 1 million orders and measures every column before and after shrinking. This synthetic table is reused in the next blocks.</p>
+<p class="problem"><span class="pl">Problem 22.2.1</span> Build a 1-million-row orders table (order_id, customer_id, region, qty, price). Measure the memory of each column, then shrink it with downcasting, <code>category</code> and <code>float32</code>, and compare.</p>
+<py>
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(42)
+n = 1_000_000
+df = pd.DataFrame({
+    "order_id": np.arange(n),
+    "customer_id": rng.integers(0, 50_000, n),
+    "region": rng.choice(["EU", "US", "APAC", "LATAM", "MEA"], n),
+    "qty": rng.integers(1, 20, n),
+    "price": rng.normal(50, 15, n).round(2),
+})
+mb = lambda s: round(s.memory_usage(deep=True, index=False) / 1e6, 1)
+print("BEFORE")
+for c in df:
+    print(f"  {c:12s} {str(df[c].dtype):6s} {mb(df[c]):6.1f} MB")
+print("  total", round(df.memory_usage(deep=True).sum() / 1e6, 1), "MB")
+
+small = df.assign(
+    order_id=pd.to_numeric(df.order_id, downcast="unsigned"),
+    customer_id=pd.to_numeric(df.customer_id, downcast="unsigned"),
+    region=df.region.astype("category"),
+    qty=pd.to_numeric(df.qty, downcast="unsigned"),
+    price=df.price.astype("float32"),
+)
+print("AFTER")
+for c in small:
+    print(f"  {c:12s} {str(small[c].dtype):8s} {mb(small[c]):5.1f} MB")
+print("  total", round(small.memory_usage(deep=True).sum() / 1e6, 1), "MB")
+</py>
+<ol>
+<li>Lines 4 to 12 build the table with a seeded random generator, so every run gives the same numbers.</li>
+<li><code>mb</code> is a one-line helper: <code>deep=True</code> counts the real size of string contents, not just pointers.</li>
+<li>BEFORE: the four numeric columns cost 8 MB each (1 million values times 8 bytes). The region column (the text <code>EU</code>, <code>US</code> and so on) costs over 50 MB, more than the other four together. In pandas 3.0 text columns default to the <code>str</code> dtype; without PyArrow installed it is still backed by Python string objects, which is why it is large. With PyArrow installed the text is stored more compactly, but a category is smaller still for few distinct values.</li>
+<li><code>pd.to_numeric(..., downcast="unsigned")</code> picks the smallest unsigned integer dtype that holds every value: 1,000,000 ids need 32 bits, customers below 50,000 need 16, quantities below 20 need 8.</li>
+<li><code>astype("category")</code> stores 5 labels and one 8-bit code per row: 1 MB.</li>
+<li><code>float32</code> halves the price column. It keeps about 7 significant digits, fine for a price of 49.99 in analytics, wrong for money you must add up exactly (see pitfalls).</li>
+<li>Result: about 84 MB becomes about 12 MB, seven times smaller, with the same information. Check the range before you force a type: <code>to_numeric(downcast=)</code> picks a dtype from the actual min and max, but a blind <code>astype("uint8")</code> on a value of 300 silently wraps it to 44, and writing 300 into an existing <code>uint8</code> column raises an error.</li>
+</ol>
+<figure><img src="images/lib22_memory.png" alt="Bar chart of memory per column for default dtypes versus downcast dtypes. The region column dominates the default total." loading="lazy"/><figcaption>Figure 22.2. Memory per column for the 1-million-row table, measured with <code>memory_usage(deep=True)</code>.</figcaption></figure>
+<p><strong>How to read it:</strong> each pair of bars is one column. The orange bar is the default dtype, the green bar the shrunk version. The tall orange bar is the text column; the other columns shrink by half or more. The lesson: look at the biggest bar first. Shrinking an already small column barely helps.</p>
+
+<h3>Intermediate: chunking, the way to beat the memory wall</h3>
+<p>If you cannot fit the file, do not load the file. A <strong>chunk</strong> is a block of rows. You read one chunk, reduce it to a small partial answer (a sum, a count, a filtered set of rows), throw the chunk away, and move to the next. At the end you combine the partial answers. This works for any <strong>decomposable</strong> statistic: sums, counts, min, max, and the mean (as sum divided by count). It does not work directly for the median or the exact distinct count, which need other tricks (Section 22.9).</p>
+<p class="problem"><span class="pl">Problem 22.2.2</span> Write the 1-million-row table to a CSV file. Compute the revenue (qty times price) per region two ways: reading the whole file, and in chunks of 100,000 and 10,000 rows. Compare the peak memory and check that the answers agree.</p>
+<py>
+import os, tempfile, tracemalloc
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(42)
+n = 1_000_000
+df = pd.DataFrame({
+    "order_id": np.arange(n),
+    "customer_id": rng.integers(0, 50_000, n),
+    "region": rng.choice(["EU", "US", "APAC", "LATAM", "MEA"], n),
+    "qty": rng.integers(1, 20, n),
+    "price": rng.normal(50, 15, n).round(2),
+})
+path = os.path.join(tempfile.mkdtemp(), "orders.csv")
+df.to_csv(path, index=False)
+del df
+print("file size over 20 MB:", os.path.getsize(path) > 20e6)
+
+def revenue_full():
+    d = pd.read_csv(path)
+    return (d.qty * d.price).groupby(d.region).sum()
+
+def revenue_chunked(size):
+    total = None
+    for ch in pd.read_csv(path, chunksize=size):
+        part = (ch.qty * ch.price).groupby(ch.region).sum()
+        total = part if total is None else total.add(part, fill_value=0)
+    return total
+
+peaks, answers = {}, {}
+for label, fn in [("full", revenue_full),
+                  ("chunk 100k", lambda: revenue_chunked(100_000)),
+                  ("chunk 10k", lambda: revenue_chunked(10_000))]:
+    tracemalloc.start()
+    answers[label] = fn().sort_index()
+    peaks[label] = tracemalloc.get_traced_memory()[1]
+    tracemalloc.stop()
+
+print("full peak above 60 MB:", peaks["full"] > 60e6)
+print("chunk 100k peak below 30 MB:", peaks["chunk 100k"] < 30e6)
+print("chunk 10k peak below 10 MB:", peaks["chunk 10k"] < 10e6)
+print("same answer:", np.allclose(answers["full"], answers["chunk 10k"]))
+print(answers["chunk 10k"].round(0).astype("int64").to_string())
+</py>
+<ol>
+<li>The first half is the same data generator, written to a temporary CSV. <code>del df</code> frees the in-memory copy, so only the file remains, like Priya's situation.</li>
+<li><code>revenue_full</code> loads everything, multiplies <code>qty * price</code> row by row, and groups the products by the region column.</li>
+<li><code>revenue_chunked</code> asks for an iterator: <code>read_csv(chunksize=size)</code> yields DataFrames of at most <code>size</code> rows. Each one is reduced to a 5-row <code>Series</code> of partial sums.</li>
+<li><code>total.add(part, fill_value=0)</code> adds two Series aligned on the region label. <code>fill_value=0</code> treats a region missing from one chunk as zero instead of producing NaN.</li>
+<li><code>tracemalloc</code> measures the peak Python-level memory while the function runs. The prints use thresholds, not exact bytes, because exact numbers differ a little between machines.</li>
+<li>The peak shrinks roughly in proportion to the chunk size, while the answer is identical (up to floating-point rounding, hence <code>allclose</code>). The last line prints the revenue per region as whole numbers.</li>
+</ol>
+<figure><img src="images/lib22_chunks.png" alt="Line chart of peak memory against rows per chunk on a log axis, rising with chunk size, with a dashed line for reading everything." loading="lazy"/><figcaption>Figure 22.3. Peak memory against chunk size for the same file, measured with <code>tracemalloc</code>.</figcaption></figure>
+<p><strong>How to read it:</strong> the x-axis is the number of rows per chunk (log scale), the y-axis the peak memory. The blue line climbs with chunk size and the red dashed line is the cost of loading everything. If the file were 100 times larger, the blue points would not move at all, because the chunk size sets the memory, not the file size. That is what lets a laptop process a 10 GB file.</p>
+
+<h3>Expert: speed numbers, honestly measured</h3>
+<p>Smaller data is also faster data, but not every trick helps every time. The next block measures reading and group-by variants on the same million rows. Timings are not pasted as checked output because they change on every run; the table after it shows what one run on one laptop gave.</p>
+<py quiet>
+import os, tempfile, time
+import numpy as np
+import pandas as pd
+
+rng = np.random.default_rng(42)
+n = 1_000_000
+df = pd.DataFrame({
+    "order_id": np.arange(n),
+    "customer_id": rng.integers(0, 50_000, n),
+    "region": rng.choice(["EU", "US", "APAC", "LATAM", "MEA"], n),
+    "qty": rng.integers(1, 20, n),
+    "price": rng.normal(50, 15, n).round(2),
+})
+path = os.path.join(tempfile.mkdtemp(), "orders.csv")
+df.to_csv(path, index=False)
+
+def best(fn, reps=5):
+    times = []
+    for _ in range(reps):
+        t0 = time.perf_counter(); fn(); times.append(time.perf_counter() - t0)
+    return min(times)
+
+print("--- reading the CSV (best of 5, seconds) ---")
+print("read everything       ", round(best(lambda: pd.read_csv(path)), 3))
+print("usecols 2 of 5        ", round(best(lambda: pd.read_csv(path, usecols=["region", "price"])), 3))
+print("usecols + dtype       ", round(best(lambda: pd.read_csv(path, usecols=["region", "price"], dtype={"region": "category", "price": "float32"})), 3))
+print("chunks of 100k, sum   ", round(best(lambda: sum(c.price.sum() for c in pd.read_csv(path, chunksize=100_000))), 3))
+
+df_cat = df.assign(region=df.region.astype("category"))
+codes = df_cat.region.cat.codes.to_numpy()
+price = df.price.to_numpy()
+region = df.region.tolist()
+def py_loop():
+    tot = {}
+    for r, p in zip(region, price):
+        tot[r] = tot.get(r, 0.0) + p
+    return tot
+print("--- mean price per region (best of 5, seconds) ---")
+print("python dict loop      ", round(best(py_loop), 3))
+print("groupby str column    ", round(best(lambda: df.groupby("region")["price"].mean()), 3))
+print("groupby category      ", round(best(lambda: df_cat.groupby("region", observed=True)["price"].mean()), 3))
+print("numpy bincount codes  ", round(best(lambda: np.bincount(codes, weights=price) / np.bincount(codes)), 3))
+</py>
+<div class="tablewrap"><table class="data"><thead><tr><th>Operation (1M rows)</th><th>Best of 5 (s), one laptop</th><th>Reading</th></tr></thead><tbody>
+<tr><td>read_csv, everything</td><td>0.164</td><td>baseline</td></tr>
+<tr><td>read_csv, usecols (2 of 5 columns)</td><td>0.105</td><td>fewer columns, less parsing</td></tr>
+<tr><td>usecols + category/float32 dtypes</td><td>0.095</td><td>a bit faster still, and far smaller in memory</td></tr>
+<tr><td>chunks of 100k, summing price</td><td>0.181</td><td>slightly slower than one read: chunking buys memory, not speed</td></tr>
+<tr><td>mean price per region, Python dict loop</td><td>0.087</td><td>interpreted loop, one row at a time</td></tr>
+<tr><td>groupby on a str column</td><td>0.036</td><td>vectorized, about 2.4 times faster than the loop</td></tr>
+<tr><td>groupby on a category column</td><td>0.007</td><td>integer codes, about 5 times faster than the str groupby</td></tr>
+<tr><td>NumPy bincount on the codes</td><td>0.004</td><td>the floor: pure integer arithmetic</td></tr>
+</tbody></table></div>
+<ol>
+<li>The timing helper runs each variant five times and keeps the minimum, which is the least noisy estimate of the cost of the code itself.</li>
+<li>Reading fewer columns saved about a third here. On a 100-column file the saving is far larger because parsing cost is per column.</li>
+<li>Chunking is not free: the same work done in 10 pieces carries a little overhead. You chunk because you must, not to go faster.</li>
+<li>Group-by on a category is much faster than on strings because comparing small integers is cheaper than comparing text. This is the same reason databases dictionary-encode strings.</li>
+<li>Your numbers will differ, and the ordering is what you should expect to reproduce. The ratios shown are computed from this single run.</li>
+</ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>df["price"] = df["price"].astype("float32")</code> on money columns, then summing a billion of them. <strong>Symptom:</strong> totals differ from the finance system by a few units, and differ again if you change the row order. <strong>Fix:</strong> store money as integer cents (<code>int64</code>, or <code>int32</code> if the range allows) and divide by 100 only for display. Use float32 only for measurements where 7 digits are plenty.</div></div>

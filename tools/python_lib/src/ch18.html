@@ -1,0 +1,1812 @@
+<p>It is Monday morning and Maya, an analyst at a food-delivery company, has four questions on her desk. The delivery-time column is skewed, so which distribution describes it, and what is the chance that an order takes more than two hours? The new route-planning app was tried on half the drivers: is it really faster, or is that luck? The support-call volume after a bad-weather day decays over time: how fast, with what error bars? And finally, 40 driver-hours must be shared between two zones to earn the most profit. None of this is machine learning. It is the older, steadier craft of scientific computing, and almost every data domain (finance, health, engineering, marketing, operations) leans on the same few libraries to do it.</p>
+<p>This chapter teaches those libraries point by point: <strong>SciPy</strong> (the scientific toolbox on top of NumPy) and <strong>statsmodels</strong> (statistical models with full inference tables), plus a quick matplotlib reference for showing results. By the end you will be able to fit and test distributions, run and interpret hypothesis tests, build confidence intervals by formula and by bootstrap, fit curves with uncertainty, solve small optimisation problems, integrate and interpolate, work with sparse matrices, find a frequency in a noisy signal, search neighbours quickly, and cluster points. Five recipes tie it together: fit a distribution, A/B test, curve fitting with uncertainty, a small optimisation, and resampling.</p>
+<div class="callout cream"><div class="lab">HONESTY NOTE</div><div class="txt">Everything marked with an output was executed on this study machine with Python 3, NumPy 2.x, SciPy 1.18, pandas 3.0 and matplotlib 3.11. <strong>statsmodels is not installed here</strong>, so every statsmodels block is labelled <em>not run here</em> and is paired with an equivalent computed in NumPy and SciPy that did run. Timings are measured on this machine and vary on yours. The full guide to charts is the Data Analytics document, Chapter 8; here you only get the matplotlib quick reference. For the ideas behind tests and confidence intervals see the Statistics document.</div></div>
+
+<h2>18.1 What SciPy and statsmodels Are, and the Mental Model</h2>
+<h3>What each library is</h3>
+<p><strong>NumPy</strong> gives you the array. <strong>SciPy</strong> is a collection of well-tested numerical routines that work on NumPy arrays: probability distributions and tests, optimisers, integrators, interpolators, linear algebra, sparse matrices, signal processing, Fourier transforms, spatial searches and clustering. Most of it wraps battle-tested C, C++ and Fortran code (LAPACK, ODEPACK, QHull and others), so you get decades of numerical care with a Python call. <strong>statsmodels</strong> is a separate package focused on statistical modelling: regression (OLS, GLM, logistic), time series (ARIMA, SARIMAX), and above all <em>inference output</em>: standard errors, p-values, confidence intervals and diagnostic tests in one summary table.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Use it when</th><th>Do NOT use it when</th></tr></thead><tbody>
+<tr><td>You need a distribution, a classical test, or a confidence interval</td><td>You want a predictive model with cross-validation and pipelines: use scikit-learn</td></tr>
+<tr><td>You need to fit a custom formula to measured points (<code>curve_fit</code>)</td><td>Your data has millions of rows and you need group-by logic: use pandas first, then call SciPy on the arrays</td></tr>
+<tr><td>You need a small constrained optimisation (a few hundred variables)</td><td>You are training a neural network: use a deep-learning framework with automatic differentiation</td></tr>
+<tr><td>You need a regression with standard errors and p-values (statsmodels)</td><td>You only need predictions from a regression: <code>numpy.linalg.lstsq</code> or scikit-learn is lighter</td></tr>
+<tr><td>You need fast nearest-neighbour search on low-dimensional points</td><td>You have 768-dimensional embeddings at scale: use an approximate nearest-neighbour index</td></tr>
+</tbody></table></div>
+<h3>Install, version check, import conventions</h3>
+<p>Install with <code>python3 -m pip install scipy statsmodels</code> (inside a virtual environment, see the Python document, Chapter 10). SciPy submodules are not imported automatically by <code>import scipy</code>, so import the pieces you need. The conventions below are what you will see in almost all code.</p>
+<pre class="code lang-python"><code>import numpy as np
+import scipy
+import pandas as pd
+import matplotlib
+from scipy import stats, optimize, integrate, interpolate, linalg, signal, spatial, fft
+from scipy import sparse
+from scipy.cluster import vq, hierarchy
+
+print("numpy ", np.__version__.split(".")[0] + ".x")
+print("scipy ", scipy.__version__)
+print("pandas", pd.__version__.split(".")[0] + ".x")
+print("matplotlib", matplotlib.__version__)
+print(stats.norm.cdf(0))</code></pre>
+<pre class="code lang-text"><code>numpy  2.x
+scipy  1.18.1
+pandas 3.x
+matplotlib 3.11.2
+0.5</code></pre>
+<ol><li>The <code>from scipy import ...</code> lines pull in the submodules. <code>import scipy</code> alone would not make <code>scipy.stats</code> usable in older versions, so always import the submodule you use.</li><li>Printing only the major version of NumPy and pandas keeps the output stable; the full version string is in <code>np.__version__</code>.</li><li><code>stats.norm.cdf(0)</code> is a first smoke test: half the standard normal lies below zero, so it prints 0.5.</li></ol>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Conventions: <code>np</code> for NumPy, <code>pd</code> for pandas, <code>plt</code> for <code>matplotlib.pyplot</code>, <code>sm</code> for <code>statsmodels.api</code>, <code>smf</code> for <code>statsmodels.formula.api</code>, and import SciPy as <code>from scipy import stats, optimize</code>. A statsmodels block (not run here) always starts <code>import statsmodels.api as sm</code>.</div></div>
+<h3>The mental model</h3>
+<p>Picture a stack. NumPy arrays are the floor: every SciPy function takes arrays in and returns arrays or small result objects out. Each SciPy submodule is a self-contained tool drawer. statsmodels, scikit-learn, pandas and matplotlib stand on the same floor, so data moves between them without copying or converting. Learning this chapter is mostly learning which drawer holds which tool and what shape of object each tool returns.</p>
+<figure><img src="images/lib18_stack.png" alt="Layered diagram: NumPy arrays at the bottom, ten SciPy submodules above, and statsmodels, scikit-learn, pandas and matplotlib at the top" loading="lazy"/><figcaption>The scientific stack: one array format shared by every layer.</figcaption></figure>
+<p><strong>How to read it:</strong> start at the bottom. Whatever the top layer is (a pandas column, a scikit-learn feature matrix), you can hand its values to a SciPy routine because they are NumPy arrays underneath. Results come back the same way, which is why a pipeline can mix all of these libraries in ten lines.</p>
+<p>Three habits make SciPy easy. First, <em>result objects</em>: modern SciPy functions return named results (<code>res.statistic</code>, <code>res.pvalue</code>, <code>res.x</code>, <code>res.success</code>) rather than anonymous tuples; read the attribute names. Second, <em>random state</em>: always pass a seeded generator, <code>rng = np.random.default_rng(0)</code>, and give it to <code>random_state=rng</code> or <code>rvs(..., random_state=rng)</code>. Third, <em>vectorise</em>: pass whole arrays, never loop over scalars.</p>
+
+<h2>18.2 scipy.stats I: Distributions</h2>
+<p>A <strong>probability distribution</strong> is a recipe that says how likely each value is. SciPy gives you about a hundred ready-made ones. Every continuous distribution is an object with the same methods, so once you learn <code>norm</code> you know <code>lognorm</code>, <code>gamma</code>, <code>expon</code> and the rest. A <em>discrete</em> distribution (<code>binom</code>, <code>poisson</code>) uses <code>pmf</code> (probability of exactly this value) instead of <code>pdf</code> (density).</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>norm</code></td><td>Bell curve with mean <code>loc</code> and spread <code>scale</code></td><td><code>stats.norm(loc=0, scale=1)</code></td></tr>
+<tr><td><code>expon</code></td><td>Waiting time between random events</td><td><code>stats.expon(scale=5)</code></td></tr>
+<tr><td><code>lognorm</code></td><td>Positive, right-skewed values (durations, prices)</td><td><code>stats.lognorm(s=0.5, scale=3)</code></td></tr>
+<tr><td><code>gamma</code></td><td>Positive skewed, sums of waiting times</td><td><code>stats.gamma(a=2, scale=1.5)</code></td></tr>
+<tr><td><code>beta</code></td><td>Values between 0 and 1 (rates, proportions)</td><td><code>stats.beta(2, 5)</code></td></tr>
+<tr><td><code>uniform</code></td><td>All values in an interval equally likely</td><td><code>stats.uniform(loc=2, scale=3)</code></td></tr>
+<tr><td><code>t</code>, <code>chi2</code></td><td>Reference curves used inside tests</td><td><code>stats.t(df=9)</code></td></tr>
+<tr><td><code>binom</code></td><td>Number of successes in n yes/no trials</td><td><code>stats.binom(n=10, p=0.3)</code></td></tr>
+<tr><td><code>poisson</code></td><td>Count of events in a fixed window</td><td><code>stats.poisson(mu=4)</code></td></tr>
+<tr><td><code>.pdf(x)</code> / <code>.pmf(k)</code></td><td>Density (or exact probability) at a point</td><td><code>stats.norm.pdf(0)</code></td></tr>
+<tr><td><code>.cdf(x)</code></td><td>Probability of being at or below x</td><td><code>stats.norm.cdf(1.96)</code></td></tr>
+<tr><td><code>.sf(x)</code></td><td>Survival function, 1 minus cdf, accurate in the tail</td><td><code>stats.norm.sf(5)</code></td></tr>
+<tr><td><code>.ppf(q)</code></td><td>Inverse cdf: the value below which q of the mass lies</td><td><code>stats.norm.ppf(0.975)</code></td></tr>
+<tr><td><code>.rvs(size, random_state)</code></td><td>Draw random samples</td><td><code>d.rvs(100, random_state=rng)</code></td></tr>
+<tr><td><code>.interval(conf)</code></td><td>Central interval holding a fraction of the mass</td><td><code>stats.norm.interval(0.95)</code></td></tr>
+<tr><td><code>.mean() .std() .var()</code></td><td>Moments of a frozen distribution</td><td><code>stats.expon(scale=5).mean()</code></td></tr>
+<tr><td><code>.logpdf(x)</code></td><td>Log density, stable for likelihoods</td><td><code>stats.norm.logpdf(x).sum()</code></td></tr>
+<tr><td><code>.fit(data)</code></td><td>Maximum-likelihood parameters from data</td><td><code>stats.lognorm.fit(x, floc=0)</code></td></tr>
+<tr><td>"Freezing"</td><td>Fix the parameters once, reuse the object</td><td><code>d = stats.gamma(2, scale=3)</code></td></tr>
+<tr><td><code>stats.describe(x)</code></td><td>Count, min/max, mean, variance, skewness, kurtosis</td><td><code>stats.describe(x).skewness</code></td></tr>
+<tr><td><code>stats.skew / kurtosis</code></td><td>Asymmetry and tail weight of a sample</td><td><code>stats.skew(x)</code></td></tr>
+<tr><td><code>stats.zscore(x)</code></td><td>Standardise: (x minus mean) / std</td><td><code>stats.zscore(x)</code></td></tr>
+<tr><td><code>stats.kstest(x, cdf)</code></td><td>Does the sample match a given distribution?</td><td><code>stats.kstest(x, "norm", args=(m, s))</code></td></tr>
+<tr><td><code>stats.probplot(x)</code></td><td>Data for a Q-Q plot (normality check)</td><td><code>stats.probplot(x, dist="norm")</code></td></tr>
+<tr><td><code>stats.scoreatpercentile / percentileofscore</code></td><td>Percentile of a value or value of a percentile</td><td><code>stats.percentileofscore(x, 3)</code></td></tr>
+<tr><td><code>stats.trim_mean(x, 0.1)</code></td><td>Mean after cutting 10% off each end</td><td><code>stats.trim_mean(x, 0.1)</code></td></tr>
+<tr><td><code>stats.iqr(x)</code></td><td>Interquartile range, a robust spread</td><td><code>stats.iqr(x)</code></td></tr>
+<tr><td><code>stats.mode(x)</code></td><td>Most frequent value</td><td><code>stats.mode([1, 2, 2]).mode</code></td></tr>
+<tr><td><code>stats.sem(x)</code></td><td>Standard error of the mean</td><td><code>stats.sem(x)</code></td></tr>
+<tr><td><code>stats.qmc.Sobol</code></td><td>Low-discrepancy points for simulation</td><td><code>stats.qmc.Sobol(2, seed=0)</code></td></tr>
+</tbody></table></div>
+<h3>Worked example 1: the four verbs on a normal curve</h3>
+<p class="problem"><span class="pl">Problem 18.2.1</span> Test scores follow a normal distribution with mean 70 and standard deviation 10. Find the density at 70, the share scoring below 85, the share above 90, the score that 90% of people stay under, and 5 random scores.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+scores = stats.norm(loc=70, scale=10)
+print("pdf at 70      :", round(scores.pdf(70), 4))
+print("P(score &lt;= 85) :", round(scores.cdf(85), 4))
+print("P(score &gt; 90)  :", round(scores.sf(90), 4))
+print("90th percentile:", round(scores.ppf(0.90), 2))
+rng = np.random.default_rng(0)
+print("5 draws        :", scores.rvs(5, random_state=rng).round(1))</code></pre>
+<pre class="code lang-text"><code>pdf at 70      : 0.0399
+P(score &lt;= 85) : 0.9332
+P(score &gt; 90)  : 0.0228
+90th percentile: 82.82
+5 draws        : [71.3 68.7 76.4 71.  64.6]</code></pre>
+<ol><li><code>stats.norm(loc=70, scale=10)</code> freezes the parameters into an object called <code>scores</code>. Every later call reuses them.</li><li><code>pdf(70)</code> is the height of the curve at its peak: 1 / (10 times the square root of 2π), about 0.0399. A density is <em>not</em> a probability, which is why it can exceed 1 for narrow curves.</li><li><code>cdf(85)</code> is the area to the left of 85, the chance of scoring 85 or less. That is 1.5 standard deviations above the mean, so about 0.93.</li><li><code>sf(90)</code> is "survival", the area to the right of 90, which is two standard deviations up: roughly 2.3%.</li><li><code>ppf(0.90)</code> goes the other way (percent point function): from a probability to a value. About 1.28 standard deviations above the mean gives 82.8.</li><li><code>rvs(5, random_state=rng)</code> draws five scores. The seeded generator makes the draws repeatable.</li></ol>
+<div class="callout blue"><div class="lab">INTUITION</div><div class="txt">Remember the pair: <code>cdf</code> turns a <em>value</em> into a <em>probability</em>, <code>ppf</code> turns a <em>probability</em> into a <em>value</em>. They are inverses: <code>ppf(cdf(x))</code> returns x. A confidence interval is just two <code>ppf</code> calls.</div></div>
+<h3>Worked example 2: discrete distributions and the tail</h3>
+<p class="problem"><span class="pl">Problem 18.2.2</span> A call centre gets on average 4 complaints per hour (Poisson). What is the chance of exactly 7 in an hour, of 10 or more, and what is the smallest staffing level that covers 99% of hours?</p>
+<pre class="code lang-python"><code>from scipy import stats
+
+calls = stats.poisson(mu=4)
+print("P(exactly 7)  :", round(calls.pmf(7), 4))
+print("P(10 or more) :", round(calls.sf(9), 5))
+print("99% covered by:", int(calls.ppf(0.99)), "calls")
+print("mean, std     :", calls.mean(), round(calls.std(), 3))</code></pre>
+<pre class="code lang-text"><code>P(exactly 7)  : 0.0595
+P(10 or more) : 0.00813
+99% covered by: 9 calls
+mean, std     : 4.0 2.0</code></pre>
+<ol><li>A Poisson distribution needs one parameter, <code>mu</code>, its mean count.</li><li><code>pmf(7)</code> is the probability of exactly 7, a real probability because the variable is discrete.</li><li>"10 or more" is "more than 9", so we use <code>sf(9)</code>. A common slip is <code>sf(10)</code>, which would drop the case of exactly 10 (see the pitfalls section).</li><li><code>ppf(0.99)</code> returns the smallest integer k with <code>cdf(k)</code> at least 0.99.</li><li>For a Poisson the mean equals the variance, so the variance is also 4, so the standard deviation is the square root of 4, which is 2.0.</li></ol>
+<h3>Worked example 3: fit a distribution to real-looking data (Recipe 1)</h3>
+<p class="problem"><span class="pl">Problem 18.2.3</span> Maya has 800 delivery times (hours). Fit a lognormal and a normal, compare them, and compute the chance an order takes more than 6 hours.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(7)
+data = rng.lognormal(mean=1.2, sigma=0.5, size=800)
+
+s, loc, scale = stats.lognorm.fit(data, floc=0)
+mu, sd = stats.norm.fit(data)
+print("lognorm shape s=%.3f scale=%.3f" % (s, scale))
+print("normal  mu=%.3f sd=%.3f" % (mu, sd))
+
+ll_log = stats.lognorm.logpdf(data, s, loc, scale).sum()
+ll_nor = stats.norm.logpdf(data, mu, sd).sum()
+print("log-likelihood lognorm: %.1f  normal: %.1f" % (ll_log, ll_nor))
+print("AIC lognorm: %.1f  normal: %.1f" % (2 * 2 - 2 * ll_log, 2 * 2 - 2 * ll_nor))
+
+print("KS p-value lognorm: %.3f" % stats.kstest(data, "lognorm", args=(s, loc, scale)).pvalue)
+print("P(time &gt; 6h):", round(stats.lognorm.sf(6, s, loc, scale), 4), "empirical:", (data &gt; 6).mean())</code></pre>
+<pre class="code lang-text"><code>lognorm shape s=0.472 scale=3.149
+normal  mu=3.519 sd=1.744
+log-likelihood lognorm: -1452.4  normal: -1580.0
+AIC lognorm: 2908.9  normal: 3163.9
+KS p-value lognorm: 0.589
+P(time &gt; 6h): 0.086 empirical: 0.08875</code></pre>
+<ol><li>We simulate data from a true lognormal so we know the right answer: shape 0.5 and scale e<sup>1.2</sup>, about 3.32. The fit lands close to both (sampling noise explains the gap).</li><li><code>lognorm.fit(data, floc=0)</code> estimates shape, location and scale. Fixing <code>floc=0</code> says "values start at zero", which is physically right for durations and makes the fit stable and faster.</li><li><code>norm.fit</code> returns the sample mean and standard deviation.</li><li>The log-likelihood adds <code>logpdf</code> over all points; larger is better. The AIC (2 times parameters minus 2 times log-likelihood, lower is better) penalises extra parameters. Both models have two free parameters here, so the comparison is fair.</li><li><code>kstest</code> compares the sample with the fitted cdf. Caution: because the parameters were estimated from the same data, the p-value is optimistic; treat it as a rough check, not proof.</li><li><code>sf(6, ...)</code> gives the tail probability, and we compare it with the plain empirical share as a sanity check.</li></ol>
+<figure><img src="images/lib18_dist_fit.png" alt="Histogram of delivery times with a lognormal curve hugging the bars and a normal curve that misses the skew" loading="lazy"/><figcaption>Delivery times with a lognormal fit (solid) and a normal fit (dashed).</figcaption></figure>
+<p><strong>How to read it:</strong> the bars are the data. The solid curve follows the sharp rise and long right tail. The dashed normal curve is symmetric, so it puts probability on negative hours and underestimates the peak. A good fit means the curve rides the tops of the bars everywhere, not just near the middle.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Reading <code>pdf</code> as a probability. <code>stats.norm(0, 0.1).pdf(0)</code> is about 3.99, which is fine: density can exceed 1. Probabilities come from <em>areas</em>: use <code>cdf(b) - cdf(a)</code>.</div></div>
+
+<h2>18.3 scipy.stats II: Tests, Intervals, Bootstrap, Correlation</h2>
+<p>A <strong>hypothesis test</strong> asks "could this difference be just luck?". It starts from a boring assumption (the <em>null hypothesis</em>, for example "both groups have the same mean"), computes a <em>test statistic</em>, and reports a <strong>p-value</strong>: the probability of seeing a result at least this extreme if the boring assumption were true. A small p-value (below a threshold you chose in advance, often 0.05) is evidence against the null. It is <em>not</em> the probability that the null is true, and it says nothing about how large or important the effect is.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>ttest_1samp</code></td><td>Is the mean different from a fixed number?</td><td><code>stats.ttest_1samp(x, 50)</code></td></tr>
+<tr><td><code>ttest_ind</code></td><td>Do two independent groups have the same mean? (<code>equal_var=False</code> is Welch)</td><td><code>stats.ttest_ind(a, b, equal_var=False)</code></td></tr>
+<tr><td><code>ttest_rel</code></td><td>Paired before/after comparison</td><td><code>stats.ttest_rel(before, after)</code></td></tr>
+<tr><td><code>mannwhitneyu</code></td><td>Rank-based two-group test, no normality needed</td><td><code>stats.mannwhitneyu(a, b)</code></td></tr>
+<tr><td><code>wilcoxon</code></td><td>Rank-based paired test</td><td><code>stats.wilcoxon(before - after)</code></td></tr>
+<tr><td><code>shapiro</code></td><td>Is the sample plausibly normal?</td><td><code>stats.shapiro(x)</code></td></tr>
+<tr><td><code>normaltest</code></td><td>Normality test from skew and kurtosis</td><td><code>stats.normaltest(x)</code></td></tr>
+<tr><td><code>levene</code></td><td>Do groups have equal variance?</td><td><code>stats.levene(a, b)</code></td></tr>
+<tr><td><code>f_oneway</code></td><td>One-way ANOVA across 3+ groups</td><td><code>stats.f_oneway(a, b, c)</code></td></tr>
+<tr><td><code>kruskal</code></td><td>Rank-based ANOVA</td><td><code>stats.kruskal(a, b, c)</code></td></tr>
+<tr><td><code>chi2_contingency</code></td><td>Are two categorical variables related?</td><td><code>stats.chi2_contingency(table)</code></td></tr>
+<tr><td><code>chisquare</code></td><td>Do counts match expected counts?</td><td><code>stats.chisquare(obs, exp)</code></td></tr>
+<tr><td><code>fisher_exact</code></td><td>Exact test for a 2x2 table with small counts</td><td><code>stats.fisher_exact([[3, 1], [1, 3]])</code></td></tr>
+<tr><td><code>binomtest</code></td><td>Is an observed rate different from a target?</td><td><code>stats.binomtest(k, n, 0.5)</code></td></tr>
+<tr><td><code>ks_2samp</code></td><td>Do two samples share a distribution?</td><td><code>stats.ks_2samp(a, b)</code></td></tr>
+<tr><td><code>pearsonr</code></td><td>Linear correlation, with p-value</td><td><code>stats.pearsonr(x, y)</code></td></tr>
+<tr><td><code>spearmanr</code></td><td>Rank correlation, handles monotone curves and outliers</td><td><code>stats.spearmanr(x, y)</code></td></tr>
+<tr><td><code>kendalltau</code></td><td>Rank correlation for small samples and ties</td><td><code>stats.kendalltau(x, y)</code></td></tr>
+<tr><td><code>linregress</code></td><td>Straight-line fit with slope p-value</td><td><code>stats.linregress(x, y)</code></td></tr>
+<tr><td><code>bootstrap</code></td><td>Confidence interval by resampling</td><td><code>stats.bootstrap((x,), np.mean)</code></td></tr>
+<tr><td><code>permutation_test</code></td><td>Test by shuffling labels</td><td><code>stats.permutation_test((a, b), stat)</code></td></tr>
+<tr><td><code>t.interval</code></td><td>Confidence interval for a mean</td><td><code>stats.t.interval(0.95, n-1, m, se)</code></td></tr>
+<tr><td><code>stats.sem</code></td><td>Standard error of the mean</td><td><code>stats.sem(x)</code></td></tr>
+<tr><td><code>false_discovery_control</code></td><td>Adjust many p-values (Benjamini-Hochberg)</td><td><code>stats.false_discovery_control(p)</code></td></tr>
+<tr><td><code>power_divergence</code></td><td>Family behind chi-square and G-test</td><td><code>stats.power_divergence(o, e, lambda_=0)</code></td></tr>
+</tbody></table></div>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Every test returns a result object with <code>.statistic</code> and <code>.pvalue</code>, and many add <code>.confidence_interval()</code>. Choose by the data shape: two numeric groups (t-test or Mann-Whitney), paired numeric (paired t or Wilcoxon), two categories (chi-square or Fisher), many groups (ANOVA or Kruskal), two numeric columns (Pearson or Spearman).</div></div>
+<h3>Worked example 1: a one-sample and a two-sample t-test (Recipe 2, A/B test)</h3>
+<p class="problem"><span class="pl">Problem 18.3.1</span> Control drivers average about 38 minutes per delivery; drivers using the new route app are simulated at about 35. With 120 drivers in each group, is the app faster? Report the difference with a 95% interval.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(42)
+control = rng.normal(38, 8, 120)
+variant = rng.normal(35, 9, 120)
+
+res = stats.ttest_ind(variant, control, equal_var=False)
+print("t = %.3f  p = %.4f" % (res.statistic, res.pvalue))
+diff = variant.mean() - control.mean()
+ci = res.confidence_interval(0.95)
+print("mean diff = %.2f min, 95%% CI (%.2f, %.2f)" % (diff, ci.low, ci.high))
+
+pooled = np.sqrt((variant.var(ddof=1) + control.var(ddof=1)) / 2)
+print("Cohen d = %.2f" % (diff / pooled))</code></pre>
+<pre class="code lang-text"><code>t = -2.802  p = 0.0055
+mean diff = -2.82 min, 95% CI (-4.80, -0.84)
+Cohen d = -0.36</code></pre>
+<ol><li>Two normal samples with different spreads imitate an A/B test. Seeding with 42 makes the numbers repeatable.</li><li><code>ttest_ind(variant, control, equal_var=False)</code> is Welch's t-test, the safe default because it does not assume equal variances. The first argument minus the second is the tested difference.</li><li>The statistic is negative because the variant mean is lower; the p-value is two-sided (the app could be slower or faster).</li><li><code>res.confidence_interval(0.95)</code> gives the range of plausible true differences. Report this, not just p: it shows size and uncertainty.</li><li>Cohen's d divides the difference by a pooled standard deviation. About 0.2 is small, 0.5 medium, 0.8 large (rules of thumb).</li></ol>
+<h3>Worked example 2: when the data is not normal</h3>
+<p class="problem"><span class="pl">Problem 18.3.2</span> Customer wait times are skewed. Check normality with Shapiro-Wilk, then compare two groups with Mann-Whitney U.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(1)
+a = rng.lognormal(1.0, 0.6, 80)
+b = rng.lognormal(1.3, 0.6, 80)
+
+print("shapiro a: p = %.5f" % stats.shapiro(a).pvalue)
+print("shapiro log(a): p = %.3f" % stats.shapiro(np.log(a)).pvalue)
+mw = stats.mannwhitneyu(a, b, alternative="two-sided")
+print("Mann-Whitney U = %.0f  p = %.5f" % (mw.statistic, mw.pvalue))
+auc = mw.statistic / (len(a) * len(b))
+print("P(random a beats random b) = %.3f" % auc)</code></pre>
+<pre class="code lang-text"><code>shapiro a: p = 0.00000
+shapiro log(a): p = 0.532
+Mann-Whitney U = 2292  p = 0.00196
+P(random a beats random b) = 0.358</code></pre>
+<ol><li>Two lognormal samples whose log-means differ (1.0 against 1.3).</li><li>Shapiro-Wilk tests the null "the data is normal". A tiny p-value rejects normality for raw <code>a</code>; the log of a lognormal is normal, so the second p-value is large (we cannot reject).</li><li><code>mannwhitneyu</code> compares ranks, so skew and outliers matter far less. <code>alternative="two-sided"</code> is explicit.</li><li>The statistic U divided by the number of pairs is the probability that a random value from <code>a</code> beats a random value from <code>b</code>, a readable effect size (0.5 means no difference).</li></ol>
+<h3>Worked example 3: categorical data with chi-square</h3>
+<p class="problem"><span class="pl">Problem 18.3.3</span> Of 1000 visitors, 500 saw page A and 500 saw page B. A converted 60, B converted 85. Is the conversion rate different?</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+table = np.array([[60, 440],
+                  [85, 415]])
+chi2, p, dof, expected = stats.chi2_contingency(table, correction=False)
+print("chi2 = %.3f  dof = %d  p = %.4f" % (chi2, dof, p))
+print("expected counts:\n", expected)
+print("fisher exact p = %.4f" % stats.fisher_exact(table).pvalue)
+print("rates:", table[:, 0] / table.sum(axis=1))</code></pre>
+<pre class="code lang-text"><code>chi2 = 5.041  dof = 1  p = 0.0247
+expected counts:
+ [[ 72.5 427.5]
+ [ 72.5 427.5]]
+fisher exact p = 0.0309
+rates: [0.12 0.17]</code></pre>
+<ol><li>The table has one row per page and columns "converted" and "not converted". Always put counts in, never percentages.</li><li><code>chi2_contingency</code> computes the counts we would expect if page and conversion were unrelated (row total times column total divided by grand total), then measures the gap. <code>correction=False</code> switches off Yates' continuity correction so the number matches the textbook formula.</li><li>The returned <code>expected</code> table must have all cells of at least about 5 for the chi-square approximation to be trusted; here the smallest is 72.5.</li><li>Fisher's exact test needs no approximation; it reaches the same conclusion (a p-value a little higher).</li><li>The last line prints the raw rates (0.12 and 0.17) so you never report p without the effect.</li></ol>
+<h3>Worked example 4: confidence intervals and the bootstrap (Recipe 5, resampling)</h3>
+<p class="problem"><span class="pl">Problem 18.3.4</span> A small sample of 60 skewed delivery times. Get a 95% interval for the mean by formula, and for the <em>median</em> by bootstrap (no formula exists for it).</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(3)
+data = rng.lognormal(1.2, 0.5, 60)
+
+m, se = data.mean(), stats.sem(data)
+lo, hi = stats.t.interval(0.95, df=len(data) - 1, loc=m, scale=se)
+print("mean %.3f, t interval (%.3f, %.3f)" % (m, lo, hi))
+
+res = stats.bootstrap((data,), np.median, n_resamples=5000,
+                      confidence_level=0.95, method="percentile", random_state=1)
+ci = res.confidence_interval
+print("median %.3f, bootstrap interval (%.3f, %.3f)" % (np.median(data), ci.low, ci.high))
+print("bootstrap std error: %.3f" % res.standard_error)</code></pre>
+<pre class="code lang-text"><code>mean 3.819, t interval (3.183, 4.455)
+median 3.132, bootstrap interval (2.939, 3.851)
+bootstrap std error: 0.281</code></pre>
+<ol><li>Formula route: the 95% interval of a mean is the mean plus or minus a t quantile times the standard error. <code>stats.t.interval</code> does that in one call, using <code>df = n - 1</code>.</li><li><code>stats.bootstrap</code> takes the data <em>as a tuple of samples</em> (note <code>(data,)</code>), a statistic function, and the number of resamples. It resamples with replacement, recomputes the median each time, and reads the interval from percentiles of those medians.</li><li><code>method="percentile"</code> is the simplest; the default <code>"BCa"</code> corrects bias and skew and is usually preferred for real work.</li><li><code>random_state=1</code> makes it repeatable, and <code>res.standard_error</code> is the spread of the resampled medians.</li></ol>
+<figure><img src="images/lib18_bootstrap.png" alt="Histogram of 5000 bootstrap medians with the sample median and the two interval ends marked" loading="lazy"/><figcaption>The bootstrap distribution of the median with its 95% interval.</figcaption></figure>
+<p><strong>How to read it:</strong> each bar counts how often a resample gave that median. The dashed lines cut off the outer 2.5% on each side. A narrow pile means the median is well pinned down; a wide one means more data is needed.</p>
+<h3>Worked example 5: correlation and many tests at once</h3>
+<p class="problem"><span class="pl">Problem 18.3.5</span> Compare Pearson and Spearman on a straight relationship with one wild reading, then correct 6 p-values for multiple testing.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(5)
+x = np.linspace(1, 10, 40)
+y = x + rng.normal(0, 0.5, 40)
+y[0] = 30                                # one broken sensor reading
+print("pearson  r = %.3f" % stats.pearsonr(x, y).statistic)
+print("spearman r = %.3f" % stats.spearmanr(x, y).statistic)
+
+p = np.array([0.001, 0.008, 0.039, 0.041, 0.20, 0.74])
+adj = stats.false_discovery_control(p)
+print("adjusted:", adj.round(3))
+print("significant at 5%:", adj &lt; 0.05)</code></pre>
+<pre class="code lang-text"><code>pearson  r = 0.290
+spearman r = 0.843
+adjusted: [0.006 0.024 0.062 0.062 0.24  0.74 ]
+significant at 5%: [ True  True False False False False]</code></pre>
+<ol><li>The relationship is a clean rising line, except that the first reading was replaced by a broken value of 30.</li><li>Pearson uses the actual values, so one extreme point drags it far down.</li><li>Spearman first converts values to ranks, so it captures any rising trend and shrugs off the single bad value.</li><li><code>false_discovery_control</code> applies the Benjamini-Hochberg procedure. Testing 6 hypotheses at 5% each would give a high chance of at least one false alarm, so the adjusted values are larger; only those under 0.05 count.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Testing many things and reporting only the p below 0.05. With 20 independent tests at 5%, the chance of at least one false positive is about 64%. Decide the tests in advance, or adjust with <code>false_discovery_control</code>.</div></div>
+
+<h2>18.4 scipy.optimize: Minimise, Fit, Solve</h2>
+<p><strong>Optimisation</strong> means "find the inputs that make some number as small as possible". Training a model, fitting a curve, planning a route and pricing a product are all optimisation. <code>scipy.optimize</code> offers one function per family of problems. Pick by asking: is it a smooth function of a few variables (<code>minimize</code>), a model to fit to points (<code>curve_fit</code>), an equation to solve (<code>root</code>, <code>brentq</code>), or a straight-line objective with straight-line limits (<code>linprog</code>)?</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>minimize</code></td><td>General minimiser; choose a <code>method</code></td><td><code>optimize.minimize(f, x0)</code></td></tr>
+<tr><td><code>minimize(method="BFGS")</code></td><td>Smooth, unconstrained, uses gradients</td><td><code>minimize(f, x0, method="BFGS")</code></td></tr>
+<tr><td><code>minimize(method="L-BFGS-B")</code></td><td>Smooth with simple bounds, many variables</td><td><code>minimize(f, x0, bounds=[(0, 5)] * 3)</code></td></tr>
+<tr><td><code>minimize(method="SLSQP")</code></td><td>Smooth with equality or inequality constraints</td><td><code>minimize(f, x0, constraints=[c])</code></td></tr>
+<tr><td><code>minimize(method="Nelder-Mead")</code></td><td>No gradients, noisy or non-smooth</td><td><code>minimize(f, x0, method="Nelder-Mead")</code></td></tr>
+<tr><td><code>minimize_scalar</code></td><td>One variable, bracket or bounds</td><td><code>optimize.minimize_scalar(g, bounds=(0, 4), method="bounded")</code></td></tr>
+<tr><td><code>curve_fit</code></td><td>Least-squares fit of a Python function to points</td><td><code>optimize.curve_fit(f, x, y, p0=[1, 1])</code></td></tr>
+<tr><td><code>least_squares</code></td><td>Robust or bounded nonlinear least squares</td><td><code>optimize.least_squares(resid, x0, loss="soft_l1")</code></td></tr>
+<tr><td><code>root</code></td><td>Solve a system f(x) = 0</td><td><code>optimize.root(F, [1, 1])</code></td></tr>
+<tr><td><code>root_scalar</code></td><td>Solve one equation in one variable</td><td><code>optimize.root_scalar(g, bracket=[0, 3])</code></td></tr>
+<tr><td><code>brentq</code></td><td>Fast bracketed root, needs a sign change</td><td><code>optimize.brentq(g, 0, 3)</code></td></tr>
+<tr><td><code>fsolve</code></td><td>Older system solver, still common</td><td><code>optimize.fsolve(F, [1, 1])</code></td></tr>
+<tr><td><code>linprog</code></td><td>Linear objective with linear limits (HiGHS solver)</td><td><code>optimize.linprog(c, A_ub=A, b_ub=b)</code></td></tr>
+<tr><td><code>milp</code></td><td>Linear problem where some variables are integers</td><td><code>optimize.milp(c, integrality=1, ...)</code></td></tr>
+<tr><td><code>linear_sum_assignment</code></td><td>Best one-to-one matching from a cost matrix</td><td><code>optimize.linear_sum_assignment(cost)</code></td></tr>
+<tr><td><code>nnls</code></td><td>Least squares with non-negative coefficients</td><td><code>optimize.nnls(A, b)</code></td></tr>
+<tr><td><code>lsq_linear</code></td><td>Linear least squares with bounds</td><td><code>optimize.lsq_linear(A, b, bounds=(0, 1))</code></td></tr>
+<tr><td><code>differential_evolution</code></td><td>Global search for rugged functions, with bounds</td><td><code>optimize.differential_evolution(f, bounds)</code></td></tr>
+<tr><td><code>basinhopping</code></td><td>Global search by random restarts</td><td><code>optimize.basinhopping(f, x0)</code></td></tr>
+<tr><td><code>dual_annealing</code></td><td>Global search by simulated annealing</td><td><code>optimize.dual_annealing(f, bounds)</code></td></tr>
+<tr><td><code>Bounds</code>, <code>LinearConstraint</code></td><td>Objects that describe limits cleanly</td><td><code>optimize.Bounds(0, 1)</code></td></tr>
+<tr><td><code>NonlinearConstraint</code></td><td>Constraint given by a function</td><td><code>NonlinearConstraint(g, 0, np.inf)</code></td></tr>
+<tr><td><code>approx_fprime</code></td><td>Numerical gradient check</td><td><code>optimize.approx_fprime(x, f, 1e-8)</code></td></tr>
+<tr><td><code>check_grad</code></td><td>Compare your gradient with a numerical one</td><td><code>optimize.check_grad(f, grad, x0)</code></td></tr>
+<tr><td><code>rosen</code>, <code>rosen_der</code></td><td>A classic test function and its gradient</td><td><code>optimize.rosen([1, 1])</code></td></tr>
+</tbody></table></div>
+<h3>Worked example 1: minimise a function of two variables</h3>
+<p class="problem"><span class="pl">Problem 18.4.1</span> Minimise f(x, y) = (1 - x)<sup>2</sup> + 5(y - x<sup>2</sup>)<sup>2</sup>, a curved valley whose bottom is at (1, 1). Start from (-1.2, 1).</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import optimize
+
+def f(v):
+    x, y = v
+    return (1 - x) ** 2 + 5 * (y - x ** 2) ** 2
+
+res = optimize.minimize(f, x0=[-1.2, 1.0], method="BFGS")
+print("success:", res.success)
+print("x      :", res.x.round(4))
+print("f(x)   :", float(res.fun) &lt; 1e-8)
+print("iterations:", res.nit, " function calls:", res.nfev)
+print(res.message)</code></pre>
+<pre class="code lang-text"><code>success: True
+x      : [1. 1.]
+f(x)   : True
+iterations: 15  function calls: 57
+Optimization terminated successfully.</code></pre>
+<ol><li><code>f</code> takes <em>one</em> array <code>v</code>, not two separate numbers. This is the contract for <code>minimize</code>.</li><li><code>x0</code> is the starting guess. Optimisers walk downhill from there, so a bad start can end in a poor place for non-convex functions.</li><li><code>method="BFGS"</code> estimates the slope numerically and builds a curved model of the valley as it goes.</li><li>Always check <code>res.success</code> and <code>res.message</code>; a run can stop early and still return numbers.</li><li>We print only whether <code>res.fun</code> is nearly zero, because the exact tiny value is noise; <code>res.nit</code> and <code>res.nfev</code> show the work done.</li></ol>
+<figure><img src="images/lib18_optimize.png" alt="Contour plot of a curved valley with BFGS steps zig-zagging to the minimum marked with a star" loading="lazy"/><figcaption>The BFGS path from (-1.2, 1) to the minimum at (1, 1).</figcaption></figure>
+<p><strong>How to read it:</strong> the closed curves are levels of equal f: tight lines mean steep ground. The orange path starts on the left, drops into the banana-shaped valley and follows it to the star. Short steps in the valley show the optimiser feeling for the curve.</p>
+<h3>Worked example 2: constraints and bounds</h3>
+<p class="problem"><span class="pl">Problem 18.4.2</span> Minimise x<sup>2</sup> + y<sup>2</sup> subject to x + y at least 1, and both between 0 and 2. By symmetry the answer is (0.5, 0.5).</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import optimize
+
+obj = lambda v: v[0] ** 2 + v[1] ** 2
+cons = optimize.LinearConstraint([[1, 1]], lb=1, ub=np.inf)
+bnds = optimize.Bounds([0, 0], [2, 2])
+res = optimize.minimize(obj, x0=[2.0, 0.0], method="SLSQP", bounds=bnds, constraints=[cons])
+print(res.x.round(4), round(res.fun, 4), res.success)</code></pre>
+<pre class="code lang-text"><code>[0.5 0.5] 0.5 True</code></pre>
+<ol><li><code>LinearConstraint([[1, 1]], lb=1, ub=np.inf)</code> reads: 1 times x plus 1 times y must lie between 1 and infinity.</li><li><code>Bounds</code> sets a box for each variable separately.</li><li>SLSQP handles both. The solution sits on the boundary x + y = 1, which is typical: constraints are "active" at the optimum.</li></ol>
+<h3>Worked example 3: curve fitting with uncertainty (Recipe 3)</h3>
+<p class="problem"><span class="pl">Problem 18.4.3</span> Support calls after a storm decay as a e<sup>-kt</sup> + c. Fit a, k, c to 30 noisy measurements and report 95% intervals.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import optimize, stats
+
+def model(t, a, k, c):
+    return a * np.exp(-k * t) + c
+
+rng = np.random.default_rng(5)
+t = np.linspace(0, 10, 30)
+y = model(t, 4.0, 0.5, 1.0) + rng.normal(0, 0.15, t.size)
+
+popt, pcov = optimize.curve_fit(model, t, y, p0=[1, 1, 0])
+perr = np.sqrt(np.diag(pcov))
+dof = t.size - len(popt)
+tcrit = stats.t.ppf(0.975, dof)
+for name, v, e in zip("a k c".split(), popt, perr):
+    print("%s = %.3f +/- %.3f   95%% CI (%.3f, %.3f)" % (name, v, e, v - tcrit * e, v + tcrit * e))
+resid = y - model(t, *popt)
+print("residual std: %.3f (true noise 0.15)" % resid.std(ddof=len(popt)))</code></pre>
+<pre class="code lang-text"><code>a = 3.954 +/- 0.091   95% CI (3.767, 4.141)
+k = 0.457 +/- 0.025   95% CI (0.405, 0.508)
+c = 0.908 +/- 0.049   95% CI (0.806, 1.009)
+residual std: 0.130 (true noise 0.15)</code></pre>
+<ol><li><code>model(t, a, k, c)</code> must take the x data first, then the parameters as separate arguments.</li><li>We generate data from known truth (a=4, k=0.5, c=1) plus noise so you can see whether the fit recovers it.</li><li><code>curve_fit(model, t, y, p0=...)</code> returns <code>popt</code> (best parameters) and <code>pcov</code> (their covariance matrix). Nonlinear fits need a sensible starting guess <code>p0</code>; the default of all ones can fail.</li><li>The square roots of the diagonal of <code>pcov</code> are the standard errors.</li><li>The 95% interval uses a t quantile with n minus the number of parameters degrees of freedom: n = 30 points, 3 parameters, so 27.</li><li>The residual standard deviation (dividing by degrees of freedom) should be near the true noise 0.15; if it is much larger, the model shape is wrong.</li></ol>
+<figure><img src="images/lib18_curvefit.png" alt="Scatter of decaying measurements with a fitted exponential curve and a narrow shaded uncertainty band" loading="lazy"/><figcaption>The fitted curve with an approximate 95% band built from the parameter covariance.</figcaption></figure>
+<p><strong>How to read it:</strong> the orange dots are measurements, the blue line the best curve and the shaded band the range the curve could plausibly take. The band is narrow where data is dense and reliable. Points outside the band are fine: the band describes the <em>curve</em>, not individual measurements.</p>
+<h3>Worked example 4: roots of equations</h3>
+<p class="problem"><span class="pl">Problem 18.4.4</span> Solve x e<sup>x</sup> = 5 for x. Then find the point where a circle x<sup>2</sup> + y<sup>2</sup> = 4 meets the line y = x.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import optimize
+
+g = lambda x: x * np.exp(x) - 5
+x1 = optimize.brentq(g, 0, 3)
+print("brentq x =", round(x1, 6), " check:", round(x1 * np.exp(x1), 6))
+
+F = lambda v: [v[0] ** 2 + v[1] ** 2 - 4, v[1] - v[0]]
+sol = optimize.root(F, [1.0, 1.0])
+print("root:", sol.x.round(6), sol.success, " sqrt(2) =", round(np.sqrt(2), 6))</code></pre>
+<pre class="code lang-text"><code>brentq x = 1.326725  check: 5.0
+root: [1.414214 1.414214] True  sqrt(2) = 1.414214</code></pre>
+<ol><li>A root solver wants a function that equals zero at the answer, so we move the 5 to the left side.</li><li><code>brentq(g, 0, 3)</code> needs a bracket where <code>g</code> changes sign (g(0) is negative, g(3) positive). It is fast and cannot fail inside a valid bracket.</li><li>For several equations in several unknowns, write a function returning a list of residuals, then call <code>root</code> with a starting guess.</li><li>The circle meets the line where x = y = square root of 2, about 1.414214.</li></ol>
+<h3>Worked example 5: a small linear optimisation (Recipe 4)</h3>
+<p class="problem"><span class="pl">Problem 18.4.5</span> You have 40 driver-hours for zones A and B. A earns 12 per hour, B earns 9. Fuel limits: 3 units per hour in A and 1 per hour in B, with 90 units in total. Zone A can absorb at most 25 hours. Maximise profit.</p>
+<table class="steps"><tr><th>Variables</th><td>a = hours in A, b = hours in B</td></tr><tr><th>Objective</th><td>maximise 12a + 9b, so minimise -12a - 9b (linprog only minimises)</td></tr><tr><th>Limits</th><td>a + b &lt;= 40; 3a + b &lt;= 90; 0 &lt;= a &lt;= 25; b &gt;= 0</td></tr></table>
+<pre class="code lang-python"><code>from scipy import optimize
+
+c = [-12, -9]
+A_ub = [[1, 1],
+        [3, 1]]
+b_ub = [40, 90]
+res = optimize.linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=[(0, 25), (0, None)], method="highs")
+print(res.status, res.message)
+print("hours A, B:", res.x.round(2))
+print("profit:", round(-res.fun, 2))
+print("slack (unused) per limit:", res.slack.round(2))</code></pre>
+<pre class="code lang-text"><code>0 Optimization terminated successfully. (HiGHS Status 7: Optimal)
+hours A, B: [25. 15.]
+profit: 435.0
+slack (unused) per limit: [0. 0.]</code></pre>
+<ol><li><code>c</code> holds the cost per unit of each variable. Negating turns maximise into minimise.</li><li><code>A_ub</code> and <code>b_ub</code> encode every "at most" row: each row of <code>A_ub</code> times the variables must be at most the matching entry of <code>b_ub</code>.</li><li><code>bounds</code> gives each variable a (low, high) pair; <code>None</code> means no limit.</li><li>Status 0 means an optimum was found. The solution is at a corner of the feasible region, which is where linear problems always have their answer.</li><li><code>res.slack</code> shows unused capacity: a slack of 0 means that limit is binding (fuel and hours are both used up).</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Forgetting that <code>linprog</code> minimises, then reporting a negative "profit" or the wrong plan. Negate the objective going in, and negate <code>res.fun</code> coming out.</div></div>
+
+<h2>18.5 scipy.integrate and scipy.interpolate</h2>
+<p><strong>Integration</strong> adds up a quantity that changes continuously: area under a curve, total distance from a speed, probability from a density. <strong>Interpolation</strong> estimates values <em>between</em> known points. Both turn scattered or sampled numbers into continuous functions you can query anywhere.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>integrate.quad</code></td><td>Area under a function between two limits, with an error estimate</td><td><code>integrate.quad(np.sin, 0, np.pi)</code></td></tr>
+<tr><td><code>integrate.dblquad</code></td><td>Double integral over a region</td><td><code>integrate.dblquad(lambda y, x: x*y, 0, 1, 0, 1)</code></td></tr>
+<tr><td><code>integrate.nquad</code></td><td>Integral in many dimensions</td><td><code>integrate.nquad(f, [[0, 1]] * 3)</code></td></tr>
+<tr><td><code>integrate.quad_vec</code></td><td>Integrate a vector-valued function</td><td><code>integrate.quad_vec(lambda x: [x, x**2], 0, 1)</code></td></tr>
+<tr><td><code>integrate.trapezoid</code></td><td>Area from sampled points (straight segments)</td><td><code>integrate.trapezoid(y, x)</code></td></tr>
+<tr><td><code>integrate.simpson</code></td><td>Area from sampled points (parabolic pieces)</td><td><code>integrate.simpson(y, x=x)</code></td></tr>
+<tr><td><code>integrate.cumulative_trapezoid</code></td><td>Running area, e.g. distance from speed</td><td><code>integrate.cumulative_trapezoid(v, t, initial=0)</code></td></tr>
+<tr><td><code>integrate.solve_ivp</code></td><td>Solve a differential equation from a start value</td><td><code>integrate.solve_ivp(rhs, (0, 5), [1.0])</code></td></tr>
+<tr><td><code>integrate.odeint</code></td><td>Older ODE solver, still common</td><td><code>integrate.odeint(rhs, y0, t)</code></td></tr>
+<tr><td><code>interpolate.interp1d</code></td><td>Legacy 1-D interpolator (no new features)</td><td><code>interpolate.interp1d(x, y, kind="cubic")</code></td></tr>
+<tr><td><code>np.interp</code></td><td>Fast linear interpolation on sorted x</td><td><code>np.interp(2.5, x, y)</code></td></tr>
+<tr><td><code>interpolate.CubicSpline</code></td><td>Smooth curve through every point</td><td><code>interpolate.CubicSpline(x, y)</code></td></tr>
+<tr><td><code>interpolate.PchipInterpolator</code></td><td>Smooth but never overshoots the data</td><td><code>interpolate.PchipInterpolator(x, y)</code></td></tr>
+<tr><td><code>interpolate.Akima1DInterpolator</code></td><td>Smooth, little wiggle near outliers</td><td><code>interpolate.Akima1DInterpolator(x, y)</code></td></tr>
+<tr><td><code>interpolate.make_interp_spline</code></td><td>B-spline of chosen degree through points</td><td><code>interpolate.make_interp_spline(x, y, k=3)</code></td></tr>
+<tr><td><code>interpolate.make_smoothing_spline</code></td><td>Smooth curve that does not chase noise</td><td><code>make_smoothing_spline(x, y, lam=1)</code></td></tr>
+<tr><td><code>interpolate.UnivariateSpline</code></td><td>Smoothing spline with a smoothing factor <code>s</code></td><td><code>UnivariateSpline(x, y, s=1)</code></td></tr>
+<tr><td><code>interpolate.RegularGridInterpolator</code></td><td>Look up values on a regular grid</td><td><code>RegularGridInterpolator((xs, ys), Z)</code></td></tr>
+<tr><td><code>interpolate.griddata</code></td><td>Interpolate scattered 2-D points to a grid</td><td><code>interpolate.griddata(pts, vals, (gx, gy))</code></td></tr>
+<tr><td><code>interpolate.RBFInterpolator</code></td><td>Smooth interpolation of scattered data in any dimension</td><td><code>RBFInterpolator(pts, vals)</code></td></tr>
+<tr><td><code>spline.derivative(), .antiderivative(), .integrate(a, b)</code></td><td>Calculus on a fitted spline</td><td><code>cs.integrate(0, 6)</code></td></tr>
+<tr><td><code>spline.roots()</code></td><td>Where the fitted curve crosses zero</td><td><code>cs.roots()</code></td></tr>
+</tbody></table></div>
+<h3>Worked example 1: integrals of functions, checked against a known answer</h3>
+<p class="problem"><span class="pl">Problem 18.5.1</span> Compute the area under the standard normal density from -1.96 to 1.96 with <code>quad</code>, and check it against the cdf. Then compute the average of a function over a range.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import integrate, stats
+
+area, err = integrate.quad(stats.norm.pdf, -1.96, 1.96)
+print("quad area = %.6f  (error estimate %.1e)" % (area, err))
+print("cdf diff  = %.6f" % (stats.norm.cdf(1.96) - stats.norm.cdf(-1.96)))
+
+val, _ = integrate.quad(lambda x: x ** 2, 0, 3)
+print("integral of x^2 on [0,3]:", round(val, 6), " mean value:", round(val / 3, 6))
+
+tail, _ = integrate.quad(lambda x: np.exp(-x), 0, np.inf)
+print("integral of exp(-x) to infinity:", round(tail, 6))</code></pre>
+<pre class="code lang-text"><code>quad area = 0.950004  (error estimate 1.0e-11)
+cdf diff  = 0.950004
+integral of x^2 on [0,3]: 9.0  mean value: 3.0
+integral of exp(-x) to infinity: 1.0</code></pre>
+<ol><li><code>quad(f, a, b)</code> returns two numbers: the value and an estimate of the absolute error. Unpack both and look at the error.</li><li>The first check matches the analytic answer from the cdf: a 95% central area of about 0.95.</li><li>The integral of x<sup>2</sup> from 0 to 3 is 3<sup>3</sup>/3 = 9, so the mean value over the range is 9/3 = 3.</li><li>Limits may be infinite (<code>np.inf</code>); the integral of e<sup>-x</sup> from 0 to infinity is exactly 1.</li></ol>
+<h3>Worked example 2: integrate sampled data</h3>
+<p class="problem"><span class="pl">Problem 18.5.2</span> A delivery van logs its speed (km/h) every 6 minutes for an hour. How far did it travel? Use the trapezoid and Simpson rules, and the running total.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import integrate
+
+t = np.linspace(0, 1, 11)                      # hours
+speed = np.array([0, 20, 35, 42, 45, 40, 38, 30, 22, 10, 0.0])
+print("trapezoid:", round(integrate.trapezoid(speed, t), 3), "km")
+print("simpson  :", round(integrate.simpson(speed, x=t), 3), "km")
+dist = integrate.cumulative_trapezoid(speed, t, initial=0)
+print("distance at each stop:", dist.round(1))</code></pre>
+<pre class="code lang-text"><code>trapezoid: 28.2 km
+simpson  : 28.267 km
+distance at each stop: [ 0.   1.   3.8  7.6 12.  16.2 20.1 23.5 26.1 27.7 28.2]</code></pre>
+<ol><li>Eleven readings give ten 0.1-hour intervals. The arguments of <code>trapezoid</code> are <code>(y, x)</code>: the values first, the positions second. Swapping them is a classic bug.</li><li>The trapezoid rule joins neighbouring points with straight lines and adds the areas.</li><li>Simpson's rule fits parabolas through triples of points and is more accurate for smooth data; it takes <code>x</code> as a keyword.</li><li><code>cumulative_trapezoid</code> returns the distance travelled so far at each reading; <code>initial=0</code> keeps the array the same length as the input.</li></ol>
+<h3>Worked example 3: a differential equation</h3>
+<p class="problem"><span class="pl">Problem 18.5.3</span> App users grow logistically: dN/dt = r N (1 - N/K) with r = 0.8 per week and capacity K = 1000. Starting from 50 users, find N after 10 weeks and when it first passes 500.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import integrate
+
+r, K = 0.8, 1000.0
+rhs = lambda t, N: r * N * (1 - N / K)
+sol = integrate.solve_ivp(rhs, (0, 10), [50.0], t_eval=np.linspace(0, 10, 101), rtol=1e-8)
+print("N(10) = %.1f" % sol.y[0, -1])
+exact = K / (1 + (K / 50 - 1) * np.exp(-r * 10))
+print("exact = %.1f" % exact)
+cross = sol.t[np.argmax(sol.y[0] &gt; 500)]
+print("passes 500 users at about week", cross)</code></pre>
+<pre class="code lang-text"><code>N(10) = 993.7
+exact = 993.7
+passes 500 users at about week 3.7</code></pre>
+<ol><li><code>solve_ivp</code> wants <code>rhs(t, y)</code> with time first, then the state. The state is an array even for one variable, hence <code>[50.0]</code>.</li><li><code>(0, 10)</code> is the time span; <code>t_eval</code> asks for output at 101 evenly spaced times; <code>rtol</code> tightens accuracy.</li><li><code>sol.y</code> has one row per variable and one column per time, so <code>sol.y[0, -1]</code> is the last value.</li><li>This equation has a known closed form, so we compare. Matching it to a few decimals is the verification habit you want.</li><li><code>np.argmax(condition)</code> returns the first index where the condition is True: the first grid time with more than 500 users.</li></ol>
+<h3>Worked example 4: interpolation and filling gaps</h3>
+<p class="problem"><span class="pl">Problem 18.5.4</span> Seven sensor readings are known. Estimate the value at x = 2.5 with three methods, then use a spline to get the slope there and the total area.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import interpolate
+
+xk = np.array([0, 1, 2, 3, 4, 5, 6.0])
+yk = np.array([0, 0.8, 0.9, 0.1, -0.8, -1.0, -0.3])
+
+print("linear:", round(float(np.interp(2.5, xk, yk)), 4))
+cs = interpolate.CubicSpline(xk, yk)
+pc = interpolate.PchipInterpolator(xk, yk)
+print("cubic :", round(float(cs(2.5)), 4))
+print("pchip :", round(float(pc(2.5)), 4))
+print("slope at 2.5:", round(float(cs.derivative()(2.5)), 4))
+print("area 0..6   :", round(float(cs.integrate(0, 6)), 4))
+print("zero crossings:", cs.roots(extrapolate=False).round(3))</code></pre>
+<pre class="code lang-text"><code>linear: 0.5
+cubic : 0.5768
+pchip : 0.6059
+slope at 2.5: -0.8452
+area 0..6   : -0.1643
+zero crossings: [0.    3.098]</code></pre>
+<ol><li>Arrays <code>xk</code> and <code>yk</code> are the known points. Interpolators need <code>x</code> sorted in increasing order.</li><li><code>np.interp</code> joins neighbours with straight lines: at 2.5 that is the midpoint of 0.9 and 0.1, which is 0.5.</li><li>A cubic spline is a smooth curve through every point; PCHIP is smooth too but is built so it never swings above or below neighbouring data.</li><li>A fitted spline is an object you can differentiate, integrate and root-find. <code>extrapolate=False</code> keeps roots to the known range; the first root, 0, is simply the first data point (its value is 0).</li></ol>
+<figure><img src="images/lib18_interp.png" alt="Seven black points joined by a linear path, a cubic spline and a PCHIP curve that overlap closely" loading="lazy"/><figcaption>Linear, cubic spline and PCHIP interpolation of the same seven points.</figcaption></figure>
+<p><strong>How to read it:</strong> every curve passes through all black points, so they only disagree between points. The orange linear path has corners. The blue spline is smoothest but may overshoot slightly near sharp turns; the dashed PCHIP stays within the neighbouring values. Choose PCHIP for data that must not overshoot (prices, counts).</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Using interpolation to <em>predict outside the data</em>. Splines are only trustworthy between the first and last x. A cubic extrapolated past the end can swing wildly. Use <code>extrapolate=False</code> or a real model.</div></div>
+
+<h2>18.6 scipy.linalg and scipy.sparse</h2>
+<p><strong>Linear algebra</strong> solves systems like A x = b, finds the best-fitting line (least squares) and splits a matrix into simpler parts (SVD, eigenvalues). <strong>Sparse matrices</strong> store only the non-zero entries, so a matrix of 10 million cells that is 99.99% zero takes a few kilobytes. <code>numpy.linalg</code> covers the basics; <code>scipy.linalg</code> is a superset with more decompositions and options, and always uses optimised LAPACK.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>linalg.solve</code></td><td>Solve A x = b (preferred over inv)</td><td><code>linalg.solve(A, b)</code></td></tr>
+<tr><td><code>linalg.inv</code>, <code>pinv</code></td><td>Inverse and pseudo-inverse</td><td><code>linalg.pinv(A)</code></td></tr>
+<tr><td><code>linalg.det</code></td><td>Determinant, zero means singular</td><td><code>linalg.det(A)</code></td></tr>
+<tr><td><code>linalg.lstsq</code></td><td>Best-fit solution of an over-determined system</td><td><code>linalg.lstsq(X, y)</code></td></tr>
+<tr><td><code>linalg.eig</code>, <code>eigh</code></td><td>Eigenvalues; <code>eigh</code> for symmetric matrices (faster, real)</td><td><code>linalg.eigh(C)</code></td></tr>
+<tr><td><code>linalg.svd</code></td><td>Singular value decomposition</td><td><code>U, s, Vt = linalg.svd(A)</code></td></tr>
+<tr><td><code>linalg.qr</code></td><td>QR decomposition</td><td><code>Q, R = linalg.qr(A)</code></td></tr>
+<tr><td><code>linalg.lu_factor / lu_solve</code></td><td>Factor once, solve many right-hand sides</td><td><code>lu = linalg.lu_factor(A)</code></td></tr>
+<tr><td><code>linalg.cholesky</code></td><td>Square-root of a positive-definite matrix</td><td><code>linalg.cholesky(C, lower=True)</code></td></tr>
+<tr><td><code>linalg.solve_triangular</code></td><td>Fast solve for triangular systems</td><td><code>linalg.solve_triangular(L, b, lower=True)</code></td></tr>
+<tr><td><code>linalg.norm</code></td><td>Vector or matrix size</td><td><code>linalg.norm(A, "fro")</code></td></tr>
+<tr><td><code>linalg.expm</code></td><td>Matrix exponential</td><td><code>linalg.expm(A)</code></td></tr>
+<tr><td><code>linalg.null_space</code>, <code>orth</code></td><td>Basis of the null space or column space</td><td><code>linalg.null_space(A)</code></td></tr>
+<tr><td><code>linalg.block_diag</code></td><td>Build a block-diagonal matrix</td><td><code>linalg.block_diag(A, B)</code></td></tr>
+<tr><td><code>sparse.csr_array</code></td><td>Compressed sparse rows: fast row slices and products</td><td><code>sparse.csr_array(dense)</code></td></tr>
+<tr><td><code>sparse.csc_array</code></td><td>Compressed sparse columns: fast column slices and solves</td><td><code>sparse.csc_array(dense)</code></td></tr>
+<tr><td><code>sparse.coo_array</code></td><td>Triplets (row, col, value): easiest to build</td><td><code>sparse.coo_array((v, (r, c)), shape=s)</code></td></tr>
+<tr><td><code>sparse.lil_array</code>, <code>dok_array</code></td><td>Cheap to change element by element</td><td><code>sparse.lil_array((3, 3))</code></td></tr>
+<tr><td><code>sparse.eye_array</code>, <code>diags_array</code></td><td>Identity and banded matrices</td><td><code>sparse.eye_array(5)</code></td></tr>
+<tr><td><code>sparse.random_array</code></td><td>Random sparse test matrix</td><td><code>sparse.random_array((100, 100), density=0.01)</code></td></tr>
+<tr><td><code>sparse.linalg.spsolve</code></td><td>Solve a sparse system</td><td><code>spsolve(A.tocsc(), b)</code></td></tr>
+<tr><td><code>sparse.linalg.cg</code></td><td>Iterative solver for symmetric positive-definite systems</td><td><code>cg(A, b)</code></td></tr>
+<tr><td><code>sparse.linalg.eigsh</code>, <code>svds</code></td><td>A few eigenvalues or singular values of a big sparse matrix</td><td><code>svds(A, k=5)</code></td></tr>
+<tr><td><code>sparse.csgraph.connected_components</code></td><td>Group nodes of a graph</td><td><code>connected_components(G)</code></td></tr>
+<tr><td><code>sparse.csgraph.dijkstra</code></td><td>Shortest paths on a weighted graph</td><td><code>dijkstra(G, indices=0)</code></td></tr>
+<tr><td><code>sparse.hstack / vstack</code></td><td>Join sparse matrices</td><td><code>sparse.hstack([A, B])</code></td></tr>
+</tbody></table></div>
+<h3>Worked example 1: solving a system, and why you never invert</h3>
+<p class="problem"><span class="pl">Problem 18.6.1</span> Three products use three ingredients. Find the batch sizes x that use exactly 100, 120 and 80 units of the ingredients. Then see what happens with a nearly singular matrix.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import linalg
+
+A = np.array([[2.0, 1.0, 1.0],
+              [1.0, 3.0, 2.0],
+              [1.0, 0.0, 4.0]])
+b = np.array([100.0, 120.0, 80.0])
+x = linalg.solve(A, b)
+print("x       :", x.round(4))
+print("A @ x   :", (A @ x).round(6))
+print("det, cond:", round(linalg.det(A), 3), round(np.linalg.cond(A), 2))
+
+B = np.array([[1.0, 2.0], [2.0, 4.0000001]])
+print("cond of nearly singular B: %.2e" % np.linalg.cond(B))</code></pre>
+<pre class="code lang-text"><code>x       : [33.6842 21.0526 11.5789]
+A @ x   : [100. 120.  80.]
+det, cond: 19.0 3.88
+cond of nearly singular B: 2.50e+08</code></pre>
+<ol><li>Each row of <code>A</code> is one ingredient; each column is one product.</li><li><code>linalg.solve</code> factors the matrix (LU) and back-substitutes. It is faster and more accurate than <code>inv(A) @ b</code>.</li><li>Check by multiplying back: <code>A @ x</code> must reproduce <code>b</code>. This is the cheapest verification there is.</li><li>The condition number tells you how much errors are amplified. A value near 1 is healthy. Matrix <code>B</code> has rows that are almost multiples of each other, so its condition number is enormous (around 10<sup>8</sup>): small noise in the data would swing the answer wildly.</li></ol>
+<h3>Worked example 2: least squares and the SVD</h3>
+<p class="problem"><span class="pl">Problem 18.6.2</span> Fit price = w0 + w1 * size + w2 * rooms to 200 simulated homes with <code>lstsq</code>, then use the SVD to see how many directions the 5 columns of a redundant feature matrix really carry.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import linalg
+
+rng = np.random.default_rng(0)
+size = rng.uniform(40, 160, 200)
+rooms = rng.integers(1, 6, 200)
+price = 20 + 3.0 * size + 12 * rooms + rng.normal(0, 10, 200)
+X = np.column_stack([np.ones(200), size, rooms])
+w, res, rank, sv = linalg.lstsq(X, price)
+print("weights:", w.round(2), " rank:", rank)
+
+base = rng.normal(size=(200, 3))
+M = np.column_stack([base, base[:, 0] + base[:, 1], 2 * base[:, 2]])   # 5 columns, 3 independent
+s = linalg.svdvals(M)
+print("singular values:", s.round(2))
+print("numerical rank :", int((s &gt; 1e-10 * s[0]).sum()))</code></pre>
+<pre class="code lang-text"><code>weights: [23.4   2.99 11.27]  rank: 3
+singular values: [30.55 25.31 12.47  0.    0.  ]
+numerical rank : 3</code></pre>
+<ol><li>The design matrix <code>X</code> has a column of ones for the intercept, then one column per feature.</li><li><code>lstsq(X, price)</code> minimises the sum of squared errors without forming the normal equations, which is numerically safer. It returns the weights, residuals, rank and singular values.</li><li>The slopes land close to the truth (3 and 12); the intercept is noisier (about 23 against a true 20) because the noise has standard deviation 10. More data tightens all three.</li><li>The matrix <code>M</code> has five columns but two are sums of others. <code>svdvals</code> shows only three clearly non-zero singular values; the other two collapse to about zero. That count is the numerical rank, and it explains why such a matrix breaks ordinary regression.</li></ol>
+<h3>Worked example 3: sparse matrices save memory and time</h3>
+<p class="problem"><span class="pl">Problem 18.6.3</span> A user-by-product matrix has 20,000 users and 5,000 products, and each user bought about 10 products. Compare dense and sparse storage, then multiply by a vector.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import sparse
+
+rng = np.random.default_rng(1)
+n_users, n_items, per_user = 20000, 5000, 10
+rows = np.repeat(np.arange(n_users), per_user)
+cols = rng.integers(0, n_items, n_users * per_user)
+vals = np.ones(rows.size)
+M = sparse.coo_array((vals, (rows, cols)), shape=(n_users, n_items)).tocsr()
+
+dense_mb = n_users * n_items * 8 / 1e6
+sparse_mb = (M.data.nbytes + M.indices.nbytes + M.indptr.nbytes) / 1e6
+print("dense  needs %.0f MB" % dense_mb)
+print("sparse needs %.1f MB" % sparse_mb)
+print("stored non-zeros:", M.nnz, " density: %.4f" % (M.nnz / (n_users * n_items)))
+
+popularity = M.sum(axis=0)                 # purchases per product
+print("most popular product id:", int(np.argmax(popularity)), "with", int(popularity.max()))
+user_scores = M @ rng.normal(size=n_items)
+print("scores shape:", user_scores.shape)</code></pre>
+<pre class="code lang-text"><code>dense  needs 800 MB
+sparse needs 3.4 MB
+stored non-zeros: 199815  density: 0.0020
+most popular product id: 2622 with 62
+scores shape: (20000,)</code></pre>
+<ol><li>The COO format stores triples (row, column, value), the easiest way to build a matrix from a list of events. Duplicate (row, col) pairs are summed when converted.</li><li><code>.tocsr()</code> converts to compressed sparse rows, the format for fast arithmetic and row slicing.</li><li>Dense float64 storage costs 8 bytes per cell: 20,000 times 5,000 times 8 is 800 MB. The sparse version stores three small arrays.</li><li><code>M.sum(axis=0)</code> and <code>M @ vector</code> run directly on the sparse structure without ever building the dense matrix.</li></ol>
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">Build in COO or LIL, compute in CSR or CSC. Row-wise work (feature rows for a model) suits CSR; column-wise work and direct solvers suit CSC. Prefer the <code>*_array</code> classes in new code; the older <code>*_matrix</code> classes have different <code>*</code> semantics (matrix multiply) and exist for compatibility.</div></div>
+<h3>Worked example 4: a big sparse system and a graph</h3>
+<p class="problem"><span class="pl">Problem 18.6.4</span> Solve a 100,000-unknown tridiagonal system (a 1-D heat-flow style problem), then find connected groups and shortest paths in a small road network.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import sparse
+from scipy.sparse import linalg as spla
+from scipy.sparse import csgraph
+
+n = 100_000
+A = sparse.diags_array([-np.ones(n - 1), 2 * np.ones(n), -np.ones(n - 1)], offsets=[-1, 0, 1], format="csc")
+b = np.ones(n)
+x = spla.spsolve(A, b)
+print("residual max:", float(np.abs(A @ x - b).max()) &lt; 1e-6, " x[n//2] = %.0f" % x[n // 2])
+
+# roads: 0-1 (4 km), 1-2 (3), 0-2 (9), 3-4 (2); nodes 3,4 are a separate island
+rows, cols, km = [0, 1, 0, 3], [1, 2, 2, 4], [4, 3, 9, 2]
+G = sparse.coo_array((km, (rows, cols)), shape=(5, 5)).tocsr()
+n_comp, labels = csgraph.connected_components(G, directed=False)
+print("components:", n_comp, labels)
+print("distance from 0:", csgraph.dijkstra(G, directed=False, indices=0))</code></pre>
+<pre class="code lang-text"><code>residual max: True  x[n//2] = 1250025000
+components: 2 [0 0 0 1 1]
+distance from 0: [ 0.  4.  7. inf inf]</code></pre>
+<ol><li><code>diags_array</code> builds a banded matrix from three diagonals. Only about 300,000 numbers are stored instead of 10<sup>10</sup>.</li><li><code>spsolve</code> wants CSC format for its direct solver. A dense solve of this size would not even fit in memory.</li><li>We verify by multiplying back and checking the residual.</li><li>A graph is just a sparse adjacency matrix with distances as values. <code>connected_components</code> finds the separate islands (two here).</li><li><code>dijkstra</code> returns the shortest distance from node 0 to every node: to node 2 it is 4 + 3 = 7 rather than the direct 9. Unreachable nodes show <code>inf</code>.</li></ol>
+
+<h2>18.7 scipy.signal and scipy.fft</h2>
+<p>A <strong>signal</strong> is any measurement taken over time: sales per day, a heartbeat, a machine's vibration. Two ideas cover most uses. <strong>Filtering</strong> removes unwanted parts (noise, slow drift). The <strong>Fourier transform</strong> re-expresses the signal as a sum of waves, so you can see <em>which frequencies</em> it contains. Frequencies need a <strong>sampling rate</strong> <code>fs</code> (samples per second, or per day for daily data).</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>fft.rfft</code></td><td>Fourier transform of real data (non-negative frequencies)</td><td><code>fft.rfft(x)</code></td></tr>
+<tr><td><code>fft.rfftfreq</code></td><td>The frequency of each rfft output bin</td><td><code>fft.rfftfreq(len(x), 1/fs)</code></td></tr>
+<tr><td><code>fft.fft</code>, <code>ifft</code></td><td>Complex transform and its inverse</td><td><code>fft.ifft(fft.fft(x))</code></td></tr>
+<tr><td><code>fft.fftfreq</code></td><td>Frequencies for the full complex transform</td><td><code>fft.fftfreq(n, d)</code></td></tr>
+<tr><td><code>fft.next_fast_len</code></td><td>A length that transforms quickly</td><td><code>fft.next_fast_len(1001)</code></td></tr>
+<tr><td><code>fft.dct</code></td><td>Cosine transform (compression)</td><td><code>fft.dct(x, norm="ortho")</code></td></tr>
+<tr><td><code>signal.butter</code></td><td>Design a Butterworth filter</td><td><code>signal.butter(4, 5, fs=100, output="sos")</code></td></tr>
+<tr><td><code>signal.sosfiltfilt</code></td><td>Apply a filter forward and back (no delay)</td><td><code>signal.sosfiltfilt(sos, x)</code></td></tr>
+<tr><td><code>signal.filtfilt</code>, <code>lfilter</code></td><td>Filter with b, a coefficients</td><td><code>signal.filtfilt(b, a, x)</code></td></tr>
+<tr><td><code>signal.savgol_filter</code></td><td>Smooth with local polynomials, keeps peak shape</td><td><code>signal.savgol_filter(x, 11, 3)</code></td></tr>
+<tr><td><code>signal.medfilt</code></td><td>Median filter, removes spikes</td><td><code>signal.medfilt(x, 5)</code></td></tr>
+<tr><td><code>signal.find_peaks</code></td><td>Locate peaks by height, distance, prominence</td><td><code>signal.find_peaks(x, prominence=1)</code></td></tr>
+<tr><td><code>signal.peak_prominences</code></td><td>How much each peak stands out</td><td><code>signal.peak_prominences(x, peaks)</code></td></tr>
+<tr><td><code>signal.welch</code></td><td>Power spectrum with less noise than a raw FFT</td><td><code>signal.welch(x, fs)</code></td></tr>
+<tr><td><code>signal.periodogram</code></td><td>Simple power spectrum</td><td><code>signal.periodogram(x, fs)</code></td></tr>
+<tr><td><code>signal.spectrogram</code></td><td>Frequencies changing over time</td><td><code>signal.spectrogram(x, fs)</code></td></tr>
+<tr><td><code>signal.convolve</code></td><td>Sliding weighted sum (moving averages)</td><td><code>signal.convolve(x, w, mode="same")</code></td></tr>
+<tr><td><code>signal.correlate</code></td><td>Find a pattern or a lag between signals</td><td><code>signal.correlate(a, b, mode="full")</code></td></tr>
+<tr><td><code>signal.detrend</code></td><td>Remove a straight-line trend</td><td><code>signal.detrend(x)</code></td></tr>
+<tr><td><code>signal.resample</code></td><td>Change the number of samples</td><td><code>signal.resample(x, 200)</code></td></tr>
+<tr><td><code>signal.hilbert</code></td><td>Envelope and phase</td><td><code>np.abs(signal.hilbert(x))</code></td></tr>
+<tr><td><code>signal.windows.hann</code></td><td>Taper to reduce spectral leakage</td><td><code>signal.windows.hann(len(x))</code></td></tr>
+</tbody></table></div>
+<h3>Worked example 1: which frequencies are in my data?</h3>
+<p class="problem"><span class="pl">Problem 18.7.1</span> A sensor sampled at 200 Hz for 2 seconds hides a 5 Hz wave of amplitude 1 and a 30 Hz wave of amplitude 0.5 under noise. Find them.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import fft
+
+rng = np.random.default_rng(2)
+fs = 200
+t = np.arange(0, 2, 1 / fs)
+x = np.sin(2 * np.pi * 5 * t) + 0.5 * np.sin(2 * np.pi * 30 * t) + rng.normal(0, 0.3, t.size)
+
+amp = np.abs(fft.rfft(x)) * 2 / t.size
+freq = fft.rfftfreq(t.size, 1 / fs)
+top = np.argsort(amp)[-2:][::-1]
+for i in top:
+    print("peak at %.1f Hz, amplitude %.2f" % (freq[i], amp[i]))
+print("bin spacing:", freq[1], "Hz; highest frequency:", freq[-1], "Hz (Nyquist = fs/2)")</code></pre>
+<pre class="code lang-text"><code>peak at 5.0 Hz, amplitude 0.97
+peak at 30.0 Hz, amplitude 0.47
+bin spacing: 0.5 Hz; highest frequency: 100.0 Hz (Nyquist = fs/2)</code></pre>
+<ol><li>Two seconds at 200 samples per second gives 400 points; <code>t</code> is in seconds.</li><li><code>rfft</code> returns complex numbers for frequencies from 0 up to fs/2. Taking <code>np.abs</code> gives strength; multiplying by 2/n converts it to the amplitude of the original wave (valid away from 0 Hz).</li><li><code>rfftfreq(n, 1/fs)</code> labels each output bin. The bin spacing is fs/n = 0.5 Hz, so frequencies that fall exactly on the grid (5 and 30) appear cleanly.</li><li>We sort amplitudes and take the two largest: 5 Hz with amplitude about 1 and 30 Hz with about 0.5.</li><li>Nothing above 100 Hz (the Nyquist limit, half the sampling rate) can be seen; faster waves would masquerade as slower ones (aliasing).</li></ol>
+<figure><img src="images/lib18_fft.png" alt="Left: a noisy wave over two seconds. Right: its spectrum with two sharp peaks at 5 and 30 hertz" loading="lazy"/><figcaption>The same signal in the time domain and in the frequency domain.</figcaption></figure>
+<p><strong>How to read it:</strong> on the left the pattern is invisible in the noise. On the right, each tall spike is one hidden wave: its position tells the frequency and its height the amplitude. The flat low carpet is the noise.</p>
+<h3>Worked example 2: filter noise away</h3>
+<p class="problem"><span class="pl">Problem 18.7.2</span> Remove everything above 10 Hz from the same signal with a Butterworth low-pass filter, and measure the improvement.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import signal
+
+rng = np.random.default_rng(2)
+fs = 200
+t = np.arange(0, 2, 1 / fs)
+clean = np.sin(2 * np.pi * 5 * t)
+noisy = clean + rng.normal(0, 0.5, t.size)
+
+sos = signal.butter(4, 10, btype="low", fs=fs, output="sos")
+smooth = signal.sosfiltfilt(sos, noisy)
+print("noise rms before: %.3f" % np.sqrt(np.mean((noisy - clean) ** 2)))
+print("noise rms after : %.3f" % np.sqrt(np.mean((smooth - clean) ** 2)))</code></pre>
+<pre class="code lang-text"><code>noise rms before: 0.504
+noise rms after : 0.125</code></pre>
+<ol><li>The "clean" signal is a 5 Hz sine; we add noise of standard deviation 0.5, covering all frequencies.</li><li><code>butter(4, 10, btype="low", fs=fs, output="sos")</code> designs a 4th-order filter that keeps frequencies below 10 Hz. Giving <code>fs</code> means the cutoff is in Hz, not a fraction of Nyquist. The <code>sos</code> output (second-order sections) is the numerically stable form.</li><li><code>sosfiltfilt</code> runs the filter forward and then backward, which cancels the time delay (zero phase). A plain forward filter shifts the signal in time.</li><li>The root-mean-square error against the known clean signal drops by a large factor: most of the noise lived above 10 Hz.</li></ol>
+<h3>Worked example 3: find the peaks (for example daily orders)</h3>
+<p class="problem"><span class="pl">Problem 18.7.3</span> Daily orders have a weekly rhythm plus noise. Find the peak days and confirm that the period is 7 days.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import signal, fft
+
+rng = np.random.default_rng(8)
+days = np.arange(140)
+orders = 100 + 20 * np.sin(2 * np.pi * days / 7) + rng.normal(0, 4, days.size)
+
+smooth = signal.savgol_filter(orders, window_length=5, polyorder=2)
+peaks, props = signal.find_peaks(smooth, distance=5, prominence=15)
+print("peak days:", peaks[:6], "... total", len(peaks))
+print("gaps between peaks:", np.diff(peaks)[:8])
+
+spec = np.abs(fft.rfft(orders - orders.mean()))
+f = fft.rfftfreq(days.size, d=1.0)             # cycles per day
+print("dominant period: %.1f days" % (1 / f[np.argmax(spec)]))</code></pre>
+<pre class="code lang-text"><code>peak days: [ 2  9 16 23 30 36] ... total 20
+gaps between peaks: [7 7 7 7 6 8 7 7]
+dominant period: 7.0 days</code></pre>
+<ol><li>Orders are a baseline of 100, a 7-day wave of amplitude 20 and noise.</li><li><code>savgol_filter</code> fits a small polynomial in a sliding window of 5 days; it smooths the noise while keeping the peak heights fairly intact (a moving average would flatten them more).</li><li><code>find_peaks</code> returns indices and a dictionary of properties. <code>distance=5</code> forbids two peaks closer than 5 days; <code>prominence=15</code> requires each to stand 15 orders above its surroundings. These two arguments are what stop noise wiggles from counting.</li><li>The gaps between neighbouring peaks are mostly 7 days (6 or 8 where noise nudges a peak by a day).</li><li>The FFT agrees: with daily samples, <code>d=1.0</code>, frequencies are in cycles per day, and 1 divided by the strongest frequency is the period. We subtract the mean first so the zero-frequency bin does not dominate.</li></ol>
+
+<h2>18.8 scipy.spatial and scipy.cluster</h2>
+<p><strong>Spatial</strong> tools answer "who is near whom?". A <strong>KDTree</strong> splits space into boxes once so that each nearest-neighbour query skips most of the data. <strong>Distance functions</strong> measure similarity between rows. <strong>Clustering</strong> groups points that belong together; <code>scipy.cluster</code> offers k-means and hierarchical clustering (for the full machine-learning treatment see scikit-learn and the Machine Learning document).</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>spatial.KDTree</code></td><td>Index for fast neighbour search in low dimensions</td><td><code>tree = spatial.KDTree(points)</code></td></tr>
+<tr><td><code>tree.query(x, k)</code></td><td>The k nearest points and their distances</td><td><code>d, i = tree.query(q, k=3)</code></td></tr>
+<tr><td><code>tree.query_ball_point(x, r)</code></td><td>All points within radius r</td><td><code>tree.query_ball_point(q, r=2.0)</code></td></tr>
+<tr><td><code>tree.query_pairs(r)</code></td><td>All pairs closer than r</td><td><code>tree.query_pairs(0.5)</code></td></tr>
+<tr><td><code>tree.sparse_distance_matrix</code></td><td>Distances for near pairs only</td><td><code>tree.sparse_distance_matrix(tree, 1.0)</code></td></tr>
+<tr><td><code>distance.cdist</code></td><td>Distance between every row of A and every row of B</td><td><code>distance.cdist(A, B)</code></td></tr>
+<tr><td><code>distance.pdist</code></td><td>All pairwise distances inside one set (condensed)</td><td><code>distance.pdist(X)</code></td></tr>
+<tr><td><code>distance.squareform</code></td><td>Convert condensed to square matrix and back</td><td><code>distance.squareform(d)</code></td></tr>
+<tr><td><code>distance.euclidean</code></td><td>Straight-line distance between two points</td><td><code>distance.euclidean(a, b)</code></td></tr>
+<tr><td><code>distance.cityblock</code></td><td>Manhattan (grid) distance</td><td><code>distance.cityblock(a, b)</code></td></tr>
+<tr><td><code>distance.cosine</code></td><td>1 minus cosine similarity (direction only)</td><td><code>distance.cosine(a, b)</code></td></tr>
+<tr><td><code>distance.mahalanobis</code></td><td>Distance that accounts for correlation</td><td><code>distance.mahalanobis(a, b, VI)</code></td></tr>
+<tr><td><code>distance.jaccard</code>, <code>hamming</code></td><td>Distance for yes/no vectors</td><td><code>distance.hamming(u, v)</code></td></tr>
+<tr><td><code>spatial.ConvexHull</code></td><td>Outer boundary of a point cloud</td><td><code>spatial.ConvexHull(points).vertices</code></td></tr>
+<tr><td><code>spatial.Delaunay</code></td><td>Triangulation of points</td><td><code>spatial.Delaunay(points)</code></td></tr>
+<tr><td><code>spatial.Voronoi</code></td><td>Region closest to each point</td><td><code>spatial.Voronoi(points)</code></td></tr>
+<tr><td><code>spatial.transform.Rotation</code></td><td>3-D rotations without gimbal trouble</td><td><code>Rotation.from_euler("z", 90, degrees=True)</code></td></tr>
+<tr><td><code>cluster.vq.kmeans2</code></td><td>k-means clustering, returns centres and labels</td><td><code>vq.kmeans2(X, 3, seed=1, minit="++")</code></td></tr>
+<tr><td><code>cluster.vq.whiten</code></td><td>Scale each column to unit spread first</td><td><code>vq.whiten(X)</code></td></tr>
+<tr><td><code>cluster.vq.vq</code></td><td>Assign points to the nearest centre</td><td><code>vq.vq(X, centres)</code></td></tr>
+<tr><td><code>cluster.hierarchy.linkage</code></td><td>Build the merge tree (Ward, average, ...)</td><td><code>hierarchy.linkage(X, "ward")</code></td></tr>
+<tr><td><code>cluster.hierarchy.fcluster</code></td><td>Cut the tree into flat clusters</td><td><code>hierarchy.fcluster(Z, 3, "maxclust")</code></td></tr>
+<tr><td><code>cluster.hierarchy.dendrogram</code></td><td>Plot the merge tree</td><td><code>hierarchy.dendrogram(Z)</code></td></tr>
+<tr><td><code>cluster.hierarchy.cophenet</code></td><td>How faithfully the tree keeps distances</td><td><code>hierarchy.cophenet(Z, d)</code></td></tr>
+</tbody></table></div>
+<h3>Worked example 1: nearest neighbours the slow and the fast way</h3>
+<p class="problem"><span class="pl">Problem 18.8.1</span> A courier app has 200,000 restaurant locations. For 2,000 customers, find the 3 nearest restaurants. Compare brute force with a KDTree.</p>
+<pre class="code lang-python"><code>import time
+import numpy as np
+from scipy import spatial
+
+rng = np.random.default_rng(0)
+shops = rng.uniform(0, 100, (200_000, 2))
+custs = rng.uniform(0, 100, (2_000, 2))
+
+t0 = time.perf_counter()
+tree = spatial.KDTree(shops)
+dist, idx = tree.query(custs, k=3)
+t_tree = time.perf_counter() - t0
+
+t0 = time.perf_counter()
+brute = np.array([np.argsort(((shops - c) ** 2).sum(axis=1))[:3] for c in custs[:200]])
+t_brute = (time.perf_counter() - t0) * 10          # scaled up from 200 to 2000 customers
+
+print("same answer:", np.array_equal(brute, idx[:200]))
+print("tree at least 10x faster:", t_brute &gt; 10 * t_tree)
+print("first customer, nearest shop distance: %.3f" % dist[0, 0])</code></pre>
+<pre class="code lang-text"><code>same answer: True
+tree at least 10x faster: True
+first customer, nearest shop distance: 0.149</code></pre>
+<ol><li>Points are rows of a 2-D array: 200,000 shops and 2,000 customers.</li><li>Building the tree is a one-off cost; <code>query(custs, k=3)</code> then handles all customers in one vectorised call, returning distances and indices (each of shape 2000 by 3).</li><li>The brute-force version computes the distance to all 200,000 shops for each customer, then sorts. We time only 200 customers and multiply by 10 to save waiting; this is an estimate.</li><li>We first check that both methods agree, then compare speed. We print a comparison rather than raw seconds because timings vary between machines and runs; on this machine the tree was far faster.</li></ol>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">KDTrees shine in 2-D and 3-D (geo points, sensor positions) and degrade as dimensions grow past about 20, when nearly every point is almost equally far away. For embeddings use an approximate index or scikit-learn's neighbour search.</div></div>
+<h3>Worked example 2: distance matrices and hierarchical clusters</h3>
+<p class="problem"><span class="pl">Problem 18.8.2</span> Six customers have (annual spend in thousands, orders per month). Compute distances, then cluster them into 2 groups with Ward linkage.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy.spatial import distance
+from scipy.cluster import hierarchy
+
+X = np.array([[1.0, 2], [1.2, 2.5], [0.8, 1.8],
+              [8.0, 9], [8.5, 9.4], [7.6, 8.8]])
+D = distance.squareform(distance.pdist(X))
+print("distance 0-1: %.3f   0-3: %.3f" % (D[0, 1], D[0, 3]))
+Z = hierarchy.linkage(X, method="ward")
+labels = hierarchy.fcluster(Z, t=2, criterion="maxclust")
+print("labels:", labels)
+print("merge heights:", Z[:, 2].round(2))
+print("cosine distance of rows 0 and 3: %.4f" % distance.cosine(X[0], X[3]))</code></pre>
+<pre class="code lang-text"><code>distance 0-1: 0.539   0-3: 9.899
+labels: [1 1 1 2 2 2]
+merge heights: [ 0.28  0.45  0.77  0.99 17.15]
+cosine distance of rows 0 and 3: 0.0344</code></pre>
+<ol><li>Each row of <code>X</code> is a customer; two groups are obvious by eye.</li><li><code>pdist</code> returns a flat list of the 15 pairwise distances; <code>squareform</code> turns it into a 6 by 6 table where <code>D[i, j]</code> is the distance between customers i and j.</li><li><code>linkage(X, "ward")</code> repeatedly merges the two closest groups. Each row of <code>Z</code> says which two were merged, at what height, and the new size.</li><li><code>fcluster(Z, t=2, criterion="maxclust")</code> cuts the tree so that exactly two clusters remain; labels start at 1.</li><li>Merge heights jump sharply at the last merge (joining the two big groups): a big jump is the signal that the previous cut was natural.</li><li>The cosine distance compares direction only, so two rows with similar proportions look close even if one is much larger. It is small here because both customers have a similar balance of spend and orders.</li></ol>
+<h3>Worked example 3: k-means</h3>
+<p class="problem"><span class="pl">Problem 18.8.3</span> Cluster 180 points drawn around three centres, then ask which cluster a new point belongs to.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy.cluster import vq
+
+rng = np.random.default_rng(4)
+pts = np.vstack([rng.normal(c, 0.6, (60, 2)) for c in ([0, 0], [4, 1], [2, 4.5])])
+centres, labels = vq.kmeans2(pts, 3, seed=1, minit="++")
+print("sizes:", np.bincount(labels))
+print("centres:\n", centres[np.argsort(centres[:, 0])].round(2))
+new_point = np.array([[3.8, 0.7]])
+code, dist = vq.vq(new_point, centres)
+print("new point joins centre", int(code[0]), "at distance %.2f" % dist[0])</code></pre>
+<pre class="code lang-text"><code>sizes: [60 60 60]
+centres:
+ [[-0.11  0.07]
+ [ 2.2   4.51]
+ [ 4.1   1.04]]
+new point joins centre 2 at distance 0.45</code></pre>
+<ol><li>Three groups of 60 points each, centred near (0, 0), (4, 1) and (2, 4.5).</li><li><code>kmeans2(pts, 3, seed=1, minit="++")</code> picks three starting centres smartly (k-means++), then alternates between assigning points to the nearest centre and moving centres to the average of their points.</li><li>Cluster numbering is arbitrary, so we sort centres by x before printing. They land near the true centres.</li><li><code>vq.vq</code> assigns new points to the nearest centre; it returns the centre index and the distance.</li></ol>
+<figure><img src="images/lib18_cluster.png" alt="Three coloured point clouds with black X marks at their centres, a purple star query point and five red circles on its nearest neighbours" loading="lazy"/><figcaption>k-means centres, plus the five nearest neighbours of a query point found with a KDTree.</figcaption></figure>
+<p><strong>How to read it:</strong> colours are the k-means groups and the X marks are centres. The star sits between clusters, so its five nearest neighbours (red circles) come from more than one group. Nearest-neighbour search and cluster membership answer different questions.</p>
+
+<h2>18.9 statsmodels: OLS, GLM, ARIMA and the Formula API</h2>
+<p>scikit-learn asks "how well does this predict?". statsmodels asks "what do the coefficients mean, and how sure are we?". It returns standard errors, t-statistics, p-values, confidence intervals and diagnostic tests in one summary table, which is what analysts, economists and scientists must report. <strong>statsmodels is not installed on this study machine.</strong> Each statsmodels block below is labelled <em>not run here</em>: it is standard, idiomatic code, but no output is shown for it, because I will not invent output. Directly after each one comes a NumPy/SciPy version that did run, which computes the same quantities from first principles. Run the statsmodels code yourself after <code>python3 -m pip install statsmodels</code> and compare.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>sm.add_constant(X)</code></td><td>Add the intercept column (statsmodels does not add one for you)</td><td><code>X = sm.add_constant(X)</code></td></tr>
+<tr><td><code>sm.OLS(y, X).fit()</code></td><td>Ordinary least squares regression</td><td><code>res = sm.OLS(y, X).fit()</code></td></tr>
+<tr><td><code>res.summary()</code></td><td>Full table: coefficients, errors, p, R-squared</td><td><code>print(res.summary())</code></td></tr>
+<tr><td><code>res.params</code>, <code>bse</code></td><td>Coefficients and their standard errors</td><td><code>res.params["x"]</code></td></tr>
+<tr><td><code>res.pvalues</code>, <code>tvalues</code></td><td>Test of each coefficient being zero</td><td><code>res.pvalues</code></td></tr>
+<tr><td><code>res.conf_int(alpha=0.05)</code></td><td>95% interval for each coefficient</td><td><code>res.conf_int()</code></td></tr>
+<tr><td><code>res.rsquared</code>, <code>rsquared_adj</code></td><td>Share of variance explained</td><td><code>res.rsquared_adj</code></td></tr>
+<tr><td><code>res.resid</code>, <code>fittedvalues</code></td><td>Residuals and fitted values for diagnostics</td><td><code>res.resid.std()</code></td></tr>
+<tr><td><code>res.predict(X_new)</code></td><td>Predictions for new rows</td><td><code>res.predict(X_new)</code></td></tr>
+<tr><td><code>res.get_prediction(X).summary_frame()</code></td><td>Predictions with confidence and prediction intervals</td><td><code>pred.summary_frame(alpha=0.05)</code></td></tr>
+<tr><td><code>fit(cov_type="HC3")</code></td><td>Robust standard errors when the spread is uneven</td><td><code>sm.OLS(y, X).fit(cov_type="HC3")</code></td></tr>
+<tr><td><code>smf.ols("y ~ x1 + C(g)", data=df)</code></td><td>Formula interface: column names, categories built in</td><td><code>smf.ols("price ~ size + C(city)", df).fit()</code></td></tr>
+<tr><td><code>sm.GLM(y, X, family=...)</code></td><td>Generalised linear model (Poisson, Binomial, Gamma)</td><td><code>sm.GLM(y, X, family=sm.families.Poisson())</code></td></tr>
+<tr><td><code>sm.Logit(y, X)</code></td><td>Logistic regression with inference</td><td><code>sm.Logit(y, X).fit()</code></td></tr>
+<tr><td><code>sm.stats.anova_lm(res)</code></td><td>Analysis of variance table</td><td><code>sm.stats.anova_lm(res, typ=2)</code></td></tr>
+<tr><td><code>variance_inflation_factor</code></td><td>Detect collinear features</td><td><code>variance_inflation_factor(X.values, i)</code></td></tr>
+<tr><td><code>het_breuschpagan</code></td><td>Test for uneven residual spread</td><td><code>sm.stats.diagnostic.het_breuschpagan(res.resid, X)</code></td></tr>
+<tr><td><code>durbin_watson</code></td><td>Residual autocorrelation (near 2 is fine)</td><td><code>sm.stats.durbin_watson(res.resid)</code></td></tr>
+<tr><td><code>sm.tsa.ARIMA(y, order=(p, d, q))</code></td><td>Time-series model with trend and noise structure</td><td><code>ARIMA(y, order=(1, 0, 0)).fit()</code></td></tr>
+<tr><td><code>sm.tsa.SARIMAX</code></td><td>ARIMA with seasonality and outside regressors</td><td><code>SARIMAX(y, order=(1,1,1), seasonal_order=(1,0,0,7))</code></td></tr>
+<tr><td><code>res.forecast(steps)</code></td><td>Predict the next steps of a time series</td><td><code>res.forecast(7)</code></td></tr>
+<tr><td><code>sm.tsa.seasonal_decompose</code></td><td>Split into trend, season and rest</td><td><code>seasonal_decompose(y, period=7)</code></td></tr>
+<tr><td><code>sm.tsa.adfuller</code></td><td>Test whether a series is stationary</td><td><code>adfuller(y)[1]</code></td></tr>
+<tr><td><code>sm.tsa.acf</code>, <code>pacf</code></td><td>Correlation of a series with its own past</td><td><code>sm.tsa.acf(y, nlags=20)</code></td></tr>
+<tr><td><code>sm.stats.proportions_ztest</code></td><td>Compare two conversion rates</td><td><code>proportions_ztest([60, 85], [500, 500])</code></td></tr>
+<tr><td><code>sm.stats.multipletests</code></td><td>Adjust many p-values</td><td><code>multipletests(p, method="fdr_bh")</code></td></tr>
+<tr><td><code>sm.stats.power.TTestIndPower</code></td><td>Sample size or power planning</td><td><code>TTestIndPower().solve_power(effect_size=0.3, power=0.8, alpha=0.05)</code></td></tr>
+</tbody></table></div>
+<h3>Worked example 1: OLS with a full inference table</h3>
+<p class="problem"><span class="pl">Problem 18.9.1</span> Regress y on x for 80 observations (true line y = 2 + 0.7 x). Report coefficients, standard errors, p-values, 95% intervals and R-squared. First the statsmodels code, which is <strong>not run here</strong>.</p>
+<pre class="code lang-text"><code>import numpy as np
+import statsmodels.api as sm
+
+rng = np.random.default_rng(11)
+x = rng.uniform(0, 10, 80)
+y = 2 + 0.7 * x + rng.normal(0, 1.0, 80)
+
+X = sm.add_constant(x)            # adds a column of ones for the intercept
+res = sm.OLS(y, X).fit()
+print(res.summary())              # coefficients, std errors, t, p, CI, R-squared
+print(res.params, res.bse, res.pvalues)
+print(res.conf_int(alpha=0.05))</code></pre>
+<ol><li><code>sm.add_constant</code> is needed: unlike scikit-learn, statsmodels fits <em>no</em> intercept unless you add the column. Forgetting it is the classic statsmodels bug.</li><li><code>sm.OLS(y, X)</code> takes the response first, then the design matrix (the reverse of scikit-learn's order for <code>fit(X, y)</code>).</li><li><code>.fit()</code> returns a results object. <code>summary()</code> prints the full table; the attributes give each part as arrays.</li></ol>
+<p>The same numbers, computed by hand with NumPy and SciPy (this block ran):</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(11)
+x = rng.uniform(0, 10, 80)
+y = 2 + 0.7 * x + rng.normal(0, 1.0, 80)
+
+X = np.column_stack([np.ones_like(x), x])
+n, k = X.shape
+beta = np.linalg.solve(X.T @ X, X.T @ y)              # normal equations
+resid = y - X @ beta
+sigma2 = resid @ resid / (n - k)                      # unbiased noise variance
+cov = sigma2 * np.linalg.inv(X.T @ X)
+se = np.sqrt(np.diag(cov))
+t = beta / se
+p = 2 * stats.t.sf(np.abs(t), df=n - k)
+tcrit = stats.t.ppf(0.975, n - k)
+r2 = 1 - resid @ resid / ((y - y.mean()) @ (y - y.mean()))
+
+for name, b, s, tv, pv in zip(["const", "x"], beta, se, t, p):
+    print("%-5s coef=%.4f se=%.4f t=%.2f p=%.2g CI=(%.4f, %.4f)" % (name, b, s, tv, pv, b - tcrit * s, b + tcrit * s))
+print("R-squared = %.4f" % r2)</code></pre>
+<pre class="code lang-text"><code>const coef=2.0100 se=0.2054 t=9.78 p=3.3e-15 CI=(1.6010, 2.4190)
+x     coef=0.7166 se=0.0391 t=18.35 p=5.1e-30 CI=(0.6389, 0.7944)
+R-squared = 0.8119</code></pre>
+<ol><li>The design matrix has a ones column and the x column, exactly what <code>add_constant</code> builds.</li><li>The least-squares coefficients solve (X<sup>T</sup>X) beta = X<sup>T</sup>y. (In production prefer <code>lstsq</code>; this form keeps the algebra visible.)</li><li>The noise variance is the sum of squared residuals divided by n minus k (observations minus parameters); dividing by n would underestimate it.</li><li>The coefficient covariance matrix is that variance times the inverse of X<sup>T</sup>X. Standard errors are square roots of its diagonal.</li><li>The t-statistic is coefficient over standard error, and the two-sided p-value comes from the t distribution with n minus k degrees of freedom.</li><li>The confidence interval is coefficient plus or minus a t quantile times the standard error. statsmodels reports these same quantities in <code>params</code>, <code>bse</code>, <code>pvalues</code> and <code>conf_int()</code>.</li></ol>
+<h3>Worked example 2: uneven spread and robust standard errors</h3>
+<p class="problem"><span class="pl">Problem 18.9.2</span> When the noise grows with x, ordinary standard errors are unreliable. See the fan shape in the residuals, then compute heteroscedasticity-robust (HC3) standard errors. statsmodels: <code>sm.OLS(y, X).fit(cov_type="HC3")</code> (not run here).</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(11)
+x = rng.uniform(0, 10, 80)
+y = 2 + 0.7 * x + rng.normal(0, 0.4 + 0.12 * x)
+X = np.column_stack([np.ones_like(x), x])
+n, k = X.shape
+XtX_inv = np.linalg.inv(X.T @ X)
+beta = XtX_inv @ X.T @ y
+resid = y - X @ beta
+
+se_classic = np.sqrt(np.diag(resid @ resid / (n - k) * XtX_inv))
+h = np.einsum("ij,jk,ik-&gt;i", X, XtX_inv, X)            # leverage of each row
+w = resid / (1 - h)
+meat = (X * w[:, None]).T @ (X * w[:, None])
+se_hc3 = np.sqrt(np.diag(XtX_inv @ meat @ XtX_inv))
+print("slope %.3f" % beta[1])
+print("classic se: %.4f   robust HC3 se: %.4f" % (se_classic[1], se_hc3[1]))
+
+fit = X @ beta
+lo = np.abs(resid[fit &lt; np.median(fit)]).mean()
+hi = np.abs(resid[fit &gt;= np.median(fit)]).mean()
+print("mean |residual| low half: %.2f, high half: %.2f" % (lo, hi))
+print("Spearman(fitted, |resid|) = %.2f" % stats.spearmanr(fit, np.abs(resid)).statistic)</code></pre>
+<pre class="code lang-text"><code>slope 0.719
+classic se: 0.0406   robust HC3 se: 0.0486
+mean |residual| low half: 0.51, high half: 1.08
+Spearman(fitted, |resid|) = 0.47</code></pre>
+<ol><li>The true noise standard deviation is 0.4 plus 0.12 times x, so large x values are noisier.</li><li>The classic standard error assumes equal noise everywhere.</li><li>The HC3 "sandwich": the middle part (meat) weights each row by its own squared residual divided by (1 minus leverage) squared; bread and meat are multiplied as XtX_inv, meat, XtX_inv. The leverage <code>h</code> says how unusual a row is.</li><li>Two diagnostics expose the problem: residuals are larger in the high half of fitted values, and the rank correlation between fitted values and absolute residuals is clearly positive. This is what <code>het_breuschpagan</code> tests formally.</li></ol>
+<figure><img src="images/lib18_ols.png" alt="Left: scatter with a fitted line. Right: residuals against fitted values forming a widening fan" loading="lazy"/><figcaption>A straight-line fit (left) and its residuals (right). The fan shape means uneven spread.</figcaption></figure>
+<p><strong>How to read it:</strong> a healthy residual plot is a flat, even band around zero. Here the band widens to the right, so predictions at large x are less certain than the classic formula suggests. That is the cue to use robust errors, a weighted fit, or a transformed response.</p>
+<h3>Worked example 3: the formula API and a GLM</h3>
+<p class="problem"><span class="pl">Problem 18.9.3</span> Daily support tickets depend on the temperature and whether it is a weekend. Counts are not normal, so use a Poisson GLM. Formulas let you write the model like a sentence: statsmodels code below (<strong>not run here</strong>).</p>
+<pre class="code lang-text"><code>import numpy as np
+import pandas as pd
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+
+rng = np.random.default_rng(0)
+df = pd.DataFrame({"temp": rng.uniform(-5, 30, 300), "weekend": rng.integers(0, 2, 300)})
+df["tickets"] = rng.poisson(np.exp(1.0 + 0.04 * df["temp"] - 0.5 * df["weekend"]))
+
+ols = smf.ols("tickets ~ temp + C(weekend)", data=df).fit()          # formula API
+glm = smf.glm("tickets ~ temp + weekend", data=df,
+              family=sm.families.Poisson()).fit()
+print(glm.summary())
+print(np.exp(glm.params))          # rate ratios: multiplicative effects</code></pre>
+<ol><li><code>smf.ols("tickets ~ temp + C(weekend)", data=df)</code> says "tickets depends on temp and the category weekend". <code>C(...)</code> turns a column into dummy variables. The intercept is added automatically by formulas.</li><li><code>family=sm.families.Poisson()</code> chooses the distribution of the response and, by default, a log link: the mean is exp(linear predictor).</li><li>Exponentiating the coefficients gives rate ratios: a coefficient of -0.5 on weekend means about 0.61 times as many tickets (e<sup>-0.5</sup>).</li></ol>
+<p>The equivalent from first principles with SciPy (ran): maximise the Poisson log-likelihood, then take standard errors from the information matrix.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import optimize, stats
+
+rng = np.random.default_rng(0)
+temp = rng.uniform(-5, 30, 300)
+weekend = rng.integers(0, 2, 300)
+tickets = rng.poisson(np.exp(1.0 + 0.04 * temp - 0.5 * weekend))
+X = np.column_stack([np.ones(300), temp, weekend])
+
+def nll(b):                                    # negative log-likelihood (constant dropped)
+    eta = X @ b
+    return np.sum(np.exp(eta) - tickets * eta)
+
+res = optimize.minimize(nll, np.zeros(3), method="BFGS")
+b = res.x
+mu = np.exp(X @ b)
+cov = np.linalg.inv(X.T @ (X * mu[:, None]))   # inverse Fisher information
+se = np.sqrt(np.diag(cov))
+z = b / se
+for name, bi, si, zi in zip(["const", "temp", "weekend"], b, se, z):
+    print("%-8s coef=%.3f se=%.3f z=%.1f p=%.3g" % (name, bi, si, zi, 2 * stats.norm.sf(abs(zi))))
+print("rate ratio for weekend: %.2f" % np.exp(b[2]))</code></pre>
+<pre class="code lang-text"><code>const    coef=1.024 se=0.066 z=15.5 p=3.2e-54
+temp     coef=0.034 se=0.003 z=11.3 p=2.15e-29
+weekend  coef=-0.418 se=0.059 z=-7.1 p=1.76e-12
+rate ratio for weekend: 0.66</code></pre>
+<ol><li>The truth is intercept 1.0, temperature 0.04, weekend -0.5. Counts come from <code>rng.poisson</code>.</li><li>For a Poisson model with a log link, the negative log-likelihood is the sum of exp(eta) minus y times eta, where eta is the linear predictor. Terms that do not depend on the coefficients are dropped.</li><li><code>minimize</code> finds the maximum-likelihood coefficients. This is the same objective statsmodels optimises (it uses a method called IRLS and arrives at the same maximum).</li><li>The covariance is the inverse of X<sup>T</sup> W X with W the fitted means; that is the Fisher information for a Poisson GLM with a log link. Standard errors and z-values follow.</li><li>The weekend rate ratio is exp of the weekend coefficient; the truth is e<sup>-0.5</sup>, about 0.61, and sampling noise explains the small gap.</li></ol>
+<h3>Worked example 4: ARIMA, and an AR(1) computed by hand</h3>
+<p class="problem"><span class="pl">Problem 18.9.4</span> A daily metric follows an AR(1) process: today = 0.7 times yesterday plus noise. Fit it and forecast the next 5 days. statsmodels (<strong>not run here</strong>):</p>
+<pre class="code lang-text"><code>import numpy as np
+from statsmodels.tsa.arima.model import ARIMA
+
+rng = np.random.default_rng(5)
+y = np.zeros(300)
+for i in range(1, 300):
+    y[i] = 0.7 * y[i - 1] + rng.normal()
+
+res = ARIMA(y, order=(1, 0, 0)).fit()        # (p, d, q) = (1, 0, 0), constant included
+print(res.summary())
+print(res.forecast(steps=5))</code></pre>
+<ol><li><code>order=(p, d, q)</code> means p lagged values (AR), d differences to remove a trend, q lagged errors (MA). AR(1) is (1, 0, 0).</li><li><code>.fit()</code> estimates by maximum likelihood; the summary lists the AR coefficient and noise variance with standard errors.</li><li><code>.forecast(steps=5)</code> predicts the next five values, which decay toward the series mean.</li></ol>
+<p>The same model, by regression on the lagged series (ran):</p>
+<pre class="code lang-python"><code>import numpy as np
+
+rng = np.random.default_rng(5)
+y = np.zeros(300)
+for i in range(1, 300):
+    y[i] = 0.7 * y[i - 1] + rng.normal()
+
+ybar = y.mean()
+z = y - ybar
+phi = (z[1:] @ z[:-1]) / (z[:-1] @ z[:-1])      # least-squares AR(1) coefficient
+sigma = np.std(z[1:] - phi * z[:-1], ddof=1)
+print("phi = %.3f  noise std = %.3f" % (phi, sigma))
+
+forecast, last = [], z[-1]
+for h in range(5):
+    last = phi * last
+    forecast.append(ybar + last)
+print("forecast:", np.round(forecast, 3))
+print("last observed value: %.3f, series mean: %.3f" % (y[-1], ybar))</code></pre>
+<pre class="code lang-text"><code>phi = 0.715  noise std = 0.960
+forecast: [-1.439 -1.067 -0.8   -0.61  -0.473]
+last observed value: -1.960, series mean: -0.130</code></pre>
+<ol><li>The loop builds an AR(1) series: each value is 0.7 times the previous plus standard normal noise.</li><li>Subtract the mean, then regress today on yesterday through the origin; the coefficient is the sum of products over the sum of squares. It should be near the true 0.7.</li><li>The noise standard deviation is that of the one-step prediction errors.</li><li>Forecasting multiplies the last deviation by phi once per step, so the forecast shrinks geometrically toward the mean, exactly the decay you would see from <code>res.forecast</code>.</li></ol>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt">Running ARIMA on a series that trends or has a changing level without differencing. Check stationarity first (<code>adfuller</code>, or look at the plot), or set <code>d=1</code>. A model fitted to a trending series gives confident-looking but meaningless coefficients.</div></div>
+
+<h2>18.10 matplotlib Quick Reference for Plotting Results</h2>
+<p>This is only a cheat sheet for plotting the results in this chapter. The full visualisation guide (chart choice, design, storytelling) is in the Data Analytics document, Chapter 8. Always use the <strong>object-oriented style</strong>: <code>fig, ax = plt.subplots()</code>, then call methods on <code>ax</code>. It scales to many panels and avoids the confusion of hidden "current figure" state.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does in plain English</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>plt.subplots(r, c, figsize)</code></td><td>Make a figure and a grid of axes</td><td><code>fig, ax = plt.subplots(figsize=(8, 4))</code></td></tr>
+<tr><td><code>ax.plot(x, y)</code></td><td>Line</td><td><code>ax.plot(x, y, lw=2, label="fit")</code></td></tr>
+<tr><td><code>ax.scatter(x, y)</code></td><td>Points, optionally sized or coloured</td><td><code>ax.scatter(x, y, s=20, c=z)</code></td></tr>
+<tr><td><code>ax.hist(x, bins, density)</code></td><td>Histogram; <code>density=True</code> to compare with a pdf</td><td><code>ax.hist(x, bins=40, density=True)</code></td></tr>
+<tr><td><code>ax.bar(x, h)</code></td><td>Bars for categories</td><td><code>ax.bar(names, values)</code></td></tr>
+<tr><td><code>ax.errorbar</code></td><td>Points with error bars (estimates with CIs)</td><td><code>ax.errorbar(x, y, yerr=se, fmt="o")</code></td></tr>
+<tr><td><code>ax.fill_between</code></td><td>Shaded band (uncertainty)</td><td><code>ax.fill_between(x, lo, hi, alpha=0.2)</code></td></tr>
+<tr><td><code>ax.axhline / axvline</code></td><td>Reference line (zero, mean, threshold)</td><td><code>ax.axhline(0, color="black")</code></td></tr>
+<tr><td><code>ax.contour / contourf</code></td><td>Level lines of a two-variable function</td><td><code>ax.contour(X, Y, Z)</code></td></tr>
+<tr><td><code>ax.imshow</code></td><td>Matrix as an image (heat map)</td><td><code>ax.imshow(M, cmap="Blues")</code></td></tr>
+<tr><td><code>ax.set_xlabel / set_ylabel / set_title</code></td><td>Label everything, always</td><td><code>ax.set_xlabel("hours")</code></td></tr>
+<tr><td><code>ax.set_xscale("log")</code></td><td>Log axis for skewed or multiplicative data</td><td><code>ax.set_yscale("log")</code></td></tr>
+<tr><td><code>ax.set_xlim / set_ylim</code></td><td>Zoom to a range</td><td><code>ax.set_xlim(0, 60)</code></td></tr>
+<tr><td><code>ax.legend(frameon=False)</code></td><td>Show labels given in <code>label=</code></td><td><code>ax.legend()</code></td></tr>
+<tr><td><code>ax.annotate</code></td><td>Text with an arrow at a point</td><td><code>ax.annotate("peak", (x0, y0), xytext=(x1, y1))</code></td></tr>
+<tr><td><code>fig.tight_layout()</code></td><td>Stop labels overlapping</td><td><code>fig.tight_layout()</code></td></tr>
+<tr><td><code>fig.savefig(path, dpi)</code></td><td>Write PNG/SVG/PDF</td><td><code>fig.savefig("a.png", dpi=110)</code></td></tr>
+<tr><td><code>stats.probplot(x, plot=ax)</code></td><td>Q-Q plot for normality checks</td><td><code>stats.probplot(x, plot=ax)</code></td></tr>
+<tr><td><code>matplotlib.use("Agg")</code></td><td>Render without a screen (servers, scripts)</td><td><code>matplotlib.use("Agg")</code></td></tr>
+<tr><td><code>plt.close(fig)</code></td><td>Free memory in loops</td><td><code>plt.close(fig)</code></td></tr>
+</tbody></table></div>
+<p class="problem"><span class="pl">Problem 18.10.1</span> Plot a Q-Q plot, a histogram with the fitted density, and a means-with-intervals chart in one figure, then save it to memory.</p>
+<pre class="code lang-python"><code>import io
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy import stats
+
+rng = np.random.default_rng(7)
+data = rng.lognormal(1.2, 0.5, 400)
+s, loc, scale = stats.lognorm.fit(data, floc=0)
+
+fig, axes = plt.subplots(1, 3, figsize=(12, 3.6))
+stats.probplot(np.log(data), dist="norm", plot=axes[0])
+axes[0].set_title("Q-Q plot of log(data)")
+
+axes[1].hist(data, bins=30, density=True, alpha=0.5)
+xs = np.linspace(0, data.max(), 200)
+axes[1].plot(xs, stats.lognorm.pdf(xs, s, loc, scale), lw=2)
+axes[1].set_title("histogram + fitted pdf")
+
+groups = [rng.normal(m, 2, 30) for m in (10, 11, 13)]
+means = [g.mean() for g in groups]
+errs = [1.96 * stats.sem(g) for g in groups]
+axes[2].errorbar([0, 1, 2], means, yerr=errs, fmt="o", capsize=4)
+axes[2].set_xticks([0, 1, 2], ["A", "B", "C"])
+axes[2].set_title("means with 95% CI")
+
+fig.tight_layout()
+buf = io.BytesIO()
+fig.savefig(buf, format="png", dpi=80)
+plt.close(fig)
+print("panels:", len(axes), " png bytes &gt; 5000:", buf.tell() &gt; 5000)
+print("x tick labels of last panel:", [t.get_text() for t in axes[2].get_xticklabels()])</code></pre>
+<pre class="code lang-text"><code>panels: 3  png bytes &gt; 5000: True
+x tick labels of last panel: ['A', 'B', 'C']</code></pre>
+<ol><li><code>plt.subplots(1, 3, figsize=(12, 3.6))</code> returns the figure and an array of three axes; all later calls go through <code>axes[i]</code>.</li><li><code>stats.probplot(..., plot=axes[0])</code> draws a Q-Q plot on that axis. Points on the straight line mean the data matches the distribution; here we test the <em>log</em> of the data against a normal.</li><li>The histogram uses <code>density=True</code> so its area is 1 and the fitted pdf can be overlaid on the same scale.</li><li><code>errorbar</code> draws a mean as a dot and 1.96 standard errors as whiskers. <code>set_xticks(positions, labels)</code> names the groups.</li><li>Saving to a <code>BytesIO</code> buffer is how you embed a figure in a web page or report without writing a file, and <code>plt.close(fig)</code> frees its memory.</li></ol>
+
+<h2>18.11 Recipes: How Do I ...?</h2>
+<p>Each recipe is a complete, standalone answer to a real task. Copy it, change the data, and keep the verification line.</p>
+
+<h3>How do I choose between several candidate distributions? (Recipe 1)</h3>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(10)
+data = rng.gamma(shape=3.0, scale=2.0, size=500)
+
+rows = []
+for name in ["norm", "lognorm", "gamma", "weibull_min", "expon"]:
+    dist = getattr(stats, name)
+    params = dist.fit(data, floc=0) if name != "norm" else dist.fit(data)
+    ll = dist.logpdf(data, *params).sum()
+    aic = 2 * len(params) - 2 * ll
+    rows.append((aic, name))
+for aic, name in sorted(rows):
+    print("%-12s AIC = %.1f" % (name, aic))</code></pre>
+<pre class="code lang-text"><code>gamma        AIC = 2544.8
+weibull_min  AIC = 2562.7
+lognorm      AIC = 2565.1
+norm         AIC = 2671.7
+expon        AIC = 2795.8</code></pre>
+<ol><li>The data is gamma by construction, so we know which should win.</li><li>For each candidate, <code>getattr(stats, name)</code> fetches the distribution, <code>fit</code> estimates its parameters (with location fixed at 0 for positive data), and the AIC scores it.</li><li>Lower AIC is better. Differences under about 2 are a tie; large gaps are decisive. Always follow with a plot (histogram plus pdf) before trusting the winner.</li></ol>
+
+<h3>How do I run an A/B test on conversion rates and plan the sample size? (Recipe 2)</h3>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+conv_a, n_a = 120, 2000
+conv_b, n_b = 156, 2000
+pa, pb = conv_a / n_a, conv_b / n_b
+pool = (conv_a + conv_b) / (n_a + n_b)
+se = np.sqrt(pool * (1 - pool) * (1 / n_a + 1 / n_b))
+z = (pb - pa) / se
+print("rates %.3f vs %.3f  z = %.2f  p = %.4f" % (pa, pb, z, 2 * stats.norm.sf(abs(z))))
+
+se_diff = np.sqrt(pa * (1 - pa) / n_a + pb * (1 - pb) / n_b)
+lo, hi = (pb - pa) + np.array([-1, 1]) * stats.norm.ppf(0.975) * se_diff
+print("lift 95%% CI: (%.4f, %.4f)" % (lo, hi))
+
+# sample size per group to detect 6% -&gt; 7.8% with 80% power, 5% two-sided
+p1, p2 = 0.06, 0.078
+zb = stats.norm.ppf(0.80) + stats.norm.ppf(0.975)
+n = zb ** 2 * (p1 * (1 - p1) + p2 * (1 - p2)) / (p2 - p1) ** 2
+print("needed per group:", int(np.ceil(n)))</code></pre>
+<pre class="code lang-text"><code>rates 0.060 vs 0.078  z = 2.25  p = 0.0247
+lift 95% CI: (0.0023, 0.0337)
+needed per group: 3109</code></pre>
+<ol><li>The two-proportion z-test pools both groups to estimate the standard error under the null (no difference).</li><li>The confidence interval for the lift uses the unpooled standard error, because we no longer assume the groups are equal.</li><li>The planning formula says: sample more when the effect is small or the rates are close to 50%. Do this <em>before</em> the test, never after. statsmodels' <code>proportions_ztest</code> and <code>NormalIndPower</code> do the same (not run here).</li></ol>
+
+<h3>How do I get a prediction band from a curve fit? (Recipe 3)</h3>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import optimize, stats
+
+def model(t, a, k):
+    return a * (1 - np.exp(-k * t))
+
+rng = np.random.default_rng(2)
+t = np.linspace(0.2, 8, 25)
+y = model(t, 10, 0.6) + rng.normal(0, 0.3, t.size)
+p, cov = optimize.curve_fit(model, t, y, p0=[5, 1])
+
+t_new = 6.0
+eps = 1e-6
+grad = np.array([(model(t_new, *(p + eps * np.eye(2)[i])) - model(t_new, *p)) / eps for i in range(2)])
+se_mean = np.sqrt(grad @ cov @ grad)                    # delta method
+s_resid = np.sqrt(np.sum((y - model(t, *p)) ** 2) / (t.size - 2))
+tc = stats.t.ppf(0.975, t.size - 2)
+fit = model(t_new, *p)
+print("fit at t=6: %.2f" % fit)
+print("95%% CI of the curve : (%.2f, %.2f)" % (fit - tc * se_mean, fit + tc * se_mean))
+print("95%% prediction range: (%.2f, %.2f)" % (fit - tc * np.hypot(se_mean, s_resid), fit + tc * np.hypot(se_mean, s_resid)))</code></pre>
+<pre class="code lang-text"><code>fit at t=6: 9.73
+95% CI of the curve : (9.58, 9.87)
+95% prediction range: (9.16, 10.29)</code></pre>
+<ol><li>The delta method turns parameter uncertainty (<code>cov</code>) into uncertainty of the curve at one point using the gradient of the model with respect to the parameters.</li><li>The curve interval answers "where is the true average curve?". The prediction interval adds the scatter of individual points (<code>s_resid</code>) and is wider. Use the second to warn about a single future measurement.</li></ol>
+
+<h3>How do I pick the best items under a budget? (Recipe 4, integer optimisation)</h3>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import optimize
+
+value = np.array([60, 100, 120, 80, 30.0])        # expected profit per campaign
+cost = np.array([10, 20, 30, 25, 5.0])            # budget needed
+budget = 55
+res = optimize.milp(c=-value,
+                    constraints=optimize.LinearConstraint(cost[None, :], ub=budget),
+                    integrality=np.ones(5), bounds=optimize.Bounds(0, 1))
+chosen = np.round(res.x).astype(int)
+print("chosen campaigns:", chosen, " profit:", int(value @ chosen), " cost:", int(cost @ chosen))</code></pre>
+<pre class="code lang-text"><code>chosen campaigns: [0 1 1 0 1]  profit: 250  cost: 55</code></pre>
+<ol><li>This is a knapsack: pick items (0 or 1 each) to maximise value within a budget. <code>integrality=1</code> forces whole numbers and the bounds 0 to 1 make them yes/no.</li><li><code>milp</code> minimises, so we pass the negated values.</li><li>The check is arithmetic: cost 55 or less, and no other combination beats the profit (here the search space has only 32 combinations, so you could confirm by brute force).</li></ol>
+
+<h3>How do I get a permutation test and a bootstrap interval for a correlation? (Recipe 5)</h3>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(6)
+x = rng.normal(size=40)
+y = 0.4 * x + rng.normal(size=40)
+
+stat = lambda a, b: np.corrcoef(a, b)[0, 1]
+perm = stats.permutation_test((x, y), stat, permutation_type="pairings",
+                              n_resamples=5000, random_state=1)
+print("r = %.3f  permutation p = %.4f  (pearsonr p = %.4f)" % (perm.statistic, perm.pvalue, stats.pearsonr(x, y).pvalue))
+
+boot = stats.bootstrap((x, y), lambda a, b: np.corrcoef(a, b)[0, 1], paired=True,
+                       vectorized=False, n_resamples=2000, random_state=1)
+print("bootstrap 95%% CI for r: (%.3f, %.3f)" % (boot.confidence_interval.low, boot.confidence_interval.high))</code></pre>
+<pre class="code lang-text"><code>r = 0.470  permutation p = 0.0008  (pearsonr p = 0.0022)
+bootstrap 95% CI for r: (0.184, 0.673)</code></pre>
+<ol><li><code>permutation_type="pairings"</code> shuffles y relative to x many times; if the observed r is rare among shuffled values, it is unlikely to be chance.</li><li>The permutation p-value should be close to the formula-based <code>pearsonr</code> p-value, a nice agreement check.</li><li>The bootstrap resamples (x, y) <em>pairs</em> together (<code>paired=True</code>) and recomputes r each time. <code>vectorized=False</code> tells SciPy the statistic handles one resample at a time.</li></ol>
+
+<h3>How do I flag outliers robustly?</h3>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(3)
+x = np.append(rng.normal(100, 5, 200), [160, 40])
+z = stats.zscore(x)
+mad = stats.median_abs_deviation(x, scale="normal")
+robust_z = (x - np.median(x)) / mad
+print("classic |z|&gt;3 count:", int((np.abs(z) &gt; 3).sum()))
+print("robust  |z|&gt;3 count:", int((np.abs(robust_z) &gt; 3).sum()))
+print("flagged values:", np.sort(x[np.abs(robust_z) &gt; 3]).round(1))</code></pre>
+<pre class="code lang-text"><code>classic |z|&gt;3 count: 2
+robust  |z|&gt;3 count: 3
+flagged values: [ 40.  116.6 160. ]</code></pre>
+<ol><li>The classic z-score uses mean and standard deviation, both distorted by the very outliers you hunt (masking).</li><li>The median and the median absolute deviation (MAD, scaled to match a standard deviation for normal data) barely move, so the robust score is sharper.</li></ol>
+
+<h3>How do I fill gaps in a time series?</h3>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+from scipy import interpolate
+
+s = pd.Series([10.0, 12.0, np.nan, np.nan, 18.0, 17.0, np.nan, 14.0],
+              index=pd.date_range("2025-01-01", periods=8, freq="D"))
+known = s.dropna()
+xk = (known.index - s.index[0]).days.to_numpy()
+pchip = interpolate.PchipInterpolator(xk, known.to_numpy())
+filled = pd.Series(pchip((s.index - s.index[0]).days), index=s.index).round(2)
+print(filled.tolist())
+print("pandas linear:", s.interpolate().round(2).tolist())</code></pre>
+<pre class="code lang-text"><code>[10.0, 12.0, 14.44, 16.89, 18.0, 17.0, 15.66, 14.0]
+pandas linear: [10.0, 12.0, 14.0, 16.0, 18.0, 17.0, 15.5, 14.0]</code></pre>
+<ol><li>Convert dates to numbers (days since the start), because SciPy interpolators need numeric x.</li><li>Fit PCHIP only to the known points, then evaluate it on every date. PCHIP does not overshoot, which matters for non-negative quantities.</li><li>For plain linear filling, <code>Series.interpolate()</code> in pandas is enough.</li></ol>
+
+<h3>How do I match drivers to orders at the lowest total distance?</h3>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import optimize
+from scipy.spatial import distance
+
+drivers = np.array([[0, 0], [5, 5], [9, 1.0]])
+orders = np.array([[8, 2], [1, 1], [6, 6.0]])
+cost = distance.cdist(drivers, orders)
+rows, cols = optimize.linear_sum_assignment(cost)
+print("driver -&gt; order:", list(zip(rows.tolist(), cols.tolist())))
+print("total distance: %.2f" % cost[rows, cols].sum())
+print("greedy first choice would pair driver 0 with order", int(cost[0].argmin()))</code></pre>
+<pre class="code lang-text"><code>driver -&gt; order: [(0, 1), (1, 2), (2, 0)]
+total distance: 4.24
+greedy first choice would pair driver 0 with order 1</code></pre>
+<ol><li><code>cdist</code> builds the cost matrix: one row per driver, one column per order.</li><li><code>linear_sum_assignment</code> finds the one-to-one matching with minimum total cost (the Hungarian algorithm); it is exact, unlike matching greedily driver by driver.</li></ol>
+
+<h3>How do I find the nearest warehouse from latitude and longitude?</h3>
+<pre class="code lang-python"><code>import numpy as np
+from scipy.spatial import KDTree
+
+def to_xyz(lat, lon):
+    lat, lon = np.radians(lat), np.radians(lon)
+    return np.column_stack([np.cos(lat) * np.cos(lon), np.cos(lat) * np.sin(lon), np.sin(lat)])
+
+wh = {"Rotterdam": (51.92, 4.48), "Berlin": (52.52, 13.40), "Madrid": (40.42, -3.70), "Milan": (45.46, 9.19)}
+names = list(wh)
+tree = KDTree(to_xyz(*np.array(list(wh.values())).T))
+d, i = tree.query(to_xyz(48.86, 2.35))                 # Paris
+print("nearest to Paris:", names[int(i[0])])
+print("chord distance %.4f -&gt; about %.0f km" % (d[0], 6371 * 2 * np.arcsin(d[0] / 2)))</code></pre>
+<pre class="code lang-text"><code>nearest to Paris: Rotterdam
+chord distance 0.0584 -&gt; about 372 km</code></pre>
+<ol><li>Latitude/longitude are angles on a sphere, so straight-line distance in degrees is wrong (a degree of longitude shrinks toward the poles). Convert to 3-D points on the unit sphere first.</li><li>Distance through the sphere (the chord) ranks neighbours in the same order as distance along the surface. Convert a chord <em>c</em> to kilometres with 2 R arcsin(c/2), where R = 6371 km.</li></ol>
+
+<h3>How do I find the break-even point of a profit curve?</h3>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import optimize
+
+price = lambda q: 50 * np.exp(-0.01 * q)          # price falls as quantity rises
+profit = lambda q: q * price(q) - (400 + 12 * q)
+low = optimize.root_scalar(profit, bracket=[1, 20])
+best = optimize.minimize_scalar(lambda q: -profit(q), bounds=(1, 200), method="bounded")
+print("break-even at q = %.2f" % low.root)
+print("max profit %.1f at q = %.1f" % (-best.fun, best.x))</code></pre>
+<pre class="code lang-text"><code>break-even at q = 12.44
+max profit 527.8 at q = 57.4</code></pre>
+<ol><li>Break-even is where profit equals zero: a root. The bracket [1, 20] must contain a sign change (profit is negative at 1, positive at 20).</li><li>The best quantity is a one-variable maximisation; negate to use a minimiser.</li></ol>
+
+<h3>How do I compute AUC or any area from a curve?</h3>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import integrate
+
+fpr = np.array([0, 0.1, 0.3, 0.6, 1.0])
+tpr = np.array([0, 0.5, 0.75, 0.9, 1.0])
+print("AUC by trapezoid: %.4f" % integrate.trapezoid(tpr, fpr))
+print("random-guess AUC: %.4f" % integrate.trapezoid(fpr, fpr))</code></pre>
+<pre class="code lang-text"><code>AUC by trapezoid: 0.7775
+random-guess AUC: 0.5000</code></pre>
+<ol><li>Values go first, positions second: <code>trapezoid(y, x)</code>. The area under a ROC curve is exactly this trapezoid sum.</li><li>The diagonal (a coin flip) must give 0.5; always run that sanity check.</li></ol>
+
+<h3>How do I test every pair of columns for correlation?</h3>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+from scipy import stats
+
+rng = np.random.default_rng(9)
+df = pd.DataFrame({"a": rng.normal(size=60)})
+df["b"] = df["a"] * 0.8 + rng.normal(size=60)
+df["c"] = rng.normal(size=60)
+res = stats.spearmanr(df)                      # a table in, a matrix out
+print(pd.DataFrame(res.statistic, index=df.columns, columns=df.columns).round(2))
+print("p(a,b) = %.2g   p(a,c) = %.2f" % (res.pvalue[0, 1], res.pvalue[0, 2]))</code></pre>
+<pre class="code lang-text"><code>a     b     c
+a  1.00  0.54 -0.19
+b  0.54  1.00 -0.12
+c -0.19 -0.12  1.00
+p(a,b) = 8.7e-06   p(a,c) = 0.14</code></pre>
+<ol><li>Passing a whole DataFrame to <code>spearmanr</code> returns a correlation matrix and a matching p-value matrix. <code>df.corr(method="spearman")</code> gives the same correlations without p-values.</li><li>With many columns, apply a multiple-testing correction to the off-diagonal p-values.</li></ol>
+
+<h2>18.12 Performance and Pitfalls</h2>
+<h3>Speed rules that matter</h3>
+<ul><li><strong>Vectorise.</strong> Pass arrays to <code>cdf</code>, <code>pdf</code>, <code>interp</code>, <code>cdist</code>. Per-call overhead of SciPy distribution objects is large for scalars.</li><li><strong>Choose the right structure.</strong> A KDTree beats brute force for neighbours; a sparse matrix beats dense when over 90% of cells are zero; <code>sosfiltfilt</code> beats a Python loop.</li><li><strong>Factor once.</strong> Solving many right-hand sides with the same matrix: <code>lu_factor</code> once, <code>lu_solve</code> many times.</li><li><strong>Use <code>workers</code>.</strong> Several functions accept <code>workers=-1</code> to use all cores: <code>KDTree.query</code>, <code>fft</code> functions, <code>differential_evolution</code>.</li><li><strong>Give gradients.</strong> If you can write the derivative, pass <code>jac=</code> to <code>minimize</code>; numerical differences cost one extra call per variable.</li></ul>
+<pre class="code lang-python"><code>import time
+import numpy as np
+from scipy import stats
+
+x = np.random.default_rng(0).normal(size=20000)
+t0 = time.perf_counter()
+slow = [stats.norm.cdf(v) for v in x]
+t_loop = time.perf_counter() - t0
+t0 = time.perf_counter()
+fast = stats.norm.cdf(x)
+t_vec = time.perf_counter() - t0
+print("same values:", np.allclose(slow, fast))
+print("vectorised at least 20x faster:", t_loop &gt; 20 * t_vec)</code></pre>
+<pre class="code lang-text"><code>same values: True
+vectorised at least 20x faster: True</code></pre>
+<ol><li>The loop calls <code>cdf</code> 20,000 times, paying input checking each time. The vectorised call checks once and computes in compiled code.</li><li>We print a comparison rather than seconds, since timings differ by machine; on this machine the gap was well above 20 times.</li></ol>
+<h3>Common mistakes with symptom and fix</h3>
+<div class="callout red"><div class="lab">COMMON MISTAKE 1: OFF-BY-ONE ON DISCRETE TAILS</div><div class="txt">Wrong: <code>sf(10)</code> to get "10 or more". Symptom: the probability is too small because exactly 10 is excluded. Fix: <code>sf(k - 1)</code> for "k or more".
+<pre class="code lang-python"><code>from scipy import stats
+d = stats.poisson(4)
+print("wrong  sf(10):", round(d.sf(10), 5), "  right sf(9):", round(d.sf(9), 5), "  by pmf sum:", round(sum(d.pmf(k) for k in range(10, 60)), 5))</code></pre>
+<pre class="code lang-text"><code>wrong  sf(10): 0.00284   right sf(9): 0.00813   by pmf sum: 0.00813</code></pre>
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 2: STUDENT T-TEST WITH UNEQUAL SPREAD</div><div class="txt">Wrong: <code>ttest_ind(a, b)</code> assumes equal variances. Symptom: p-values drift when group sizes and spreads differ. Fix: <code>equal_var=False</code> (Welch) by default.
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+rng = np.random.default_rng(0)
+a = rng.normal(0, 1, 10); b = rng.normal(0, 6, 100)
+print("student p = %.3f   welch p = %.3f" % (stats.ttest_ind(a, b).pvalue, stats.ttest_ind(a, b, equal_var=False).pvalue))</code></pre>
+<pre class="code lang-text"><code>student p = 0.906   welch p = 0.729</code></pre>
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 3: curve_fit WITHOUT A STARTING GUESS</div><div class="txt">Wrong: default <code>p0</code> of all ones for an oscillating model. Symptom: no error, but a terrible fit stuck in a local minimum. Fix: give <code>p0</code> from a plot or a quick estimate, and always check the residuals.
+<pre class="code lang-python"><code>import numpy as np
+from scipy import optimize
+rng = np.random.default_rng(0)
+t = np.linspace(0, 10, 100); y = 2 * np.sin(3 * t) + rng.normal(0, 0.1, 100)
+f = lambda t, a, w: a * np.sin(w * t)
+for p0 in (None, [1, 2.9]):
+    p, _ = optimize.curve_fit(f, t, y, p0=p0)
+    print("p0=%-10s params=%s rmse=%.3f" % (p0, p.round(2), np.sqrt(np.mean((y - f(t, *p)) ** 2))))</code></pre>
+<pre class="code lang-text"><code>p0=None       params=[0.05 1.02] rmse=1.442
+p0=[1, 2.9]   params=[2.03 3.  ] rmse=0.094</code></pre>
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 4: lognorm.fit WITHOUT floc=0</div><div class="txt">Wrong: letting the location float. Symptom: a third parameter that shifts the curve, unstable shape and scale. Fix: <code>floc=0</code> for quantities that start at zero.
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+d = np.random.default_rng(0).lognormal(1.2, 0.5, 200)
+print("free loc  :", np.round(stats.lognorm.fit(d), 3))
+print("floc=0    :", np.round(stats.lognorm.fit(d, floc=0), 3))</code></pre>
+<pre class="code lang-text"><code>free loc  : [ 0.434 -0.322  3.703]
+floc=0    : [0.481 0.    3.346]</code></pre>
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 5: np.interp WITH UNSORTED x</div><div class="txt">Wrong: x not increasing. Symptom: silently wrong answers, no error. Fix: sort first.
+<pre class="code lang-python"><code>import numpy as np
+x = np.array([3, 1, 2.0]); y = np.array([30, 10, 20.0])
+print("wrong:", np.interp(1.5, x, y), "  right:", np.interp(1.5, *zip(*sorted(zip(x, y)))))</code></pre>
+<pre class="code lang-text"><code>wrong: 30.0   right: 15.0</code></pre>
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 6: * MEANS DIFFERENT THINGS FOR SPARSE MATRIX AND ARRAY</div><div class="txt">Wrong: assuming <code>A * B</code> is matrix multiplication for every sparse type. Symptom: elementwise result from <code>csr_array</code>, matrix product from <code>csr_matrix</code>. Fix: use <code>@</code> always.
+<pre class="code lang-python"><code>import numpy as np
+from scipy import sparse
+d = np.array([[1, 2], [3, 4]])
+print("csr_matrix A*A:", (sparse.csr_matrix(d) * sparse.csr_matrix(d)).toarray().tolist())
+print("csr_array  A*A:", (sparse.csr_array(d) * sparse.csr_array(d)).toarray().tolist())
+print("csr_array  A@A:", (sparse.csr_array(d) @ sparse.csr_array(d)).toarray().tolist())</code></pre>
+<pre class="code lang-text"><code>csr_matrix A*A: [[7, 10], [15, 22]]
+csr_array  A*A: [[1, 4], [9, 16]]
+csr_array  A@A: [[7, 10], [15, 22]]</code></pre>
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 7: INVERTING A MATRIX TO SOLVE A SYSTEM</div><div class="txt">Wrong: <code>inv(A) @ b</code>. Symptom: larger rounding error, especially for ill-conditioned A. Fix: <code>solve(A, b)</code>.
+<pre class="code lang-python"><code>import numpy as np
+from scipy import linalg
+H = linalg.hilbert(10); truth = np.ones(10); b = H @ truth
+err_inv = np.abs(np.linalg.inv(H) @ b - truth).max()
+err_solve = np.abs(linalg.solve(H, b) - truth).max()
+print("inverse error is larger than solve error:", err_inv &gt; err_solve)</code></pre>
+<pre class="code lang-text"><code>inverse error is larger than solve error: True</code></pre>
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 8: FFT FREQUENCY AXIS WITHOUT THE SAMPLING STEP</div><div class="txt">Wrong: <code>fftfreq(n)</code> alone. Symptom: the 5 Hz wave shows up at 0.025 "something", meaningless units. Fix: pass the spacing <code>d = 1/fs</code>.
+<pre class="code lang-python"><code>import numpy as np
+from scipy import fft
+fs = 200; t = np.arange(0, 2, 1 / fs); x = np.sin(2 * np.pi * 5 * t)
+k = np.argmax(np.abs(fft.rfft(x)))
+print("wrong:", fft.rfftfreq(t.size)[k], "  right:", fft.rfftfreq(t.size, 1 / fs)[k], "Hz")</code></pre>
+<pre class="code lang-text"><code>wrong: 0.025   right: 5.0 Hz</code></pre>
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 9: A TINY P-VALUE FOR A TINY EFFECT</div><div class="txt">Wrong: reporting only p. Symptom: with 200,000 rows per group even a 0.01 standard-deviation difference is "significant". Fix: report the effect size and interval, and ask whether the size matters.
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+rng = np.random.default_rng(0)
+a = rng.normal(0, 1, 200000); b = rng.normal(0.01, 1, 200000)
+r = stats.ttest_ind(a, b)
+print("p = %.4f   difference = %.4f standard deviations" % (r.pvalue, abs(a.mean() - b.mean())))</code></pre>
+<pre class="code lang-text"><code>p = 0.0015   difference = 0.0101 standard deviations</code></pre>
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 10: UNSEEDED RANDOMNESS</div><div class="txt">Wrong: <code>rvs(size)</code> or <code>bootstrap</code> with no seed. Symptom: every run gives different numbers, so results cannot be reviewed or tested. Fix: pass <code>random_state=</code> (an integer or a Generator).
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+a = stats.norm.rvs(size=3, random_state=42); b = stats.norm.rvs(size=3, random_state=42)
+c = stats.norm.rvs(size=3); d = stats.norm.rvs(size=3)
+print("seeded runs identical:", np.array_equal(a, b), "  unseeded identical:", np.array_equal(c, d))</code></pre>
+<pre class="code lang-text"><code>seeded runs identical: True   unseeded identical: False</code></pre>
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 11: WRITING INTO A PANDAS ARRAY (PANDAS 3 COPY-ON-WRITE)</div><div class="txt">Wrong: <code>a = df["x"].to_numpy(); a[0] = 9</code> to "fix" a value before a SciPy call. Symptom: <code>ValueError: assignment destination is read-only</code>, and the DataFrame is never modified by accident. Fix: take an explicit <code>.copy()</code>, or use <code>df.loc</code> to change the table.
+<pre class="code lang-python"><code>import pandas as pd
+df = pd.DataFrame({"x": [1.0, 2.0, 3.0]})
+a = df["x"].to_numpy()
+try:
+    a[0] = 9
+except ValueError as e:
+    print("error:", e)
+a = df["x"].to_numpy().copy(); a[0] = 9
+print("copy edited:", a.tolist(), " table unchanged:", df["x"].tolist())</code></pre>
+<pre class="code lang-text"><code>error: assignment destination is read-only
+copy edited: [9.0, 2.0, 3.0]  table unchanged: [1.0, 2.0, 3.0]</code></pre>
+</div></div>
+<div class="callout red"><div class="lab">COMMON MISTAKE 12: K-MEANS ON UNSCALED COLUMNS</div><div class="txt">Wrong: clustering income (tens of thousands) with age (tens). Symptom: clusters follow only the large-scale column. Fix: <code>vq.whiten</code> or standardise first.
+<pre class="code lang-python"><code>import numpy as np
+from scipy.cluster import vq
+rng = np.random.default_rng(0)
+age = np.concatenate([rng.normal(25, 3, 100), rng.normal(55, 3, 100)])   # two clear age groups
+income = rng.normal(50000, 15000, 200)                                      # unrelated, huge scale
+X = np.column_stack([age, income])
+for name, data in [("raw", X), ("whitened", vq.whiten(X))]:
+    _, lab = vq.kmeans2(data, 2, seed=1, minit="++")
+    truth = np.arange(200) &gt;= 100
+    agree = max(np.mean(lab == truth), np.mean(lab != truth))
+    print("%-9s agreement with the age groups: %.2f" % (name, agree))</code></pre>
+<pre class="code lang-text"><code>raw       agreement with the age groups: 0.56
+whitened  agreement with the age groups: 1.00</code></pre>
+</div></div>
+
+<h2>18.13 Cross-Library Integration</h2>
+<p>The libraries share NumPy arrays, so integration is mostly about moving data cleanly. Three patterns cover most real work.</p>
+<h3>Pandas to SciPy: one test per group</h3>
+<pre class="code lang-python"><code>import numpy as np
+import pandas as pd
+from scipy import stats
+
+rng = np.random.default_rng(12)
+df = pd.DataFrame({
+    "city": np.repeat(["Oslo", "Lima", "Pune"], 60),
+    "variant": np.tile(["control", "new"], 90),
+    "minutes": np.concatenate([rng.normal(m, 6, 60) for m in (30, 34, 28)]),
+})
+df.loc[df["variant"] == "new", "minutes"] -= 3.0
+
+rows = []
+for city, g in df.groupby("city"):
+    a = g.loc[g["variant"] == "control", "minutes"]
+    b = g.loc[g["variant"] == "new", "minutes"]
+    r = stats.ttest_ind(b, a, equal_var=False)
+    rows.append({"city": city, "diff": b.mean() - a.mean(), "p": r.pvalue})
+out = pd.DataFrame(rows)
+out["p_adj"] = stats.false_discovery_control(out["p"])
+print(out.round(3).to_string(index=False))
+print("city dtype:", df["city"].dtype)</code></pre>
+<pre class="code lang-text"><code>city   diff     p  p_adj
+Lima -3.415 0.021  0.036
+Oslo -3.383 0.024  0.036
+Pune -2.228 0.157  0.157
+city dtype: str</code></pre>
+<ol><li>The table has a text column (<code>city</code>), a group column and a numeric column. In pandas 3 the text column has the dedicated <code>str</code> dtype, shown on the last line.</li><li>Pandas Series go straight into SciPy; they are converted to NumPy arrays internally. We never loop over rows, only over the 3 groups.</li><li>Collecting results into a list of dictionaries and building one DataFrame at the end is the clean pattern (appending rows to a DataFrame inside a loop is slow).</li><li>With three simultaneous tests we adjust the p-values with <code>false_discovery_control</code>.</li></ol>
+<h3>SciPy to scikit-learn: distributions as search spaces, sparse matrices as features</h3>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats, sparse
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import RandomizedSearchCV
+
+rng = np.random.default_rng(0)
+X = sparse.random_array((400, 50), density=0.1, rng=rng, format="csr")
+w = rng.normal(size=50)
+y = X @ w + rng.normal(0, 0.1, 400)
+
+search = RandomizedSearchCV(Ridge(), {"alpha": stats.loguniform(1e-3, 1e2)},
+                            n_iter=12, cv=3, random_state=0)
+search.fit(X, y)
+print("input is sparse:", sparse.issparse(X), " nnz =", X.nnz)
+print("best alpha: %.4f   cv R2: %.3f" % (search.best_params_["alpha"], search.best_score_))</code></pre>
+<pre class="code lang-text"><code>input is sparse: True  nnz = 2000
+best alpha: 0.0826   cv R2: 0.988</code></pre>
+<ol><li>A scikit-learn estimator accepts a SciPy sparse matrix directly, so a text-feature matrix never needs to be made dense.</li><li><code>stats.loguniform(1e-3, 1e2)</code> is a frozen SciPy distribution. <code>RandomizedSearchCV</code> calls its <code>rvs</code> method, so any distribution from section 18.2 can define a search range. Log-uniform is right for scale-like settings such as regularisation strengths.</li><li>The best settings and scores are the search result; the exact alpha depends on the random draws, which are seeded.</li></ol>
+<h3>SciPy with statsmodels and joblib</h3>
+<p>statsmodels (not run here) accepts NumPy arrays and pandas DataFrames, and its results can be post-processed with SciPy: for instance <code>stats.t.ppf</code> for custom intervals, or <code>stats.probplot(res.resid, plot=ax)</code> for a residual Q-Q plot. To spread many independent bootstraps over cores, wrap the work with <code>joblib.Parallel</code>; give each task its own seed so results stay reproducible.</p>
+<pre class="code lang-python"><code>import numpy as np
+from joblib import Parallel, delayed
+
+data = np.random.default_rng(0).lognormal(1.2, 0.5, 300)
+
+def boot_median(seed):
+    r = np.random.default_rng(seed)
+    return np.median(r.choice(data, size=data.size, replace=True))
+
+meds = Parallel(n_jobs=2)(delayed(boot_median)(s) for s in range(400))
+print("n resamples:", len(meds), " 95%% interval: (%.3f, %.3f)" % tuple(np.percentile(meds, [2.5, 97.5])))
+again = Parallel(n_jobs=2)(delayed(boot_median)(s) for s in range(400))
+print("reproducible:", meds == again)</code></pre>
+<pre class="code lang-text"><code>n resamples: 400  95% interval: (2.990, 3.467)
+reproducible: True</code></pre>
+<ol><li>Each job gets a different integer seed (0 to 399), so the 400 resamples differ from each other but the whole run repeats exactly.</li><li><code>Parallel(n_jobs=2)</code> runs tasks in separate worker processes; for work this light, the start-up cost can exceed the gain. Parallelise heavy tasks, not tiny ones.</li></ol>
+
+<h2>18.14 How to Solve Any SciPy/statsmodels Problem</h2>
+<h3>The decision flow</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Ask yourself</th><th>If yes, reach for</th></tr></thead><tbody>
+<tr><td>Do I need a probability, quantile or random draw?</td><td><code>stats</code> distribution: <code>cdf, sf, ppf, rvs</code></td></tr>
+<tr><td>Is a difference real or luck?</td><td><code>stats</code> test chosen by data type, plus an interval and effect size</td></tr>
+<tr><td>Do I need uncertainty and no formula exists?</td><td><code>stats.bootstrap</code> or <code>permutation_test</code></td></tr>
+<tr><td>Do I have a formula with unknown constants?</td><td><code>optimize.curve_fit</code> (or <code>least_squares</code>)</td></tr>
+<tr><td>Do I want the best inputs?</td><td><code>minimize</code> (smooth), <code>linprog</code>/<code>milp</code> (linear), <code>differential_evolution</code> (rugged)</td></tr>
+<tr><td>Do I need a total over a range or a changing system?</td><td><code>integrate.quad</code>, <code>trapezoid</code>, <code>solve_ivp</code></td></tr>
+<tr><td>Do I need values between or smoother than my points?</td><td><code>interpolate</code> or <code>signal.savgol_filter</code></td></tr>
+<tr><td>Is it a repeating pattern or noise in time?</td><td><code>fft</code>, <code>signal.welch</code>, <code>find_peaks</code>, <code>butter</code></td></tr>
+<tr><td>Is it about who is close or similar?</td><td><code>spatial.KDTree</code>, <code>cdist</code>, <code>cluster</code></td></tr>
+<tr><td>Do I need coefficients with p-values and intervals?</td><td>statsmodels (<code>OLS, GLM, ARIMA</code>) or the manual NumPy version</td></tr>
+<tr><td>Is the matrix mostly zeros or huge?</td><td><code>sparse</code> and <code>sparse.linalg</code></td></tr>
+</tbody></table></div>
+<h3>Six recurring problem patterns, each solved</h3>
+<p><strong>Pattern 1: "What is the chance?"</strong> Name the distribution, then use <code>sf</code> or <code>cdf</code>.</p>
+<pre class="code lang-python"><code>from scipy import stats
+# A server answers in a lognormal time with median 200 ms and shape 0.4. P(slower than 500 ms)?
+d = stats.lognorm(s=0.4, scale=200)
+print("P(&gt;500 ms) = %.4f   99th percentile = %.0f ms" % (d.sf(500), d.ppf(0.99)))</code></pre>
+<pre class="code lang-text"><code>P(&gt;500 ms) = 0.0110   99th percentile = 507 ms</code></pre>
+<ol><li>For a lognormal, <code>scale</code> is the median. <code>sf(500)</code> is the tail beyond 500; <code>ppf(0.99)</code> is the value 99% of requests stay under.</li></ol>
+<p><strong>Pattern 2: "Is it different?"</strong> Check the shape, choose the test, report effect and interval.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+rng = np.random.default_rng(21)
+before = rng.lognormal(3.0, 0.5, 40)
+after = before * rng.lognormal(-0.15, 0.2, 40)          # same users measured twice
+diff = np.log(after) - np.log(before)
+print("normal log-differences? shapiro p = %.2f" % stats.shapiro(diff).pvalue)
+t = stats.ttest_1samp(diff, 0.0)
+ci = t.confidence_interval()
+print("paired on log scale: p = %.2g, mean ratio %.2f (CI %.2f to %.2f)" % (t.pvalue, np.exp(diff.mean()), np.exp(ci.low), np.exp(ci.high)))</code></pre>
+<pre class="code lang-text"><code>normal log-differences? shapiro p = 0.46
+paired on log scale: p = 5.4e-08, mean ratio 0.85 (CI 0.81 to 0.89)</code></pre>
+<ol><li>Same users twice means paired data. The ratios are skewed, but their logs are normal, so a one-sample t-test on the log-differences works, and exponentiating gives a ratio with an interval.</li></ol>
+<p><strong>Pattern 3: "How sure am I?"</strong> If the statistic has no formula, bootstrap it.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+rng = np.random.default_rng(4)
+x = rng.exponential(5, 50)
+r = stats.bootstrap((x,), lambda s: np.percentile(s, 90), n_resamples=3000, random_state=0)
+print("p90 = %.2f, 95%% CI (%.2f, %.2f)" % (np.percentile(x, 90), *r.confidence_interval))</code></pre>
+<pre class="code lang-text"><code>p90 = 13.91, 95% CI (9.24, 23.30)</code></pre>
+<ol><li>The 90th percentile has no tidy standard-error formula, but the bootstrap works for any function of the sample. Default method BCa handles the skew.</li></ol>
+<p><strong>Pattern 4: "What are the best inputs?"</strong> Write the objective as a function of one array, add limits, minimise.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import optimize
+# Split 100 units between 3 channels with diminishing returns a*sqrt(x); maximise total return.
+a = np.array([3.0, 2.0, 1.0])
+res = optimize.minimize(lambda x: -(a * np.sqrt(x)).sum(), x0=[30, 30, 40], bounds=[(0, 100)] * 3,
+                        constraints=[{"type": "eq", "fun": lambda x: x.sum() - 100}], method="SLSQP")
+print(res.x.round(1), "return %.2f" % -res.fun)
+print("theory (x proportional to a^2):", (100 * a ** 2 / (a ** 2).sum()).round(1))</code></pre>
+<pre class="code lang-text"><code>[64.3 28.6  7.1] return 37.42
+theory (x proportional to a^2): [64.3 28.6  7.1]</code></pre>
+<ol><li>The equality constraint keeps the total at 100. Lagrange theory says the best split is proportional to a squared, which the numerical answer matches: a good verification.</li></ol>
+<p><strong>Pattern 5: "Accumulate or evolve."</strong> Total over a range: integrate. Something changing by a rule: <code>solve_ivp</code>.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import integrate
+# Drug concentration decays at rate 0.3/h; a 10-unit dose is given each 4 h in a continuous 'pump' approximation.
+sol = integrate.solve_ivp(lambda t, c: 10 / 4 - 0.3 * c, (0, 24), [0.0], t_eval=[24], rtol=1e-8)
+print("c(24h) = %.3f   steady state = %.3f" % (sol.y[0, 0], 10 / 4 / 0.3))</code></pre>
+<pre class="code lang-text"><code>c(24h) = 8.327   steady state = 8.333</code></pre>
+<ol><li>Inflow minus decay gives dc/dt = 2.5 - 0.3 c. The level climbs toward the steady state 2.5/0.3 = 8.33; after 24 hours it has nearly arrived.</li></ol>
+<p><strong>Pattern 6: "Find structure in a signal or in space."</strong> Frequencies via FFT; neighbours via KDTree.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import fft, spatial
+rng = np.random.default_rng(1)
+sales = 50 + 8 * np.sin(2 * np.pi * np.arange(364) / 52) + rng.normal(0, 2, 364)   # daily data with a 52-day cycle
+f = fft.rfftfreq(364, 1.0)
+print("cycle length: %.0f days" % (1 / f[1:][np.argmax(np.abs(fft.rfft(sales - sales.mean()))[1:])]))
+pts = rng.uniform(size=(1000, 2))
+print("pairs closer than 0.02:", len(spatial.KDTree(pts).query_pairs(0.02)))</code></pre>
+<pre class="code lang-text"><code>cycle length: 52 days
+pairs closer than 0.02: 612</code></pre>
+<ol><li>Remove the mean, transform, ignore the zero-frequency bin, and invert the peak frequency to get a period (here 52 days exactly divides 364 days, so there is no leakage).</li><li><code>query_pairs</code> lists every pair of points within a radius without comparing all pairs.</li></ol>
+<h3>How to verify</h3>
+<ul><li><strong>Recover a known answer.</strong> Simulate data with known parameters, run your method, and see whether it finds them (as in most examples above).</li><li><strong>Compute it two ways.</strong> <code>quad</code> against <code>cdf</code>; permutation p against formula p; <code>solve</code> then multiply back.</li><li><strong>Check boundaries.</strong> Probabilities between 0 and 1; fitted distributions with positive support for positive data; the optimum respects constraints (<code>res.success</code>, then test constraints yourself).</li><li><strong>Plot it.</strong> A fit you have not plotted is a guess.</li></ul>
+<h3>How to debug</h3>
+<ol><li><strong>Read the result object.</strong> <code>res.success</code>, <code>res.message</code>, <code>res.status</code>; <code>print(res)</code> shows everything.</li><li><strong>Shrink the problem.</strong> Run on 10 points, then 100, then all.</li><li><strong>Check shapes and dtypes.</strong> <code>x.shape</code>, <code>x.dtype</code>, <code>np.isnan(x).sum()</code>. NaN silently poisons many statistics; use <code>nan_policy="omit"</code> where offered or drop them first.</li><li><strong>Change the start.</strong> For optimisers try three different <code>x0</code>; if the answers differ, the problem has several local minima.</li><li><strong>Turn warnings into errors while debugging:</strong> <code>warnings.simplefilter("error")</code>. A "covariance could not be estimated" warning from <code>curve_fit</code> means the fit failed, even if numbers came out.</li><li><strong>Compare to a simpler method</strong> (<code>np.polyfit</code> for a line, a histogram for a distribution).</li></ol>
+
+<h2>18.15 Going Deeper: Internals, Memory, Speed, Interviews</h2>
+<h3>How distribution objects work</h3>
+<p>Every SciPy continuous distribution subclasses <code>rv_continuous</code>. You supply one function, <code>_pdf</code> (or <code>_cdf</code>), and the base class derives the rest numerically: cdf by integrating the pdf, ppf by root-finding on the cdf, rvs by inverting the cdf. Distributions with closed forms override these methods for speed. You can define your own:</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+class Triangle(stats.rv_continuous):
+    "Density 2x on [0, 1]"
+    def _pdf(self, x):
+        return 2 * x
+
+tri = Triangle(a=0, b=1, name="tri")
+print("cdf(0.5) = %.4f   (exact 0.25)" % tri.cdf(0.5))
+print("ppf(0.25) = %.4f  (exact 0.5)" % tri.ppf(0.25))
+print("mean = %.4f   (exact 2/3)" % tri.mean())
+print("sample mean = %.3f" % tri.rvs(size=2000, random_state=1).mean())</code></pre>
+<pre class="code lang-text"><code>cdf(0.5) = 0.2500   (exact 0.25)
+ppf(0.25) = 0.5000  (exact 0.5)
+mean = 0.6667   (exact 2/3)
+sample mean = 0.673</code></pre>
+<ol><li><code>a</code> and <code>b</code> are the support limits. Only <code>_pdf</code> is defined.</li><li>The cdf and mean come from numerical integration, ppf from root-finding, and rvs from inverting the cdf. This works but is slow; defining <code>_cdf</code> and <code>_ppf</code> yourself speeds it up greatly.</li></ol>
+<h3>Optimiser internals in one paragraph</h3>
+<p><code>minimize</code> is a front door to several algorithms. BFGS builds an approximation of the inverse curvature from successive gradients (cost grows with the square of the number of variables). L-BFGS-B stores only a short history of steps, so it scales to thousands of variables and supports bounds. SLSQP solves a sequence of quadratic problems with linearised constraints. Nelder-Mead moves a simplex and uses no derivatives, but is slow and can stall in more than about 10 variables. <code>linprog</code> with <code>method="highs"</code> uses the HiGHS simplex or interior-point solver, and <code>curve_fit</code> calls Levenberg-Marquardt (unbounded) or a trust-region method (bounded). Convergence is controlled by <code>tol</code> and <code>options</code>; a run that hits <code>maxiter</code> returns <code>success=False</code>.</p>
+<h3>Memory: sparse formats and dtypes</h3>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import sparse
+
+rng = np.random.default_rng(0)
+n = 5000
+r = rng.integers(0, n, 50000); c = rng.integers(0, n, 50000)
+coo = sparse.coo_array((np.ones(50000), (r, c)), shape=(n, n))
+csr = coo.tocsr()
+lil = coo.tolil()
+mb = lambda b: round(b / 1e6, 2)
+print("dense float64 :", mb(n * n * 8), "MB")
+print("COO           :", mb(coo.data.nbytes + coo.row.nbytes + coo.col.nbytes), "MB")
+print("CSR           :", mb(csr.data.nbytes + csr.indices.nbytes + csr.indptr.nbytes), "MB")
+print("index dtype   :", csr.indices.dtype, " nnz after duplicates summed:", csr.nnz)</code></pre>
+<pre class="code lang-text"><code>dense float64 : 200.0 MB
+COO           : 1.2 MB
+CSR           : 0.84 MB
+index dtype   : int64  nnz after duplicates summed: 49949</code></pre>
+<ol><li>COO stores three numbers per entry (value, row, column). CSR replaces the row array by a short pointer array of length n + 1, so it is smaller and gives fast row operations.</li><li>The last line prints the index dtype (64-bit here, because the inputs were 64-bit). 32-bit indices would take half the index memory, so check <code>.indices.dtype</code> on very large matrices.</li><li>Converting COO to CSR sums duplicate coordinates, so <code>nnz</code> can be below the number of entries you inserted (random pairs collided here).</li><li>LIL (a list of rows) is the flexible format for editing individual elements but is slow and heavy for arithmetic, so convert before computing.</li></ol>
+<h3>Speed: where the time goes</h3>
+<ul><li>FFT cost is about n log n, but only for lengths with small prime factors; a length that is a large prime can be far slower. <code>fft.next_fast_len(n)</code> and zero-padding, or choosing a good length, fix it.</li><li>Dense linear algebra calls optimised BLAS/LAPACK libraries; time scales with n cubed for solve, so doubling the size costs about 8 times.</li><li>KDTree build is about n log n and a query about log n in low dimensions, degrading toward brute force as dimension grows.</li><li>Distribution methods have per-call overhead. For a hot loop, pull the maths out (<code>scipy.special.ndtr</code> for the normal cdf) or vectorise.</li><li>Many functions accept <code>workers</code> for parallelism; BLAS threading is controlled by environment variables such as <code>OMP_NUM_THREADS</code>.</li></ul>
+<h3>What interviewers probe</h3>
+<ol><li><strong>"What does a p-value mean?"</strong> Probability, under the null, of a statistic at least as extreme as observed. Not the probability the null is true.</li><li><strong>"Why Welch rather than Student?"</strong> Equal variances are rarely guaranteed; Welch loses almost nothing when they are equal.</li><li><strong>"Why is <code>solve</code> better than <code>inv</code>?"</strong> One LU factorisation (about 2n<sup>3</sup>/3 operations) with smaller rounding error, while inversion costs more and amplifies error through the condition number.</li><li><strong>"Bootstrap versus formula?"</strong> The bootstrap needs no distribution formula and works for medians, ratios and percentiles, but needs a reasonably representative sample and fails for extremes such as the maximum.</li><li><strong>"What if <code>curve_fit</code> fails?"</strong> Better <code>p0</code>, bounds, rescale parameters to similar magnitudes, check the model is identifiable (two parameters doing the same job make <code>pcov</code> infinite).</li><li><strong>"KDTree in 500 dimensions?"</strong> Distances concentrate and pruning fails; use approximate nearest-neighbour methods.</li><li><strong>"Aliasing?"</strong> Frequencies above half the sampling rate fold back to lower ones; sample faster or low-pass filter before sampling.</li></ol>
+
+<h2>Chapter recap</h2>
+<ul>
+<li>SciPy is a set of tool drawers on top of NumPy arrays; statsmodels adds regression and time-series models with full inference tables. Import the submodule you need.</li>
+<li>Every distribution has <code>pdf/pmf, cdf, sf, ppf, rvs, fit</code>. <code>cdf</code> maps value to probability, <code>ppf</code> maps probability to value.</li>
+<li>Pick tests by data type, prefer Welch over Student, use rank tests for skewed data, and always report an effect size and an interval, not only p.</li>
+<li>The bootstrap gives intervals for any statistic; permutation tests give p-values without formulas. Seed them.</li>
+<li><code>minimize</code> for smooth problems, <code>curve_fit</code> for fitting formulas (give <code>p0</code>), <code>root</code>/<code>brentq</code> for equations, <code>linprog</code>/<code>milp</code> for linear plans (minimises, so negate).</li>
+<li><code>trapezoid(y, x)</code> and <code>quad</code> integrate; <code>solve_ivp</code> evolves systems; splines and PCHIP interpolate but should not extrapolate.</li>
+<li><code>solve</code> not <code>inv</code>; <code>lstsq</code> for fits; sparse matrices for mostly-zero data (build in COO, compute in CSR); use <code>@</code> for products.</li>
+<li><code>rfft</code> plus <code>rfftfreq(n, 1/fs)</code> finds frequencies; <code>sosfiltfilt</code> filters without delay; <code>find_peaks</code> needs prominence or distance.</li>
+<li>KDTree for neighbours in low dimensions, <code>cdist</code> for small matrices, <code>linkage</code> and <code>kmeans2</code> for quick clustering (scale the columns first).</li>
+<li>statsmodels needs <code>add_constant</code> in the array API; formulas add the intercept. Its numbers can be reproduced with NumPy, which is the best way to understand them.</li>
+<li>Verify by recovering a known answer, computing two ways, and plotting.</li>
+</ul>
+<div class="tablewrap"><table class="data"><thead><tr><th>Formula / pattern</th><th>Meaning</th></tr></thead><tbody>
+<tr><td><code>d.cdf(b) - d.cdf(a)</code></td><td>Probability of landing between a and b</td></tr>
+<tr><td><code>d.sf(k - 1)</code></td><td>Discrete "k or more"</td></tr>
+<tr><td><code>mean +/- t.ppf(0.975, n-1) * sem</code></td><td>95% confidence interval for a mean</td></tr>
+<tr><td><code>ttest_ind(a, b, equal_var=False)</code></td><td>Welch two-group test</td></tr>
+<tr><td><code>n = 2 ((z<sub>1-a/2</sub> + z<sub>power</sub>) / d)<sup>2</sup></code></td><td>Sample size per group for standardised effect d</td></tr>
+<tr><td><code>bootstrap((x,), stat)</code></td><td>Interval for any statistic</td></tr>
+<tr><td><code>curve_fit(f, x, y, p0)</code>, <code>sqrt(diag(pcov))</code></td><td>Parameters and standard errors</td></tr>
+<tr><td><code>linprog(-c, A_ub, b_ub)</code></td><td>Maximise c.x within limits</td></tr>
+<tr><td><code>solve(A, b)</code></td><td>Linear system (never <code>inv(A) @ b</code>)</td></tr>
+<tr><td><code>rfftfreq(n, 1/fs)[argmax(abs(rfft(x)))]</code></td><td>Dominant frequency in Hz</td></tr>
+<tr><td><code>tree.query(q, k)</code></td><td>k nearest neighbours</td></tr>
+<tr><td><code>(X'X)<sup>-1</sup>X'y</code>, se = sqrt(diag(s<sup>2</sup>(X'X)<sup>-1</sup>))</td><td>OLS coefficients and standard errors</td></tr>
+</tbody></table></div>
+
+<h2>Practice set</h2>
+<p>Twenty-five problems, graded from easy to expert. Try each before reading the answer.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.1</span> (easy) What is the probability that a standard normal value is at most 1.96? What is it for a value above 1.96?</p>
+<p><strong>Answer:</strong> <code>stats.norm.cdf(1.96)</code> is about 0.975, and the upper tail <code>sf(1.96)</code> is 0.025. They add to 1. The two tails together hold 5%, which is why 1.96 is the 95% interval multiplier.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.2</span> (easy, what does it print?)</p>
+<pre class="code lang-python"><code>from scipy import stats
+print(stats.norm.ppf(0.5, loc=10, scale=3))</code></pre>
+<p><strong>Answer:</strong> it prints 10.0. The 50th percentile of a symmetric distribution is its mean (and median), so <code>loc</code> is returned; <code>scale</code> does not matter here.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.3</span> (easy) You have 30 waiting times in each of two groups, both strongly right-skewed. Which SciPy test do you choose and why?</p>
+<p><strong>Answer:</strong> <code>stats.mannwhitneyu</code>, because it compares ranks and does not need normality. A good alternative is to log-transform the times and run Welch's <code>ttest_ind</code> if the logs look normal (check with <code>shapiro</code> or a Q-Q plot). Report an effect size either way.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.4</span> (easy, what does it print?)</p>
+<pre class="code lang-python"><code>from scipy import optimize
+res = optimize.minimize(lambda v: (v[0] - 3) ** 2 + 1, x0=[0.0])
+print(round(float(res.x[0]), 3), round(float(res.fun), 3))</code></pre>
+<p><strong>Answer:</strong> 3.0 1.0. The parabola (x - 3)<sup>2</sup> + 1 has its lowest point at x = 3 with value 1. Note that <code>x0</code> is an array, so <code>res.x</code> is an array and we take element 0.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.5</span> (easy) By hand, what does <code>integrate.trapezoid([0, 2, 4], [0, 1, 2])</code> return?</p>
+<p><strong>Answer:</strong> two trapezoids, each of width 1. The first has heights 0 and 2: area (0 + 2)/2 = 1. The second has heights 2 and 4: area 3. Total 4, which equals the exact area under y = 2x from 0 to 2 (a straight line has no error): 4.0.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.6</span> (easy, what does it print?)</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import sparse
+A = sparse.csr_array(np.array([[0, 0, 3], [4, 0, 0], [0, 0, 0]]))
+print(A.nnz, A.shape, A.toarray().sum())</code></pre>
+<p><strong>Answer:</strong> 2 (3, 3) 7. Only the two non-zero entries (3 and 4) are stored, the shape is 3 by 3 and their sum is 7. A sparse matrix remembers values and positions, not the zeros.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.7</span> (medium, what does it print?)</p>
+<pre class="code lang-python"><code>import numpy as np
+print(np.interp([0, 1.5, 9], [1, 2], [10, 20]))</code></pre>
+<p><strong>Answer:</strong> [10. 15. 20.]. 1.5 is halfway between 1 and 2, so 15. Outside the known range <code>np.interp</code> does not extrapolate: it clamps to the end values (10 on the left, 20 on the right). That silent clamping can hide a data problem.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.8</span> (medium, find the bug) The code is meant to maximise 3x + 2y with x + y at most 4, x and y at least 0. It reports a profit of zero. Why?</p>
+<pre class="code lang-python"><code>from scipy import optimize
+res = optimize.linprog([3, 2], A_ub=[[1, 1]], b_ub=[4], bounds=[(0, None)] * 2)
+print(res.x, res.fun)</code></pre>
+<p><strong>Answer:</strong> it prints [0. 0.] 0.0. <code>linprog</code> minimises, so the best "minimum" of 3x + 2y is at the origin. Fix: pass <code>c=[-3, -2]</code> and negate the result; the true optimum is x = 4, y = 0 with value 12.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.9</span> (medium, find the bug) A speed log is integrated and gives a negative distance. What went wrong?</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import integrate
+t = np.array([0.0, 1.0, 2.0, 3.0]); v = np.array([5.0, 6.0, 7.0, 6.0])
+print(integrate.trapezoid(t, v))</code></pre>
+<p><strong>Answer:</strong> it prints -0.5, a negative number. The signature is <code>trapezoid(y, x)</code>: values first. With the arguments swapped the function integrates time with respect to speed, and because speed falls at the end the small steps count backward. Correct call: <code>trapezoid(v, t)</code> = 18.5.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.10</span> (medium) A sample of 25 values has mean 50 and standard deviation 10. Give the 95% t interval for the mean.</p>
+<p><strong>Answer:</strong> standard error = 10 / sqrt(25) = 2. The t quantile with 24 degrees of freedom is 2.064. Interval = 50 plus or minus 4.13, so (45.87, 54.13). In code: <code>stats.t.interval(0.95, 24, loc=50, scale=2)</code>. Using 1.96 instead of 2.064 would make the interval too narrow for a sample this small.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.11</span> (medium) A table has page A: 30 converted, 70 not; page B: 50 converted, 50 not. Compute the chi-square statistic by hand.</p>
+<p><strong>Answer:</strong> totals: converted 80, not 120, each page 100, grand 200. Expected converted per page = 100 * 80 / 200 = 40, not converted = 60. Chi-square = sum of (O - E)<sup>2</sup>/E = 100/40 + 100/60 + 100/40 + 100/60 = 2.5 + 1.667 + 2.5 + 1.667 = 8.333, with 1 degree of freedom. Code check: 8.333, p = 0.0039, so the rates 30% and 50% differ significantly.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.12</span> (medium, find the bug) This call fails or returns nonsense. Why?</p>
+<pre class="code lang-text"><code>def model(a, k, t):                # parameters first, x last
+    return a * np.exp(-k * t)
+popt, pcov = optimize.curve_fit(model, t, y)</code></pre>
+<p><strong>Answer:</strong> <code>curve_fit</code> always passes the x data as the <em>first</em> argument and the parameters after it. Here it would treat <code>a</code> as x and fit <code>k</code> and <code>t</code> as parameters (and complain about the wrong number of values). Fix the signature to <code>model(t, a, k)</code>.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.13</span> (medium, what does it print?)</p>
+<pre class="code lang-python"><code>from scipy import stats
+d = stats.poisson(2)
+print(round(d.cdf(2), 4), round(d.sf(2), 4), round(d.pmf(2), 4))</code></pre>
+<p><strong>Answer:</strong> 0.6767 0.3233 0.2707. <code>cdf(2)</code> is P(0, 1 or 2 events), <code>sf(2)</code> is P(3 or more) and the two add to 1. <code>pmf(2)</code> is just P(exactly 2). Mixing these up is the most common discrete-distribution error.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.14</span> (medium) Write code for a 90% bootstrap interval for the 75th percentile of a sample.</p>
+<p><strong>Answer:</strong></p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+x = np.random.default_rng(0).gamma(2.0, 3.0, 80)
+r = stats.bootstrap((x,), lambda s, axis: np.percentile(s, 75, axis=axis), n_resamples=3000,
+                    confidence_level=0.90, random_state=0)
+print("p75 = %.2f, 90%% CI (%.2f, %.2f)" % (np.percentile(x, 75), r.confidence_interval.low, r.confidence_interval.high))</code></pre>
+<pre class="code lang-text"><code>p75 = 6.94, 90% CI (6.39, 8.32)</code></pre>
+<ol><li>The data goes in as a tuple <code>(x,)</code>.</li><li>The default is vectorised: the statistic receives a batch of resamples and an <code>axis</code> argument, so the lambda takes <code>axis</code> and passes it to <code>np.percentile</code>. Forgetting <code>axis</code> is the usual cause of errors or wrong shapes here.</li><li><code>confidence_level=0.90</code> gives a 90% interval.</li></ol>
+
+<p class="problem"><span class="pl">Problem 18.P.15</span> (hard, find the bug) A colleague fits a normal to data, then runs <code>stats.kstest(data, "norm", args=(data.mean(), data.std()))</code> and reports "p = 0.4, so the data is normal". Find two problems.</p>
+<p><strong>Answer:</strong> (1) The parameters were estimated from the same data being tested, which makes the KS p-value too large (too forgiving); the proper fix is a Lilliefors-style test or a parametric bootstrap that repeats the estimate on simulated data. (2) A large p-value does not prove normality; it only says the test could not reject it. Complement with a Q-Q plot (<code>stats.probplot</code>) and, with small samples, remember the test has little power.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.16</span> (hard) How many users per group do you need to detect a standardised difference of 0.3 with 80% power at a two-sided 5% level?</p>
+<p><strong>Answer:</strong> with the normal approximation, n = 2 * ((z<sub>0.975</sub> + z<sub>0.80</sub>) / d)<sup>2</sup> = 2 * ((1.96 + 0.8416) / 0.3)<sup>2</sup> = 175 per group (rounded up). Exact t-based calculations (statsmodels <code>TTestIndPower</code>, not run here) give a slightly larger number. Halving the effect size quadruples the sample size, which is why small effects are expensive.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.17</span> (hard) A user-item matrix has 1,000,000 rows, 1,000,000 columns and 5,000,000 non-zero values. Estimate the memory of dense float64 and of CSR with 32-bit indices.</p>
+<p><strong>Answer:</strong> dense: 10<sup>12</sup> cells * 8 bytes = 8 * 10<sup>12</sup> bytes = 8 TB, impossible. CSR: values 5 * 10<sup>6</sup> * 8 = 40 MB, column indices 5 * 10<sup>6</sup> * 4 = 20 MB, row pointers (10<sup>6</sup> + 1) * 4 = 4 MB, total about 64 MB. Density is 5 * 10<sup>-6</sup>, so sparse is the only option.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.18</span> (hard, what does it print?)</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+print(stats.zscore([1, 2, 3]).round(4), stats.zscore([1, 2, 3], ddof=1).round(4))</code></pre>
+<p><strong>Answer:</strong> [-1.2247  0.      1.2247] [-1.  0.  1.]. By default <code>zscore</code> divides by the population standard deviation (<code>ddof=0</code>: sqrt(2/3) = 0.8165), giving plus or minus 1.2247. With <code>ddof=1</code> the sample standard deviation is 1, giving plus or minus 1. pandas' <code>std</code> uses <code>ddof=1</code> by default, so results can differ between libraries unless you set it.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.19</span> (hard) Find the x where cos(x) = x.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import optimize
+print(round(optimize.brentq(lambda x: np.cos(x) - x, 0, 1), 6))</code></pre>
+<p><strong>Answer:</strong> 0.739085. Define f(x) = cos x - x, which is positive at 0 (value 1) and negative at 1 (about -0.46), so a root lies in [0, 1] and <code>brentq</code> is guaranteed to find it. Check: cos(0.739085) is 0.739085.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.20</span> (hard, find the bug) The code is meant to find the weekly peaks, but it returns far too many.</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import signal
+rng = np.random.default_rng(0)
+x = 10 * np.sin(2 * np.pi * np.arange(140) / 7) + rng.normal(0, 4, 140)
+print(len(signal.find_peaks(x)[0]), len(signal.find_peaks(x, prominence=10, distance=5)[0]))</code></pre>
+<p><strong>Answer:</strong> it prints 29 20 (the true count is 20, one per week). Plain <code>find_peaks</code> calls every tiny noise wiggle a peak. Constrain it: <code>prominence</code> says how much a peak must stand above its surroundings, and <code>distance</code> says how far apart peaks must be. Choose these from the domain (a weekly cycle means at least 5 days apart).</p>
+
+<p class="problem"><span class="pl">Problem 18.P.21</span> (hard, design) Delivery-time data has 30% exact zeros (pre-cooked items) and positive skew otherwise. How would you model it with SciPy?</p>
+<p><strong>Answer:</strong> a single lognormal cannot have exact zeros. Use a two-part (hurdle) model: estimate the zero share p0 as a proportion (with a <code>binomtest</code> interval), fit <code>lognorm.fit(positive_values, floc=0)</code> to the rest, and combine: P(T &gt; t) = (1 - p0) * lognorm.sf(t). Validate by simulating from the model and comparing quantiles with the data.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.22</span> (expert) Show that the standard error of the OLS slope in simple regression is sigma / sqrt(S<sub>xx</sub>), where S<sub>xx</sub> is the sum of squared deviations of x, and confirm numerically.</p>
+<p><strong>Answer:</strong> the slope is sum((x - mean x)(y - mean y)) / S<sub>xx</sub> = sum((x - mean x) y) / S<sub>xx</sub>, a linear combination of y with weights w = (x - mean x)/S<sub>xx</sub>. With independent noise of variance sigma<sup>2</sup>, the variance is sigma<sup>2</sup> * sum(w<sup>2</sup>) = sigma<sup>2</sup> * S<sub>xx</sub>/S<sub>xx</sub><sup>2</sup> = sigma<sup>2</sup>/S<sub>xx</sub>. Numerical confirmation against the matrix formula:</p>
+<pre class="code lang-python"><code>import numpy as np
+
+rng = np.random.default_rng(11)
+x = rng.uniform(0, 10, 80)
+y = 2 + 0.7 * x + rng.normal(0, 1.0, 80)
+X = np.column_stack([np.ones(80), x])
+beta = np.linalg.solve(X.T @ X, X.T @ y)
+s2 = ((y - X @ beta) ** 2).sum() / 78
+se_matrix = np.sqrt(s2 * np.linalg.inv(X.T @ X)[1, 1])
+se_formula = np.sqrt(s2 / ((x - x.mean()) ** 2).sum())
+print(round(se_matrix, 6), round(se_formula, 6))</code></pre>
+<pre class="code lang-text"><code>0.039062 0.039062</code></pre>
+<p>Both routes give the same number, and the formula shows why a wider spread of x (larger S<sub>xx</sub>) gives a more precise slope: design your experiments to spread x out.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.23</span> (expert, interview) Why do numerical analysts say "never compute the inverse to solve a system", and what do you do when the same matrix must be solved against 1,000 right-hand sides?</p>
+<p><strong>Answer:</strong> solving by LU costs about 2n<sup>3</sup>/3 operations and has backward-stable error behaviour; forming the inverse costs about 2n<sup>3</sup> and then a multiply, and its errors are larger when the matrix is ill-conditioned (condition number large). For many right-hand sides, factor once with <code>lu_factor</code> (or <code>cholesky</code> for symmetric positive-definite matrices), then call <code>lu_solve</code> for each (or pass all right-hand sides as columns of one matrix). Also check <code>np.linalg.cond</code>: if it is near 1/eps (about 10<sup>16</sup>), the answer has no correct digits whatever method you use.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.24</span> (expert, interview) Your KDTree nearest-neighbour search on 768-dimensional text embeddings is no faster than brute force. Why, and what are your options?</p>
+<p><strong>Answer:</strong> in high dimensions distances to the nearest and farthest points become similar, so the tree cannot rule out whole boxes and must visit almost every node. Options: reduce dimension first (PCA or SVD, accepting some loss), use approximate nearest-neighbour libraries (graph or quantisation indexes), or batch brute force as a matrix multiplication on normalised vectors (<code>E @ q</code>), which is often fast enough up to a few hundred thousand vectors because it uses optimised BLAS.</p>
+
+<p class="problem"><span class="pl">Problem 18.P.25</span> (expert, design) An experiment has 10 million users per arm, and the data lives in a warehouse. How do you run the t-test without moving all rows?</p>
+<p><strong>Answer:</strong> compute count, mean and variance per arm in SQL, then run the test from the summaries with <code>ttest_ind_from_stats</code>. It gives the same result as the row-level test:</p>
+<pre class="code lang-python"><code>import numpy as np
+from scipy import stats
+
+rng = np.random.default_rng(0)
+a = rng.normal(10.00, 3, 200000); b = rng.normal(10.02, 3, 200000)
+full = stats.ttest_ind(b, a, equal_var=False)
+summ = stats.ttest_ind_from_stats(b.mean(), b.std(ddof=1), b.size, a.mean(), a.std(ddof=1), a.size, equal_var=False)
+print(round(full.pvalue, 8), round(summ.pvalue, 8), np.isclose(full.statistic, summ.statistic))</code></pre>
+<pre class="code lang-text"><code>0.03389195 0.03389195 True</code></pre>
+<p>The summaries must use the sample standard deviation (<code>ddof=1</code>). With ten million users per arm even tiny differences are significant, so judge practical size with the interval and the business threshold, and consider variance-reduction methods (pre-experiment covariates) before spending more traffic.</p>
+
+<h2>Prompt pack</h2>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional moving into data roles, and English is my second language, so use simple English. Teach me SciPy and statsmodels step by step: scipy.stats distributions (pdf, cdf, ppf, rvs, fit), hypothesis tests (t-test, Mann-Whitney, chi-square, Shapiro), confidence intervals and the bootstrap, then optimize (minimize, curve_fit, linprog), integrate, interpolate and the OLS output table of statsmodels. Use small runnable Python examples with seeded randomness and show real output. After each part, ask me one check question and wait for my answer before continuing.</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional learning scientific Python, and English is my second language. Review my analysis code below. Check: Is the statistical test right for my data (paired or independent, normal or skewed)? Do I report an effect size and a confidence interval, not only a p-value? Are random seeds set? Did I give curve_fit a starting guess and check the residuals? Did I use solve instead of inv, and sparse matrices where the data is mostly zeros? List the top 5 problems in order of importance, with a corrected snippet for each. My code: [PASTE HERE]</pre></div>
+<div class="prompt"><div class="ph"><span>✨ AI prompt: copy and paste into any AI</span><button type="button" class="copy">Copy</button></div><pre>You are my patient, practical professor. I am a working professional preparing for data science interviews, and English is my second language. Run a 30-minute mock interview on SciPy and statsmodels: p-values, Welch versus Student, bootstrap versus formula intervals, power and sample size, curve_fit failures, optimisation methods, solve versus inv, sparse matrices, FFT aliasing and KDTree limits. Ask one question at a time, mixing concept questions with a small coding task. After each answer give a score out of 5, a model answer, and one tip on how to say it clearly in English.</pre></div>

@@ -1,0 +1,141 @@
+<p>Priya works at an online shop. On Monday the data team drops a file called <code>events.csv</code> into a shared folder: every click, cart and purchase from the last year. It is 10 GB. Her laptop has 16 GB of memory. She types <code>pd.read_csv("events.csv")</code>, the fan spins up, the notebook freezes for four minutes, and then the kernel dies with no message. She did nothing wrong. Pandas is a superb tool, but it was designed to hold a table in memory, and a table can be bigger than memory.</p>
+<p>This chapter is the map of what to do next. You will learn to measure how big a problem really is, shrink it with cheap pandas tricks, read it in chunks, and then move to the right bigger tool: <strong>Parquet</strong> files (a compact column-based file format), <strong>Polars</strong> (a very fast DataFrame library), <strong>DuckDB</strong> (a database that runs SQL directly on files), <strong>Dask</strong> (pandas split across many pieces) and <strong>PySpark</strong> (the cluster engine used in many companies). By the end you will be able to choose between them on purpose, write the same task in each, read a Spark UI, and fix the usual disasters: out-of-memory kills, skewed joins and slow Python functions.</p>
+<p><em>How the code in this chapter is labelled.</em> Polars, DuckDB, Dask, PySpark and PyArrow are <strong>not installed</strong> on the study machine, so their code is marked <strong>NOT RUN HERE</strong>. It is written to be correct and current, and every such example solves the same small task as a block that <strong>was run</strong> with pandas and with <code>sqlite3</code> (which ships with Python), so you can verify the expected result by eye. Everything else was run with Python 3.14, pandas 3.0 and NumPy 2.x, and the output shown is the real output. Timings are measured on one laptop and will vary on yours; trust the ratios and the shapes, not the exact seconds.</p>
+
+<h2>22.1 What these libraries are, and when to leave pandas</h2>
+<h3>Beginner: the problem in one picture</h3>
+<p>A <strong>DataFrame</strong> is a table: rows are records, columns are fields. Pandas keeps the whole table in RAM (the fast working memory of your computer) and works on one CPU core for most operations. That gives two limits. <strong>Memory</strong>: if the table needs more RAM than you have, the program crashes or starts swapping to disk and crawls. <strong>Speed</strong>: if a job takes an hour on one core while your laptop has eight, seven cores sit idle.</p>
+<p>The tools in this chapter attack those two limits with three ideas. Learn the ideas once and every library becomes easier.</p>
+<ul>
+<li><strong>Columnar storage.</strong> Store each column together, not each row. A question about one column reads only that column (figure below).</li>
+<li><strong>Lazy execution.</strong> Do not run each line immediately. Collect the whole plan, let an optimizer clean it up, then run once.</li>
+<li><strong>Partitioning.</strong> Cut the data into pieces that can be processed independently (in parallel, or one at a time), then combine the partial answers.</li>
+</ul>
+<figure><img src="images/lib22_rowcol.png" alt="Left: a row store where a sum of one column must read every cell. Right: a column store where the sum reads one column." loading="lazy"/><figcaption>Figure 22.1. Row storage versus column storage. The highlighted column is the only one the query needs.</figcaption></figure>
+<p><strong>How to read it:</strong> each small square is one cell. In the row store (a CSV file or a <code>sqlite3</code> table) the cells of a row sit next to each other on disk, so adding up <code>amount</code> forces the reader to walk past every other cell. In the column store the cells of a column sit together, so only the orange column is read. With 4 columns that saves about three quarters of the reading; with 100 columns it saves 99 percent. This is the main reason Parquet, Polars and DuckDB are fast on analytics.</p>
+
+<h3>The five libraries at a glance</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Library</th><th>What it is</th><th>Use it when</th><th>Do NOT use it when</th></tr></thead><tbody>
+<tr><td>pandas</td><td>In-memory DataFrame, one core mostly</td><td>Data fits in RAM comfortably (a good rule: the in-memory size is under a third of your RAM)</td><td>The file will not load, or one step takes hours</td></tr>
+<tr><td>Polars</td><td>Rust DataFrame library, multi-core, eager and lazy modes</td><td>One machine, data from a few GB to larger than RAM (lazy/streaming), you like method chains</td><td>You need the exact pandas API, or a cluster</td></tr>
+<tr><td>DuckDB</td><td>In-process analytical SQL database</td><td>You think in SQL, you query Parquet/CSV files directly, you want window functions and joins on big files</td><td>Many small writes per second (that is OLTP, use PostgreSQL or SQLite)</td></tr>
+<tr><td>Dask</td><td>Parallel pandas: many pandas pieces plus a scheduler</td><td>You have pandas code and need more cores or more than RAM, maybe a small cluster</td><td>Data is small (the overhead is larger than the gain), or you can use Polars/DuckDB on one machine</td></tr>
+<tr><td>PySpark</td><td>Python API for Apache Spark, a distributed engine</td><td>Data is many hundreds of GB or TB, or your company already runs Spark (Databricks, EMR, Dataproc, Synapse)</td><td>Data fits on one machine: Spark startup and shuffle costs will make it slower</td></tr>
+</tbody></table></div>
+
+<h3>Install, version check and import conventions</h3>
+<p>Install with pip into a virtual environment (see Chapter 9 for environments). PySpark also needs a Java runtime installed on the machine, because Spark itself runs on the JVM.</p>
+<pre class="code lang-bash"><code>pip install pyarrow polars duckdb "dask[dataframe]" pyspark
+java -version        # PySpark needs a Java runtime; install a JDK if this fails</code></pre>
+<p>This block checks which of the libraries exist on the current machine and prints the version of each one that does. It is the first thing to run when someone says "it works on my laptop".</p>
+<py>
+import importlib.util
+from importlib.metadata import version, PackageNotFoundError
+
+for name in ["pandas", "numpy", "pyarrow", "polars", "duckdb", "dask", "pyspark"]:
+    if importlib.util.find_spec(name) is None:
+        print(f"{name:8s} not installed")
+    else:
+        try:
+            print(f"{name:8s} {version(name)}")
+        except PackageNotFoundError:
+            print(f"{name:8s} present")
+import sqlite3
+print("sqlite3  ", sqlite3.sqlite_version)
+</py>
+<ol>
+<li><code>find_spec</code> asks Python whether an import would succeed, without importing (a slow import of Spark is avoided).</li>
+<li>For installed packages, <code>importlib.metadata.version</code> returns the version string from the package metadata.</li>
+<li>The last two lines show the version of the SQLite engine inside Python. It matters: window functions need SQLite 3.25 or newer.</li>
+<li>On the study machine the output above shows pandas and NumPy present, and PyArrow, Polars, DuckDB, Dask and PySpark missing. That is why their code is labelled NOT RUN HERE.</li>
+</ol>
+<p>The import conventions you will see everywhere:</p>
+<pre class="code lang-python notrun"><code># NOT RUN HERE (libraries not installed)
+import pandas as pd
+import polars as pl
+import duckdb
+import dask.dataframe as dd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from pyspark.sql import SparkSession, functions as F, Window</code></pre>
+
+<div class="callout green"><div class="lab">KEY IDEA</div><div class="txt">There is no best library, only the smallest tool that finishes in time. Each step up (pandas, Polars/DuckDB, Dask, Spark) buys capacity and costs simplicity: more setup, less debugging comfort, more concepts (partitions, shuffles). Cheap fixes first: read fewer columns, use smaller dtypes, read in chunks.</div></div>
+
+<h3>The running task used in this chapter</h3>
+<p>To compare libraries fairly, we solve one small task in all of them. Ten orders, six customers. <strong>For each region, rank customers by their total revenue (rank 1 is the biggest), and attach each customer's loyalty tier.</strong> That needs a group-by, a join and a window function (rank within a group), which are the three operations that decide whether a tool is any good. First in pandas.</p>
+<p class="problem"><span class="pl">Problem 22.1.1</span> Using the ten orders and the customer tiers below, produce one row per (region, customer) with the customer's revenue, tier and rank within the region. Compute it with pandas.</p>
+<py>
+import io
+import pandas as pd
+
+orders = pd.read_csv(io.StringIO("""order_id,customer_id,region,category,amount
+1,c1,EU,book,20
+2,c2,EU,toy,35
+3,c1,EU,toy,15
+4,c3,US,book,50
+5,c4,US,toy,10
+6,c3,US,toy,25
+7,c5,APAC,book,40
+8,c5,APAC,book,30
+9,c6,APAC,toy,5
+10,c2,EU,book,45"""))
+tiers = pd.DataFrame({"customer_id": ["c1", "c2", "c3", "c4", "c5", "c6"],
+                      "tier": ["gold", "silver", "gold", "bronze", "silver", "bronze"]})
+
+rev = orders.groupby(["region", "customer_id"], as_index=False)["amount"].sum()
+rev = rev.rename(columns={"amount": "revenue"})
+rev = rev.merge(tiers, on="customer_id", how="left")
+rev["rank"] = rev.groupby("region")["revenue"].rank(method="first", ascending=False).astype(int)
+print(rev.sort_values(["region", "rank"]).to_string(index=False))
+</py>
+<ol>
+<li><code>read_csv(io.StringIO(...))</code> reads CSV text from a string as if it were a file. This keeps the block standalone.</li>
+<li><code>groupby([...], as_index=False)["amount"].sum()</code> adds up the amount per (region, customer) pair. <code>as_index=False</code> keeps the keys as normal columns.</li>
+<li><code>rename</code> gives the new column an honest name, <code>revenue</code>.</li>
+<li><code>merge(tiers, on="customer_id", how="left")</code> is a left join: every revenue row is kept and the tier is attached.</li>
+<li><code>groupby("region")["revenue"].rank(...)</code> is the window function: it ranks within each region. <code>method="first"</code> breaks ties by order of appearance and <code>ascending=False</code> makes the largest revenue rank 1.</li>
+<li>The last line sorts for a stable, readable print. Check by hand: EU c2 = 35 + 45 = 80, c1 = 20 + 15 = 35. US c3 = 75, c4 = 10. APAC c5 = 70, c6 = 5.</li>
+</ol>
+<p>Keep these six rows in mind. Every other library in the chapter must give the same six rows, and the next block proves the SQL version does.</p>
+<py>
+import io, sqlite3
+import pandas as pd
+
+csv = """order_id,customer_id,region,category,amount
+1,c1,EU,book,20
+2,c2,EU,toy,35
+3,c1,EU,toy,15
+4,c3,US,book,50
+5,c4,US,toy,10
+6,c3,US,toy,25
+7,c5,APAC,book,40
+8,c5,APAC,book,30
+9,c6,APAC,toy,5
+10,c2,EU,book,45"""
+con = sqlite3.connect(":memory:")
+pd.read_csv(io.StringIO(csv)).to_sql("orders", con, index=False)
+con.execute("CREATE TABLE tiers(customer_id TEXT, tier TEXT)")
+con.executemany("INSERT INTO tiers VALUES (?, ?)", [("c1","gold"),("c2","silver"),("c3","gold"),("c4","bronze"),("c5","silver"),("c6","bronze")])
+
+sql = """
+WITH rev AS (
+    SELECT region, customer_id, SUM(amount) AS revenue
+    FROM orders GROUP BY region, customer_id
+)
+SELECT r.region, r.customer_id, r.revenue, t.tier,
+       ROW_NUMBER() OVER (PARTITION BY r.region ORDER BY r.revenue DESC) AS rnk
+FROM rev r LEFT JOIN tiers t ON t.customer_id = r.customer_id
+ORDER BY r.region, rnk
+"""
+for row in con.execute(sql):
+    print(row)
+</py>
+<ol>
+<li>An in-memory SQLite database is created; the orders table is loaded from the same ten rows with <code>to_sql</code>.</li>
+<li>A small <code>tiers</code> table is created and filled with <code>executemany</code> (placeholders <code>?</code> keep values out of the SQL text).</li>
+<li>The CTE (<code>WITH rev AS (...)</code>) is the group-by step: one row per region and customer.</li>
+<li><code>LEFT JOIN tiers</code> attaches the tier, same as <code>merge(..., how="left")</code>.</li>
+<li><code>ROW_NUMBER() OVER (PARTITION BY region ORDER BY revenue DESC)</code> is the window function: number the rows inside each region, biggest revenue first.</li>
+<li>The tuples printed match the pandas table cell for cell (pandas prints a table, SQLite prints tuples; the values are the same). <strong>DuckDB accepts this exact SQL text</strong>, which is why the DuckDB section can reuse it.</li>
+</ol>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">When you move a pipeline to a bigger tool, never trust it on faith. Keep a tiny sample dataset with a known answer (like these ten rows) and a test that compares the new output with the old output. Most migration bugs (different tie-breaking, null handling, integer overflow) show up on ten rows.</div></div>

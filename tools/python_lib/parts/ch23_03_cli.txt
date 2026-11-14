@@ -1,0 +1,117 @@
+
+<h2>23.3 Logging, argparse, Typer/Click and pathlib: Jobs That Run Without You</h2>
+<p>A job that runs at 3 a.m. has no screen. You need three things: a record of what happened (logging), a way to give it inputs (a command-line interface) and paths that do not break when the folder changes (pathlib).</p>
+<h3>Logging</h3>
+<p>The <code>logging</code> module sends <strong>records</strong> (message plus level plus time plus source) from <strong>loggers</strong> to <strong>handlers</strong> (screen, file, network), which format them with <strong>formatters</strong>. Levels are ordered: DEBUG (10), INFO (20), WARNING (30), ERROR (40), CRITICAL (50). Anything below the configured level is dropped.</p>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>logging.getLogger(name)</code></td><td>Gets (or creates) the named logger; the same name gives the same object</td><td><code>log = logging.getLogger(__name__)</code></td></tr>
+<tr><td><code>log.debug/info/warning/error/critical</code></td><td>Emit a record at that level</td><td><code>log.info("rows=%d", n)</code></td></tr>
+<tr><td><code>log.exception</code></td><td>Error record with the current traceback; use inside <code>except</code></td><td><code>log.exception("load failed")</code></td></tr>
+<tr><td><code>basicConfig</code></td><td>One-call setup of the root logger (does nothing if already configured, unless <code>force=True</code>)</td><td><code>logging.basicConfig(level="INFO")</code></td></tr>
+<tr><td><code>setLevel</code></td><td>Minimum level a logger or handler lets through</td><td><code>log.setLevel(logging.DEBUG)</code></td></tr>
+<tr><td><code>StreamHandler</code></td><td>Writes to a stream (stderr by default)</td><td><code>logging.StreamHandler(sys.stdout)</code></td></tr>
+<tr><td><code>FileHandler</code></td><td>Appends to a file</td><td><code>logging.FileHandler("job.log")</code></td></tr>
+<tr><td><code>RotatingFileHandler</code></td><td>Starts a new file when the size limit is reached (in <code>logging.handlers</code>)</td><td><code>RotatingFileHandler("job.log", maxBytes=1_000_000, backupCount=3)</code></td></tr>
+<tr><td><code>Formatter</code></td><td>Layout of one line</td><td><code>Formatter("%(asctime)s %(levelname)s %(message)s")</code></td></tr>
+<tr><td><code>addHandler</code></td><td>Attaches a handler to a logger</td><td><code>log.addHandler(h)</code></td></tr>
+<tr><td><code>propagate</code></td><td>Whether records also go to parent loggers' handlers</td><td><code>log.propagate = False</code></td></tr>
+<tr><td><code>extra=</code></td><td>Attach custom fields to a record</td><td><code>log.info("done", extra={"run_id": 7})</code></td></tr>
+<tr><td><code>dictConfig</code></td><td>Whole configuration as a dictionary (or YAML/JSON)</td><td><code>logging.config.dictConfig(cfg)</code></td></tr>
+<tr><td><code>NullHandler</code></td><td>What a library attaches so it never prints unasked</td><td><code>logging.getLogger("mylib").addHandler(logging.NullHandler())</code></td></tr>
+<tr><td><code>captureWarnings</code></td><td>Routes <code>warnings.warn</code> into logging</td><td><code>logging.captureWarnings(True)</code></td></tr>
+<tr><td><code>LoggerAdapter</code></td><td>Adds fixed context to every message</td><td><code>logging.LoggerAdapter(log, {"job": "etl"})</code></td></tr>
+<tr><td><code>logging.disable</code></td><td>Silence everything up to a level (useful in tests)</td><td><code>logging.disable(logging.CRITICAL)</code></td></tr>
+</tbody></table></div>
+<h3>Example 6: the basic setup</h3>
+@@py
+import logging
+import sys
+
+logging.basicConfig(level=logging.INFO, stream=sys.stdout,
+                    format="%(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("etl")
+
+rows = 1250
+log.debug("this is hidden, level is INFO")
+log.info("loaded %d rows", rows)
+log.warning("column %s has %.1f%% missing", "age", 12.34)
+log.error("could not write %s", "out.csv")
+@@end
+<ol><li><code>basicConfig</code> configures the root logger once: minimum level INFO, output to stdout (default is stderr), and a format using placeholders like <code>%(levelname)s</code>.</li>
+<li><code>getLogger("etl")</code> returns a child logger. In real modules use <code>getLogger(__name__)</code> so the name shows which file spoke.</li>
+<li>The <code>debug</code> call is dropped because DEBUG (10) is below INFO (20).</li>
+<li>Arguments are passed separately (<code>"loaded %d rows", rows</code>), not pre-formatted with an f-string. Logging formats the text only if the record is actually emitted, which saves work for hidden debug messages.</li>
+<li>Output: three lines, one per emitted level. In production you would add <code>%(asctime)s</code> to the format; we left it out so this output is the same every time.</li></ol>
+<h3>Example 7: two handlers with different levels</h3>
+<p>Typical need: the console shows only warnings, the log file keeps everything.</p>
+@@py
+import io
+import logging
+
+console, logfile = io.StringIO(), io.StringIO()
+log = logging.getLogger("train")
+log.setLevel(logging.DEBUG)
+log.propagate = False
+
+h1 = logging.StreamHandler(console)
+h1.setLevel(logging.WARNING)
+h1.setFormatter(logging.Formatter("%(levelname)s | %(message)s"))
+h2 = logging.StreamHandler(logfile)          # stands in for FileHandler
+h2.setLevel(logging.DEBUG)
+h2.setFormatter(logging.Formatter("%(name)s %(levelname)-7s %(message)s"))
+log.addHandler(h1)
+log.addHandler(h2)
+
+log.debug("fold 1 started")
+log.info("fold 1 accuracy=0.81")
+log.warning("fold 2 has few positives")
+
+print("CONSOLE:")
+print(console.getvalue(), end="")
+print("FILE:")
+print(logfile.getvalue(), end="")
+@@end
+<ol><li>The logger level (DEBUG) is the first gate: nothing below it is created. Each handler then applies its own level as a second gate.</li>
+<li><code>propagate = False</code> stops the record from also reaching the root logger, which would print duplicates if the root has a handler (a very common surprise).</li>
+<li><code>h1</code> only accepts WARNING and above and uses a short format. <code>h2</code> accepts everything and uses a longer one. <code>StringIO</code> stands in for a file so we can print what would be in it.</li>
+<li>Output: the console received one line, the file received three lines, with the level padded to 7 characters by <code>%(levelname)-7s</code>.</li></ol>
+<figure><img src="images/lib23_logging_flow.png" alt="Diagram: a log call goes to a logger with level DEBUG, which sends the record to a console handler at WARNING and a file handler at DEBUG, each with its own formatter" loading="lazy"/><figcaption>One record, two gates: the logger level and then each handler level.</figcaption></figure>
+<p><strong>How to read it:</strong> follow an <code>info</code> record from the left. It passes the logger (DEBUG allows it), reaches both handlers, is blocked by the console handler (INFO is below WARNING) and written by the file handler. Always ask "which gate dropped my message?": the logger level, a handler level, or <code>propagate</code>.</p>
+<h3>Example 8: dictConfig and exceptions</h3>
+<p>Larger programs keep the configuration in one dictionary (often loaded from YAML), so changing the format needs no code change. Inside <code>except</code>, use <code>log.exception</code> to record the traceback.</p>
+@@py
+import logging
+import logging.config
+import sys
+
+class ShortExc(logging.Formatter):
+    """Keep only the last traceback line (full paths differ on every machine)."""
+    def formatException(self, exc_info):
+        return super().formatException(exc_info).splitlines()[-1]
+
+config = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {"plain": {"()": ShortExc, "format": "%(levelname)s [%(name)s] %(message)s"}},
+    "handlers": {"out": {"class": "logging.StreamHandler", "stream": "ext://sys.stdout",
+                         "formatter": "plain", "level": "INFO"}},
+    "loggers": {"pipeline": {"level": "DEBUG", "handlers": ["out"], "propagate": False}},
+}
+logging.config.dictConfig(config)
+log = logging.getLogger("pipeline.clean")     # a child of "pipeline"
+
+def parse_age(text):
+    try:
+        return int(text)
+    except ValueError:
+        log.exception("bad age %r", text)
+        return None
+
+print(parse_age("41"))
+print(parse_age("forty"))
+@@end
+<ol><li>A formatter turns the traceback into text with <code>formatException</code>. We override it to keep only the last line, so the output below is stable; in production keep the full traceback. The dictionary key <code>"()"</code> means "build this callable instead of the default class".</li>
+<li>The dictionary describes formatters, handlers and loggers by name; <code>"ext://sys.stdout"</code> is the syntax for "the object <code>sys.stdout</code>". <code>disable_existing_loggers: False</code> keeps loggers that other libraries created before.</li>
+<li><code>getLogger("pipeline.clean")</code> is a child of <code>pipeline</code>; dots make the hierarchy, so the child inherits the handler configured on its parent.</li>
+<li><code>parse_age("41")</code> returns 41, nothing is logged. <code>parse_age("forty")</code> raises inside <code>int</code>, the <code>except</code> block logs at ERROR level with the traceback attached, and the function returns <code>None</code>.</li>
+<li>The output shows <code>41</code>, then the <code>ERROR</code> line followed by the one-line exception <code>ValueError: invalid literal for int() with base 10: 'forty'</code>, then <code>None</code>.</li></ol>

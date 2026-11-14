@@ -1,0 +1,218 @@
+
+<h2>20.7 Web APIs: requests and httpx</h2>
+<p>An API call is one question and one answer over HTTP: you send a method (<code>GET</code> to read, <code>POST</code> to create), a URL, optional headers and body, and you get back a status code, headers and a body, usually JSON. <code>requests</code> is the long-standing simple choice. <code>httpx</code> has almost the same API and adds async support and strict default timeouts. The networking basics (methods, status families, REST design) are in Chapter 12; this chapter is about using the clients robustly to collect data.</p>
+<div class="callout red"><div class="lab">COMMON MISTAKE</div><div class="txt"><strong>Wrong:</strong> <code>requests.get(url)</code> with no timeout. <strong>Symptom:</strong> a nightly job hangs forever when the server accepts the connection and then goes silent; <code>requests</code> has no default timeout. <strong>Fix:</strong> always pass <code>timeout=</code>, for example <code>timeout=(3.05, 10)</code> (connect, read). <code>httpx</code> defaults to 5 seconds, but set it explicitly anyway.</div></div>
+<h3>Reference: requests and httpx essentials</h3>
+<div class="tablewrap"><table class="data"><thead><tr><th>Name</th><th>What it does</th><th>Minimal example</th></tr></thead><tbody>
+<tr><td><code>requests.get(url)</code></td><td>Read a resource</td><td><code>requests.get(u, timeout=5)</code></td></tr>
+<tr><td><code>requests.post(url, json=...)</code></td><td>Send a JSON body and set the header</td><td><code>requests.post(u, json={"a": 1}, timeout=5)</code></td></tr>
+<tr><td><code>params={...}</code></td><td>Build the query string safely</td><td><code>get(u, params={"page": 2})</code></td></tr>
+<tr><td><code>headers={...}</code></td><td>Custom headers</td><td><code>get(u, headers={"Accept": "application/json"})</code></td></tr>
+<tr><td><code>timeout=</code></td><td>Maximum seconds to connect and to wait for data</td><td><code>timeout=(3, 10)</code></td></tr>
+<tr><td><code>auth=(user, pw)</code></td><td>HTTP Basic authentication</td><td><code>get(u, auth=("me", pw))</code></td></tr>
+<tr><td>Bearer token header</td><td>Token authentication</td><td><code>headers={"Authorization": f"Bearer {tok}"}</code></td></tr>
+<tr><td><code>r.status_code</code>, <code>r.ok</code></td><td>Result number; <code>True</code> if below 400</td><td><code>if not r.ok: ...</code></td></tr>
+<tr><td><code>r.raise_for_status()</code></td><td>Raise <code>HTTPError</code> for 4xx and 5xx</td><td><code>r.raise_for_status()</code></td></tr>
+<tr><td><code>r.json()</code></td><td>Parse the body as JSON</td><td><code>data = r.json()</code></td></tr>
+<tr><td><code>r.text</code>, <code>r.content</code></td><td>Body as decoded text, as raw bytes</td><td><code>r.content[:100]</code></td></tr>
+<tr><td><code>r.headers</code></td><td>Case-insensitive header dict</td><td><code>r.headers["Retry-After"]</code></td></tr>
+<tr><td><code>stream=True</code>, <code>r.iter_content(n)</code></td><td>Download big bodies in pieces</td><td><code>for part in r.iter_content(8192): ...</code></td></tr>
+<tr><td><code>requests.Session()</code></td><td>Reuse connection, headers and cookies</td><td><code>s = requests.Session(); s.get(u)</code></td></tr>
+<tr><td><code>HTTPAdapter(max_retries=Retry(...))</code></td><td>Automatic retries with backoff</td><td><code>s.mount("https://", adapter)</code></td></tr>
+<tr><td><code>requests.Timeout</code>, <code>ConnectionError</code>, <code>HTTPError</code></td><td>The exceptions to catch</td><td><code>except requests.Timeout:</code></td></tr>
+<tr><td><code>httpx.Client(base_url=, timeout=)</code></td><td>Session-like client with shared base URL</td><td><code>httpx.Client(base_url="https://api.x.com")</code></td></tr>
+<tr><td><code>httpx.AsyncClient</code></td><td>Many requests concurrently with <code>await</code></td><td><code>await ac.get("/x")</code></td></tr>
+<tr><td><code>httpx.Timeout(5, connect=2)</code></td><td>Separate limits per phase</td><td><code>Client(timeout=httpx.Timeout(10, connect=3))</code></td></tr>
+<tr><td><code>httpx.HTTPTransport(retries=n)</code></td><td>Retry failed connections only (not 5xx)</td><td><code>Client(transport=httpx.HTTPTransport(retries=2))</code></td></tr>
+</tbody></table></div>
+<p><strong>The offline test server.</strong> All HTTP examples start the same small server on <code>127.0.0.1</code> with a free port chosen by the operating system (port <code>0</code>). You pass it one function that decides the reply for each path. This is also how you can unit-test your own API code without the internet.</p>
+<h3>Example 1: one call, parameters, auth, errors, then httpx</h3>
+<pre class="code lang-python"><code>import asyncio, json, os, threading, time
+import httpx, requests
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+
+def start(route):
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            u = urlparse(self.path)
+            code, obj, hdrs = route(u.path, parse_qs(u.query), self.headers)
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            for k, v in {"Content-Type": "application/json", "Content-Length": len(body), **hdrs}.items():
+                self.send_header(k, str(v))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *args):
+            pass
+    os.environ["NO_PROXY"] = "127.0.0.1"   # local test traffic must never go through a proxy
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_port}"
+
+def route(path, query, headers):
+    if path == "/secure" and headers.get("Authorization") != "Bearer s3cret":
+        return 401, {"error": "bad token"}, {}
+    if path == "/slow":
+        time.sleep(0.3)
+    return 200, {"path": path, "query": query}, {}
+
+srv, base = start(route)
+r = requests.get(f"{base}/items", params={"page": 2, "tag": ["a", "b"]}, timeout=5)
+print(r.status_code, r.ok, r.url.split("/items")[1])
+print(r.json())
+
+bad = requests.get(f"{base}/secure", timeout=5)
+print(bad.status_code, bad.json())
+try:
+    bad.raise_for_status()
+except requests.HTTPError as e:
+    print("HTTPError, status", e.response.status_code)
+
+s = requests.Session()
+s.headers.update({"Authorization": "Bearer s3cret"})
+print(s.get(f"{base}/secure", timeout=5).status_code)
+
+async def many():
+    async with httpx.AsyncClient(base_url=base, timeout=5.0) as ac:
+        return await asyncio.gather(*(ac.get("/slow", params={"n": i}) for i in range(3)))
+
+t0 = time.perf_counter()
+replies = asyncio.run(many())
+print([x.json()["query"]["n"][0] for x in replies], "concurrent:", time.perf_counter() - t0 &lt; 0.8)
+srv.shutdown()</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>Lines 1 to 22 are the reusable test server: <code>start(route)</code> builds a handler whose <code>do_GET</code> asks your <code>route</code> function for a status code, a JSON-able object and extra headers. It binds port 0 (any free port) in a background thread. Setting <code>NO_PROXY</code> makes <code>requests</code> and <code>httpx</code> skip any environment proxy (common on company networks) for the local address.</li><li><code>route</code> answers 401 on <code>/secure</code> without the right bearer token, sleeps 0.3 s on <code>/slow</code>, and otherwise echoes path and query.</li><li>The first call passes <code>params</code> as a dict; a list becomes a repeated key (<code>tag=a&amp;tag=b</code>). The server sees every value as a list of strings, as <code>parse_qs</code> always reports.</li><li><code>requests</code> does <strong>not</strong> raise on 4xx by itself: call <code>raise_for_status()</code>; the response stays available as <code>e.response</code>.</li><li>A <code>Session</code> stores headers once and keeps the connection open between calls.</li><li><code>httpx</code> looks almost the same but adds async. <code>asyncio.gather</code> sends three 0.3 s calls at once and returns replies in the order given. Done one after another they would need 0.9 s; the printed <code>True</code> means they finished in under 0.8 s (exact seconds vary, so I print a yes/no).</li></ol>
+<p>The figure shows why sessions matter even on a local machine: opening a new connection for every call costs more time than reusing one.</p>
+<figure><img src="images/lib20_session.png" alt="Bar chart comparing the time for 300 local GET requests with a new connection each time against one shared Session" loading="lazy"/><figcaption>Measured on one machine against a local server; absolute numbers vary, the gap is what matters.</figcaption></figure>
+<p><strong>How to read it:</strong> the left bar is 300 calls that each build a fresh connection, the right bar is the same 300 calls through one <code>Session</code>. Over a real network the gap is larger, because DNS lookup and the TLS handshake are skipped too.</p>
+<h3>Example 2: timeouts, retries, backoff, pagination and 429</h3>
+<p><strong>Retry only what can succeed later</strong>: timeouts, connection errors, 429 and 5xx. Never retry 400, 401, 403 or 404, because the answer will not change. <strong>Backoff</strong> means waiting longer after each failure (0.05, 0.1, 0.2 seconds ...), and <strong>jitter</strong> means adding randomness so that many clients do not all return at the same instant.</p>
+<pre class="code lang-python"><code>import json, os, random, threading, time, requests
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse, parse_qs
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def start(route):
+    class H(BaseHTTPRequestHandler):
+        def do_GET(self):
+            u = urlparse(self.path)
+            code, obj, hdrs = route(u.path, parse_qs(u.query), self.headers)
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            for k, v in {"Content-Type": "application/json", "Content-Length": len(body), **hdrs}.items():
+                self.send_header(k, str(v))
+            self.end_headers()
+            self.wfile.write(body)
+        def log_message(self, *args):
+            pass
+    os.environ["NO_PROXY"] = "127.0.0.1"
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_port}"
+
+ITEMS = [{"id": i, "v": i * i} for i in range(1, 24)]
+state = {"flaky": 0, "feed": 0, "limited": 0}
+def route(path, query, headers):
+    if path == "/flaky":
+        state["flaky"] += 1
+        return (503, {"error": "busy"}, {}) if state["flaky"] &lt; 3 else (200, {"ok": True}, {})
+    if path == "/slow":
+        time.sleep(1.0)
+    if path == "/feed":
+        state["feed"] += 1
+        if state["feed"] % 3 == 0:
+            state["limited"] += 1
+            return 429, {"error": "slow down"}, {"Retry-After": "0"}
+        after, limit = int(query["after"][0]), int(query["limit"][0])
+        page = [x for x in ITEMS if x["id"] &gt; after][:limit]
+        return 200, {"items": page, "next": page[-1]["id"] if len(page) == limit else None}, {}
+    return 200, {}, {}
+
+srv, base = start(route)
+
+def get_with_retry(session, url, tries=5, base_delay=0.05, cap=1.0, rng=random.Random(0)):
+    delays = []
+    for attempt in range(1, tries + 1):
+        try:
+            r = session.get(url, timeout=2)
+            if r.status_code not in (429, 500, 502, 503, 504):
+                r.raise_for_status()
+                return r, delays
+        except (requests.ConnectionError, requests.Timeout):
+            pass
+        if attempt == tries:
+            raise RuntimeError(f"gave up after {tries} tries")
+        delay = rng.uniform(0, min(cap, base_delay * 2 ** (attempt - 1)))
+        delays.append(round(delay, 3))
+        time.sleep(delay)
+
+r, delays = get_with_retry(requests.Session(), f"{base}/flaky")
+print(r.json(), "waits:", delays)
+
+state["flaky"] = 0
+s = requests.Session()
+s.mount("http://", HTTPAdapter(max_retries=Retry(total=4, backoff_factor=0.05, status_forcelist=[503])))
+print(s.get(f"{base}/flaky", timeout=2).json(), "server calls:", state["flaky"])
+
+try:
+    requests.get(f"{base}/slow", timeout=(1, 0.3))
+except requests.exceptions.ReadTimeout as e:
+    print("timeout:", type(e).__name__)
+
+def paged(session, url, limit=10):
+    after = 0
+    while True:
+        r = session.get(url, params={"after": after, "limit": limit}, timeout=5)
+        if r.status_code == 429:
+            time.sleep(float(r.headers.get("Retry-After", 1)))
+            continue
+        r.raise_for_status()
+        body = r.json()
+        yield from body["items"]
+        if body["next"] is None:
+            break
+        after = body["next"]
+
+rows = list(paged(requests.Session(), f"{base}/feed"))
+print(len(rows), rows[0], rows[-1], "unique:", len({x["id"] for x in rows}))
+print("feed calls:", state["feed"], "rate limited:", state["limited"])
+srv.shutdown()</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>The first 22 lines are the same test server as Example 1. The route table has <code>/flaky</code> (503 twice, then 200), <code>/slow</code> (sleeps one second) and <code>/feed</code> (cursor pages of 23 items, with every third call answered by 429 and <code>Retry-After: 0</code>).</li><li><code>get_with_retry</code> retries connection errors, timeouts and the statuses 429, 500, 502, 503, 504. A 4xx such as 404 goes straight to <code>raise_for_status()</code>. The delay is <code>uniform(0, min(cap, base * 2**(attempt-1)))</code>: exponential growth, a cap and full jitter; the seeded generator makes the printed waits repeatable. Two waits were needed.</li><li>The second approach mounts a urllib3 <code>Retry</code> policy: <code>total=4</code> retries, <code>backoff_factor=0.05</code> (the first retry is immediate, later waits grow), <code>status_forcelist=[503]</code>. The server saw three calls. It also honours <code>Retry-After</code>.</li><li>The slow route needs a second but we allow 0.3 s to <em>read</em>, so <code>ReadTimeout</code> is raised. A tuple means (connect timeout, read timeout).</li><li><code>paged</code> is a <strong>generator</strong>: <code>yield from</code> hands out items one by one, so the caller can stream them into a database. On 429 it sleeps as long as the server asked and repeats the same request; the cursor did not move, so nothing is skipped.</li><li>Result: 23 unique items from four feed calls: two full pages, one refused call, and a last short page of 3.</li></ol>
+<figure><img src="images/lib20_backoff.png" alt="Line chart of wait time against retry number for exponential backoff with a cap, a fixed delay, and random jittered delays" loading="lazy"/><figcaption>Exponential backoff doubles the wait up to a cap; full jitter picks a random point below the line.</figcaption></figure>
+<p><strong>How to read it:</strong> the horizontal axis is how many times you have already failed, the vertical axis is how long you wait before the next try. The red line shows a fixed delay, which keeps hitting a struggling server every half second. The blue line doubles each time until it reaches the 20 second cap. The orange dots are jittered waits: each is a random value between zero and the blue line, so a crowd of clients does not move in lockstep.</p>
+<div class="callout cream"><div class="lab">REAL JOB</div><div class="txt">Concurrency is permission to hurt a server faster. Cap it (for example with <code>asyncio.Semaphore(5)</code>) and respect the provider's rate limit, otherwise your fast script gets your key blocked.</div></div>
+<h3>Offset or cursor pagination</h3>
+<p>APIs return big collections in pages (the <code>paged</code> generator above is the pattern). There are two styles. <strong>Offset or page-number</strong> pagination (<code>?page=3</code>) is simple, but if rows are added while you read, the pages shift and you see duplicates or miss rows. <strong>Cursor</strong> pagination (<code>?after=20</code>) asks for "the next rows after the last one I saw" and stays correct.</p>
+<figure><img src="images/lib20_pagination.png" alt="Two scatter plots of row ids returned per request: offset paging shows duplicate rows after new rows arrive, cursor paging shows none" loading="lazy"/><figcaption>Three new rows arrive after request 2. Offset paging repeats rows (red crosses); cursor paging does not.</figcaption></figure>
+<p><strong>How to read it:</strong> each column of dots is one request and each dot is a row id it returned (newest ids at the top). On the left, request 3 starts three ids too high because the new rows pushed everything down, so it returns rows already seen in request 2 (red crosses). On the right, the cursor says "ids below 81", so request 3 continues exactly where request 2 stopped.</p>
+<h3>Example 3: staying under a rate limit with a token bucket</h3>
+<p>A <strong>token bucket</strong> is the classic polite-client tool. The bucket refills at a steady rate, up to a maximum. Each request takes one token. If the bucket is empty you wait. This allows short bursts but a steady average. To keep the example repeatable, the clock is passed in, so we can use a fake clock.</p>
+<pre class="code lang-python"><code>class TokenBucket:
+    def __init__(self, rate, capacity, clock):
+        self.rate, self.capacity, self.clock = rate, capacity, clock
+        self.tokens, self.last = capacity, clock()
+
+    def take(self):
+        """Return 0.0 if a request may go now, else the seconds to wait."""
+        now = self.clock()
+        self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+        self.last = now
+        if self.tokens &gt;= 1:
+            self.tokens -= 1
+            return 0.0
+        return round((1 - self.tokens) / self.rate, 3)
+
+now = [0.0]
+bucket = TokenBucket(rate=2, capacity=3, clock=lambda: now[0])
+print([bucket.take() for _ in range(5)])
+now[0] += 1.0
+print([bucket.take() for _ in range(3)])</code></pre>
+<pre class="code lang-text"><code>@@</code></pre>
+<ol><li>The bucket stores the refill rate (2 per second), the capacity (3) and a clock function. It starts full.</li><li><code>take</code> adds tokens for the time passed (capped), then spends one and returns 0.0, or returns how long to wait for the missing part of a token.</li><li>At time 0 the first three calls pass (the burst); the fourth and fifth must wait 0.5 s. After one fake second two tokens are back, so two calls pass and the third waits again.</li><li>In real code pass <code>time.monotonic</code> as the clock and <code>time.sleep(wait)</code> when the result is above zero.</li></ol>
+<figure><img src="images/lib20_tokenbucket.png" alt="Line chart of tokens in the bucket over ten seconds with two bursts of requests that drain it and a steady refill" loading="lazy"/><figcaption>A simulated bucket (2 tokens per second, capacity 5) absorbing two bursts.</figcaption></figure>
+<p><strong>How to read it:</strong> the blue line is how many tokens are available. Each green dot is a request that went out and drains the bucket by one. During the burst at second 2 the line falls; the red cross shows a moment when the bucket was nearly empty and a request would have had to wait. Between bursts the line climbs at the refill rate and stops at the capacity of 5. The average rate stays at 2 requests per second, but short bursts are allowed.</p>
+<h3>Authentication in practice</h3>
+<ul><li><strong>Bearer token</strong>: <code>Authorization: Bearer &lt;token&gt;</code> in a header. Store the token in an environment variable (<code>os.environ["API_TOKEN"]</code>), never in the script, and never print it.</li><li><strong>API key</strong>: usually a header such as <code>X-API-Key</code>. A key in the URL query string ends up in server logs and browser history, so prefer headers when the API allows.</li><li><strong>Basic auth</strong>: <code>auth=("user", "password")</code>. Only over HTTPS.</li><li><strong>OAuth 2</strong>: you exchange credentials for a short-lived token and must refresh it when it expires. Use a library built for the provider.</li><li>Proxies: <code>requests</code> and <code>httpx</code> read <code>HTTP_PROXY</code> and <code>NO_PROXY</code> from the environment. If a local test call is unexpectedly routed through a corporate proxy, set <code>NO_PROXY=127.0.0.1</code> (as the examples do) or pass <code>trust_env=False</code>.</li></ul>
