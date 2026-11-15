@@ -92,3 +92,25 @@
   });
   document.addEventListener("click", function (e) { if (!wrap.contains(e.target)) drop.hidden = true; });
 })();
+
+// Notebook links: a small bar under the chapter banner (download the .ipynb or open it in Google Colab).
+(function () {
+  var m = /\/study\/([a-z]+)\/(ch\d\d)\.html/.exec(location.pathname);
+  var banner = document.querySelector(".banner");
+  if (!m || !banner) return;
+  var me = document.querySelector('script[src*="study.js"]');
+  var base = me ? me.src.replace(/assets\/study\.js.*$/, "") : "../../";
+  var s = document.createElement("script");
+  s.src = base + "assets/notebooks.js";
+  s.onload = function () {
+    if (!(window.NOTEBOOKS && window.NOTEBOOKS[m[1]] && window.NOTEBOOKS[m[1]][m[2]])) return;
+    var colab = "https://colab.research.google.com/github/Dadipavan/Learning/blob/main/study/" + m[1] + "/notebooks/" + m[2] + ".ipynb";
+    var bar = document.createElement("div");
+    bar.style.cssText = "display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:14px 0 4px;padding:10px 12px;background:var(--soft,#f6f8fc);border:1px solid var(--line,#dfe5f0);border-left:4px solid var(--accent,#2b4fd6);font-size:14px";
+    bar.innerHTML = '<span style="flex:1 1 240px;color:var(--muted,#5a6580)">Practise the code of this chapter in a notebook:</span>' +
+      '<a class="btn ghost" style="padding:7px 12px;font-size:13px" href="notebooks/' + m[2] + '.ipynb" download>Download notebook (.ipynb)</a>' +
+      '<a class="btn ghost" style="padding:7px 12px;font-size:13px" target="_blank" rel="noopener" href="' + colab + '">Open in Colab</a>';
+    banner.parentNode.insertBefore(bar, banner.nextSibling);
+  };
+  document.head.appendChild(s);
+})();
